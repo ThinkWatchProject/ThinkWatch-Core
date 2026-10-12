@@ -1109,6 +1109,22 @@ async fn pump(
             let _ = forward(&state, p, tails, None, false, &mut c_tx).await;
         }
     }
+    // 回答过滤扣着的尾巴也一样：上游没收尾就走了，那几个字照样交给客户端（已经过了过滤）
+    if matches!(end, End::UpstreamClosed | End::Broke(_))
+        && let Some(f) = p.answer.as_mut()
+    {
+        for s in f.drain() {
+            if c_tx
+                .send(Message::Text(s.data.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    // 这一次回答里认定的命中挂在它那一轮上报，在那一轮收场之前
+    report_answer(&state, p);
     // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了。在等准入的那一轮
     // 开始了的话记成取消；在跑的几轮，上游断了、收了连接的是失败，客户端走了的是取消
     drop(waiting);
@@ -1404,7 +1420,7 @@ fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     if hits.is_empty() {
         return UpMsg::Text(text.into());
     }
-    let found = tw_guard::redact::rules::findings(&text, &hits);
+    let found = tw_guard::redact::flow::reported(&text, &p.rules.redact, &hits);
     let replaced = mode.acts().then(|| {
         // 只记录的规则命中的不换
         let r = tw_guard::redact::replace::apply(
@@ -1647,16 +1663,12 @@ async fn forward(
             (msgs, err)
         }
     };
-    // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的
-    let outgoing = if late {
-        outgoing
-    } else {
-        let out = filter_answer(p, outgoing);
-        if terminal || kind == Some("error") {
-            report_answer(state, p);
-        }
-        out
-    };
+    // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的。收了尾的
+    // 那一次回答又来的一帧也过（上游先报 `error` 再补一个带着整段正文的 `response.failed`）
+    let outgoing = filter_answer(p, outgoing);
+    if terminal || kind == Some("error") {
+        report_answer(state, p);
+    }
     for msg in outgoing {
         let hits = match p.wall.as_mut() {
             Some(w) => w.feed(as_sse(&msg).as_bytes()),

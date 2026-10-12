@@ -2016,3 +2016,121 @@ async fn an_answer_on_a_websocket_is_filtered_and_its_hit_is_reported_on_its_tur
         );
     }
 }
+
+/// 按剧本回答的 Responses 上游：`close` 回了一段字就走了（不收尾），`error-failed` 先报
+/// `error`、再补一个带着整段正文的 `response.failed`
+async fn playing(script: &'static str) -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(move |sock| play(sock, script))
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+async fn play(mut sock: WebSocket, script: &'static str) {
+    while let Some(Ok(m)) = sock.recv().await {
+        let Message::Text(_) = m else { continue };
+        let delta = |d: &str| serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":d});
+        let mut frames = vec![
+            serde_json::json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"gpt-5","output":[]}}),
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg","role":"assistant","content":[]}}),
+        ];
+        match script {
+            "close" => frames.push(delta("hello world, all of this is text")),
+            _ => {
+                frames.push(delta("a secret here"));
+                frames.push(serde_json::json!({"type":"error","error":{"type":"server_error","message":"boom"},"response_id":"resp_1"}));
+                frames.push(serde_json::json!({"type":"response.failed","response":{"id":"resp_1","status":"failed","output":[{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"a secret here"}]}]}}));
+            }
+        }
+        for f in frames {
+            if sock
+                .send(Message::Text(f.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        if script == "close" {
+            return;
+        }
+    }
+}
+
+/// 内容过滤只查回答、删掉 `pattern` 的网关
+async fn stripping_gateway(up: SocketAddr, pattern: &str) -> SocketAddr {
+    let pattern = pattern.to_string();
+    let (gw, _rx, _state) = turns_gateway(
+        up,
+        move |cfg| {
+            cfg.security.content = tw_config::ContentPolicy {
+                mode: SecurityMode::Enforce,
+                custom: vec![tw_config::CustomContentRule {
+                    name: "r".into(),
+                    pattern,
+                    scope: vec![tw_config::ContentScope::Response],
+                    matching: Default::default(),
+                    case_sensitive: false,
+                    action: tw_config::ContentAction::Strip,
+                    replacement: "***".into(),
+                    disabled: false,
+                }],
+                ..Default::default()
+            };
+        },
+        None,
+    )
+    .await;
+    gw
+}
+
+/// 发一个 `response.create`，读到连接没了或者静下来为止
+async fn everything(gw: SocketAddr) -> Vec<String> {
+    let mut c = connect(gw).await;
+    c.send(create("hi")).await.unwrap();
+    let mut out = Vec::new();
+    while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(2), c.next()).await {
+        if let tokio_tungstenite::tungstenite::Message::Text(t) = m {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// 上游答到一半就走了：回答过滤扣着的尾巴照样交给客户端
+#[tokio::test]
+async fn the_held_tail_reaches_the_client_when_the_upstream_goes_away_mid_answer() {
+    let up = playing("close").await;
+    let gw = stripping_gateway(up, "zzzzzzzzzzzz").await;
+    let text: String = everything(gw)
+        .await
+        .iter()
+        .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+        .filter(|v| v["type"] == "response.output_text.delta")
+        .map(|v| v["delta"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(text, "hello world, all of this is text");
+}
+
+/// 收了尾的那一次回答又来的一帧（`error` 之后补的 `response.failed`）照样过回答过滤：带着的
+/// 整段正文不把删掉的字带回来
+#[tokio::test]
+async fn a_late_failed_frame_after_an_error_is_filtered_too() {
+    let up = playing("error-failed").await;
+    let gw = stripping_gateway(up, "secret").await;
+    let frames = everything(gw).await;
+    assert!(
+        frames.iter().any(|f| f.contains("response.failed")),
+        "{frames:#?}"
+    );
+    assert!(
+        !frames.iter().any(|f| f.contains("secret")),
+        "删掉的字到了客户端：{frames:#?}"
+    );
+}

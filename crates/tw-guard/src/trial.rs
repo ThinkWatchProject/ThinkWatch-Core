@@ -422,10 +422,11 @@ fn content_answer(rules: &content::Rules, sample: &str) -> TrialResult {
             refused: false,
         };
     };
-    let mut lane = answer.lane(true);
+    let mut lane = answer.lane(true).keeping_all();
     let out = lane.whole(sample);
     let mut hits: Vec<TrialHit> = lane
-        .take_found()
+        .take()
+        .found
         .iter()
         .filter_map(|f| {
             let rule = answer.rule(f)?;

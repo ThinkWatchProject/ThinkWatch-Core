@@ -16,7 +16,8 @@
 //! # 仅记录的规则
 //!
 //! 动作是「仅记录」的规则（[`RuleSet::records`]）照样找、照样报，只是不换：原值照发，不进
-//! 账本，回答里也就没有要换回来的。
+//! 账本，回答里也就没有要换回来的。**和要换的规则认到同一处时，换的那条说了算**：只记录的
+//! 规则盖不住一个本该换掉的值（见 [`reported`]）。
 //!
 //! # 观察档和替换档用同一套规则
 //!
@@ -113,7 +114,30 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
     let Ok(text) = std::str::from_utf8(body) else {
         return Vec::new();
     };
-    crate::redact::rules::findings(text, &hits(text, rules))
+    reported(text, rules, &hits(text, rules))
+}
+
+/// 报出去的记录：`found`（[`hits`] 在 `text` 上找到的），**加上被换成占位符的命中盖住的、
+/// 只记录的规则的命中**。
+///
+/// 一处值两条规则都认得、一条换成占位符一条只记录时，换的那条说了算（见
+/// [`crate::redact::rules::scan`]）：发出去的是占位符。只记录的那条照样命中了，照样报 ——
+/// 用户要看得见它在认哪些值。没有只记录的规则时就是 `found` 的那些
+pub fn reported(text: &str, rules: &RuleSet, found: &[Hit]) -> Vec<Finding> {
+    let Some(rec) = rules.recording_only() else {
+        return crate::redact::rules::findings(text, found);
+    };
+    let extra: Vec<Hit> = hits(text, &rec)
+        .into_iter()
+        .filter(|h| !found.contains(h))
+        .collect();
+    if extra.is_empty() {
+        return crate::redact::rules::findings(text, found);
+    }
+    let mut all = found.to_vec();
+    all.extend(extra);
+    all.sort_by_key(|h| h.bytes.start);
+    crate::redact::rules::findings(text, &all)
 }
 
 /// 一本新账，让开 `body` 里已经写着的占位符（见 [`Ledger::avoiding`]）。
@@ -177,7 +201,7 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> Look
         return empty();
     };
     let hits = hits(text, rules);
-    let found = crate::redact::rules::findings(text, &hits);
+    let found = reported(text, rules, &hits);
     let ledger = if !mode.acts() {
         Ledger::new(Scheme::SECRET)
     } else {
@@ -740,6 +764,156 @@ mod tests {
             let mut kept = hits;
             outside(&mut kept, spans.clone());
             assert_eq!(kept, pairwise, "{spans:?}");
+        }
+    }
+
+    /// 一条只记录的规则和一条换成占位符的规则认到同一处：换的那条说了算，值不原样发出；两条都报
+    #[test]
+    fn a_record_only_rule_never_hides_a_value_another_rule_replaces() {
+        use crate::policy::{ContentMatch, CustomRedactRule, RedactAction, RedactPolicy};
+        let custom = |name: &str, pattern: &str, action| CustomRedactRule {
+            name: name.into(),
+            pattern: pattern.into(),
+            matching: ContentMatch::Regex,
+            case_sensitive: false,
+            label: None,
+            action,
+            disabled: false,
+        };
+        let send = |p: &RedactPolicy, body: &str| {
+            let rules = p.rules().unwrap();
+            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+            let (out, _) = replace(Mode::Enforce, &rules, body.to_string().into(), &l.ledger);
+            let reported: Vec<(String, bool)> = l
+                .found
+                .iter()
+                .map(|f| (f.rule.id().to_string(), rules.records(&f.rule)))
+                .collect();
+            (String::from_utf8(out.to_vec()).unwrap(), reported)
+        };
+        // 自定义的只记录、内置的 OpenAI 密钥换掉：只记录的那条从更前面开始
+        let key = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdEFGH";
+        let body = serde_json::json!({"messages":[{"role":"user",
+            "content":format!("my env: OPENAI_API_KEY={key} ok")}]})
+        .to_string();
+        let p = RedactPolicy {
+            custom: vec![custom("env", r"OPENAI_API_KEY=\S+", RedactAction::Record)],
+            ..Default::default()
+        };
+        let (out, reported) = send(&p, &body);
+        assert!(!out.contains(key), "{out}");
+        assert!(out.contains("OPENAI_API_KEY=<<TW_SECRET_1>>"), "{out}");
+        assert!(
+            reported.contains(&("openai-project-key".to_string(), false)),
+            "{reported:?}"
+        );
+        assert!(
+            reported.contains(&("env".to_string(), true)),
+            "{reported:?}"
+        );
+        // 内置的邮箱只记录、自定义的换掉
+        let mut p = RedactPolicy {
+            enable: vec!["email".into()],
+            custom: vec![custom(
+                "corp",
+                r"[a-z]+@corp\.example\.com",
+                RedactAction::Placeholder,
+            )],
+            ..Default::default()
+        };
+        p.actions.insert("email".into(), RedactAction::Record);
+        let body = serde_json::json!({"messages":[{"role":"user",
+            "content":"mail alice@corp.example.com and bob@other.example.org"}]})
+        .to_string();
+        let (out, reported) = send(&p, &body);
+        assert!(!out.contains("alice@corp.example.com"), "{out}");
+        assert!(out.contains("bob@other.example.org"), "只记录的照发：{out}");
+        assert_eq!(
+            reported,
+            [
+                ("corp".to_string(), false),
+                ("email".to_string(), true),
+                ("email".to_string(), true)
+            ],
+            "两处邮箱都报，换掉的那处也报"
+        );
+    }
+
+    /// 随机的规则和正文：加上只记录的规则，换掉的一个都不少 —— 发出去的和没有它们时一样
+    #[test]
+    fn record_only_rules_never_change_what_is_replaced() {
+        use crate::policy::{ContentMatch, CustomRedactRule, RedactAction, RedactPolicy};
+        let mut seed = 0x0bad_5eed_1234_5678_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        let patterns = [
+            r"a[b1]{1,3}",
+            r"b+a",
+            r"[ab]{3}",
+            r"x1y",
+            r"\d{2}",
+            r"a1",
+            r"y[ab]+",
+        ];
+        let alphabet = ["a", "b", "1", "2", "x", "y", " ", "中"];
+        let builtins = ["email", "jwt", "openai-api-key"];
+        for _ in 0..400 {
+            let mut p = RedactPolicy {
+                enable: vec!["email".into()],
+                ..Default::default()
+            };
+            for i in 0..1 + next(4) {
+                let action = if next(2) == 0 {
+                    RedactAction::Record
+                } else {
+                    RedactAction::Placeholder
+                };
+                p.custom.push(CustomRedactRule {
+                    name: format!("r{i}"),
+                    pattern: patterns[next(patterns.len())].into(),
+                    matching: ContentMatch::Regex,
+                    case_sensitive: false,
+                    label: None,
+                    action,
+                    disabled: false,
+                });
+            }
+            for b in builtins {
+                if next(3) == 0 {
+                    p.actions.insert(b.into(), RedactAction::Record);
+                }
+            }
+            let mut text: String = (0..next(50))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            if next(2) == 0 {
+                text.push_str(" a1@x.example.com sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd");
+            }
+            let body = serde_json::json!({"messages":[{"role":"user","content":text}]}).to_string();
+            // 不带只记录的规则：内置的关掉、自定义的去掉
+            let mut bare = p.clone();
+            bare.custom
+                .retain(|c| c.action == RedactAction::Placeholder);
+            for (id, a) in &p.actions {
+                if *a == RedactAction::Record {
+                    bare.disable.push(id.clone());
+                    if id == "email" {
+                        bare.enable.retain(|e| e != "email");
+                    }
+                }
+            }
+            bare.actions.clear();
+            let out = |p: &RedactPolicy| {
+                let rules = p.rules().unwrap();
+                let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+                let (out, _) = replace(Mode::Enforce, &rules, body.clone().into(), &l.ledger);
+                String::from_utf8(out.to_vec()).unwrap()
+            };
+            assert_eq!(out(&p), out(&bare), "{text:?} {p:?}");
         }
     }
 

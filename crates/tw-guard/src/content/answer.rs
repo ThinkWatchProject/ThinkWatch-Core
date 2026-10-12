@@ -223,6 +223,22 @@ pub struct Found {
     pub place: Option<Place>,
 }
 
+/// 一路正文里认定了的命中（[`Lane::take`]）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Matches {
+    /// 留了前后文的那几处，按先后
+    pub found: Vec<Found>,
+    /// 每条规则一共几处，按 [`Answer`] 里的顺序（[`Answer::rule_at`]）
+    pub counts: Vec<usize>,
+}
+
+impl Matches {
+    /// 一共几处
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+}
+
 impl Found {
     /// 第几条规则（[`Answer`] 里的顺序，[`Answer::rule_at`]）
     pub fn rule_index(&self) -> usize {
@@ -259,8 +275,13 @@ pub struct Lane {
     scan: Vec<usize>,
     /// 认定了、还没发出去的要改的地方：`buf` 里的区间和第几条规则
     edits: Vec<(Range<usize>, usize)>,
-    /// 认定了的命中，还没被取走的
+    /// 认定了的命中里留了前后文的那几处（每条规则在这一路里最多 [`PLACES_MAX`] 处），还没被
+    /// 取走的。**再多的只数个数**（`counts`）：一段回答里同一个词出现几万次，不该攒几万条
     found: Vec<Found>,
+    /// 每条规则认定了几处，还没被取走的
+    counts: Vec<usize>,
+    /// 每一处都留下位置（管理界面的「按回答测试」：样本有多长就标多少处）
+    keep_all: bool,
     /// `found` 里后面的字还没收齐的那几处：`(found 的下标, 下一个要接的字在这一路里的位置)`
     open: Vec<(usize, usize)>,
     /// 每条规则在这一路里留了几处的前后文
@@ -280,10 +301,18 @@ impl Lane {
             scan: vec![0; n],
             edits: Vec::new(),
             found: Vec::new(),
+            counts: vec![0; n],
+            keep_all: false,
             open: Vec::new(),
             placed: vec![0; n],
             done: false,
         }
+    }
+
+    /// 每一处都留下位置，不只前 [`PLACES_MAX`] 处。只给样本有限的「测试」用
+    pub fn keeping_all(mut self) -> Self {
+        self.keep_all = true;
+        self
     }
 
     /// 会不会改字：第三档，而且有删除、替换规则
@@ -317,10 +346,15 @@ impl Lane {
         out
     }
 
-    /// 认定了的命中，取走。后面的字还没收齐的那几处，后面的字就到这里为止
-    pub fn take_found(&mut self) -> Vec<Found> {
+    /// 认定了的命中，取走：留了前后文的那几处，和每条规则一共几处。后面的字还没收齐的那几处，
+    /// 后面的字就到这里为止
+    pub fn take(&mut self) -> Matches {
         self.open.clear();
-        std::mem::take(&mut self.found)
+        let n = self.counts.len();
+        Matches {
+            found: std::mem::take(&mut self.found),
+            counts: std::mem::replace(&mut self.counts, vec![0; n]),
+        }
     }
 
     /// 这一处是哪条规则命中的
@@ -422,6 +456,12 @@ impl Lane {
                 after: String::new(),
             }
         });
+        if let Some(c) = self.counts.get_mut(ri) {
+            *c += 1;
+        }
+        if place.is_none() && !self.keep_all {
+            return;
+        }
         if place.is_some() {
             self.open.push((self.found.len(), self.base + at.end));
         }

@@ -573,6 +573,28 @@ impl RuleSet {
         !self.record.is_empty() && self.record.contains(rule)
     }
 
+    /// 只有只记录的那几条规则（内置的照这一份的开关）。没有只记录的规则是 `None`
+    pub fn recording_only(&self) -> Option<RuleSet> {
+        if self.record.is_empty() {
+            return None;
+        }
+        Some(RuleSet {
+            on: self
+                .on
+                .iter()
+                .copied()
+                .filter(|id| self.record.contains(&Rule::Builtin(id)))
+                .collect(),
+            custom: self
+                .custom
+                .iter()
+                .filter(|c| self.record.contains(&Rule::Custom(c.name.clone())))
+                .cloned()
+                .collect(),
+            record: self.record.clone(),
+        })
+    }
+
     /// 要换成占位符的那几处：去掉只记录的规则命中的（见 [`Self::records`]）。没有只记录的
     /// 规则时原样借出去，不抄一份
     pub fn to_replace<'h>(&self, hits: &'h [Hit]) -> std::borrow::Cow<'h, [Hit]> {
@@ -1482,12 +1504,29 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     });
     spaced.finish(text, &mut out);
     custom_hits(text, set, &mut out);
-    disjoint(out)
+    disjoint(out, set)
+}
+
+/// 排好序、去掉重叠的（见 [`first_wins`]）。**要换成占位符的命中先挑**：只记录的规则
+/// （[`RuleSet::records`]）的命中和它们重叠就让开 —— 反过来的话，一条只记录的规则会把
+/// 一处本该换掉的值整个盖住，那个值就原样发出去了。只记录的规则之间照样先到先得。
+fn disjoint(out: Vec<Hit>, set: &RuleSet) -> Vec<Hit> {
+    if set.record.is_empty() {
+        return first_wins(out);
+    }
+    let (rec, rep): (Vec<Hit>, Vec<Hit>) = out.into_iter().partition(|h| set.records(&h.rule));
+    let rep = first_wins(rep);
+    let mut rec = first_wins(rec);
+    rec.retain(|h| !overlaps_any(&rep, &h.bytes));
+    let mut all = rep;
+    all.extend(rec);
+    all.sort_by_key(|h| h.bytes.start);
+    all
 }
 
 /// 排好序、去掉重叠的。**重叠的只留第一个。**私钥块里的 base64 会被 token
 /// 扫描当成别的东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段。
-fn disjoint(mut out: Vec<Hit>) -> Vec<Hit> {
+fn first_wins(mut out: Vec<Hit>) -> Vec<Hit> {
     out.sort_by_key(|h| (h.bytes.start, std::cmp::Reverse(h.bytes.end)));
     let mut kept: Vec<Hit> = Vec::with_capacity(out.len());
     for h in out {
@@ -1497,6 +1536,12 @@ fn disjoint(mut out: Vec<Hit>) -> Vec<Hit> {
         kept.push(h);
     }
     kept
+}
+
+/// `r` 和 `hits`（按起点排好、互不重叠）里的哪一处重叠
+pub(crate) fn overlaps_any(hits: &[Hit], r: &Range<usize>) -> bool {
+    let k = hits.partition_point(|h| h.bytes.end <= r.start);
+    hits.get(k).is_some_and(|h| h.bytes.start < r.end)
 }
 
 /// 一个字符在 JSON 字符串里写出来有几个字节。**和 serde_json 的转义一致。**
@@ -1561,7 +1606,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
     let builtins = RuleSet {
         on: set.on.clone(),
         custom: Vec::new(),
-        record: HashSet::new(),
+        record: set.record.clone(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
@@ -1573,7 +1618,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
             });
         }
     }
-    disjoint(out)
+    disjoint(out, set)
 }
 
 /// 报出去的样子。**一律打码** —— 「发现了 sk-ant-xxx」这句话本身就是一次

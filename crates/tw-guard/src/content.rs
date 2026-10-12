@@ -20,7 +20,7 @@
 //!
 //! # 三种匹配
 //!
-//! - `contains`：子串，按原样找。写起来最省事，也最不容易写错；
+//! - `contains`：子串，按原样找（`.`、`*` 没有特殊含义）。写起来最省事，也最不容易写错；
 //! - `regex`：正则，**编译后的大小有上限** —— 这条正则要在每个请求上跑，一条病态写法
 //!   不该拖慢所有请求；
 //! - `codepoints`：按字符本身认（[`Codepoints`]）。看不见的字符写不成关键词，出厂的
@@ -240,8 +240,7 @@ pub struct Rule {
     pub sides: Sides,
     /// 处置是替换时换成的文字
     pub replacement: String,
-    /// `contains` 不分大小写时用：小写过的样子
-    lower: String,
+    /// 正则，和不分大小写的关键词（转义过的文字加上不分大小写）
     re: Option<regex::Regex>,
     points: Option<Codepoints>,
 }
@@ -265,7 +264,17 @@ impl Rule {
             return Err(bad("the pattern is empty".into()));
         }
         let (re, points) = match r.matching {
-            Match::Contains => (None, None),
+            // 分大小写的按字节找；不分的编成正则：和回答那一边（[`answer`]）同一个认法，一个字
+            // 对一个字（Unicode 的简单大小写对应）。以前在小写过的正文上找、再把位置对回原文，
+            // 碰上小写之后字节数变了的字（`Ⱥ`、开尔文符号）会切错地方
+            Match::Contains if r.case_sensitive => (None, None),
+            Match::Contains => (
+                Some(
+                    crate::bounded_with(&regex::escape(r.pattern), true)
+                        .map_err(|e| bad(e.to_string()))?,
+                ),
+                None,
+            ),
             Match::Regex => (
                 Some(
                     crate::bounded_with(pattern, !r.case_sensitive)
@@ -289,7 +298,6 @@ impl Rule {
             case_sensitive: r.case_sensitive,
             sides: r.sides,
             replacement: r.replacement.to_string(),
-            lower: r.pattern.to_lowercase(),
             re,
             points,
         })
@@ -335,10 +343,9 @@ impl Rule {
     }
 
     /// 在 `text` 里的全部命中：按先后、互不重叠的字节区间，和一共几处（码位规则是
-    /// 几个字符，连在一起的几个字符是一段区间）。`lower` 是 `text` 小写过的样子，
-    /// 只有 `contains` 用；`escapes`：码位规则也认 JSON 的 `\uXXXX` 写法（见
-    /// [`screen_text`]）。
-    fn find_all(&self, text: &str, lower: &mut Lower<'_>, escapes: bool) -> Found {
+    /// 几个字符，连在一起的几个字符是一段区间）。`escapes`：码位规则也认 JSON 的 `\uXXXX`
+    /// 写法（见 [`screen_text`]）。
+    fn find_all(&self, text: &str, escapes: bool) -> Found {
         if let Some(p) = &self.points {
             return find_points(p, text, escapes);
         }
@@ -351,10 +358,7 @@ impl Rule {
                 .collect();
             return Found::of(ranges);
         }
-        if self.case_sensitive {
-            return Found::of(find_exact(text, &self.pattern));
-        }
-        Found::of(find_contains(text, lower.get(), &self.lower))
+        Found::of(find_exact(text, &self.pattern))
     }
 }
 
@@ -368,49 +372,6 @@ fn find_exact(text: &str, needle: &str) -> Vec<Range<usize>> {
     for at in memchr::memmem::find_iter(text.as_bytes(), needle.as_bytes()) {
         if out.last().is_none_or(|p| p.end <= at) {
             out.push(at..at + needle.len());
-        }
-    }
-    out
-}
-
-/// 一段正文小写过的样子，用到才算
-struct Lower<'a> {
-    text: &'a str,
-    lower: Option<String>,
-}
-
-impl<'a> Lower<'a> {
-    fn new(text: &'a str) -> Self {
-        Lower { text, lower: None }
-    }
-    fn get(&mut self) -> &str {
-        self.lower.get_or_insert_with(|| lowercase(self.text))
-    }
-}
-
-/// 和 `text.to_lowercase()` 一样的结果，快一些：ASCII 的一段整段转，别的字符逐个转（标准库
-/// 碰到头一个 ASCII 以外的字符之后就逐个字符地转了，夹着中文、`→` 的正文几乎整段都是）。
-///
-/// 按上下文转的只有 `Σ`（在词尾是 `ς`）：正文里有它就整段交给标准库。
-fn lowercase(text: &str) -> String {
-    if memchr::memmem::find(text.as_bytes(), "Σ".as_bytes()).is_some() {
-        return text.to_lowercase();
-    }
-    let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        i = ascii_end(b, i);
-        if i > start {
-            let at = out.len();
-            out.push_str(&text[start..i]);
-            out[at..].make_ascii_lowercase();
-        }
-        // 停在一个多字节字符的头一个字节上：字符边界
-        if let Some(c) = text.get(i..).and_then(|rest| rest.chars().next()) {
-            out.extend(c.to_lowercase());
-            i += c.len_utf8();
         }
     }
     out
@@ -446,41 +407,6 @@ impl Found {
             ranges,
         }
     }
-}
-
-/// 不分大小写的子串，全部出现的地方。
-///
-/// 小写之后长度没变时在小写串上找、下标对回原文；变了（少数字母会）就在原文上逐个
-/// 字符地比，慢一点但对。
-fn find_contains(text: &str, lower: &str, needle: &str) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    if needle.is_empty() {
-        return out;
-    }
-    if lower.len() == text.len() {
-        // 按字节找（SIMD）：每段正文、每条规则都要从头找到尾。和 `match_indices` 一样是
-        // 一个接一个、互不重叠的
-        for at in memchr::memmem::find_iter(lower.as_bytes(), needle.as_bytes()) {
-            // 区间落回原文要对齐到字符边界
-            let start = floor(text, at);
-            let end = ceil(text, at + needle.len());
-            if out.last().is_none_or(|p: &Range<usize>| p.end <= start) {
-                out.push(start..end);
-            }
-        }
-        return out;
-    }
-    let mut from = 0;
-    while from < text.len() {
-        let Some(r) = find_folded(&text[from..], needle) else {
-            break;
-        };
-        let r = from + r.start..from + r.end;
-        from = r.end.max(r.start + 1);
-        from = ceil(text, from);
-        out.push(r);
-    }
-    out
 }
 
 /// 一段正文里每一个字符（按出现的先后）和它的字节区间。`escapes`：JSON 的 `\uXXXX`
@@ -684,12 +610,11 @@ impl Rules {
                 continue;
             }
             let keep = kept.get(si).map_or(&[][..], Vec::as_slice);
-            let mut lower = Lower::new(text);
             for (ri, r) in self.rules.iter().enumerate() {
                 if !r.sides.request || (scope.codepoints_only && r.points.is_none()) {
                     continue;
                 }
-                let mut f = r.find_all(text, &mut lower, scope.escapes);
+                let mut f = r.find_all(text, scope.escapes);
                 if !keep.is_empty() {
                     f.ranges.retain(|m| !overlaps(keep, m));
                     f.count = match r.points {
@@ -855,32 +780,6 @@ fn floor(text: &str, mut i: usize) -> usize {
         i -= 1;
     }
     i
-}
-
-/// `i` 往后挪到字符边界上
-fn ceil(text: &str, mut i: usize) -> usize {
-    i = i.min(text.len());
-    while !text.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-/// 小写之后长度对不上时的子串查找：逐个字符起点比。
-fn find_folded(text: &str, needle_lower: &str) -> Option<Range<usize>> {
-    for (i, _) in text.char_indices() {
-        let mut folded = String::new();
-        for (j, c) in text[i..].char_indices() {
-            folded.extend(c.to_lowercase());
-            if folded.len() >= needle_lower.len() {
-                if folded.starts_with(needle_lower) {
-                    return Some(i..i + j + c.len_utf8());
-                }
-                break;
-            }
-        }
-    }
-    None
 }
 
 /// 命中处前后的一小段：前面带十个字节，整段不超过 [`SNIPPET_MAX`] 个字符，
@@ -1323,40 +1222,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// 快一些的小写和标准库的一字不差：`Σ` 在词尾、词中，会变长的（`İ`）、四个字节的、
-    /// 组合字符、开尔文符号这类转成 ASCII 的
-    #[test]
-    fn lowercasing_by_runs_gives_what_the_standard_library_gives() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = |n: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % n as u64) as usize
-        };
-        // 码位用 `char::from_u32` 拼：测试里直接写出来的转义，经过某些编辑工具会变成真字符
-        let ch = |n: u32| char::from_u32(n).unwrap().to_string();
-        let pieces: Vec<String> = ["A", "z", " ", "IGNORE", "Previous", ".", "→", "密钥", "😀"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain(
-                [
-                    0x03A3, 0x0391, 0x0130, 0x212A, 0x1E9E, 0x00DF, 0x01C5, 0xFB00, 0x0301, 0x2167,
-                    0x10400, 0x00C9, 0x0049, 0x0131, 0x03C2,
-                ]
-                .into_iter()
-                .map(ch),
-            )
-            .collect();
-        for _ in 0..20_000 {
-            let text: String = (0..next(30))
-                .map(|_| pieces[next(pieces.len())].as_str())
-                .collect();
-            assert_eq!(lowercase(&text), text.to_lowercase(), "{text:?}");
-        }
-        let long = format!("{}{}", "Ignore Previous ".repeat(10), ch(0x212A));
-        assert_eq!(lowercase(&long), long.to_lowercase());
     }
 }

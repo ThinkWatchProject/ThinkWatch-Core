@@ -762,6 +762,53 @@ mod tests {
         );
     }
 
+    /// 小写之后单个字的字节数变了、总长没变的正文（`Ⱥ` 小写多一个字节，开尔文符号少两个）：
+    /// 删、换的是命中的那几个字，不偏不倚；请求和回答两边认的一样
+    #[test]
+    fn a_letter_whose_lowercase_has_another_length_does_not_shift_the_cut() {
+        // 码位用 `char::from_u32` 拼：测试里直接写出来的转义，经过某些编辑工具会变成真字符
+        let ch = |n: u32| char::from_u32(n).unwrap();
+        let (a_bar, kelvin) = (ch(0x23A), ch(0x212A));
+        let text = format!("{a_bar}{a_bar} abc {kelvin}");
+        for (action, want) in [
+            (Action::Strip, format!("{a_bar}{a_bar}  {kelvin}")),
+            (Action::Replace, format!("{a_bar}{a_bar} *** {kelvin}")),
+        ] {
+            let input = |sides| RuleInput {
+                id: "r",
+                name: "r",
+                custom: true,
+                pattern: "ABC",
+                action,
+                sides,
+                ..RuleInput::default()
+            };
+            let rs = Rules::build([input(super::super::Sides::default())]).unwrap();
+            let b = body(json!({"messages": [{"role": "user", "content": text}]}));
+            let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+            assert_eq!(
+                sent(&s)["messages"][0]["content"],
+                want.as_str(),
+                "{action:?}"
+            );
+            let answer = super::super::answer::Answer::build(
+                &Rules::build([input(super::super::Sides {
+                    request: false,
+                    response: true,
+                })])
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(answer.lane(true).whole(&text), want, "{action:?}");
+        }
+        // 开尔文符号本身也是 `k`
+        let rs = rules(&[("k", "k", Contains, Strip)]);
+        let b =
+            body(json!({"messages": [{"role": "user", "content": format!("{kelvin}{a_bar}k")}]}));
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(sent(&s)["messages"][0]["content"], a_bar.to_string());
+    }
+
     /// 分大小写的规则只认写的那样
     #[test]
     fn a_case_sensitive_rule_matches_only_as_written() {

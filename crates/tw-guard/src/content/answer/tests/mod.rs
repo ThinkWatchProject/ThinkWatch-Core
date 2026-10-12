@@ -194,7 +194,7 @@ fn observe_sends_everything_at_once_and_still_finds_matches_across_pieces() {
     assert_eq!(lane.push("请看北"), "请看北", "观察档不扣");
     assert_eq!(lane.push("极星。"), "极星。");
     assert_eq!(lane.finish(), "");
-    let found = lane.take_found();
+    let found = lane.take().found;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].at, "请看".len().."请看北极星".len());
     let p = found[0].place.as_ref().unwrap();
@@ -228,7 +228,7 @@ fn context_around_a_match_is_kept_for_the_log() {
         lane.push(&c.to_string());
     }
     lane.finish();
-    let found = lane.take_found();
+    let found = lane.take().found;
     let p = found[0].place.as_ref().unwrap();
     assert_eq!(p.before, "前".repeat(80));
     assert_eq!(p.matched, "secret");
@@ -346,10 +346,10 @@ fn streaming_agrees_with_the_whole_text_for_random_text_rules_and_cuts() {
         out.push_str(&lane.finish());
         assert_eq!(out, whole, "{text:?} {pieces:?} {patterns:?}");
         // 认出来的命中也一样多
-        let streamed_found = lane.take_found().len();
+        let streamed_found = lane.take().counts;
         let mut once = a.lane(acts);
         once.whole(&text);
-        assert_eq!(streamed_found, once.take_found().len(), "{text:?}");
+        assert_eq!(streamed_found, once.take().counts, "{text:?}");
     }
 }
 
@@ -856,4 +856,357 @@ fn whole_answers_are_filtered_in_every_format() {
         whole(&a, true, Dialect::Chat, b"not json"),
         (None, Vec::new())
     );
+}
+
+// ───────────────────────────────────────────────────────── 复核时查出来的
+
+/// Gemini 的文字被函数调用隔开就是两路：扣着的字不挪到调用后面，没有命中的整份回答一个
+/// 字节都不动
+#[test]
+fn gemini_text_on_either_side_of_a_function_call_stays_where_it_is() {
+    let a = star("k", "zzzzzzzzzz");
+    let body = json!({"candidates":[{"index":0,"content":{"role":"model","parts":[
+        {"text":"Let me check the weather."},
+        {"functionCall":{"name":"weather","args":{"city":"Paris"}}},
+        {"text":"Done."}
+    ]}}]});
+    let (out, hits) = whole(&a, true, Dialect::Gemini, body.to_string().as_bytes());
+    assert!(
+        out.is_none() && hits.is_empty(),
+        "没命中的回答改了：{out:?}"
+    );
+    // 流着的：调用之前的字在调用那一帧之前发完
+    let frames = [
+        json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Let me check the weather."}]}}]}),
+        json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"weather","args":{}}}]}}]}),
+        json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Done."}]},"finishReason":"STOP"}]}),
+    ];
+    let stream: String = frames.iter().map(|f| data(f.clone())).collect();
+    let mut b = Body::new(a.clone(), true, Dialect::Gemini, true);
+    let out = frames_of(&through(&mut b, &stream, 5));
+    let call = out
+        .iter()
+        .position(|f| {
+            f["candidates"][0]["content"]["parts"][0]
+                .get("functionCall")
+                .is_some()
+        })
+        .unwrap();
+    let text = |fs: &[Value]| -> String {
+        fs.iter()
+            .filter_map(|f| f["candidates"][0]["content"]["parts"][0]["text"].as_str())
+            .collect()
+    };
+    assert_eq!(text(&out[..call]), "Let me check the weather.");
+    assert_eq!(text(&out[call..]), "Done.");
+    // 跨过调用的两段字不是一处命中
+    let a = star("k", "weather.Done");
+    let (out, hits) = whole(&a, true, Dialect::Gemini, body.to_string().as_bytes());
+    assert!(out.is_none() && hits.is_empty());
+    // 一个调用两边各有命中：各换各的
+    let a = star("k", "e");
+    let (out, _) = whole(&a, true, Dialect::Gemini, body.to_string().as_bytes());
+    let v: Value = serde_json::from_slice(&out.unwrap()).unwrap();
+    let parts = &v["candidates"][0]["content"]["parts"];
+    assert_eq!(parts[0]["text"], "L***t m*** ch***ck th*** w***ath***r.");
+    assert_eq!(parts[1]["functionCall"]["name"], "weather", "调用不碰");
+    assert_eq!(parts[2]["text"], "Don***.");
+}
+
+/// 随机的 Gemini 回答：文字、函数调用、思考交错，切成随机的帧。被函数调用隔开的每一段文字
+/// （思考不算隔开）流出来的和整段一次处理的一样，别的部分原样、按原来的先后；整份的回答没
+/// 命中就一个字节都不动
+#[test]
+fn gemini_parts_mixed_with_calls_stream_like_their_runs() {
+    let mut seed = 0x6e6d_1a5c_0ffe_e123_u64;
+    let mut next = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n.max(1) as u64) as usize
+    };
+    let words = ["ab", "ba", "a", "b", " ", "中文", "x"];
+    for round in 0..300 {
+        let a = star("k", ["ab", "ba", "aa", "中文x"][next(4)]);
+        // 一串部分：文字或者函数调用 / 思考
+        let mut parts: Vec<Value> = Vec::new();
+        for _ in 0..1 + next(6) {
+            match next(4) {
+                0 => parts.push(json!({"functionCall":{"name":"f","args":{}}})),
+                1 => parts.push(json!({"text":"ab","thought":true})),
+                _ => {
+                    let t: String = (0..next(8)).map(|_| words[next(words.len())]).collect();
+                    parts.push(json!({"text": t}));
+                }
+            }
+        }
+        // 每一段连着的文字整段处理的样子
+        let mut want: Vec<String> = Vec::new();
+        let mut run = String::new();
+        for p in &parts {
+            if p.get("functionCall").is_some() {
+                want.push(whole_text(&a, true, &std::mem::take(&mut run)));
+            } else if p["thought"] != true {
+                run.push_str(p["text"].as_str().unwrap());
+            }
+        }
+        want.push(whole_text(&a, true, &run));
+        // 流着的：一帧一个部分，文字再随机切开
+        let mut frames: Vec<Value> = Vec::new();
+        for p in &parts {
+            match p["text"].as_str().filter(|_| p["thought"] != true) {
+                Some(t) => {
+                    let cs: Vec<char> = t.chars().collect();
+                    let mut i = 0;
+                    loop {
+                        let e = (i + 1 + next(4)).min(cs.len());
+                        let piece: String = cs[i..e].iter().collect();
+                        frames.push(json!({"candidates":[{"index":0,"content":{"parts":[{"text":piece}]}}]}));
+                        i = e;
+                        if i >= cs.len() {
+                            break;
+                        }
+                    }
+                }
+                None => frames.push(json!({"candidates":[{"index":0,"content":{"parts":[p]}}]})),
+            }
+        }
+        frames.push(json!({"candidates":[{"index":0,"content":{"parts":[{"text":""}]},"finishReason":"STOP"}]}));
+        let stream: String = frames.iter().map(|f| data(f.clone())).collect();
+        let mut b = Body::new(a.clone(), true, Dialect::Gemini, true);
+        let out = frames_of(&through(&mut b, &stream, round as u64 + 1));
+        let mut got: Vec<String> = vec![String::new()];
+        let mut others = Vec::new();
+        for f in &out {
+            for p in f["candidates"][0]["content"]["parts"].as_array().unwrap() {
+                if p.get("functionCall").is_some() {
+                    got.push(String::new());
+                    others.push(p.clone());
+                } else if p["thought"] == true {
+                    others.push(p.clone());
+                } else {
+                    got.last_mut()
+                        .unwrap()
+                        .push_str(p["text"].as_str().unwrap());
+                }
+            }
+        }
+        assert_eq!(got, want, "{parts:?}");
+        let want_others: Vec<Value> = parts
+            .iter()
+            .filter(|p| p.get("functionCall").is_some() || p["thought"] == true)
+            .cloned()
+            .collect();
+        assert_eq!(others, want_others);
+        // 整份
+        let body = json!({"candidates":[{"index":0,"content":{"role":"model","parts":parts}}]});
+        let (changed, _) = whole(&a, true, Dialect::Gemini, body.to_string().as_bytes());
+        let joined: Vec<String> = parts
+            .iter()
+            .filter_map(|p| p["text"].as_str().filter(|_| p["thought"] != true))
+            .map(str::to_string)
+            .collect();
+        match changed {
+            None => {
+                assert_eq!(want.concat(), joined.concat(), "没改却该改：{parts:?}")
+            }
+            Some(b) => {
+                let v: Value = serde_json::from_slice(&b).unwrap();
+                let mut got = vec![String::new()];
+                for p in v["candidates"][0]["content"]["parts"].as_array().unwrap() {
+                    if p.get("functionCall").is_some() {
+                        got.push(String::new());
+                    } else if p["thought"] != true {
+                        got.last_mut()
+                            .unwrap()
+                            .push_str(p["text"].as_str().unwrap());
+                    }
+                }
+                assert_eq!(got, want, "{parts:?}");
+            }
+        }
+    }
+}
+
+/// 改了字的回答里，logprobs 不能把删掉的字带出去：流着的一律去掉，整份的改了字才去掉
+#[test]
+fn logprobs_do_not_carry_what_was_removed() {
+    let a = answer(vec![rule("s", "secret", Match::Contains, Action::Strip)]);
+    let body = json!({"choices":[{"index":0,
+        "message":{"role":"assistant","content":"the secret is out"},
+        "logprobs":{"content":[{"token":" secret","logprob":0.0,"bytes":[32],"top_logprobs":[]}]},
+        "finish_reason":"stop"}]});
+    let (out, _) = whole(&a, true, Dialect::Chat, body.to_string().as_bytes());
+    let out = String::from_utf8(out.unwrap()).unwrap();
+    assert!(!out.contains("secret"), "{out}");
+    // 没改字：原样
+    let clean = json!({"choices":[{"index":0,"message":{"content":"hello"},
+        "logprobs":{"content":[{"token":"hello","logprob":0.0}]}}]});
+    assert!(
+        whole(&a, true, Dialect::Chat, clean.to_string().as_bytes())
+            .0
+            .is_none()
+    );
+    // 流着的 Chat
+    let stream = data(
+        json!({"id":"c","choices":[{"index":0,"delta":{"content":"a secret"},
+        "logprobs":{"content":[{"token":" secret","logprob":0.0}]},"finish_reason":"stop"}]}),
+    );
+    let mut b = Body::new(a.clone(), true, Dialect::Chat, true);
+    let out = through(&mut b, &stream, 3);
+    assert!(!out.contains("secret"), "{out}");
+    // Responses 的增量和整段
+    let stream = [
+        responses_event(
+            "response.output_text.delta",
+            json!({"item_id":"m","output_index":0,"content_index":0,"delta":"a secret",
+                "logprobs":[{"token":" secret","logprob":0.0}]}),
+        ),
+        responses_event(
+            "response.output_text.done",
+            json!({"item_id":"m","output_index":0,"content_index":0,"text":"a secret",
+                "logprobs":[{"token":" secret","logprob":0.0}]}),
+        ),
+    ]
+    .concat();
+    let mut b = Body::new(a.clone(), true, Dialect::Responses, true);
+    let out = through(&mut b, &stream, 4);
+    assert!(!out.contains("secret"), "{out}");
+    // 观察档不改字，logprobs 留着
+    let mut b = Body::new(a, false, Dialect::Responses, true);
+    assert_eq!(through(&mut b, &stream, 4), stream);
+}
+
+/// Anthropic 开头一帧带着的字、拒答，都是正文
+#[test]
+fn block_start_text_and_refusals_are_filtered() {
+    let a = answer(vec![rule("s", "secret", Match::Contains, Action::Strip)]);
+    let stream = [
+        named(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"a secret "}}),
+        ),
+        named(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"and more"}}),
+        ),
+        named("content_block_stop", json!({"type":"content_block_stop","index":0})),
+    ]
+    .concat();
+    let mut b = Body::new(a.clone(), true, Dialect::Anthropic, true);
+    let out = through(&mut b, &stream, 2);
+    assert!(!out.contains("secret"), "{out}");
+    let text: String = frames_of(&out)
+        .iter()
+        .filter_map(|f| {
+            f["content_block"]["text"]
+                .as_str()
+                .or(f["delta"]["text"].as_str())
+        })
+        .collect();
+    assert_eq!(text, "a  and more");
+    // Chat 的拒答
+    let stream = [
+        data(json!({"id":"c","choices":[{"index":0,"delta":{"refusal":"no sec"},"finish_reason":null}]})),
+        data(json!({"id":"c","choices":[{"index":0,"delta":{"refusal":"ret here"},"finish_reason":"stop"}]})),
+    ]
+    .concat();
+    let mut b = Body::new(a.clone(), true, Dialect::Chat, true);
+    let out = through(&mut b, &stream, 6);
+    let refusal: String = frames_of(&out)
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["refusal"].as_str())
+        .collect();
+    assert_eq!(refusal, "no  here");
+    let (out, _) = whole(
+        &a,
+        true,
+        Dialect::Chat,
+        json!({"choices":[{"index":0,"message":{"content":null,"refusal":"a secret"}}]})
+            .to_string()
+            .as_bytes(),
+    );
+    assert!(!String::from_utf8(out.unwrap()).unwrap().contains("secret"));
+    // Responses 的拒答：增量、`.done`、整段
+    let stream = [
+        responses_event(
+            "response.refusal.delta",
+            json!({"item_id":"m","output_index":0,"content_index":0,"delta":"a sec"}),
+        ),
+        responses_event(
+            "response.refusal.delta",
+            json!({"item_id":"m","output_index":0,"content_index":0,"delta":"ret"}),
+        ),
+        responses_event(
+            "response.refusal.done",
+            json!({"item_id":"m","output_index":0,"content_index":0,"refusal":"a secret"}),
+        ),
+        responses_event(
+            "response.completed",
+            json!({"response":{"output":[{"type":"message","content":[{"type":"refusal","refusal":"a secret"}]}]}}),
+        ),
+    ]
+    .concat();
+    let mut b = Body::new(a, true, Dialect::Responses, true);
+    let out = through(&mut b, &stream, 8);
+    assert!(!out.contains("secret"), "{out}");
+    let refusal: String = frames_of(&out)
+        .iter()
+        .filter(|f| f["type"] == "response.refusal.delta")
+        .filter_map(|f| f["delta"].as_str())
+        .collect();
+    assert_eq!(refusal, "a ");
+}
+
+/// 字节不是 UTF-8 的一帧、解析不了的一个数组元素：会改字时不原样转发
+#[test]
+fn broken_frames_do_not_carry_matches_through() {
+    let a = answer(vec![rule("s", "secret", Match::Contains, Action::Strip)]);
+    let raw = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a secret \xff\"}}\n\n";
+    let mut b = Body::new(a.clone(), true, Dialect::Anthropic, true);
+    let mut out = b.process(raw);
+    out.extend(b.flush());
+    let out = String::from_utf8(out).expect("rewritten as UTF-8");
+    assert!(!out.contains("secret") && out.contains('\u{FFFD}'), "{out}");
+    // 数组里坏掉的一个元素：会改字时不发，数组照样完整
+    let mut b = Body::new(a.clone(), true, Dialect::Gemini, false);
+    let bytes = b"[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]},\r\n{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a secret\",}]}}]}]";
+    let mut out = b.process(bytes);
+    out.extend(b.flush());
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("secret"), "{out}");
+    serde_json::from_str::<Value>(&out).expect("still one array");
+    // 观察档原样
+    let mut b = Body::new(a, false, Dialect::Gemini, false);
+    let mut out = b.process(bytes);
+    out.extend(b.flush());
+    assert_eq!(out, bytes.to_vec());
+}
+
+/// 命中再多，一路正文里留下位置的也只有前几十处，个数照数
+#[test]
+fn many_matches_keep_counts_not_every_place() {
+    let a = answer(vec![rule("a", "a", Match::Contains, Action::Record)]);
+    let mut lane = a.lane(true);
+    for _ in 0..200 {
+        lane.push(&"a".repeat(500));
+    }
+    lane.finish();
+    let m = lane.take();
+    assert_eq!(m.total(), 100_000);
+    assert_eq!(m.found.len(), PLACES_MAX);
+    // 一次回答里各路合起来也一样：个数是全部，位置最多那么多
+    let mut b = Body::new(a, true, Dialect::Anthropic, true);
+    let stream: String = (0..50)
+        .map(|_| {
+            named(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a".repeat(100)}}),
+            )
+        })
+        .collect();
+    through(&mut b, &stream, 1);
+    let hits = b.take_hits();
+    assert_eq!(hits[0].count, 5_000);
+    assert_eq!(hits[0].places.len(), PLACES_MAX);
 }

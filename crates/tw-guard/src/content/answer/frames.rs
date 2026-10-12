@@ -4,11 +4,16 @@
 //! 看的是**客户端收到的那种格式**（转换、回答钩子之后，工具调用审查之前）。每一路正文
 //! 一个 [`Lane`]：
 //!
-//! - Anthropic：一个内容块一路（`text_delta`），`content_block_stop` 结束；
-//! - Chat：一个回答（choice）一路（`delta.content`），`finish_reason` 结束；
+//! - Anthropic：一个内容块一路（`content_block_start` 里带着的开头、`text_delta`），
+//!   `content_block_stop` 结束；
+//! - Chat：一个回答（choice）的正文一路（`delta.content`）、拒答一路（`delta.refusal`），
+//!   `finish_reason` 结束；
 //! - Responses：一段正文一路（`output_text.delta`，按 `output_index` 和 `content_index`），
-//!   Codex 自由格式工具的输入一路（`custom_tool_call_input.delta`），各自的 `.done` 结束；
-//! - Gemini：一个候选回答一路（不是思考的 `text`），`finishReason` 结束；
+//!   一段拒答一路（`refusal.delta`），Codex 自由格式工具的输入一路
+//!   （`custom_tool_call_input.delta`），各自的 `.done` 结束；
+//! - Gemini：一个候选回答里**连着的几段文字**一路（不是思考的 `text`；思考过程另起一处显示，
+//!   不算隔开）。中间隔着别的部分（函数调用、代码、图片……）就断开：扣着的字不挪到那一部分
+//!   后面，跨过它的两段字也不算一处命中。`finishReason` 结束；
 //! - Bedrock Converse：一个内容块一路（`delta.text`），`contentBlockStop` 结束。
 //!
 //! 一路结束时扣着的尾巴：那一帧里正好有这一路的字段就接在后面，没有就按这一路自己的格式
@@ -18,12 +23,20 @@
 //! # 带着整段正文的帧
 //!
 //! Responses 在结束的时候把整段正文再说一遍：`output_text.done` 的 `text`、
-//! `content_part.done` 的 `part.text`、`output_item.done` 的 `item`、`response.completed`
-//! 的 `response.output`，自由格式工具的输入也一样。它们一律改成**这一路实际发出去的那一段**，
-//! 和客户端拼出来的一字不差。一路正文一个增量都没来、只在这些帧里出现的，在这里查一遍（只
-//! 查一遍：后面再出现的照第一遍的结果写）。
+//! `refusal.done` 的 `refusal`、`content_part.done` 的 `part`、`output_item.done` 的
+//! `item`、`response.completed` 的 `response.output`，自由格式工具的输入也一样。它们一律
+//! 改成**这一路实际发出去的那一段**，和客户端拼出来的一字不差。一路正文一个增量都没来、只在
+//! 这些帧里出现的，在这里查一遍（只查一遍：后面再出现的照第一遍的结果写）。
 //!
-//! 整份的回答（[`whole`]）是同一套：一份 JSON 里每一路正文一个 [`Lane`]，一次处理完。
+//! # logprobs
+//!
+//! logprobs 里一个 token 一个 token 地又写了一遍正文（Chat 的 `logprobs.content[].token`、
+//! `bytes`、`top_logprobs`，Responses 正文的 `logprobs`，Gemini 的 `logprobsResult`）。删掉、
+//! 换掉的字不能从那里漏出去，又没法按 token 对回改过的正文：**会改字时（第三档、有删除或
+//! 替换规则），流着的回答里的 logprobs 一律去掉**；整份的回答只在真的改了字时去掉。
+//!
+//! 整份的回答（[`whole`]）是同一套：一份 JSON 里每一路正文一个 [`Lane`]，一次处理完。**一个
+//! 字都没改的回答原样交回**，一个字节都不动。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -31,7 +44,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 use tw_dialect::ir::Dialect;
 
-use super::{Answer, Found, Lane, PLACES_MAX, Place};
+use super::{Answer, Lane, Matches, PLACES_MAX, Place};
 use crate::content::{Action, Match, Outcome, SNIPPET_MAX};
 use crate::redact::sse::{Rewritten, Synth, write};
 
@@ -41,6 +54,8 @@ pub enum LaneKey {
     /// 正文。Anthropic、Bedrock 是内容块的 index，Chat、Gemini 是第几个回答（choice、
     /// candidate），Responses 是 `output_index` 和 `content_index` 拼起来的
     Text(u64),
+    /// 拒答（`refusal`）。Chat 是第几个回答，Responses 同 [`LaneKey::Text`]
+    Refusal(u64),
     /// Responses 自由格式工具（Codex 的 `apply_patch`）的输入，`output_index`
     Input(u64),
 }
@@ -48,12 +63,18 @@ pub enum LaneKey {
 impl LaneKey {
     /// Responses 的正文一路：`output_index` 和 `content_index` 拼成一个
     pub fn responses_text(output: u64, content: u64) -> Self {
-        LaneKey::Text((output << 32) | (content & 0xffff_ffff))
+        LaneKey::Text(responses_key(output, content))
     }
 
+    /// Responses 的拒答一路
+    pub fn responses_refusal(output: u64, content: u64) -> Self {
+        LaneKey::Refusal(responses_key(output, content))
+    }
+
+    /// Responses 的这一路属于第几项（`output_index`）
     fn output_index(self) -> u64 {
         match self {
-            LaneKey::Text(k) => k >> 32,
+            LaneKey::Text(k) | LaneKey::Refusal(k) => k >> 32,
             LaneKey::Input(k) => k,
         }
     }
@@ -64,6 +85,10 @@ impl LaneKey {
     pub fn path(self, d: Dialect) -> String {
         match (d, self) {
             (_, LaneKey::Input(oi)) => format!("output[{oi}].input"),
+            (Dialect::Chat, LaneKey::Refusal(i)) => format!("choices[{i}].message.refusal"),
+            (_, LaneKey::Refusal(k)) => {
+                format!("output[{}].content[{}].refusal", k >> 32, k & 0xffff_ffff)
+            }
             (Dialect::Anthropic, LaneKey::Text(i)) => format!("content[{i}].text"),
             (Dialect::Chat, LaneKey::Text(i)) => format!("choices[{i}].message.content"),
             (Dialect::Responses, LaneKey::Text(k)) => {
@@ -73,6 +98,10 @@ impl LaneKey {
             (Dialect::Bedrock, LaneKey::Text(i)) => format!("output.message.content[{i}].text"),
         }
     }
+}
+
+fn responses_key(output: u64, content: u64) -> u64 {
+    (output << 32) | (content & 0xffff_ffff)
 }
 
 /// 一条规则在一次回答里的命中，各路合起来。**一条规则一条**，和请求那一边一样。
@@ -109,44 +138,64 @@ struct Tally {
 }
 
 impl Tally {
-    fn add(&mut self, answer: &Answer, acts: bool, path: &str, found: Vec<Found>) {
-        for f in found {
-            let Some(rule) = answer.rule(&f) else {
-                continue;
-            };
-            let k = *self.at.entry(f.rule).or_insert_with(|| {
-                let outcome = match rule.action() {
-                    Action::Strip if acts => Outcome::Stripped,
-                    Action::Replace if acts => Outcome::Replaced,
-                    _ => Outcome::Recorded,
-                };
-                self.hits.push(AnswerHit {
-                    rule: rule.id().to_string(),
-                    name: rule.name().to_string(),
-                    custom: rule.custom(),
-                    pattern: rule.pattern().to_string(),
-                    matching: rule.matching(),
-                    case_sensitive: rule.case_sensitive(),
-                    action: rule.action(),
-                    outcome,
-                    replacement: rule.replacement().to_string(),
-                    count: 0,
-                    snippet: String::new(),
-                    places: Vec::new(),
-                });
-                self.hits.len() - 1
-            });
-            let h = &mut self.hits[k];
-            h.count += 1;
-            if let Some(p) = f.place {
-                if h.snippet.is_empty() {
-                    h.snippet = snippet(&p);
-                }
-                if h.places.len() < PLACES_MAX {
-                    h.places.push((path.to_string(), p));
-                }
+    fn add(&mut self, answer: &Answer, acts: bool, path: &str, m: Matches) {
+        // 先按留了前后文的那几处排出先后，再加上只数了个数的
+        let order = m
+            .found
+            .iter()
+            .map(|f| f.rule)
+            .chain((0..m.counts.len()).filter(|&ri| m.counts[ri] > 0));
+        for ri in order {
+            self.entry(answer, acts, ri);
+        }
+        for (ri, n) in m.counts.iter().enumerate() {
+            if *n > 0
+                && let Some(&k) = self.at.get(&ri)
+            {
+                self.hits[k].count += n;
             }
         }
+        for f in m.found {
+            let (Some(&k), Some(p)) = (self.at.get(&f.rule), f.place) else {
+                continue;
+            };
+            let h = &mut self.hits[k];
+            if h.snippet.is_empty() {
+                h.snippet = snippet(&p);
+            }
+            if h.places.len() < PLACES_MAX {
+                h.places.push((path.to_string(), p));
+            }
+        }
+    }
+
+    fn entry(&mut self, answer: &Answer, acts: bool, ri: usize) {
+        if self.at.contains_key(&ri) {
+            return;
+        }
+        let Some(rule) = answer.rule_at(ri) else {
+            return;
+        };
+        let outcome = match rule.action() {
+            Action::Strip if acts => Outcome::Stripped,
+            Action::Replace if acts => Outcome::Replaced,
+            _ => Outcome::Recorded,
+        };
+        self.hits.push(AnswerHit {
+            rule: rule.id().to_string(),
+            name: rule.name().to_string(),
+            custom: rule.custom(),
+            pattern: rule.pattern().to_string(),
+            matching: rule.matching(),
+            case_sensitive: rule.case_sensitive(),
+            action: rule.action(),
+            outcome,
+            replacement: rule.replacement().to_string(),
+            count: 0,
+            snippet: String::new(),
+            places: Vec::new(),
+        });
+        self.at.insert(ri, self.hits.len() - 1);
     }
 }
 
@@ -200,6 +249,13 @@ struct Field {
     path: Vec<Seg>,
 }
 
+/// 一帧（或者一份整份的回答）里按先后排的：一处正文，或者一路在这里断开（Gemini 的文字中间
+/// 隔着别的部分）
+enum Item {
+    Text(Field),
+    Break(LaneKey),
+}
+
 #[derive(Debug, Clone)]
 enum Seg {
     Key(&'static str),
@@ -234,8 +290,8 @@ impl FrameFilter {
         }
     }
 
-    /// 会改字吗（第三档、有删除或替换规则）。不会的话不用记发出去的整段
-    fn edits(&self) -> bool {
+    /// 会改字吗（第三档、有删除或替换规则）。不会的话不用记发出去的整段，logprobs 也留着
+    pub fn edits(&self) -> bool {
         self.acts && self.answer.edits
     }
 
@@ -244,23 +300,37 @@ impl FrameFilter {
         let mut out = Rewritten::default();
         let d = self.dialect;
         let keep = d == Dialect::Responses && self.edits();
-        let fields = fields(d, v);
-        for f in &fields {
-            let ids = ids(d, v);
-            let open = self.lanes.entry(f.lane).or_insert_with(|| Open {
-                lane: self.answer.lane(self.acts),
-                ids: Value::Null,
-                out: keep.then(String::new),
-            });
-            open.ids = ids;
-            if let Some(s) = at(v, &f.path) {
-                let next = open.lane.push(s);
-                if let Some(o) = open.out.as_mut() {
-                    o.push_str(&next);
+        let items = items(d, v, false);
+        // 这一帧里每一路最近的那个字段：一路断开、结束时扣着的尾巴接在它后面
+        let mut last: HashMap<LaneKey, usize> = HashMap::new();
+        for (k, item) in items.iter().enumerate() {
+            match item {
+                Item::Text(f) => {
+                    let ids = ids(d, v);
+                    let open = self.lanes.entry(f.lane).or_insert_with(|| Open {
+                        lane: self.answer.lane(self.acts),
+                        ids: Value::Null,
+                        out: keep.then(String::new),
+                    });
+                    open.ids = ids;
+                    if let Some(s) = at(v, &f.path) {
+                        let next = open.lane.push(s);
+                        if let Some(o) = open.out.as_mut() {
+                            o.push_str(&next);
+                        }
+                        if next != *s {
+                            out.changed = true;
+                            *s = next;
+                        }
+                    }
+                    last.insert(f.lane, k);
                 }
-                if next != *s {
-                    out.changed = true;
-                    *s = next;
+                Item::Break(lane) => {
+                    let field = last.remove(lane).and_then(|k| match &items[k] {
+                        Item::Text(f) => Some(f),
+                        Item::Break(_) => None,
+                    });
+                    self.close_lane(*lane, field, v, &mut out);
                 }
             }
         }
@@ -276,32 +346,48 @@ impl FrameFilter {
             Close::All => self.lanes.keys().copied().collect(),
         };
         for lane in closing {
-            let Some(mut open) = self.lanes.remove(&lane) else {
-                continue;
-            };
-            let tail = open.lane.finish();
-            self.harvest(lane, &mut open.lane);
-            if let Some(o) = open.out.as_mut() {
-                o.push_str(&tail);
-            }
-            self.finals.insert(lane, open.out.take());
-            if tail.is_empty() {
-                continue;
-            }
-            match fields.iter().rev().find(|f| f.lane == lane) {
-                Some(f) => {
-                    if let Some(s) = at(v, &f.path) {
-                        s.push_str(&tail);
-                        out.changed = true;
-                    }
-                }
-                None => out.before.push(synth(d, lane, &open.ids, tail)),
-            }
+            let field = last.get(&lane).and_then(|&k| match &items[k] {
+                Item::Text(f) => Some(f),
+                Item::Break(_) => None,
+            });
+            self.close_lane(lane, field, v, &mut out);
         }
         if d == Dialect::Responses {
             out.changed |= self.repeat(v);
         }
+        if self.edits() {
+            out.changed |= drop_logprobs(d, v);
+        }
         out
+    }
+
+    /// 一路到这里为止：扣着的尾巴接在这一帧里它最近的那个字段后面（`field`），没有就补一帧
+    fn close_lane(
+        &mut self,
+        lane: LaneKey,
+        field: Option<&Field>,
+        v: &mut Value,
+        out: &mut Rewritten,
+    ) {
+        let Some(mut open) = self.lanes.remove(&lane) else {
+            return;
+        };
+        let tail = open.lane.finish();
+        self.harvest(lane, &mut open.lane);
+        if let Some(o) = open.out.as_mut() {
+            o.push_str(&tail);
+        }
+        self.finals.insert(lane, open.out.take());
+        if tail.is_empty() {
+            return;
+        }
+        match field.and_then(|f| at(v, &f.path)) {
+            Some(s) => {
+                s.push_str(&tail);
+                out.changed = true;
+            }
+            None => out.before.push(synth(self.dialect, lane, &open.ids, tail)),
+        }
     }
 
     /// 碰到不是 JSON 的帧（`[DONE]`），或者流结束了、断了：所有扣着的尾巴补成帧。
@@ -338,10 +424,10 @@ impl FrameFilter {
     }
 
     fn harvest(&mut self, key: LaneKey, lane: &mut Lane) {
-        let found = lane.take_found();
-        if !found.is_empty() {
+        let m = lane.take();
+        if m.total() > 0 {
             let path = key.path(self.dialect);
-            self.tally.add(&self.answer, self.acts, &path, found);
+            self.tally.add(&self.answer, self.acts, &path, m);
         }
     }
 
@@ -366,42 +452,40 @@ impl FrameFilter {
         known.filter(|o| o != given)
     }
 
+    /// 一个装着整段正文的字段改成实际发出去的那一段。返回改了没有
+    fn set_final(&mut self, slot: Option<&mut Value>, key: LaneKey) -> bool {
+        if let Some(Value::String(s)) = slot
+            && let Some(t) = self.final_text(key, s)
+        {
+            *s = t;
+            return true;
+        }
+        false
+    }
+
     /// Responses 带着整段正文的帧：改成实际发出去的那一段（见模块说明）。返回改了没有
     fn repeat(&mut self, v: &mut Value) -> bool {
-        let u = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let mut changed = false;
-        let mut set = |me: &mut Self, slot: Option<&mut Value>, key: LaneKey| {
-            if let Some(Value::String(s)) = slot
-                && let Some(t) = me.final_text(key, s)
-            {
-                *s = t;
-                changed = true;
-            }
-        };
+        let (oi, ci) = (u(v, "output_index"), u(v, "content_index"));
         match kind(v) {
             Some("response.output_text.done") => {
-                let key = LaneKey::responses_text(u(v, "output_index"), u(v, "content_index"));
-                set(self, v.get_mut("text"), key);
+                self.set_final(v.get_mut("text"), LaneKey::responses_text(oi, ci))
+            }
+            Some("response.refusal.done") => {
+                self.set_final(v.get_mut("refusal"), LaneKey::responses_refusal(oi, ci))
             }
             Some("response.custom_tool_call_input.done") => {
-                let key = LaneKey::Input(u(v, "output_index"));
-                set(self, v.get_mut("input"), key);
+                self.set_final(v.get_mut("input"), LaneKey::Input(oi))
             }
-            Some("response.content_part.done") => {
-                let key = LaneKey::responses_text(u(v, "output_index"), u(v, "content_index"));
-                if let Some(part) = v.get_mut("part")
-                    && kind(part) == Some("output_text")
-                {
-                    set(self, part.get_mut("text"), key);
-                }
-            }
-            Some("response.output_item.done") => {
-                let oi = u(v, "output_index");
-                if let Some(item) = v.get_mut("item") {
-                    changed |= self.item(oi, item);
-                }
-            }
+            Some("response.content_part.done") => match v.get_mut("part") {
+                Some(part) => self.part(oi, ci, part),
+                None => false,
+            },
+            Some("response.output_item.done") => match v.get_mut("item") {
+                Some(item) => self.item(oi, item),
+                None => false,
+            },
             Some("response.completed" | "response.incomplete" | "response.failed") => {
+                let mut changed = false;
                 if let Some(items) = v
                     .pointer_mut("/response/output")
                     .and_then(Value::as_array_mut)
@@ -410,39 +494,38 @@ impl FrameFilter {
                         changed |= self.item(i as u64, item);
                     }
                 }
+                changed
             }
-            _ => {}
+            _ => false,
         }
-        changed
     }
 
-    /// Responses 的一项（`output` 里的一个）：消息的每段正文、自由格式工具的输入
+    /// Responses 一项里的一段：正文或者拒答
+    fn part(&mut self, oi: u64, ci: u64, part: &mut Value) -> bool {
+        match kind(part) {
+            Some("output_text") => {
+                self.set_final(part.get_mut("text"), LaneKey::responses_text(oi, ci))
+            }
+            Some("refusal") => {
+                self.set_final(part.get_mut("refusal"), LaneKey::responses_refusal(oi, ci))
+            }
+            _ => false,
+        }
+    }
+
+    /// Responses 的一项（`output` 里的一个）：消息的每段正文和拒答、自由格式工具的输入
     fn item(&mut self, oi: u64, item: &mut Value) -> bool {
         let mut changed = false;
         match kind(item) {
             Some("message") => {
                 if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
                     for (ci, part) in parts.iter_mut().enumerate() {
-                        if kind(part) != Some("output_text") {
-                            continue;
-                        }
-                        let key = LaneKey::responses_text(oi, ci as u64);
-                        if let Some(Value::String(s)) = part.get_mut("text")
-                            && let Some(t) = self.final_text(key, s)
-                        {
-                            *s = t;
-                            changed = true;
-                        }
+                        changed |= self.part(oi, ci as u64, part);
                     }
                 }
             }
             Some("custom_tool_call") => {
-                if let Some(Value::String(s)) = item.get_mut("input")
-                    && let Some(t) = self.final_text(LaneKey::Input(oi), s)
-                {
-                    *s = t;
-                    changed = true;
-                }
+                changed |= self.set_final(item.get_mut("input"), LaneKey::Input(oi));
             }
             _ => {}
         }
@@ -458,62 +541,140 @@ fn u(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// 一帧里流着的正文在哪几个字段，按先后
-fn fields(d: Dialect, v: &Value) -> Vec<Field> {
+/// 第几个回答（choice、candidate）：写了 `index` 的按它，没写的按在数组里的位置
+fn index_of(c: &Value, k: usize) -> u64 {
+    c.get("index").and_then(Value::as_u64).unwrap_or(k as u64)
+}
+
+/// 一帧（`whole`：一份整份的回答）里的正文在哪几个字段、Gemini 的文字在哪儿断开，按先后
+fn items(d: Dialect, v: &Value, whole: bool) -> Vec<Item> {
     use Seg::{Idx, Key};
     let mut out = Vec::new();
-    match d {
-        Dialect::Anthropic => {
-            if kind(v) == Some("content_block_delta")
-                && v.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+    let text = |lane, path| Item::Text(Field { lane, path });
+    let arr = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned();
+    match (d, whole) {
+        (Dialect::Anthropic, false) => match kind(v) {
+            Some("content_block_delta")
+                if v.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta") =>
             {
-                out.push(Field {
-                    lane: LaneKey::Text(u(v, "index")),
-                    path: vec![Key("delta"), Key("text")],
-                });
+                out.push(text(
+                    LaneKey::Text(u(v, "index")),
+                    vec![Key("delta"), Key("text")],
+                ));
             }
-        }
-        Dialect::Chat => {
-            let Some(choices) = v.get("choices").and_then(Value::as_array) else {
-                return out;
-            };
-            for (k, c) in choices.iter().enumerate() {
-                if c.pointer("/delta/content").is_some_and(Value::is_string) {
-                    let i = c.get("index").and_then(Value::as_u64).unwrap_or(k as u64);
-                    out.push(Field {
-                        lane: LaneKey::Text(i),
-                        path: vec![Key("choices"), Idx(k), Key("delta"), Key("content")],
-                    });
+            // 开头一帧也可能带着字（转换、插件写出来的）
+            Some("content_block_start")
+                if v.pointer("/content_block/type").and_then(Value::as_str) == Some("text")
+                    && v.pointer("/content_block/text")
+                        .is_some_and(Value::is_string) =>
+            {
+                out.push(text(
+                    LaneKey::Text(u(v, "index")),
+                    vec![Key("content_block"), Key("text")],
+                ));
+            }
+            _ => {}
+        },
+        (Dialect::Anthropic, true) => {
+            for (i, b) in arr(v, "content").unwrap_or_default().iter().enumerate() {
+                if kind(b) == Some("text") && b.get("text").is_some_and(Value::is_string) {
+                    out.push(text(
+                        LaneKey::Text(i as u64),
+                        vec![Key("content"), Idx(i), Key("text")],
+                    ));
                 }
             }
         }
-        Dialect::Responses => match kind(v) {
-            Some("response.output_text.delta") => out.push(Field {
-                lane: LaneKey::responses_text(u(v, "output_index"), u(v, "content_index")),
-                path: vec![Key("delta")],
-            }),
-            Some("response.custom_tool_call_input.delta") => out.push(Field {
-                lane: LaneKey::Input(u(v, "output_index")),
-                path: vec![Key("delta")],
-            }),
-            _ => {}
-        },
-        Dialect::Gemini => {
-            let Some(cands) = v.get("candidates").and_then(Value::as_array) else {
-                return out;
+        (Dialect::Chat, _) => {
+            let msg = if whole { "message" } else { "delta" };
+            for (k, c) in arr(v, "choices").unwrap_or_default().iter().enumerate() {
+                let i = index_of(c, k);
+                for (field, lane) in [
+                    ("content", LaneKey::Text(i)),
+                    ("refusal", LaneKey::Refusal(i)),
+                ] {
+                    if c.get(msg)
+                        .and_then(|m| m.get(field))
+                        .is_some_and(Value::is_string)
+                    {
+                        out.push(text(
+                            lane,
+                            vec![Key("choices"), Idx(k), Key(msg), Key(field)],
+                        ));
+                    }
+                }
+            }
+        }
+        (Dialect::Responses, false) => {
+            let (oi, ci) = (u(v, "output_index"), u(v, "content_index"));
+            let lane = match kind(v) {
+                Some("response.output_text.delta") => Some(LaneKey::responses_text(oi, ci)),
+                Some("response.refusal.delta") => Some(LaneKey::responses_refusal(oi, ci)),
+                Some("response.custom_tool_call_input.delta") => Some(LaneKey::Input(oi)),
+                _ => None,
             };
-            for (k, c) in cands.iter().enumerate() {
-                let i = c.get("index").and_then(Value::as_u64).unwrap_or(k as u64);
-                let Some(parts) = c.pointer("/content/parts").and_then(Value::as_array) else {
-                    continue;
-                };
+            if let Some(lane) = lane
+                && v.get("delta").is_some_and(Value::is_string)
+            {
+                out.push(text(lane, vec![Key("delta")]));
+            }
+        }
+        (Dialect::Responses, true) => {
+            for (i, item) in arr(v, "output").unwrap_or_default().iter().enumerate() {
+                match kind(item) {
+                    Some("message") => {
+                        for (ci, p) in arr(item, "content").unwrap_or_default().iter().enumerate() {
+                            let (lane, field) = match kind(p) {
+                                Some("output_text") => {
+                                    (LaneKey::responses_text(i as u64, ci as u64), "text")
+                                }
+                                Some("refusal") => {
+                                    (LaneKey::responses_refusal(i as u64, ci as u64), "refusal")
+                                }
+                                _ => continue,
+                            };
+                            if p.get(field).is_some_and(Value::is_string) {
+                                out.push(text(
+                                    lane,
+                                    vec![
+                                        Key("output"),
+                                        Idx(i),
+                                        Key("content"),
+                                        Idx(ci),
+                                        Key(field),
+                                    ],
+                                ));
+                            }
+                        }
+                    }
+                    Some("custom_tool_call") if item.get("input").is_some_and(Value::is_string) => {
+                        out.push(text(
+                            LaneKey::Input(i as u64),
+                            vec![Key("output"), Idx(i), Key("input")],
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (Dialect::Gemini, _) => {
+            for (k, c) in arr(v, "candidates").unwrap_or_default().iter().enumerate() {
+                let lane = LaneKey::Text(index_of(c, k));
+                let parts = c
+                    .pointer("/content/parts")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 for (j, p) in parts.iter().enumerate() {
-                    // 思考过程不碰：带着签名
-                    let thought = p.get("thought").and_then(Value::as_bool) == Some(true);
-                    if !thought && p.get("text").is_some_and(Value::is_string) {
-                        out.push(Field {
-                            lane: LaneKey::Text(i),
-                            path: vec![
+                    // 思考过程不碰：带着签名。它另起一处显示，不把回答的文字隔开；函数调用、
+                    // 代码、图片这些夹在文字中间的才隔开
+                    if p.get("thought").and_then(Value::as_bool) == Some(true) {
+                        continue;
+                    }
+                    if p.get("text").is_some_and(Value::is_string) {
+                        out.push(text(
+                            lane,
+                            vec![
                                 Key("candidates"),
                                 Idx(k),
                                 Key("content"),
@@ -521,22 +682,111 @@ fn fields(d: Dialect, v: &Value) -> Vec<Field> {
                                 Idx(j),
                                 Key("text"),
                             ],
-                        });
+                        ));
+                    } else {
+                        out.push(Item::Break(lane));
                     }
                 }
             }
         }
         // Converse 的流在进门时已经拆成了 SSE，载荷里不带事件名，按形状认
-        Dialect::Bedrock => {
+        (Dialect::Bedrock, false) => {
             if v.pointer("/delta/text").is_some_and(Value::is_string) {
-                out.push(Field {
-                    lane: LaneKey::Text(u(v, "contentBlockIndex")),
-                    path: vec![Key("delta"), Key("text")],
-                });
+                out.push(text(
+                    LaneKey::Text(u(v, "contentBlockIndex")),
+                    vec![Key("delta"), Key("text")],
+                ));
+            }
+        }
+        (Dialect::Bedrock, true) => {
+            let blocks = v
+                .pointer("/output/message/content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (i, b) in blocks.iter().enumerate() {
+                if b.get("text").is_some_and(Value::is_string) {
+                    out.push(text(
+                        LaneKey::Text(i as u64),
+                        vec![
+                            Key("output"),
+                            Key("message"),
+                            Key("content"),
+                            Idx(i),
+                            Key("text"),
+                        ],
+                    ));
+                }
             }
         }
     }
     out
+}
+
+/// 去掉 logprobs（见模块说明）。返回去掉了没有
+fn drop_logprobs(d: Dialect, v: &mut Value) -> bool {
+    /// 这个对象上的 `key` 是有内容的，就换成 `empty`
+    fn clear(o: Option<&mut Value>, key: &str, empty: Value) -> bool {
+        let Some(slot) = o.and_then(|o| o.get_mut(key)) else {
+            return false;
+        };
+        let has = match &*slot {
+            Value::Null => false,
+            Value::Array(a) => !a.is_empty(),
+            _ => true,
+        };
+        if has {
+            *slot = empty;
+        }
+        has
+    }
+    let mut changed = false;
+    match d {
+        Dialect::Chat => {
+            if let Some(cs) = v.get_mut("choices").and_then(Value::as_array_mut) {
+                for c in cs {
+                    changed |= clear(Some(c), "logprobs", Value::Null);
+                }
+            }
+        }
+        Dialect::Responses => {
+            changed |= clear(Some(v), "logprobs", json!([]));
+            changed |= clear(v.get_mut("part"), "logprobs", json!([]));
+            let mut items: Vec<&mut Value> = Vec::new();
+            if v.get("item").is_some() {
+                items.extend(v.get_mut("item"));
+            } else if v.pointer("/response/output").is_some() {
+                if let Some(out) = v
+                    .pointer_mut("/response/output")
+                    .and_then(Value::as_array_mut)
+                {
+                    items.extend(out.iter_mut());
+                }
+            } else if let Some(out) = v.get_mut("output").and_then(Value::as_array_mut) {
+                items.extend(out.iter_mut());
+            }
+            for item in items {
+                if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
+                    for p in parts {
+                        changed |= clear(Some(p), "logprobs", json!([]));
+                    }
+                }
+            }
+        }
+        Dialect::Gemini => {
+            if let Some(cs) = v.get_mut("candidates").and_then(Value::as_array_mut) {
+                for c in cs {
+                    if let Some(o) = c.as_object_mut()
+                        && o.remove("logprobsResult").is_some()
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Dialect::Anthropic | Dialect::Bedrock => {}
+    }
+    changed
 }
 
 /// 哪几路在这一帧结束
@@ -563,10 +813,9 @@ fn close(d: Dialect, v: &Value) -> Close {
                     cs.iter()
                         .enumerate()
                         .filter(|(_, c)| c.get("finish_reason").is_some_and(|f| !f.is_null()))
-                        .map(|(k, c)| {
-                            LaneKey::Text(
-                                c.get("index").and_then(Value::as_u64).unwrap_or(k as u64),
-                            )
+                        .flat_map(|(k, c)| {
+                            let i = index_of(c, k);
+                            [LaneKey::Text(i), LaneKey::Refusal(i)]
                         })
                         .collect()
                 })
@@ -577,22 +826,29 @@ fn close(d: Dialect, v: &Value) -> Close {
                 Close::Lanes(done)
             }
         }
-        Dialect::Responses => match kind(v) {
-            Some("response.output_text.done" | "response.content_part.done") => {
-                Close::Lanes(vec![LaneKey::responses_text(
-                    u(v, "output_index"),
-                    u(v, "content_index"),
-                )])
+        Dialect::Responses => {
+            let (oi, ci) = (u(v, "output_index"), u(v, "content_index"));
+            match kind(v) {
+                Some("response.output_text.done") => {
+                    Close::Lanes(vec![LaneKey::responses_text(oi, ci)])
+                }
+                Some("response.refusal.done") => {
+                    Close::Lanes(vec![LaneKey::responses_refusal(oi, ci)])
+                }
+                Some("response.content_part.done") => Close::Lanes(vec![
+                    LaneKey::responses_text(oi, ci),
+                    LaneKey::responses_refusal(oi, ci),
+                ]),
+                Some("response.custom_tool_call_input.done") => {
+                    Close::Lanes(vec![LaneKey::Input(oi)])
+                }
+                Some("response.output_item.done") => Close::Output(oi),
+                Some(
+                    "response.completed" | "response.incomplete" | "response.failed" | "error",
+                ) => Close::All,
+                _ => Close::None,
             }
-            Some("response.custom_tool_call_input.done") => {
-                Close::Lanes(vec![LaneKey::Input(u(v, "output_index"))])
-            }
-            Some("response.output_item.done") => Close::Output(u(v, "output_index")),
-            Some("response.completed" | "response.incomplete" | "response.failed" | "error") => {
-                Close::All
-            }
-            _ => Close::None,
-        },
+        }
         Dialect::Gemini => {
             let done: Vec<LaneKey> = v
                 .get("candidates")
@@ -601,11 +857,7 @@ fn close(d: Dialect, v: &Value) -> Close {
                     cs.iter()
                         .enumerate()
                         .filter(|(_, c)| c.get("finishReason").is_some_and(|f| !f.is_null()))
-                        .map(|(k, c)| {
-                            LaneKey::Text(
-                                c.get("index").and_then(Value::as_u64).unwrap_or(k as u64),
-                            )
-                        })
+                        .map(|(k, c)| LaneKey::Text(index_of(c, k)))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -651,6 +903,17 @@ fn ids(d: Dialect, v: &Value) -> Value {
 /// 一路扣着的尾巴补成一帧，形状照着那一路自己的格式
 fn synth(d: Dialect, lane: LaneKey, ids: &Value, tail: String) -> Synth {
     let item_id = ids.get("item_id").cloned().unwrap_or(Value::Null);
+    let chat = |delta: Value| {
+        let mut m = ids.as_object().cloned().unwrap_or_default();
+        m.insert(
+            "choices".into(),
+            json!([{ "index": match lane { LaneKey::Text(i) | LaneKey::Refusal(i) | LaneKey::Input(i) => i }, "delta": delta, "finish_reason": null }]),
+        );
+        Synth {
+            event: None,
+            data: Value::Object(m),
+        }
+    };
     match (d, lane) {
         (_, LaneKey::Input(oi)) => Synth {
             event: Some("response.custom_tool_call_input.delta".into()),
@@ -658,6 +921,18 @@ fn synth(d: Dialect, lane: LaneKey, ids: &Value, tail: String) -> Synth {
                 "type": "response.custom_tool_call_input.delta",
                 "item_id": item_id,
                 "output_index": oi,
+                "delta": tail,
+            }),
+        },
+        (Dialect::Chat, LaneKey::Text(_)) => chat(json!({ "content": tail })),
+        (Dialect::Chat, LaneKey::Refusal(_)) => chat(json!({ "refusal": tail })),
+        (_, LaneKey::Refusal(k)) => Synth {
+            event: Some("response.refusal.delta".into()),
+            data: json!({
+                "type": "response.refusal.delta",
+                "item_id": item_id,
+                "output_index": k >> 32,
+                "content_index": k & 0xffff_ffff,
                 "delta": tail,
             }),
         },
@@ -669,17 +944,6 @@ fn synth(d: Dialect, lane: LaneKey, ids: &Value, tail: String) -> Synth {
                 "delta": { "type": "text_delta", "text": tail },
             }),
         },
-        (Dialect::Chat, LaneKey::Text(i)) => {
-            let mut m = ids.as_object().cloned().unwrap_or_default();
-            m.insert(
-                "choices".into(),
-                json!([{ "index": i, "delta": { "content": tail }, "finish_reason": null }]),
-            );
-            Synth {
-                event: None,
-                data: Value::Object(m),
-            }
-        }
         (Dialect::Responses, LaneKey::Text(k)) => Synth {
             event: Some("response.output_text.delta".into()),
             data: json!({
@@ -749,17 +1013,17 @@ impl SseFilter {
         out
     }
 
+    /// 改写一帧。**看不懂的原样转发**；字节不是 UTF-8 的照替换坏字节之后的样子看（客户端
+    /// 也是这么读的），改了字的写成替换过的样子 —— 不让一帧坏字节把命中的字带过去
     fn rewrite(&mut self, frame: &[u8]) -> Vec<u8> {
-        let Ok(text) = std::str::from_utf8(frame) else {
-            return frame.to_vec();
-        };
+        let text = String::from_utf8_lossy(frame);
         if !text
             .lines()
             .any(|l| tw_dialect::frame::data_of(l).is_some())
         {
             return frame.to_vec();
         }
-        let data = tw_dialect::frame::parse(frame)
+        let data = tw_dialect::frame::parse(text.as_bytes())
             .map(|f| f.data)
             .unwrap_or_default();
         let Ok(mut v) = serde_json::from_str::<Value>(&data) else {
@@ -877,11 +1141,17 @@ impl ArrayFilter {
                 return;
             }
         }
-        let Ok(mut v) = serde_json::from_slice::<Value>(&raw[start..]) else {
-            out.extend_from_slice(raw);
-            self.element = true;
+        // 字节不是 UTF-8 的照替换坏字节之后的样子看；还是解析不了的，会改字时整个不发 —— 看不懂
+        // 它里面有没有命中的字。不改字时原样转发
+        let lossy = String::from_utf8_lossy(&raw[start..]);
+        let Ok(mut v) = serde_json::from_str::<Value>(&lossy) else {
+            if !self.frames.edits() {
+                out.extend_from_slice(raw);
+                self.element = true;
+            }
             return;
         };
+        let lossless = matches!(lossy, std::borrow::Cow::Borrowed(_));
         let r = self.frames.frame(&mut v);
         let had = !r.before.is_empty();
         self.synths(r.before, out);
@@ -891,7 +1161,7 @@ impl ArrayFilter {
             out.extend_from_slice(b",\r\n");
         }
         out.extend_from_slice(seps);
-        if r.changed {
+        if r.changed || (!lossless && self.frames.edits()) {
             out.extend_from_slice(v.to_string().as_bytes());
         } else {
             out.extend_from_slice(&raw[start..]);
@@ -944,151 +1214,73 @@ impl Body {
 // ───────────────────────────────────────────────────────── 整份
 
 /// 一份整份的回答（客户端的格式，JSON）：每一路正文一次处理完。返回改过的回答（没改是
-/// `None`）和命中。不是 JSON 的什么都不做
+/// `None`，**一个字节都不动**）和命中。字节不是 UTF-8 的照替换坏字节之后的样子看；不是 JSON
+/// 的什么都不做
 pub fn whole(
     answer: &Arc<Answer>,
     acts: bool,
     dialect: Dialect,
     body: &[u8],
 ) -> (Option<Vec<u8>>, Vec<AnswerHit>) {
-    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+    let lossy = String::from_utf8_lossy(body);
+    let Ok(mut v) = serde_json::from_str::<Value>(&lossy) else {
         return (None, Vec::new());
     };
-    let spots = whole_fields(dialect, &v);
-    let mut lanes: BTreeMap<LaneKey, Lane> = BTreeMap::new();
-    let mut last: BTreeMap<LaneKey, usize> = BTreeMap::new();
-    let mut changed = false;
-    for (k, f) in spots.iter().enumerate() {
-        let lane = lanes.entry(f.lane).or_insert_with(|| answer.lane(acts));
-        last.insert(f.lane, k);
-        if let Some(s) = at(&mut v, &f.path) {
-            let next = lane.push(s);
-            if next != *s {
-                *s = next;
-                changed = true;
-            }
-        }
-    }
+    let items = items(dialect, &v, true);
     let mut tally = Tally::default();
-    for (key, mut lane) in lanes {
+    let mut changed = false;
+    // 一路一段一段地处理：Gemini 的文字被别的部分隔开就是两路
+    let mut runs: Vec<(LaneKey, Vec<usize>)> = Vec::new();
+    let mut open: HashMap<LaneKey, usize> = HashMap::new();
+    for (k, item) in items.iter().enumerate() {
+        match item {
+            Item::Text(f) => match open.get(&f.lane) {
+                Some(&r) => runs[r].1.push(k),
+                None => {
+                    open.insert(f.lane, runs.len());
+                    runs.push((f.lane, vec![k]));
+                }
+            },
+            Item::Break(lane) => {
+                open.remove(lane);
+            }
+        }
+    }
+    for (key, ks) in runs {
+        let fields: Vec<&Field> = ks
+            .iter()
+            .filter_map(|&k| match &items[k] {
+                Item::Text(f) => Some(f),
+                Item::Break(_) => None,
+            })
+            .collect();
+        let before: Vec<String> = fields
+            .iter()
+            .map(|f| at(&mut v, &f.path).map(|s| s.clone()).unwrap_or_default())
+            .collect();
+        let mut lane = answer.lane(acts);
+        let mut after: Vec<String> = before.iter().map(|s| lane.push(s)).collect();
         let tail = lane.finish();
-        if !tail.is_empty()
-            && let Some(s) = last
-                .get(&key)
-                .and_then(|&k| spots.get(k))
-                .and_then(|f| at(&mut v, &f.path))
-        {
-            s.push_str(&tail);
-            changed = true;
+        if let Some(last) = after.last_mut() {
+            last.push_str(&tail);
         }
-        let found = lane.take_found();
-        tally.add(answer, acts, &key.path(dialect), found);
+        tally.add(answer, acts, &key.path(dialect), lane.take());
+        // 一个字都没改的一路原样留着：扣住又补回去的字不挪到别的字段里
+        if after.concat() == before.concat() {
+            continue;
+        }
+        for (f, s) in fields.iter().zip(after) {
+            if let Some(slot) = at(&mut v, &f.path) {
+                *slot = s;
+            }
+        }
+        changed = true;
     }
-    let body = changed.then(|| v.to_string().into_bytes());
+    if changed {
+        drop_logprobs(dialect, &mut v);
+    }
+    // 坏字节在会改字的时候也不原样交出去
+    let rewrite = changed || (acts && answer.edits && matches!(lossy, std::borrow::Cow::Owned(_)));
+    let body = rewrite.then(|| v.to_string().into_bytes());
     (body, tally.hits)
-}
-
-/// 一份整份的回答里正文在哪几个字段，按先后
-fn whole_fields(d: Dialect, v: &Value) -> Vec<Field> {
-    use Seg::{Idx, Key};
-    let mut out = Vec::new();
-    let arr = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned();
-    match d {
-        Dialect::Anthropic => {
-            for (i, b) in arr(v, "content").unwrap_or_default().iter().enumerate() {
-                if kind(b) == Some("text") {
-                    out.push(Field {
-                        lane: LaneKey::Text(i as u64),
-                        path: vec![Key("content"), Idx(i), Key("text")],
-                    });
-                }
-            }
-        }
-        Dialect::Chat => {
-            for (k, c) in arr(v, "choices").unwrap_or_default().iter().enumerate() {
-                if c.pointer("/message/content").is_some_and(Value::is_string) {
-                    let i = c.get("index").and_then(Value::as_u64).unwrap_or(k as u64);
-                    out.push(Field {
-                        lane: LaneKey::Text(i),
-                        path: vec![Key("choices"), Idx(k), Key("message"), Key("content")],
-                    });
-                }
-            }
-        }
-        Dialect::Responses => {
-            for (i, item) in arr(v, "output").unwrap_or_default().iter().enumerate() {
-                match kind(item) {
-                    Some("message") => {
-                        for (ci, p) in arr(item, "content").unwrap_or_default().iter().enumerate() {
-                            if kind(p) == Some("output_text") {
-                                out.push(Field {
-                                    lane: LaneKey::responses_text(i as u64, ci as u64),
-                                    path: vec![
-                                        Key("output"),
-                                        Idx(i),
-                                        Key("content"),
-                                        Idx(ci),
-                                        Key("text"),
-                                    ],
-                                });
-                            }
-                        }
-                    }
-                    Some("custom_tool_call") => out.push(Field {
-                        lane: LaneKey::Input(i as u64),
-                        path: vec![Key("output"), Idx(i), Key("input")],
-                    }),
-                    _ => {}
-                }
-            }
-        }
-        Dialect::Gemini => {
-            for (k, c) in arr(v, "candidates").unwrap_or_default().iter().enumerate() {
-                let i = c.get("index").and_then(Value::as_u64).unwrap_or(k as u64);
-                let parts = c
-                    .pointer("/content/parts")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for (j, p) in parts.iter().enumerate() {
-                    let thought = p.get("thought").and_then(Value::as_bool) == Some(true);
-                    if !thought && p.get("text").is_some_and(Value::is_string) {
-                        out.push(Field {
-                            lane: LaneKey::Text(i),
-                            path: vec![
-                                Key("candidates"),
-                                Idx(k),
-                                Key("content"),
-                                Key("parts"),
-                                Idx(j),
-                                Key("text"),
-                            ],
-                        });
-                    }
-                }
-            }
-        }
-        Dialect::Bedrock => {
-            let blocks = v
-                .pointer("/output/message/content")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for (i, b) in blocks.iter().enumerate() {
-                if b.get("text").is_some_and(Value::is_string) {
-                    out.push(Field {
-                        lane: LaneKey::Text(i as u64),
-                        path: vec![
-                            Key("output"),
-                            Key("message"),
-                            Key("content"),
-                            Idx(i),
-                            Key("text"),
-                        ],
-                    });
-                }
-            }
-        }
-    }
-    out
 }
