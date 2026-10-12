@@ -621,6 +621,8 @@ struct Pipes {
     /// **整条连接一本账。**每帧各起一本的话，第二帧的
     /// `<<TW_SECRET_1>>` 会和第一帧的撞车（见 `tw_guard::redact::replace::apply` 的注释）
     ledger: tw_guard::redact::replace::Ledger,
+    /// 上游的帧按这本账还原（见 [`restore_frame`]），连同建它时账里有几个值：账长了就换一个
+    restorer: Option<(tw_guard::redact::sse::FrameRestorer, usize)>,
     /// 工具调用审查关着的时候没有它
     wall: Option<tw_guard::tools::wall::Wall>,
     /// 正在跑的那次回答的 id（`response.created` 里的）。切掉这次回答时的
@@ -831,6 +833,7 @@ pub(crate) async fn proxy(
     };
     let mut p = Pipes {
         ledger: tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+        restorer: None,
         wall: rules
             .inspect_mode
             .detects()
@@ -1083,6 +1086,17 @@ async fn pump(
             }
         }
     };
+    // 上游没收尾就走了：扣着的半截占位符原样交给客户端，那是模型说过的字
+    if matches!(end, End::UpstreamClosed | End::Broke(_))
+        && let Some((r, _)) = p.restorer.as_mut()
+    {
+        for s in r.drain() {
+            let frame = serde_json::to_string(&s.data).unwrap_or_default();
+            if c_tx.send(Message::Text(frame.into())).await.is_err() {
+                break;
+            }
+        }
+    }
     // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了。在等准入的那一轮
     // 开始了的话记成取消；在跑的几轮，上游断了、收了连接的是失败，客户端走了的是取消
     drop(waiting);
@@ -1537,17 +1551,20 @@ async fn relay(
     late: bool,
     c_tx: &mut ClientSink,
 ) -> Flow {
-    let restored = tw_guard::redact::replace::restore(t, &p.ledger);
+    // 还原：扣着的尾巴补成的帧在前，这一帧在最后
+    let mut pieces = restore_frame(p, t);
     // 模型名换回客户端用的名称：一条消息是一个完整的 JSON，整条过一遍。排在回答钩子之前，
     // 和 HTTP 那条路一样
-    let restored = match p.rename.as_mut() {
-        Some(r) => {
-            let mut out = r.feed(restored.as_bytes());
+    if let Some(r) = p.rename.as_mut() {
+        for piece in &mut pieces {
+            let mut out = r.feed(piece.as_bytes());
             out.extend(r.flush());
-            String::from_utf8(out).unwrap_or(restored)
+            if let Ok(renamed) = String::from_utf8(out) {
+                *piece = renamed;
+            }
         }
-        None => restored,
-    };
+    }
+    let restored = pieces.last().cloned().unwrap_or_default();
     // 回答的边界：一次新的回答起一组回答钩子的实例；被切掉的那次剩下的帧不发
     let terminal = matches!(
         kind,
@@ -1571,10 +1588,18 @@ async fn relay(
     }
     // 回答钩子：一帧可能变成几帧，也可能先扣着
     let (outgoing, failed) = match p.reply.as_mut().filter(|_| !late) {
-        None => (vec![restored], None),
+        None => (pieces, None),
         Some(s) => {
-            let (out, mut err) = s.feed(as_sse(&restored).as_bytes()).await;
-            let mut msgs = payloads(&out);
+            let mut msgs = Vec::new();
+            let mut err = None;
+            for piece in &pieces {
+                let (out, e) = s.feed(as_sse(piece).as_bytes()).await;
+                msgs.extend(payloads(&out));
+                if e.is_some() {
+                    err = e;
+                    break;
+                }
+            }
             if err.is_none() && terminal {
                 let (more, e) = s.finish(false).await;
                 msgs.extend(payloads(&more));
@@ -1644,6 +1669,52 @@ async fn relay(
         return fail_response(p, c_tx, e.detail).await;
     }
     Flow::Sent
+}
+
+/// 上游的一帧还原占位符：要发给客户端的几帧，这一帧在最后，前面是扣着的尾巴补成的帧。
+///
+/// **按帧、按路还原，和 SSE 那条路同一个还原器**（[`tw_guard::redact::sse::FrameRestorer`]，
+/// 按 Responses 的事件认）：模型按 token 吐字，一个占位符会切在两帧的增量里，一帧一帧各自
+/// 换是换不回来的；参数的增量放转义过的原值，正文放原样。不是 JSON 的一帧整帧按原文换。
+///
+/// 账在连接中途长了（客户端又发来一帧、里面有新的值）就照新账另起一个，旧的扣着的尾巴先
+/// 补出来，排在这一帧前面。
+fn restore_frame(p: &mut Pipes, t: &str) -> Vec<String> {
+    use tw_guard::redact::sse::{FrameRestorer, Synth};
+    let text = |s: &Synth| serde_json::to_string(&s.data).unwrap_or_default();
+    if p.ledger.is_empty() {
+        return vec![t.to_string()];
+    }
+    let mut out = Vec::new();
+    if p.restorer
+        .as_ref()
+        .is_none_or(|(_, n)| *n != p.ledger.len())
+    {
+        if let Some((mut old, _)) = p.restorer.take() {
+            out.extend(old.drain().iter().map(text));
+        }
+        let fresh = FrameRestorer::new(&p.ledger, tw_dialect::ir::Dialect::Responses);
+        p.restorer = Some((fresh, p.ledger.len()));
+    }
+    let Some((r, _)) = p.restorer.as_mut() else {
+        return vec![t.to_string()];
+    };
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(mut v) => {
+            let rw = r.frame(&mut v);
+            out.extend(rw.before.iter().map(text));
+            out.push(if rw.changed {
+                v.to_string()
+            } else {
+                t.to_string()
+            });
+        }
+        Err(_) => {
+            out.extend(r.drain().iter().map(text));
+            out.push(tw_guard::redact::replace::restore(t, &p.ledger));
+        }
+    }
+    out
 }
 
 /// 切掉这一次回答：替它发 `response.failed`，它剩下的帧不再发。这一轮的结局记成拒绝

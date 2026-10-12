@@ -188,11 +188,22 @@ impl FrameRestorer {
         if self.is_noop() {
             return out;
         }
+        // 流着的正文先拿出来，交给它那一路：一个增量里的参数片段（`"KEY=<<TW_SECRET_1>>"`）
+        // 看不出是 JSON，按键认的话会当成正文放进去
+        let fields = fields(self.dialect, v);
+        let streamed: Vec<Option<String>> = fields
+            .iter()
+            .map(|f| at(v, &f.path).map(std::mem::take))
+            .collect();
         // 完整的占位符，不管在哪个字段里：`output_text.done` 带着整段正文、
         // Gemini 的函数调用参数整个在一帧里
         out.changed |= walk(v, &self.oneshot, &self.oneshot_json, Form::Text, None);
+        for (f, s) in fields.iter().zip(streamed) {
+            if let (Some(slot), Some(s)) = (at(v, &f.path), s) {
+                *slot = s;
+            }
+        }
         // 流着的正文，按路扣住半截的
-        let fields = fields(self.dialect, v);
         for f in &fields {
             let open = self.lanes.entry(f.lane).or_insert_with(|| Open {
                 restorer: self.oneshot.fresh_as(f.lane.form()),
@@ -256,10 +267,17 @@ impl FrameRestorer {
 }
 
 /// `parent` 下面的 `key` 是不是装着一段 JSON 的字符串：工具调用的参数（Chat、Responses 的
-/// `arguments`，Anthropic 的 `partial_json`，Converse 的 `toolUse.input`）。原值放进去要转义
-/// 一次；别处的字符串是解码过的正文。Responses 自由格式工具的 `input` 是一段话，不算
-fn json_text(key: &str, parent: Option<&str>) -> bool {
-    matches!(key, "arguments" | "partial_json") || (key == "input" && parent == Some("toolUse"))
+/// `arguments`，Anthropic 的 `partial_json`，Converse 的 `toolUse.input`），而且 `value` 真
+/// 长得像 JSON（工具自己的参数里叫 `arguments` 的字段放的可能是一句话）。原值放进去要转义
+/// 一次；别处的字符串是解码过的正文。Responses 自由格式工具的 `input` 是一段话，不算。
+///
+/// 和整份 JSON 原文的还原认的是同一批（见 `crate::redact::nest`）。流着的片段不走这里，
+/// 按它那一路认（[`Lane::form`]）
+fn json_text(key: &str, parent: Option<&str>, value: &Value) -> bool {
+    (matches!(key, "arguments" | "partial_json") || (key == "input" && parent == Some("toolUse")))
+        && value
+            .as_str()
+            .is_some_and(|s| s.trim_start().starts_with(['{', '[']))
 }
 
 /// 在一帧的每个字符串上做一次性还原，跳过 [`UNTOUCHED`] 下面的。返回改了没有。
@@ -285,7 +303,7 @@ fn walk(v: &mut Value, text: &Restorer, json: &Restorer, form: Form, parent: Opt
             .iter_mut()
             .filter(|(k, _)| !UNTOUCHED.contains(&k.as_str()))
             .fold(false, |c, (k, i)| {
-                let form = if json_text(k, parent) {
+                let form = if json_text(k, parent, i) {
                     Form::Json
                 } else {
                     Form::Text
@@ -1408,5 +1426,31 @@ mod tests {
             joined(&out, "response.custom_tool_call_input.delta", "delta"),
             "+<<TW_SECRET_"
         );
+    }
+
+    #[test]
+    fn a_whole_placeholder_in_one_argument_delta_is_escaped_for_the_arguments() {
+        // 一个增量里整个占位符都在：片段看不出是 JSON，交给参数那一路，不按正文放
+        let l = pem_ledger();
+        let ev = |d: &str| {
+            named(
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"f1","output_index":1,"delta":d}),
+            )
+        };
+        let frames = vec![ev("{\"pem\":"), ev("\"<<TW_SECRET_1>>\""), ev("}")];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        let args = joined(&out, "response.function_call_arguments.delta", "delta");
+        let v: Value = serde_json::from_str(&args).expect("arguments are still JSON");
+        assert_eq!(v["pem"], PEM);
+        // 工具自己的参数里叫 `arguments` 的字段放的是一句话：整帧里按正文放
+        let frames = vec![named(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"<<TW_SECRET_1>>"}],"arguments":"照 <<TW_SECRET_1>>"}}),
+        )];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        let v = &values(&out)[0]["item"];
+        assert_eq!(v["content"][0]["text"], PEM);
+        assert_eq!(v["arguments"], format!("照 {PEM}"));
     }
 }

@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 
+use crate::redact::nest::Nest;
 use crate::redact::replace::{Form, Ledger};
 
 /// 一条流上的还原器。
@@ -30,10 +31,13 @@ use crate::redact::replace::{Form, Ledger};
 /// 还原的结果。**顺序和内容都不变，唯一的差别是有些字节晚几毫秒发出去。
 ///
 /// 放回去的样子看这条流是哪种写法（[`Form`]）：一份 JSON 原文的字节流（[`Restorer::new`]）
-/// 放转义过的，解码过的正文（[`Restorer::text`]，SSE 里一帧的正文字段）放原值本来的样子。
+/// 按每一处所在的层转义（见 [`crate::redact::replace::restore`]），解码过的正文
+/// （[`Restorer::text`]，SSE 里一帧的正文字段）放原值本来的样子。
 pub struct Restorer {
     book: Arc<Book>,
     form: Form,
+    /// JSON 原文读到了哪儿：发出去的每一段接着读（[`Form::Json`] 才用）
+    nest: Nest,
     /// 占位符开头的第一个字节。先按它筛，再比前缀
     lead: u8,
     open: &'static str,
@@ -46,9 +50,8 @@ pub struct Restorer {
 /// 查一次，不拿账里的每个占位符挨个比 —— 一个请求换了几万个值时，后者在每个 chunk 上
 /// 都要比几万次。
 struct Book {
-    /// (占位符, 原值, 原值写在 JSON 字符串里的样子)，按占位符的字节序排。和原值一样的
-    /// （绝大多数）不另抄一份，是 `None`
-    entries: Vec<(String, String, Option<String>)>,
+    /// (占位符, 原值)，按占位符的字节序排。原值是解开转义之后的
+    entries: Vec<(String, String)>,
     /// 占位符有哪几种长度，从短到长
     lens: Vec<usize>,
     /// 最长的占位符有多长：扣住的永远不会比它更多
@@ -57,16 +60,10 @@ struct Book {
 
 impl Book {
     fn of(ledger: &Ledger) -> Self {
-        let mut entries: Vec<(String, String, Option<String>)> = ledger
+        let mut entries: Vec<(String, String)> = ledger
             .table()
             .iter()
-            .map(|(p, o)| {
-                let json = match crate::redact::replace::json_escaped(o) {
-                    std::borrow::Cow::Owned(j) => Some(j),
-                    std::borrow::Cow::Borrowed(_) => None,
-                };
-                (p.clone(), o.clone(), json)
-            })
+            .map(|(p, o)| (p.clone(), o.clone()))
             .collect();
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let lens = ledger.lens().to_vec();
@@ -79,16 +76,12 @@ impl Book {
 
     /// 第一个不小于 `s` 的占位符在哪儿
     fn seek(&self, s: &[u8]) -> usize {
-        self.entries.partition_point(|(p, _, _)| p.as_bytes() < s)
+        self.entries.partition_point(|(p, _)| p.as_bytes() < s)
     }
 
-    /// 占位符的原值，按 `form` 写
-    fn original(&self, placeholder: &str, form: Form) -> Option<&str> {
-        let (p, o, json) = self.entries.get(self.seek(placeholder.as_bytes()))?;
-        (p == placeholder).then_some(match (form, json) {
-            (Form::Json, Some(j)) => j.as_str(),
-            _ => o.as_str(),
-        })
+    fn original(&self, placeholder: &str) -> Option<&str> {
+        let (p, o) = self.entries.get(self.seek(placeholder.as_bytes()))?;
+        (p == placeholder).then_some(o.as_str())
     }
 
     /// `tail` 是不是某个占位符的**严格**前缀。
@@ -100,7 +93,7 @@ impl Book {
         self.entries[self.seek(tail)..]
             .iter()
             .take(2)
-            .any(|(p, _, _)| p.len() > tail.len() && p.as_bytes().starts_with(tail))
+            .any(|(p, _)| p.len() > tail.len() && p.as_bytes().starts_with(tail))
     }
 }
 
@@ -122,6 +115,7 @@ impl Restorer {
         Self {
             book: Arc::new(Book::of(ledger)),
             form,
+            nest: Nest::default(),
             lead: open.as_bytes()[0],
             open,
             buffer: String::new(),
@@ -139,6 +133,7 @@ impl Restorer {
         Self {
             book: Arc::clone(&self.book),
             form,
+            nest: Nest::default(),
             lead: self.lead,
             open: self.open,
             buffer: String::new(),
@@ -174,17 +169,17 @@ impl Restorer {
         if self.buffer.is_empty() {
             return String::new();
         }
-        let out = self.restore(&self.buffer.clone());
-        self.buffer.clear();
-        out
+        let rest = std::mem::take(&mut self.buffer);
+        self.restore(&rest)
     }
 
     /// 不走缓冲的一次性还原（错误信息之类）。
     ///
     /// **不碰内部缓冲**：上游报错打断了一条正卡在占位符中间的流时，
-    /// 后面那次 `flush()` 仍然要能正常收尾。
+    /// 后面那次 `flush()` 仍然要能正常收尾。`s` 是一段完整的文字，从头读起，也不接着流
+    /// 读到的地方。
     pub fn oneshot(&self, s: &str) -> String {
-        self.restore(s)
+        self.swap(s, &mut Nest::default())
     }
 
     /// 从哪个字节开始必须扣住。返回 `buffer.len()` 表示全都能发。
@@ -201,15 +196,29 @@ impl Restorer {
         buf.len()
     }
 
-    fn restore(&self, s: &str) -> String {
+    /// 流里发出去的下一段：接着这条流读到的地方读
+    fn restore(&mut self, s: &str) -> String {
+        let mut nest = std::mem::take(&mut self.nest);
+        let out = self.swap(s, &mut nest);
+        self.nest = nest;
+        out
+    }
+
+    fn swap(&self, s: &str, nest: &mut Nest) -> String {
         if self.is_noop() {
             return s.to_string();
         }
-        crate::redact::replace::swap_with(s, self.open, &self.book.lens, |ph| {
-            self.book
-                .original(ph, self.form)
-                .map(std::borrow::Cow::Borrowed)
-        })
+        let nest = match self.form {
+            Form::Json => Some(nest),
+            Form::Text => None,
+        };
+        crate::redact::replace::swap_with(
+            s,
+            self.open,
+            &self.book.lens,
+            |ph| self.book.original(ph),
+            nest,
+        )
     }
 }
 
@@ -612,5 +621,38 @@ mod byte_tests {
         assert!(r.is_noop());
         let raw = &[0xff, 0xfe, 0x00][..];
         assert_eq!(r.process(raw), raw.to_vec(), "二进制体也该原样过去");
+    }
+
+    #[test]
+    fn a_whole_answer_cut_anywhere_is_restored_like_it_was_in_one_piece() {
+        // 读到第几层接着上一块记：参数那段 JSON 里的占位符，切在哪儿都转义两次
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+        let l = redact(
+            &serde_json::json!({ "content": pem }).to_string(),
+            &RuleSet::only(&["private-key"]),
+            Ledger::new(Scheme::SECRET),
+        )
+        .ledger;
+        let body = serde_json::json!({"choices": [{"message": {
+            "content": "钥匙：<<TW_SECRET_1>>",
+            "tool_calls": [{"function": {"arguments": "{\"pem\":\"<<TW_SECRET_1>>\",\"x\":\"a\\\"b\"}"}}],
+        }}]})
+        .to_string();
+        let whole = crate::redact::replace::restore(&body, &l);
+        let v: serde_json::Value = serde_json::from_str(&whole).unwrap();
+        let args = v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let args: serde_json::Value = serde_json::from_str(args).unwrap();
+        assert_eq!(args["pem"], pem);
+        for size in 1..40 {
+            let mut r = ByteRestorer::new(&l);
+            let mut out = Vec::new();
+            for piece in body.as_bytes().chunks(size) {
+                out.extend(r.process(piece));
+            }
+            out.extend(r.flush());
+            assert_eq!(String::from_utf8(out).unwrap(), whole, "{size}");
+        }
     }
 }

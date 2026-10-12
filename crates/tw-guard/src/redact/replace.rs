@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::redact::nest::Nest;
 use crate::redact::rules::{Hit, RuleSet};
 
 /// 占位符长什么样：`{open}{label}_{n}{close}`。
@@ -289,11 +290,13 @@ pub fn redact_text(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     apply_text(text, &hits, ledger)
 }
 
-/// 一次性还原一份 **JSON 原文**（非流式响应、WebSocket 的一帧、存下来的回答）：原值按
-/// JSON 字符串转义一次再放回去。私钥块里的换行回到 `\n`，和请求体里写的一样；一个带引号的
+/// 一次性还原一份 **JSON 原文**（非流式响应、WebSocket 的一帧、存下来的回答）：原值按它
+/// 所在的那一层转义再放回去。私钥块里的换行回到 `\n`，和请求体里写的一样；一个带引号的
 /// 值原样塞回去，整份 JSON 就坏了。
 ///
-/// 没有要转义的字的值原样放回去。
+/// **按 JSON 的结构读一遍定层数**（见 [`crate::redact::nest`]）：正文字符串里的转义一次，
+/// 工具参数那段 JSON 的字符串里的转义两次。不是 JSON 的文字一律转义一次。没有要转义的字的
+/// 值原样放回去，没有占位符的地方一个字节都不动。
 pub fn restore(text: &str, ledger: &Ledger) -> String {
     swap(text, ledger, Form::Json)
 }
@@ -305,21 +308,37 @@ pub fn restore_text(text: &str, ledger: &Ledger) -> String {
 }
 
 fn swap(text: &str, ledger: &Ledger, form: Form) -> String {
-    if ledger.is_empty() {
+    if ledger.is_empty() || !text.contains(ledger.scheme.open) {
         return text.to_string();
     }
-    let lookup = |ph: &str| {
-        let original = ledger.back.get(ph)?.as_str();
-        Some(match form {
-            Form::Json => json_escaped(original),
-            Form::Text => Cow::Borrowed(original),
-        })
+    let lookup = |ph: &str| ledger.back.get(ph).map(String::as_str);
+    let mut nest = Nest::default();
+    let nest = match form {
+        Form::Json => Some(&mut nest),
+        Form::Text => None,
     };
-    swap_with(text, ledger.scheme.open, &ledger.lens, lookup)
+    swap_with(text, ledger.scheme.open, &ledger.lens, lookup, nest)
+}
+
+/// `s` 转义 `times` 次
+pub(crate) fn escaped_times(s: &str, times: usize) -> Cow<'_, str> {
+    let mut out = Cow::Borrowed(s);
+    for _ in 0..times {
+        let next = match json_escaped(&out) {
+            Cow::Owned(e) => e,
+            // 这一遍没有要转义的，再转几遍也一样
+            Cow::Borrowed(_) => break,
+        };
+        out = Cow::Owned(next);
+    }
+    out
 }
 
 /// 一遍扫过去，把 `text` 里写着的占位符换回原值。`lens` 是占位符有哪几种长度（从短到长），
-/// `lookup` 按占位符查要放回去的样子。
+/// `lookup` 按占位符查原值（解开转义之后的）。
+///
+/// `nest` 是 JSON 原文读到了哪儿（[`Form::Json`]）：每一处按它所在的层转义，读过的接着记在
+/// 它上面 —— 流式还原的下一段从这里接着读。`None` 是解码过的正文，原值原样放。
 ///
 /// **在每个占位符开头处按这几种长度各查一次表**，不拿账里的每个占位符去整段文字里找一遍：
 /// 后者是「占位符个数 × 文字长度」，一个请求换了几万个值、回答又把它们念了一遍时，光
@@ -328,11 +347,12 @@ pub(crate) fn swap_with<'a>(
     text: &str,
     open: &str,
     lens: &[usize],
-    lookup: impl Fn(&str) -> Option<Cow<'a, str>>,
+    lookup: impl Fn(&str) -> Option<&'a str>,
+    mut nest: Option<&mut Nest>,
 ) -> String {
     let mut out = String::new();
-    // 抄到了哪儿、从哪儿接着找下一个开头
-    let (mut done, mut from) = (0, 0);
+    // 抄到了哪儿、从哪儿接着找下一个开头、读到了哪儿
+    let (mut done, mut from, mut read) = (0, 0, 0);
     while let Some(i) = text[from..].find(open) {
         let at = from + i;
         let found = lens.iter().find_map(|&n| {
@@ -346,7 +366,14 @@ pub(crate) fn swap_with<'a>(
                     out.reserve(text.len());
                 }
                 out.push_str(&text[done..at]);
-                out.push_str(&original);
+                match nest.as_deref_mut() {
+                    Some(nest) => {
+                        nest.advance(&text.as_bytes()[read..at]);
+                        read = at;
+                        out.push_str(&escaped_times(original, nest.level()));
+                    }
+                    None => out.push_str(original),
+                }
                 done = at + n;
                 from = done;
             }
@@ -354,6 +381,9 @@ pub(crate) fn swap_with<'a>(
             // `<` 起
             None => from = at + 1,
         }
+    }
+    if let Some(nest) = nest {
+        nest.advance(&text.as_bytes()[read..]);
     }
     if done == 0 {
         return text.to_string();
@@ -834,5 +864,77 @@ mod tests {
     fn json_escaping_lends_out_what_needs_none() {
         assert!(matches!(json_escaped("plain 中文"), Cow::Borrowed(_)));
         assert_eq!(json_escaped("a\"b\\c\nd\u{1}"), r#"a\"b\\c\nd\u0001"#);
+    }
+
+    /// 一份请求体里换下来的私钥块的账
+    fn pem_ledger() -> Ledger {
+        let body = serde_json::json!({ "content": PEM }).to_string();
+        redact(&body, &all(), l()).ledger
+    }
+
+    fn arg_of(args: &str, key: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(args).expect("the arguments are JSON");
+        v[key].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_placeholder_in_tool_arguments_inside_a_whole_answer_is_escaped_twice() {
+        // 参数那段 JSON 本身是一个字符串：解开外面一层是参数，再解开一层才是值。只转义一次，
+        // 客户端解出来的参数里夹着一个真的换行
+        let l = pem_ledger();
+        let chat = serde_json::json!({"choices": [{"message": {
+            "content": "钥匙：<<TW_SECRET_1>>",
+            "tool_calls": [{"function": {"name": "write", "arguments": "{\"pem\":\"<<TW_SECRET_1>>\"}"}}],
+        }}]})
+        .to_string();
+        let v: serde_json::Value = serde_json::from_str(&restore(&chat, &l)).expect("still JSON");
+        let m = &v["choices"][0]["message"];
+        assert_eq!(m["content"], format!("钥匙：{PEM}"));
+        let args = m["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(arg_of(args, "pem"), PEM);
+
+        // Responses 的 function_call 项、Converse 的 toolUse.input 一样；Anthropic 的 input
+        // 是对象，一层
+        let other = serde_json::json!({
+            "output": [{"type": "function_call", "arguments": "{\"pem\":\"<<TW_SECRET_1>>\"}"}],
+            "delta": {"toolUse": {"input": "{\"pem\":\"<<TW_SECRET_1>>\"}"}},
+            "content": [{"type": "tool_use", "input": {"pem": "<<TW_SECRET_1>>", "arguments": "照 <<TW_SECRET_1>>"}}],
+        })
+        .to_string();
+        let v: serde_json::Value = serde_json::from_str(&restore(&other, &l)).expect("still JSON");
+        assert_eq!(
+            arg_of(v["output"][0]["arguments"].as_str().unwrap(), "pem"),
+            PEM
+        );
+        assert_eq!(
+            arg_of(v["delta"]["toolUse"]["input"].as_str().unwrap(), "pem"),
+            PEM
+        );
+        assert_eq!(v["content"][0]["input"]["pem"], PEM);
+        // 工具自己的参数里叫 `arguments` 的字段放的是一句话
+        assert_eq!(v["content"][0]["input"]["arguments"], format!("照 {PEM}"));
+    }
+
+    #[test]
+    fn only_the_placeholders_move_in_a_whole_answer() {
+        // 别的字节一个不动：`\u00e9` 还是 `\u00e9`，空白、键的先后照旧
+        let l = pem_ledger();
+        let bs = '\\';
+        let body = format!("{{ \"b\": \"{bs}u00e9 <<TW_SECRET_1>>\",\n  \"a\": 1 }}");
+        let want = format!(
+            "{{ \"b\": \"{bs}u00e9 {}\",\n  \"a\": 1 }}",
+            json_escaped(PEM)
+        );
+        assert_eq!(restore(&body, &l), want);
+        // 没有占位符的原样
+        let none = "{ \"arguments\": \"{}\" }";
+        assert_eq!(restore(none, &l), none);
+        // 不是 JSON 的文字：转义一次
+        assert_eq!(
+            restore("你说的是 <<TW_SECRET_1>>", &l),
+            format!("你说的是 {}", json_escaped(PEM))
+        );
     }
 }
