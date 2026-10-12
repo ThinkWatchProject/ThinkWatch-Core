@@ -6,6 +6,10 @@
 //! 又在那段 JSON 的一个字符串里：要转义两次 —— 解开外面这层是参数那段 JSON，再解开一层才是
 //! 值。只转义一次的话，客户端解出来的参数里夹着一个真的换行，解析不了。
 //!
+//! **一层套一层地读**：参数那段 JSON 里又有一个放 JSON 的字段（工具自己的参数叫
+//! `arguments`、里面是一段 JSON）时，再往里一层，转义三次，多少层都一样。每一层是同一个
+//! 读法（[`Reader`]），读的是外面那层字符串解开之后的字。
+//!
 //! **一边往下读一边记**，不解析成一棵树再写回去：整份的回答、按块到的字节流、WebSocket 的
 //! 一帧都用它，没有占位符的地方一个字节都不动，流也不必攒齐了才发。
 //!
@@ -37,8 +41,8 @@ fn classify(raw: &[u8]) -> Key {
 /// 分类只看键的头几个字节：认的那几个键都比它短
 const HEAD: usize = 16;
 
-/// 外层字符串里解出来的那段 JSON 读到了哪儿
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 一层字符串里放的东西读到了哪儿
+#[derive(Debug, Clone, Default)]
 enum Inner {
     /// 不是放参数的字符串
     #[default]
@@ -47,10 +51,8 @@ enum Inner {
     Undecided,
     /// 不像 JSON：一句话
     Plain,
-    Json {
-        in_str: bool,
-        esc: bool,
-    },
+    /// 一段 JSON：往里再读一层
+    Json(Box<Reader>),
 }
 
 /// 读到哪儿了（见模块说明）。
@@ -59,29 +61,14 @@ pub(crate) struct Nest {
     /// 读到过不是空白的字没有；读到过的话，开头是不是 JSON（`{`、`[`、`"`）。不是 JSON 的
     /// 文字不往下看，原值一律转义一次
     json: Option<bool>,
-    in_str: bool,
-    esc: bool,
-    /// `\uXXXX` 还差几位、读到的值
-    hex: u8,
-    code: u32,
-    /// 这个字符串可能是一个键（前面没有冒号在等值）
-    maybe_key: bool,
-    /// 这个字符串的头几个字节：读完是一个键的话按它分类
-    head: Vec<u8>,
-    /// 刚读完的那个字符串
-    last: Key,
-    /// 读到冒号、在等值的那个键
-    pending: Option<Key>,
-    /// 每一层容器是哪个键的值
-    stack: Vec<Key>,
-    inner: Inner,
+    top: Reader,
 }
 
 impl Nest {
     /// 此刻放进去的原值要转义几次
     pub(crate) fn level(&self) -> usize {
-        match self.inner {
-            Inner::Json { in_str: true, .. } if self.in_str => 2,
+        match self.json {
+            Some(true) => self.top.depth().max(1),
             _ => 1,
         }
     }
@@ -99,23 +86,67 @@ impl Nest {
                 Some(false) => return,
                 Some(true) => {}
             }
-            if self.in_str {
-                // 一个字符串里不会改变什么的字整段跳过：只等引号和反斜杠
-                if !self.esc
-                    && self.hex == 0
-                    && matches!(self.inner, Inner::Off | Inner::Plain)
-                    && (!self.maybe_key || self.head.len() >= HEAD)
-                {
-                    match memchr::memchr2(b'"', b'\\', &s[i..]) {
-                        Some(n) => i += n,
-                        None => return,
-                    }
+            // 一个字符串里不会改变什么的字整段跳过：只等引号和反斜杠
+            if self.top.plain_run() {
+                match memchr::memchr2(b'"', b'\\', &s[i..]) {
+                    Some(n) => i += n,
+                    None => return,
                 }
-                self.string_byte(s[i]);
-            } else {
-                self.structure(s[i]);
             }
+            self.top.feed(s[i]);
             i += 1;
+        }
+    }
+}
+
+/// 一层 JSON 读到了哪儿：最外面一层读原文的字节，里面每一层读外面那层字符串解开之后的字。
+#[derive(Debug, Clone, Default)]
+struct Reader {
+    in_str: bool,
+    esc: bool,
+    /// `\uXXXX` 还差几位、读到的值
+    hex: u8,
+    code: u32,
+    /// 这个字符串可能是一个键（前面没有冒号在等值）
+    maybe_key: bool,
+    /// 这个字符串的头几个字节：读完是一个键的话按它分类
+    head: Vec<u8>,
+    /// 刚读完的那个字符串
+    last: Key,
+    /// 读到冒号、在等值的那个键
+    pending: Option<Key>,
+    /// 每一层容器是哪个键的值
+    stack: Vec<Key>,
+    /// 此刻这个字符串里放的东西
+    inner: Inner,
+}
+
+impl Reader {
+    /// 此刻在第几层字符串里：这一层不在字符串里是 0
+    fn depth(&self) -> usize {
+        if !self.in_str {
+            return 0;
+        }
+        1 + match &self.inner {
+            Inner::Json(r) => r.depth(),
+            _ => 0,
+        }
+    }
+
+    /// 接下来的字只要不是引号和反斜杠，就什么都不改变
+    fn plain_run(&self) -> bool {
+        self.in_str
+            && !self.esc
+            && self.hex == 0
+            && matches!(self.inner, Inner::Off | Inner::Plain)
+            && (!self.maybe_key || self.head.len() >= HEAD)
+    }
+
+    fn feed(&mut self, b: u8) {
+        if self.in_str {
+            self.string_byte(b);
+        } else {
+            self.structure(b);
         }
     }
 
@@ -152,7 +183,7 @@ impl Nest {
             self.code = self.code * 16 + (b as char).to_digit(16).unwrap_or(0);
             self.hex -= 1;
             if self.hex == 0 {
-                // 只有引号和反斜杠对里面那段 JSON 有意义，别的都当一个普通的字
+                // 只有引号、反斜杠和括号对里面那段 JSON 有意义，别的都当一个普通的字
                 let c = u8::try_from(self.code).unwrap_or(b'x');
                 self.decoded(c);
             }
@@ -192,33 +223,22 @@ impl Nest {
         }
     }
 
-    /// 外层字符串解开之后的一个字节，交给里面那段 JSON
+    /// 这一层字符串解开之后的一个字节，交给里面那段 JSON
     fn decoded(&mut self, c: u8) {
         match &mut self.inner {
             Inner::Off | Inner::Plain => {}
             Inner::Undecided => {
                 if !c.is_ascii_whitespace() {
                     self.inner = if c == b'{' || c == b'[' {
-                        Inner::Json {
-                            in_str: false,
-                            esc: false,
-                        }
+                        let mut r = Box::<Reader>::default();
+                        r.feed(c);
+                        Inner::Json(r)
                     } else {
                         Inner::Plain
                     };
                 }
             }
-            Inner::Json { in_str, esc } => {
-                if !*in_str {
-                    *in_str = c == b'"';
-                } else if *esc {
-                    *esc = false;
-                } else if c == b'\\' {
-                    *esc = true;
-                } else if c == b'"' {
-                    *in_str = false;
-                }
-            }
+            Inner::Json(r) => r.feed(c),
         }
     }
 }
@@ -256,6 +276,22 @@ mod tests {
             levels(r#"{"arguments":"{\u0022v\u0022:\u0022@\u0022}"}"#),
             [2]
         );
+    }
+
+    #[test]
+    fn json_inside_json_inside_json_is_one_level_deeper_each_time() {
+        use serde_json::json;
+        // 工具自己的参数里有个 `arguments`，放的又是一段 JSON
+        let inner = json!({ "content": "@" }).to_string();
+        let args = json!({ "tool": "w", "arguments": inner, "x": "@" }).to_string();
+        let chat = json!({ "arguments": args }).to_string();
+        assert_eq!(levels(&chat), [3, 2]);
+        // 再往里一层
+        let deeper = json!({ "arguments": json!({ "arguments": chat }).to_string() }).to_string();
+        assert_eq!(levels(&deeper), [5, 4]);
+        // 读完一层回到外面
+        let back = json!({ "arguments": json!({ "arguments": "{}" }).to_string(), "t": "@" });
+        assert_eq!(levels(&back.to_string()), [1]);
     }
 
     #[test]

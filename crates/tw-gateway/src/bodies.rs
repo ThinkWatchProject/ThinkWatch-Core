@@ -148,25 +148,18 @@ impl Redaction {
         out
     }
 
-    /// 原值在 JSON 原文里的写法 → 发给上游的占位符（[`Self::piece`] 要的那张表）。存下来的
+    /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表），在 JSON 原文里找。存下来的
     /// 正文、安全日志的前后文都是 JSON 原文
     pub(crate) fn sent(&self) -> Sent<'_> {
         self.sent_as(Form::Json)
     }
 
-    /// [`Self::sent`]，原值按 `form` 写。账里记的是解开转义之后的样子：JSON 原文里截下来的
-    /// 一段，要和转义过的比（私钥块的换行在那儿是 `\n` 两个字符）
+    /// [`Self::sent`]，在按 `form` 写的文字里找
     fn sent_as(&self, form: Form) -> Sent<'_> {
-        self.ledger
-            .replacements()
-            .map(|(o, p)| {
-                let written = match form {
-                    Form::Json => tw_guard::redact::replace::json_escaped(o),
-                    Form::Text => Cow::Borrowed(o),
-                };
-                (written, p)
-            })
-            .collect()
+        Sent {
+            by_value: self.ledger.replacements().collect(),
+            form,
+        }
     }
 
     /// `text` 里的一段：落在这一段里的命中换掉或打码，再按形状打一遍。各段在 token 的边界上
@@ -203,8 +196,27 @@ impl Redaction {
     }
 }
 
-/// 原值（按要找的那段文字的写法）→ 占位符，见 [`Redaction::sent`]
-pub(crate) type Sent<'a> = HashMap<Cow<'a, str>, &'a str>;
+/// 原值 → 发给上游的占位符，见 [`Redaction::sent`]。
+///
+/// **按解开转义之后的值比**：账里记的就是那个样子，而原文里的写法不止一种 —— 私钥块的换行
+/// 是 `\n`，Python 发来的 `é` 是 `\u00e9`，PHP 发来的斜杠是 `\/`。按某一种转义写法比的话，
+/// 换一种写法的客户端，它的值存下来是打了码的，上游收到的却是占位符。
+pub(crate) struct Sent<'a> {
+    by_value: HashMap<&'a str, &'a str>,
+    /// 要找的那段文字是哪种写法
+    form: Form,
+}
+
+impl Sent<'_> {
+    /// 从文字里截下来的 `raw` 换成了哪个占位符
+    fn get(&self, raw: &str) -> Option<&str> {
+        let value = match self.form {
+            Form::Json if raw.contains('\\') => Cow::Owned(tw_guard::locate::unescape(raw)),
+            _ => Cow::Borrowed(raw),
+        };
+        self.by_value.get(value.as_ref()).copied()
+    }
+}
 
 /// 正文里转换时压缩出的前文摘要：`tw1.c.` 开头、解得开的那串（[`tw_dialect::compaction`]），
 /// 在正文里的位置和解开的摘要，按出现的顺序。
@@ -575,6 +587,30 @@ mod tests {
         assert_eq!(stored.as_bytes(), &sent[..]);
         assert!(
             stored.contains("<<TW_SECRET_1>> 和 postgres://app:<<TW_SECRET_2>>@db"),
+            "{stored}"
+        );
+    }
+
+    #[test]
+    fn a_value_written_with_other_escapes_is_still_stored_as_its_placeholder() {
+        // Python 把 `é` 写成 `\u00e9`，PHP 把斜杠写成 `\/`：和 serde 的写法不一样，比的是解开
+        // 之后的值，存下来的才是上游收到的那一份
+        let body = concat!(
+            r#"{"model":"m","messages":[{"role":"user","content":"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj\/p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY----- "#,
+            r#"\u548c postgres://app:p\u00e9w@db/x"}]}"#
+        );
+        let r = enforced(body);
+        assert_eq!(r.ledger.len(), 2);
+        let (sent, _) = crate::guard::replace(
+            tw_config::SecurityMode::Enforce,
+            &r.rules,
+            Bytes::from(body),
+            &r.ledger,
+        );
+        let stored = written(record(BodyKind::Request, body, r));
+        assert_eq!(stored.as_bytes(), &sent[..]);
+        assert!(
+            stored.contains(r#"<<TW_SECRET_1>> \u548c postgres://app:<<TW_SECRET_2>>@db"#),
             "{stored}"
         );
     }

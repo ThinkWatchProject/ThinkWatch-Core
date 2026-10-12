@@ -73,6 +73,33 @@ async fn handle(mut sock: WebSocket, st: Up) {
                 }
                 continue;
             }
+            // 第一帧回半个占位符，第二帧（客户端又发来一把新的 key 之后）回另一半
+            "grow" => {
+                let n = st.seen.lock().unwrap().len();
+                let delta = |d: &str| {
+                    serde_json::json!({"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":d}).to_string()
+                };
+                let frames = if n == 1 {
+                    vec![delta("钥匙 <<TW_SEC")]
+                } else {
+                    vec![
+                        delta("RET_1>> 完"),
+                        serde_json::json!({"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"钥匙 <<TW_SECRET_1>> 完"}).to_string(),
+                    ]
+                };
+                for frame in frames {
+                    if sock.send(Message::Text(frame.into())).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
+            // 回半个占位符就把连接收掉
+            "cut" => {
+                let frame = serde_json::json!({"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"结果是 <<TW_SEC"}).to_string();
+                let _ = sock.send(Message::Text(frame.into())).await;
+                return;
+            }
             _ => "ok".to_string(),
         };
         if sock.send(Message::Text(reply.into())).await.is_err() {
@@ -264,6 +291,69 @@ async fn a_placeholder_split_across_two_frames_comes_back_whole() {
         .find(|v| v["type"] == "response.output_text.done")
         .unwrap();
     assert_eq!(text["text"], format!("钥匙 {pem}。"));
+}
+
+async fn next_json(c: &mut Socket) -> serde_json::Value {
+    let m = tokio::time::timeout(Duration::from_secs(3), c.next())
+        .await
+        .expect("等回帧超时")
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(m.into_text().unwrap().as_str()).expect("一帧是 JSON")
+}
+
+/// 扣着半个占位符的时候客户端又发来一把新的 key：账换了，扣着的那一半照样等到下一帧拼回来。
+#[tokio::test]
+async fn a_held_half_placeholder_survives_the_ledger_growing() {
+    let (up, _) = start_upstream("grow").await;
+    let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
+    let mut c = connect(gw).await;
+    c.send(tokio_tungstenite::tungstenite::Message::Text(
+        format!("第一把 {USER_KEY}").into(),
+    ))
+    .await
+    .unwrap();
+    // 扣住的那一半之前的字先到：这时网关已经扣着 `<<TW_SEC`
+    let first = next_json(&mut c).await;
+    assert_eq!(first["delta"], "钥匙 ");
+    c.send(tokio_tungstenite::tungstenite::Message::Text(
+        "第二把 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB".into(),
+    ))
+    .await
+    .unwrap();
+    let mut got = vec![first];
+    while !got.iter().any(|v| v["type"] == "response.output_text.done") {
+        got.push(next_json(&mut c).await);
+    }
+    let text: String = got
+        .iter()
+        .filter(|v| v["type"] == "response.output_text.delta")
+        .filter_map(|v| v["delta"].as_str())
+        .collect();
+    assert_eq!(text, format!("钥匙 {USER_KEY} 完"));
+}
+
+/// 上游扣着半个占位符就走了：那一半照样交给客户端，是一帧它认得的增量。
+#[tokio::test]
+async fn a_held_tail_is_delivered_when_the_upstream_goes_away() {
+    let (up, _) = start_upstream("cut").await;
+    let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
+    let mut c = connect(gw).await;
+    c.send(tokio_tungstenite::tungstenite::Message::Text(
+        format!("key {USER_KEY}").into(),
+    ))
+    .await
+    .unwrap();
+    let mut text = String::new();
+    while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(3), c.next()).await {
+        let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+        assert_eq!(v["type"], "response.output_text.delta", "{v}");
+        text.push_str(v["delta"].as_str().unwrap());
+    }
+    assert_eq!(text, "结果是 <<TW_SEC");
 }
 
 /// 一次连接里的第二帧**不能重用第一帧的编号**。

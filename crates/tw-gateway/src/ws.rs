@@ -1086,15 +1086,18 @@ async fn pump(
             }
         }
     };
-    // 上游没收尾就走了：扣着的半截占位符原样交给客户端，那是模型说过的字
+    // 上游没收尾就走了：扣着的半截占位符交给客户端，那是模型说过的字。和别的补出来的帧
+    // 走同一条路（模型名、回答钩子、工具墙）
     if matches!(end, End::UpstreamClosed | End::Broke(_))
         && let Some((r, _)) = p.restorer.as_mut()
     {
-        for s in r.drain() {
-            let frame = serde_json::to_string(&s.data).unwrap_or_default();
-            if c_tx.send(Message::Text(frame.into())).await.is_err() {
-                break;
-            }
+        let tails: Vec<String> = r
+            .drain()
+            .iter()
+            .map(|s| serde_json::to_string(&s.data).unwrap_or_default())
+            .collect();
+        if !tails.is_empty() {
+            let _ = forward(&state, p, tails, None, false, &mut c_tx).await;
         }
     }
     // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了。在等准入的那一轮
@@ -1552,7 +1555,20 @@ async fn relay(
     c_tx: &mut ClientSink,
 ) -> Flow {
     // 还原：扣着的尾巴补成的帧在前，这一帧在最后
-    let mut pieces = restore_frame(p, t);
+    let pieces = restore_frame(p, t);
+    forward(state, p, pieces, kind, late, c_tx).await
+}
+
+/// 还原过的几帧交给客户端：模型名、回答钩子、工具墙，和 [`relay`] 一样。`kind` 是最后那一帧
+/// （上游来的那一帧）的 `type`；上游走了之后补出来的尾巴没有上游的帧，是 `None`
+async fn forward(
+    state: &AppState,
+    p: &mut Pipes,
+    mut pieces: Vec<String>,
+    kind: Option<&str>,
+    late: bool,
+    c_tx: &mut ClientSink,
+) -> Flow {
     // 模型名换回客户端用的名称：一条消息是一个完整的 JSON，整条过一遍。排在回答钩子之前，
     // 和 HTTP 那条路一样
     if let Some(r) = p.rename.as_mut() {
@@ -1677,8 +1693,9 @@ async fn relay(
 /// 按 Responses 的事件认）：模型按 token 吐字，一个占位符会切在两帧的增量里，一帧一帧各自
 /// 换是换不回来的；参数的增量放转义过的原值，正文放原样。不是 JSON 的一帧整帧按原文换。
 ///
-/// 账在连接中途长了（客户端又发来一帧、里面有新的值）就照新账另起一个，旧的扣着的尾巴先
-/// 补出来，排在这一帧前面。
+/// 账在连接中途长了（客户端又发来一帧、里面有新的值）就换上新账接着还原，各路扣着的尾巴
+/// 留着（[`tw_guard::redact::sse::FrameRestorer::rebook`]）：补出来的话，扣着的 `<<TW_SEC`
+/// 等不到下一帧的 `RET_1>>`。
 fn restore_frame(p: &mut Pipes, t: &str) -> Vec<String> {
     use tw_guard::redact::sse::{FrameRestorer, Synth};
     let text = |s: &Synth| serde_json::to_string(&s.data).unwrap_or_default();
@@ -1686,19 +1703,16 @@ fn restore_frame(p: &mut Pipes, t: &str) -> Vec<String> {
         return vec![t.to_string()];
     }
     let mut out = Vec::new();
-    if p.restorer
-        .as_ref()
-        .is_none_or(|(_, n)| *n != p.ledger.len())
-    {
-        if let Some((mut old, _)) = p.restorer.take() {
-            out.extend(old.drain().iter().map(text));
-        }
-        let fresh = FrameRestorer::new(&p.ledger, tw_dialect::ir::Dialect::Responses);
-        p.restorer = Some((fresh, p.ledger.len()));
+    let (r, n) = p.restorer.get_or_insert_with(|| {
+        (
+            FrameRestorer::new(&p.ledger, tw_dialect::ir::Dialect::Responses),
+            p.ledger.len(),
+        )
+    });
+    if *n != p.ledger.len() {
+        r.rebook(&p.ledger);
+        *n = p.ledger.len();
     }
-    let Some((r, _)) = p.restorer.as_mut() else {
-        return vec![t.to_string()];
-    };
     match serde_json::from_str::<serde_json::Value>(t) {
         Ok(mut v) => {
             let rw = r.frame(&mut v);

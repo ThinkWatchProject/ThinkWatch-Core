@@ -140,6 +140,17 @@ impl Restorer {
         }
     }
 
+    /// 换成一本更全的账（同一个请求后来又换了新的值），**扣着的和读到哪儿都留着**：旧账里的
+    /// 占位符在新账里还是那个原值，扣着的半截照样可能长成它
+    pub fn rebook(&mut self, ledger: &Ledger) {
+        self.book = Arc::new(Book::of(ledger));
+    }
+
+    /// 和 `from` 共用一本账，扣着的和读到哪儿都留着（见 [`Restorer::rebook`]）
+    pub(crate) fn share_book(&mut self, from: &Restorer) {
+        self.book = Arc::clone(&from.book);
+    }
+
     /// 没东西要还原。**调用方据此整条短路** —— 没脱敏的请求不该为这个
     /// 功能付任何延迟。
     pub fn is_noop(&self) -> bool {

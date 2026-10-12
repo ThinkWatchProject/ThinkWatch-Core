@@ -182,6 +182,17 @@ impl FrameRestorer {
         self.oneshot.is_noop()
     }
 
+    /// 换成一本更全的账（WebSocket 的连接中途客户端又发来新的值）。**各路扣着的尾巴留着**，
+    /// 接着按新账还原：旧账里的占位符在新账里还是那个原值，补出来再换就晚了 —— 扣着的
+    /// `<<TW_SEC` 等不到下一帧的 `RET_1>>`
+    pub fn rebook(&mut self, ledger: &Ledger) {
+        self.oneshot.rebook(ledger);
+        self.oneshot_json.share_book(&self.oneshot);
+        for open in self.lanes.values_mut() {
+            open.restorer.share_book(&self.oneshot);
+        }
+    }
+
     /// 改写一帧。帧本身就地改，返回要先于它发出去的补帧。
     pub fn frame(&mut self, v: &mut Value) -> Rewritten {
         let mut out = Rewritten::default();
@@ -1452,5 +1463,55 @@ mod tests {
         let v = &values(&out)[0]["item"];
         assert_eq!(v["content"][0]["text"], PEM);
         assert_eq!(v["arguments"], format!("照 {PEM}"));
+    }
+
+    #[test]
+    fn nested_arguments_stream_back_like_the_whole_answer_restores_them() {
+        // 工具的参数里又有个放 JSON 的 `arguments`：流式按路还原和整份还原转义的层数一样
+        let l = pem_ledger();
+        let args = json!({
+            "tool": "write_file",
+            "arguments": json!({ "content": "<<TW_SECRET_1>>" }).to_string(),
+        })
+        .to_string();
+        let whole = json!({"arguments": args}).to_string();
+        let whole: Value =
+            serde_json::from_str(&crate::redact::replace::restore(&whole, &l)).unwrap();
+        let whole = whole["arguments"].as_str().unwrap().to_string();
+        for size in [1, 3, 7, 16] {
+            let pieces: Vec<String> = args
+                .as_bytes()
+                .chunks(size)
+                .map(|c| String::from_utf8(c.to_vec()).unwrap())
+                .collect();
+            let mut frames: Vec<String> = pieces
+                .iter()
+                .map(|p| {
+                    chat(
+                        json!({"tool_calls":[{"index":0,"function":{"arguments":p}}]}),
+                        Value::Null,
+                    )
+                })
+                .collect();
+            frames.push(chat(json!({}), json!("tool_calls")));
+            let out = run_with(&l, Dialect::Chat, &frames);
+            let streamed: String = values(&out)
+                .iter()
+                .filter_map(|v| {
+                    v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+                })
+                .collect();
+            assert_eq!(streamed, whole, "{size}");
+            // 整帧里的完整参数（`.done`）也一样
+            let done = named(
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"f1","output_index":1,"arguments":args}),
+            );
+            let out = run_with(&l, Dialect::Responses, &[done]);
+            assert_eq!(values(&out)[0]["arguments"], whole);
+        }
+        let v: Value = serde_json::from_str(&whole).unwrap();
+        let inner: Value = serde_json::from_str(v["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["content"], PEM);
     }
 }

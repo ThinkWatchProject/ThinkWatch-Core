@@ -937,4 +937,26 @@ mod tests {
             format!("你说的是 {}", json_escaped(PEM))
         );
     }
+
+    #[test]
+    fn a_tools_own_arguments_field_holding_json_is_one_level_deeper_again() {
+        // 工具的参数里又有个 `arguments`，放的是一段 JSON：最里面的值转义三次，不然客户端
+        // 一层层解到底，拿到的字符串里夹着真的换行
+        let l = pem_ledger();
+        let args = serde_json::json!({
+            "tool": "write_file",
+            "arguments": serde_json::json!({ "content": "<<TW_SECRET_1>>" }).to_string(),
+        })
+        .to_string();
+        let chat = serde_json::json!({"choices": [{"message": {
+            "tool_calls": [{"function": {"name": "call", "arguments": args}}],
+        }}]})
+        .to_string();
+        let v: serde_json::Value = serde_json::from_str(&restore(&chat, &l)).expect("still JSON");
+        let args = v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let inner = arg_of(args, "arguments");
+        assert_eq!(arg_of(&inner, "content"), PEM);
+    }
 }
