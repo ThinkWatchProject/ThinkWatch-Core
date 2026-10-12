@@ -1326,8 +1326,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(content_actions),
                     Def::Is("record"),
                     t(
-                        "Under `enforce`: `block` the request (requests only), `strip` what matched and send the rest, `replace` what matched with `replacement` and send the rest, or only `record` the match. Text that comes together where something was stripped is checked again, until no match is left; a replacement is never checked again. Replacing cannot be undone: the answer does not get the original back.",
-                        "`enforce` 下拒绝请求（`block`，仅用于请求）、删除命中的内容后发出（`strip`）、将命中的内容替换为 `replacement` 后发出（`replace`），或只记录（`record`）。删除处前后拼接成的文字重新检查，直到不再有命中；替换上的文字不再检查。替换不可还原，回答中不换回原文。",
+                        "Under `enforce`: `block` the request (requests only), `strip` what matched and send the rest, `replace` what matched with `replacement` and send the rest, or only `record` the match. Text that comes together where something was stripped is checked again, until no match is left; a replacement is never checked again, and in an answer a regular expression anchored to the start or end of the text or of a line (`^`, `$`, `\\A`, `\\z`) is checked once. Replacing cannot be undone: the answer does not get the original back.",
+                        "`enforce` 下拒绝请求（`block`，仅用于请求）、删除命中的内容后发出（`strip`）、将命中的内容替换为 `replacement` 后发出（`replace`），或只记录（`record`）。删除处前后拼接成的文字重新检查，直到不再有命中；替换上的文字不再检查；回答中锚定正文或行首尾的正则（`^`、`$`、`\\A`、`\\z`）只检查一次。替换不可还原，回答中不换回原文。",
                     ),
                 ),
                 row(

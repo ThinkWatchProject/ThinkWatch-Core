@@ -194,7 +194,8 @@ fn nested_strips_are_removed_until_none_is_left_wherever_the_text_is_cut() {
         rule("w", r"\bcat\b", Match::Regex, Action::Strip),
     ]);
     every_cut(&c, "catX dog", " dog");
-    every_cut(&c, "a catX", "a ");
+    // 删在这一路末尾的不算接缝：只有要看开头、结尾的规则会因为它变，一路删下去会把整段删光
+    every_cut(&c, "a catX", "a cat");
     // 换成的字不再查：换上去的 `[x]` 和两边拼不成新的命中
     let r = answer(vec![RuleInput {
         replacement: "[x]",
@@ -221,8 +222,8 @@ fn nested_strips_are_removed_until_none_is_left_wherever_the_text_is_cut() {
     );
 }
 
-/// 套得太深（第一遍之后又过了 [`MAX_ROUNDS`] 遍还在改字）：这一路剩下的整个不发，和请求
-/// 那边整段删掉一样；发出去的里面一处命中都没有。套得浅的整份删干净，流着的发出去的里面也
+/// 套得太深（第一遍之后又过了 [`MAX_ROUNDS`] 遍还在改字）：从还在改的那一处起这一路不再
+/// 发，前面的照发；发出去的里面一处命中都没有。套得浅的整份删干净，流着的发出去的里面也
 /// 找不到
 #[test]
 fn nesting_beyond_the_bound_silences_the_rest_of_the_lane() {
@@ -231,12 +232,52 @@ fn nesting_beyond_the_bound_silences_the_rest_of_the_lane() {
     assert_eq!(whole_text(&a, true, &nested(MAX_ROUNDS)), "xy");
     assert_eq!(whole_text(&a, true, &nested(MAX_ROUNDS + 1)), "");
     let text = format!("{}tail", nested(MAX_ROUNDS + 5));
-    assert_eq!(whole_text(&a, true, &text), "");
+    // 删了 65 层还剩 4 层：从剩下的那一处往前一个字（`reach`）起不要了
+    assert_eq!(whole_text(&a, true, &text), "xaaa");
     let pieces: Vec<String> = text.chars().map(String::from).collect();
     let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
     let out = streamed(&a, true, &refs);
     assert!(!out.contains("ab") && !out.contains("tail"), "{out}");
     every_cut_safe(&a, &nested(6), "xy", "ab");
+}
+
+/// 用到开头、结尾的规则只在原文上查一遍：删掉末尾的一个字，前一个字又成了末尾 —— 再查
+/// 的话一路删下去整段就没了，而流着的那边早就发出去了。整份的和流式的一样，只删原文里的那
+/// 一处；`\b` 这类规则删在这一路两头的也不再查
+#[test]
+fn rules_anchored_to_the_ends_do_not_erode_the_answer() {
+    for (pattern, text, want) in [
+        (r"(?s).\z", "hello world", "hello worl"),
+        (r"\d$", "call 12345", "call 1234"),
+        (r"^\w", "hello", "ello"),
+        (r"\d(?m)$", "a1\nb22\n", "a\nb2\n"),
+        (r".\b", "ab cd", "a"),
+    ] {
+        let a = answer(vec![RuleInput {
+            case_sensitive: true,
+            ..rule("e", pattern, Match::Regex, Action::Strip)
+        }]);
+        every_cut(&a, text, want);
+    }
+}
+
+/// 整份回答里一路正文分在几个字段里：一起处理一遍，每个字留在原来的字段里
+#[test]
+fn a_lane_split_over_fields_is_filtered_once_and_split_back_where_the_text_was() {
+    let a = answer(vec![
+        rule("s", "secret", Match::Contains, Action::Strip),
+        RuleInput {
+            replacement: "[x]",
+            ..rule("r", "北极星", Match::Contains, Action::Replace)
+        },
+    ]);
+    let mut lane = a.lane(true);
+    let parts = lane.whole_split(&["one se", "cret two 北极", "星 three sesecretcret"]);
+    assert_eq!(parts, ["one ", " two [x]", " three "]);
+    assert_eq!(lane.take().counts, vec![3, 1]);
+    // 没改字的原样留在各自的字段里
+    let mut lane = a.lane(true);
+    assert_eq!(lane.whole_split(&["ab", "", "cd"]), ["ab", "", "cd"]);
 }
 
 #[test]
@@ -370,29 +411,45 @@ fn context_around_a_match_is_kept_for_the_log() {
 fn reference(a: &Answer, text: &str) -> (String, Vec<Range<usize>>) {
     let mut t = text.to_string();
     let mut kept: Vec<Range<usize>> = Vec::new();
+    // 上一遍改过的地方（替换文本两头都算），这一路的开头、结尾不算
+    let mut seams: Vec<usize> = Vec::new();
     for round in 0..=MAX_ROUNDS {
         let mut edits = Vec::new();
         for (ri, r) in a.rules.iter().enumerate() {
-            if !r.action.edits() {
+            if !r.action.edits() || (round > 0 && r.anchored) {
                 continue;
             }
             if round == 0 {
                 let found = r.re.find_iter(&t).filter(|m| !m.is_empty());
                 edits.extend(found.map(|m| (m.range(), ri)));
             } else {
+                // 起点在某个接缝前 `hold` 个字以内的每一处
+                let near = |m: &Range<usize>| {
+                    seams.iter().any(|&j| {
+                        let from = t[..j].char_indices().rev().nth(r.hold.max(1) - 1);
+                        let from = if r.hold == 0 {
+                            j
+                        } else {
+                            from.map_or(0, |(i, _)| i)
+                        };
+                        from <= m.start && m.start <= j
+                    })
+                };
                 let found = every_match(&r.re, &t).into_iter();
-                edits.extend(found.filter(|m| !overlapping(&kept, m)).map(|m| (m, ri)));
+                edits.extend(
+                    found
+                        .filter(|m| near(m) && !overlapping(&kept, m))
+                        .map(|m| (m, ri)),
+                );
             }
         }
         if edits.is_empty() {
             return (t, kept);
         }
-        if round == MAX_ROUNDS {
-            break;
-        }
         let merged = merge_edits(edits, |ri| a.rules[ri].edit_with());
-        // 替换文本跟着改动挪，这一遍换上去的接着记
+        // 替换文本跟着改动挪，这一遍换上去的接着记；接缝是这一遍改过的地方
         let mut next = Vec::new();
+        seams.clear();
         let mut delta: isize = 0;
         let mut old = kept.into_iter().peekable();
         for (r, w) in &merged {
@@ -403,6 +460,7 @@ fn reference(a: &Answer, text: &str) -> (String, Vec<Range<usize>>) {
             if !w.is_empty() {
                 next.push(at..at + w.len());
             }
+            seams.extend([at, at + w.len()]);
             delta += w.len() as isize - r.len() as isize;
         }
         next.extend(
@@ -410,8 +468,23 @@ fn reference(a: &Answer, text: &str) -> (String, Vec<Range<usize>>) {
         );
         kept = next;
         t = apply_edits(&t, &merged);
+        seams.retain(|&j| j != 0 && j != t.len());
+        seams.dedup();
+        if round == MAX_ROUNDS && !seams.is_empty() {
+            // 套得太深：从还在改的那一处（头一个接缝往前 `reach` 个字）起不要了
+            let first = seams[0];
+            let from = t[..first].char_indices().rev().nth(a.reach.max(1) - 1);
+            let keep = if a.reach == 0 {
+                first
+            } else {
+                from.map_or(0, |(i, _)| i)
+            };
+            t.truncate(keep);
+            kept.retain(|k| k.end <= keep);
+            return (t, kept);
+        }
     }
-    (String::new(), Vec::new())
+    (t, kept)
 }
 
 /// 每个位置上（从那儿起）的那一处命中，空的不算。互相重叠的都在
@@ -441,7 +514,8 @@ fn agree(
     if acts {
         let (want, kept) = reference(a, text);
         assert_eq!(whole, want, "{text:?} {why}");
-        for r in a.rules.iter().filter(|r| r.action.edits()) {
+        // 要看前后一个字的不查：这一路的开头、结尾不算接缝（见 `Pass::piece`）
+        for r in a.rules.iter().filter(|r| r.action.edits() && !r.looks) {
             let left: Vec<_> = every_match(&r.re, &want)
                 .into_iter()
                 .filter(|m| !overlapping(&kept, m))
@@ -475,9 +549,12 @@ fn agree(
     let short = lane.tally.short;
     // 只有删除规则的：发出去的正文里一处都找不到。套得比扣住的字还深的时候，要看前后一个字
     // 的正则整个落在已经发出去的字里的那种收不回来（模块说明里那条明说的边界）
-    let looks = a.rules.iter().any(|r| r.action.edits() && r.looks);
-    if acts && a.rules.iter().all(|r| r.action != Action::Replace) && !(short && looks) {
-        for r in a.rules.iter().filter(|r| r.action == Action::Strip) {
+    if acts && a.rules.iter().all(|r| r.action != Action::Replace) {
+        for r in a
+            .rules
+            .iter()
+            .filter(|r| r.action == Action::Strip && !r.looks)
+        {
             assert!(
                 r.re.find(&out).is_none(),
                 "{text:?} {pieces:?} → {out:?} {why}"
@@ -1654,7 +1731,33 @@ fn only_a_real_error_object_ends_the_lanes() {
         data(v)
     };
     let stream = [g("a se", json!({"error": null})), g("cret b", json!({}))].concat();
-    let mut b = Body::new(a, true, Dialect::Gemini, true);
+    let mut b = Body::new(a.clone(), true, Dialect::Gemini, true);
     let out = through(&mut b, &stream, 4);
     assert!(!out.contains("cret"), "{out}");
+    // 只有错误、不带正文的一帧是在报错：字符串写的、没有 message 和 code 的对象，扣着的尾巴
+    // 赶在它前面补出来
+    for (dialect, first, err) in [
+        (
+            Dialect::Chat,
+            chat("tail se", json!({})),
+            json!({"error": "rate limited"}),
+        ),
+        (
+            Dialect::Chat,
+            chat("tail se", json!({})),
+            json!({"error": {"type": "overloaded"}}),
+        ),
+        (
+            Dialect::Gemini,
+            g("tail se", json!({})),
+            json!({"error": {"status": "UNAVAILABLE"}}),
+        ),
+    ] {
+        let stream = [first, data(err.clone())].concat();
+        let mut b = Body::new(a.clone(), true, dialect, true);
+        let out = through(&mut b, &stream, 3);
+        let tail = out.find("se").unwrap_or(usize::MAX);
+        let error = out.find("error").unwrap_or(0);
+        assert!(tail < error, "{dialect:?} {err}: 尾巴要在报错之前：{out}");
+    }
 }

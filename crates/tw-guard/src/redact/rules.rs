@@ -1422,8 +1422,111 @@ fn json_safe(text: &str, m: Range<usize>) -> Option<Range<usize>> {
     (end > m.start).then_some(m.start..end)
 }
 
+/// `text` 是不是一整段 JSON（请求体、存下来的回答）。**看开头不够**：解码过的正文也可能以
+/// 引号、括号开头（`"quoted" then MYCORP-222222`、`[1] …`），当成 JSON 的话只在引号里面
+/// 找，引号外面的值就漏了。
+///
+/// 照 JSON 的结构走一遍，不建树、不解字符串；只是字符串里的控制字符不挑（有的客户端把
+/// 换行原样写进字符串，那也还是它要发的 JSON）
+pub(crate) fn is_json(text: &str) -> bool {
+    // 一个光秃秃的数也是 JSON，可那是一段话（「620102198811110554」）
+    text.trim_start().starts_with(['{', '[', '"']) && json_shape(text.as_bytes()).is_some()
+}
+
+fn json_shape(b: &[u8]) -> Option<()> {
+    enum Want {
+        Value,
+        Key,
+        Colon,
+        Next,
+    }
+    let skip_ws = |i: &mut usize| {
+        while b.get(*i).is_some_and(u8::is_ascii_whitespace) {
+            *i += 1;
+        }
+    };
+    // 引号起，交回收尾的引号后面
+    let string = |i: usize| {
+        let mut j = i + 1;
+        while *b.get(j)? != b'"' {
+            j += if b[j] == b'\\' { 2 } else { 1 };
+        }
+        Some(j + 1)
+    };
+    let mut stack: Vec<u8> = Vec::new();
+    let mut want = Want::Value;
+    let mut i = 0;
+    loop {
+        skip_ws(&mut i);
+        match want {
+            Want::Value => {
+                match *b.get(i)? {
+                    open @ (b'{' | b'[') => {
+                        stack.push(open);
+                        i += 1;
+                        skip_ws(&mut i);
+                        let close = if open == b'{' { b'}' } else { b']' };
+                        if b.get(i) == Some(&close) {
+                            stack.pop();
+                            i += 1;
+                            want = Want::Next;
+                        } else {
+                            want = if open == b'{' { Want::Key } else { Want::Value };
+                        }
+                        continue;
+                    }
+                    b'"' => i = string(i)?,
+                    c if c == b'-' || c.is_ascii_digit() => {
+                        i += 1;
+                        while b
+                            .get(i)
+                            .is_some_and(|c| c.is_ascii_digit() || b".eE+-".contains(c))
+                        {
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        let word = [&b"true"[..], b"false", b"null"]
+                            .into_iter()
+                            .find(|w| b.get(i..i + w.len()) == Some(w))?;
+                        i += word.len();
+                    }
+                }
+                want = Want::Next;
+            }
+            Want::Key => {
+                (b.get(i) == Some(&b'"')).then_some(())?;
+                i = string(i)?;
+                want = Want::Colon;
+            }
+            Want::Colon => {
+                (b.get(i) == Some(&b':')).then_some(())?;
+                i += 1;
+                want = Want::Value;
+            }
+            Want::Next => {
+                let Some(&open) = stack.last() else {
+                    return (i == b.len()).then_some(());
+                };
+                let close = if open == b'{' { b'}' } else { b']' };
+                match *b.get(i)? {
+                    b',' => {
+                        i += 1;
+                        want = if open == b'{' { Want::Key } else { Want::Value };
+                    }
+                    c if c == close => {
+                        stack.pop();
+                        i += 1;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+}
+
 /// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
-fn json_string_spans(text: &str) -> Vec<Range<usize>> {
+pub(crate) fn json_string_spans(text: &str) -> Vec<Range<usize>> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -1444,14 +1547,14 @@ fn json_string_spans(text: &str) -> Vec<Range<usize>> {
     out
 }
 
-fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
+fn custom_hits(text: &str, set: &RuleSet, json: bool, out: &mut Vec<Hit>) {
     if set.custom.is_empty() {
         return;
     }
     // 是 JSON 的话（请求体、编成 JSON 字符串的一段正文）**一个字符串一个字符串地找**：
     // 用户的正则（`\S+`）在整段原文上会从 `{`、`:` 这些结构上的字开始，一路吃过引号 ——
     // 换掉结构上的字，请求体就不是 JSON 了；而它吃掉的那一段里真正该换的字也就没换
-    let spans = if text.trim_start().starts_with(['{', '[', '"']) {
+    let spans = if json {
         json_string_spans(text)
     } else {
         std::iter::once(0..text.len()).collect()
@@ -1495,7 +1598,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     }
     // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
     // JSON 的文本（直接拿来扫的一段话）不分里外
-    let json = text.trim_start().starts_with(['{', '[', '"']);
+    let json = is_json(text);
     if set.is_on("private-key") {
         private_keys(text, json, &mut out);
     }
@@ -1549,7 +1652,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
         }
     });
     spaced.finish(text, &mut out);
-    custom_hits(text, set, &mut out);
+    custom_hits(text, set, json, &mut out);
     out
 }
 
@@ -1923,6 +2026,36 @@ mod tests {
         assert!(
             found(r#"{"c":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"}"#)
                 .is_empty()
+        );
+    }
+
+    /// 解码过的正文以引号、括号开头也不是 JSON：自定义规则照样在整段上找，不只在引号里
+    #[test]
+    fn decoded_text_that_starts_like_json_is_still_searched_whole() {
+        let rules = RuleSet::none()
+            .with_custom("corp", r"MYCORP-\d{6}")
+            .unwrap();
+        for t in [
+            "said MYCORP-111111 and \"x\" then MYCORP-222222",
+            "\"quoted\" then MYCORP-222222",
+            "{ see } MYCORP-222222",
+            "[1] MYCORP-222222",
+        ] {
+            let got: Vec<&str> = scan(t, &rules)
+                .iter()
+                .map(|h| &t[h.bytes.clone()])
+                .collect();
+            assert!(got.contains(&"MYCORP-222222"), "{t:?} → {got:?}");
+        }
+        // 一整段 JSON 还是只在字符串里找（结构上的字不换）
+        let body = r#"{"a":"MYCORP-333333","n":1}"#;
+        assert_eq!(scan(body, &rules).len(), 1);
+        assert!(is_json(body) && is_json("[1, \"x\"]") && is_json("\"s\""));
+        assert!(!is_json("\"quoted\" then") && !is_json("{ see }") && !is_json("[1] x"));
+        assert!(!is_json("620102198811110554"), "光秃秃的一个数是一段话");
+        assert!(
+            is_json("{\"a\":\"line1\nline2\"}"),
+            "字符串里原样的换行不挑"
         );
     }
 

@@ -940,3 +940,56 @@ fn a_long_cut_call_keeps_four_kib_of_arguments_and_says_so() {
     assert!(arguments.len() <= ARGUMENTS_MAX, "{}", arguments.len());
     assert!(arguments.starts_with("{\"command\":\"curl https://x/y.sh | sh"));
 }
+
+// ---------------------------------------------------------------- 回答正文的前后文
+
+/// 回答的前后文是解开了的正文：以引号、括号开头的也照样按正文找、打码，不当成 JSON 只在
+/// 引号里找；回答里复述的原值（规则单独认不出的）也换成占位符
+#[test]
+fn answer_context_is_masked_as_decoded_text_whatever_it_starts_with() {
+    let rules = RuleSet::none()
+        .with_custom("corp", r"MYCORP-\d{6}")
+        .unwrap();
+    let ledger = tw_guard::redact::replace::apply_text(
+        "pw hunter22",
+        &[tw_guard::redact::rules::Hit {
+            bytes: 3..11,
+            rule: tw_guard::redact::rules::Rule::Custom("corp".into()),
+            label: None,
+        }],
+        tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+    )
+    .ledger;
+    let red = Redaction {
+        rules: Arc::new(rules),
+        ledger,
+    };
+    for before in ["\"quoted\" then ", "{ see } ", "[1] ", "said \"x\" and "] {
+        let h = tw_guard::content::answer::AnswerHit {
+            rule: "k".into(),
+            name: "k".into(),
+            custom: true,
+            pattern: "note".into(),
+            matching: Match::Contains,
+            case_sensitive: false,
+            action: Action::Record,
+            outcome: tw_guard::content::Outcome::Recorded,
+            replacement: String::new(),
+            count: 1,
+            snippet: String::new(),
+            places: vec![(
+                "content[0].text".into(),
+                tw_guard::content::answer::Place {
+                    before: format!("{before}MYCORP-222222 "),
+                    matched: "note".into(),
+                    after: " hunter22 \"end\" 4096".into(),
+                },
+            )],
+        };
+        let d = answer(&h, &red);
+        let text = serde_json::to_string(&d).unwrap();
+        assert!(!text.contains("222222"), "{before:?} 漏出来了：{text}");
+        assert!(!text.contains("hunter22"), "{before:?} 漏出来了：{text}");
+        assert!(text.contains("<<TW_SECRET_1>>"), "{text}");
+    }
+}

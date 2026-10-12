@@ -660,9 +660,11 @@ struct Pipes {
     /// 这一次回答的回答过滤（Responses 的连接、有查回答的规则时）：`response.created` 起一个，
     /// 回答收尾时报命中
     answer: Option<tw_guard::content::answer::FrameFilter>,
-    /// 上一次回答的过滤，连同那次回答的 id：它收了尾之后又来的一帧（`error` 之后补的
-    /// `response.failed`）按它自己的过滤处理，**不碰这一次回答的**
-    answered: Option<(Option<String>, tw_guard::content::answer::FrameFilter)>,
+    /// 最近几次收了尾的回答的过滤，连同那次回答的 id、它的命中挂在哪一行：它收了尾之后又来的
+    /// 一帧（`error` 之后补的 `response.failed`）按它自己的过滤处理，**不碰这一次回答的**
+    answered: std::collections::VecDeque<Answered>,
+    /// 这一次回答（`answer`）的命中挂在哪一行：它开始时在前头的那一轮
+    answer_of: u64,
 }
 
 impl Pipes {
@@ -862,7 +864,8 @@ pub(crate) async fn proxy(
         reply: None,
         rename: None,
         answer: None,
-        answered: None,
+        answered: std::collections::VecDeque::new(),
+        answer_of: 0,
     };
     pump(state.clone(), client, up, &mut p, ending).await;
     // 连接断在一次回答中间：这次回答里已经认定的命中照样报
@@ -1625,7 +1628,10 @@ async fn forward(
         // 回答过滤：这一次回答起一个。上一次的命中先报掉，过滤留着给它收尾之后又来的帧
         report_answer(state, p);
         if let Some(old) = p.answer.take() {
-            p.answered = Some((previous, old));
+            p.answered.push_back((previous, old, p.answer_of));
+            if p.answered.len() > ANSWERED_KEPT {
+                p.answered.pop_front();
+            }
         }
         p.answer = p.turns.as_ref().and(p.rules.answer.as_ref()).map(|f| {
             tw_guard::content::answer::FrameFilter::new(
@@ -1634,6 +1640,7 @@ async fn forward(
                 tw_dialect::ir::Dialect::Responses,
             )
         });
+        p.answer_of = p.event_id();
         // 回答钩子：这一次回答起一组实例
         if let Err(why) = start_reply(state, p).await {
             return fail_response(p, c_tx, why).await;
@@ -1764,9 +1771,16 @@ fn filter_answer(f: &mut tw_guard::content::answer::FrameFilter, msgs: Vec<Strin
     out
 }
 
+/// 一次收了尾的回答：它的 id、它的过滤、它的命中挂在哪一行
+type Answered = (Option<String>, tw_guard::content::answer::FrameFilter, u64);
+
+/// 收了尾的回答留着几次的过滤：它们收尾之后又来的帧按它们自己的过滤处理
+const ANSWERED_KEPT: usize = 8;
+
 /// 收了尾的那一次回答又来的几帧：按**那一次回答自己的**过滤处理 —— 还是此刻这一次的就用
-/// 此刻的（命中挂在这一次上报），是上一次的就用留着的那个，更早的（或者认不出是哪一次的）
-/// 另起一个只管这几帧的；后两种的命中不报，见下面。
+/// 此刻的（命中挂在这一次上报），是最近 [`ANSWERED_KEPT`] 次里的就用留着的那个（结束了的路
+/// 照记下的写、不多算；没见过的字里的命中挂在那一次的那一轮上报），更早的（或者认不出是哪
+/// 一次的）另起一个只管这几帧的，命中不报，见下面。
 /// **不碰此刻这一次回答的路**：它的 `response.failed` 会结束所有的路，套在此刻的过滤上就把
 /// 这一次扣着的字提前交了出去
 fn filter_late(
@@ -1783,13 +1797,17 @@ fn filter_late(
         report_answer(state, p);
         return out;
     }
-    if let Some((id, f)) = p.answered.as_mut()
-        && response.is_some()
-        && response == id.as_deref()
+    if let Some((_, f, then)) = p
+        .answered
+        .iter_mut()
+        .rev()
+        .find(|(id, ..)| response.is_some() && response == id.as_deref())
     {
-        // 那一次回答的路都已经结束、整段正文记着：照记下的写，不会多出命中
+        // 结束了的路照记下的写，不会多出命中；又来的新的字（一路新的增量）里的命中挂在那一次
+        // 回答的那一轮上报
         let out = filter_answer(f, msgs);
-        let _ = f.take_hits();
+        let (hits, then) = (f.take_hits(), *then);
+        report_hits(state, p, then, hits);
         return out;
     }
     let Some(rules) = p.rules.answer.as_ref().filter(|_| p.turns.is_some()) else {
@@ -1804,10 +1822,24 @@ fn filter_late(
     // 只管这几帧：扣着的不留到以后
     let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
     out.extend(f.drain().iter().map(text));
-    // 命中不报：这几帧说的是那一次回答早先说过的话（命中在它那时报过），它那一轮已经收场，
-    // 挂到此刻在答的这一轮上就是记错了地方
+    // 命中不报：认不出是哪一次回答（或者早过了留着的那几次），不知道它那时报过哪些 —— 整段
+    // 正文的帧多半是它早先说过的话，再报一次就记重了；挂到此刻在答的这一轮上也是记错了地方
     let _ = f.take_hits();
     out
+}
+
+/// 收了尾的回答又来的帧里的命中报出去，挂在 `id` 上
+fn report_hits(
+    state: &AppState,
+    p: &Pipes,
+    id: u64,
+    hits: Vec<tw_guard::content::answer::AnswerHit>,
+) {
+    if hits.is_empty() {
+        return;
+    }
+    let redaction = p.redaction();
+    crate::guard::report_answer(&state.bus, id, &p.provider, hits, &redaction);
 }
 
 /// 这一次回答里认定的命中报出去，挂在此刻在回答的那一轮上

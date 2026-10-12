@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true }
 memchr = { workspace = true }
+aho-corasick = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tw-dialect = { workspace = true }

@@ -804,7 +804,7 @@ enum Close {
 fn close(d: Dialect, v: &Value) -> Close {
     // 一帧错误（Chat、Gemini 在流里报的 `{"error": {"message": …}}`，别的格式也可能这么
     // 写）：回答到此为止，扣着的尾巴赶在它前面补出来
-    if v.get("error").is_some_and(real_error) {
+    if error_frame(d, v) {
         return Close::All;
     }
     match d {
@@ -891,9 +891,37 @@ fn close(d: Dialect, v: &Value) -> Close {
     }
 }
 
-/// 顶层的 `error` 是不是一个真的错误：OpenAI（Chat）和 Gemini 写的都是一个对象，带着
-/// `message` 或者 `code`。`null`、`false`、空串、空对象不算 —— 把它们当成错误会让一路正文
-/// 提前结束，一个切在两帧里的词就认不出来了
+/// 这一帧是不是在报错（回答到此为止）。
+///
+/// - 顶层的 `error` 是一个真的错误：OpenAI（Chat）和 Gemini 写的都是一个对象，带着
+///   `message` 或者 `code`；
+/// - 或者这一帧只有错误、不带正文（Chat 没有 `choices`、Gemini 没有 `candidates`、别的格式
+///   没有 `type`）：中转站写的 `{"error":"rate limited"}`、没有 `message` 也没有 `code` 的
+///   错误对象，也是在报错。
+///
+/// `null`、`false`、空串、空对象不算，带着正文的一帧里别的样子的 `error` 也不算 —— 把它们
+/// 当成错误会让一路正文提前结束，一个切在两帧里的词就认不出来了
+fn error_frame(d: Dialect, v: &Value) -> bool {
+    let Some(e) = v.get("error") else {
+        return false;
+    };
+    if real_error(e) {
+        return true;
+    }
+    let bare = match d {
+        Dialect::Chat => v.get("choices").is_none(),
+        Dialect::Gemini => v.get("candidates").is_none(),
+        Dialect::Anthropic | Dialect::Responses => v.get("type").is_none(),
+        Dialect::Bedrock => v.as_object().is_some_and(|o| o.len() == 1),
+    };
+    bare && match e {
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        _ => false,
+    }
+}
+
+/// 顶层的 `error` 是一个带着 `message` 或者 `code` 的对象
 fn real_error(e: &Value) -> bool {
     e.as_object().is_some_and(|o| {
         o.get("message")
@@ -1236,41 +1264,6 @@ impl Body {
 /// 一份整份的回答（客户端的格式，JSON）：每一路正文一次处理完。返回改过的回答（没改是
 /// `None`，**一个字节都不动**）和命中。字节不是 UTF-8 的照替换坏字节之后的样子看；不是 JSON
 /// 的什么都不做
-/// 整段处理出来的 `out` 分回一路的几个字段：照一个字段一个字段喂给一路的样子分（扣住的尾巴
-/// 落在下一个字段里）。分出来的拼起来和 `out` 不一样的（一层套一层跨过了字段），能对上的
-/// 前几个字段照分，剩下的都放进接着的那一个字段，后面的空着
-fn split_like(answer: &Arc<Answer>, acts: bool, fields: &[String], out: String) -> Vec<String> {
-    if fields.len() < 2 {
-        return vec![out];
-    }
-    let mut lane = answer.lane(acts);
-    let mut parts: Vec<String> = fields.iter().map(|s| lane.push(s)).collect();
-    let tail = lane.finish();
-    if let Some(last) = parts.last_mut() {
-        last.push_str(&tail);
-    }
-    if parts.concat() == out {
-        return parts;
-    }
-    // 最后一个字段总是接着剩下的
-    let mut at = 0;
-    let mut kept = 0;
-    for p in parts.iter().take(fields.len() - 1) {
-        match out.get(at..) {
-            Some(rest) if rest.starts_with(p.as_str()) => {
-                at += p.len();
-                kept += 1;
-            }
-            _ => break,
-        }
-    }
-    let rest = out.get(at..).unwrap_or_default().to_string();
-    parts.truncate(kept);
-    parts.push(rest);
-    parts.resize(fields.len(), String::new());
-    parts
-}
-
 pub fn whole(
     answer: &Arc<Answer>,
     acts: bool,
@@ -1313,11 +1306,11 @@ pub fn whole(
             .iter()
             .map(|f| at(&mut v, &f.path).map(|s| s.clone()).unwrap_or_default())
             .collect();
-        // 整段一次处理（套多少层都删干净），再照一个字段一个字段喂出来的样子分回各个字段
+        // 整段一次处理（套多少层都删干净），再按原文的位置分回各个字段
         let mut lane = answer.lane(acts);
-        let out = lane.whole(&before.concat());
+        let fields_text: Vec<&str> = before.iter().map(String::as_str).collect();
+        let after = lane.whole_split(&fields_text);
         tally.add(answer, acts, &key.path(dialect), lane.take());
-        let after = split_like(answer, acts, &before, out);
         // 一个字都没改的一路原样留着：扣住又补回去的字不挪到别的字段里
         if after.concat() == before.concat() {
             continue;

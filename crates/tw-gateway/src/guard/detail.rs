@@ -574,7 +574,8 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
 /// （`path`）、前后的字，都按这个请求的 [`Redaction`] 打码 —— 回答里的占位符已经换回了原值，
 /// 前后文里可能就有一把真的密钥。
 pub fn answer(h: &tw_guard::content::answer::AnswerHit, red: &Redaction) -> SecurityHitDetail {
-    let sent = red.sent();
+    // 前后文是解开了的正文，不是 JSON 原文：原值按正文的样子找，引号外面也找
+    let sent = red.sent_as(tw_guard::redact::replace::Form::Text);
     let locations = h
         .places
         .iter()

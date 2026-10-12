@@ -102,3 +102,53 @@ fn tens_of_thousands_of_distinct_values_cost_linear_time() {
         "4 万个值花了 1 万个值的 {ratio:.1} 倍（{small:?} → {large:?}）：有一步不再是线性的"
     );
 }
+
+/// 账本里记着这几个原值
+fn ledger_of(values: &[String]) -> replace::Ledger {
+    let text = values.join("\u{1}");
+    let mut hits = Vec::new();
+    let mut at = 0;
+    for v in values {
+        hits.push(tw_guard::redact::rules::Hit {
+            bytes: at..at + v.len(),
+            rule: tw_guard::redact::rules::Rule::Custom("c".into()),
+            label: None,
+        });
+        at += v.len() + 1;
+    }
+    replace::apply_text(&text, &hits, replace::Ledger::new(replace::Scheme::SECRET)).ledger
+}
+
+/// 落盘前把账本里的原值换回占位符：`n` 个值、文字跟着长，里面每个值念一遍，还夹着一样多的
+/// 占位符
+fn hide(n: usize) -> Duration {
+    let values: Vec<String> = (0..n)
+        .map(|i| format!("user{i:06}@corp.example.com"))
+        .collect();
+    let ledger = ledger_of(&values);
+    let content: String = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("<<TW_SECRET_{}>> lorem ipsum {v} dolor ", i + 1))
+        .collect();
+    let body =
+        json!({"messages": [{"role": "user", "content": content}], "max_tokens": 4096}).to_string();
+    let started = Instant::now();
+    let out = replace::hide_values(&body, &ledger, replace::Form::Json);
+    let took = started.elapsed();
+    assert!(!out.contains("@corp.example.com"));
+    assert!(serde_json::from_str::<Value>(&out).is_ok());
+    took
+}
+
+#[test]
+fn hiding_tens_of_thousands_of_values_costs_linear_time() {
+    let fastest = |n| (0..3).map(|_| hide(n)).min().unwrap();
+    let small = fastest(10_000);
+    let large = fastest(40_000);
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    assert!(
+        ratio < 10.0,
+        "4 万个值花了 1 万个值的 {ratio:.1} 倍（{small:?} → {large:?}）：落盘前打码不再是线性的"
+    );
+}

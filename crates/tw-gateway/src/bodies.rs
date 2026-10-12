@@ -157,7 +157,7 @@ impl Redaction {
     }
 
     /// [`Self::sent`]，在按 `form` 写的文字里找
-    fn sent_as(&self, form: Form) -> Sent<'_> {
+    pub(crate) fn sent_as(&self, form: Form) -> Sent<'_> {
         Sent {
             by_value: self.ledger.replacements().collect(),
             form,
@@ -177,26 +177,45 @@ impl Redaction {
         hits: &[Hit],
         sent: &Sent<'_>,
     ) -> String {
-        let mut out = String::with_capacity(range.len());
-        let mut at = range.start;
         let first = hits.partition_point(|h| h.bytes.start < range.start);
-        for h in hits[first..]
+        let mine: Vec<&Hit> = hits[first..]
             .iter()
             .take_while(|h| h.bytes.start < range.end)
             .filter(|h| h.bytes.end <= range.end)
-        {
-            out.push_str(&text[at..h.bytes.start]);
+            .collect();
+        // 规则认不出的原值也换掉：回答里换回来的口令单独出现时，没有前后文，规则认不出它
+        // （见 [`tw_guard::redact::replace::value_spans`]）。和规则的命中重叠的让给命中
+        let values =
+            tw_guard::redact::replace::value_spans(text, range.clone(), &self.ledger, sent.form);
+        let mut changes: Vec<(Range<usize>, String)> = Vec::with_capacity(mine.len());
+        for h in &mine {
             let value = &text[h.bytes.clone()];
-            match sent.get(value) {
-                Some(placeholder) => out.push_str(placeholder),
-                None => out.push_str(&masked(&h.rule, value)),
+            changes.push((
+                h.bytes.clone(),
+                match sent.get(value) {
+                    Some(placeholder) => placeholder.to_string(),
+                    None => masked(&h.rule, value),
+                },
+            ));
+        }
+        for (r, placeholder) in values {
+            let k = mine.partition_point(|h| h.bytes.end <= r.start);
+            if !mine.get(k).is_some_and(|h| h.bytes.start < r.end) {
+                changes.push((r, placeholder.to_string()));
             }
-            at = h.bytes.end;
+        }
+        changes.sort_by_key(|(r, _)| r.start);
+        let mut out = String::with_capacity(range.len());
+        let mut at = range.start;
+        for (r, with) in changes {
+            if r.start < at {
+                continue;
+            }
+            out.push_str(&text[at..r.start]);
+            out.push_str(&with);
+            at = r.end;
         }
         out.push_str(&text[at..range.end]);
-        // 规则认不出的原值也换掉：回答里换回来的口令单独出现时，没有前后文，规则认不出它
-        // （见 [`tw_guard::redact::replace::hide_values`]）
-        let out = tw_guard::redact::replace::hide_values(&out, &self.ledger, sent.form);
         tw_secret::mask_body(&out)
     }
 }

@@ -3327,6 +3327,7 @@ dependencies = [
 name = "tw-guard"
 version = "0.72.0"
 dependencies = [
+ "aho-corasick",
  "base64",
  "bytes",
  "memchr",

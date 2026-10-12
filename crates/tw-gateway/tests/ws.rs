@@ -2350,3 +2350,112 @@ async fn late_frames_of_older_answers_keep_to_themselves() {
         .collect();
     assert_eq!(counts, [1], "{evs:?}");
 }
+
+/// 两次回答：第一次报了 `error`，第二次说到一半时第一次补来一个 `response.failed`，里面除了
+/// 说过的那段，还有一段从没流过的
+async fn late_with_new_text() -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut sock: WebSocket| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(_) = m else { continue };
+                    n += 1;
+                    let delta = |d: &str| serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":d});
+                    let item = |id: &str, t: &str| serde_json::json!({"type":"message","id":id,"role":"assistant","content":[{"type":"output_text","text":t}]});
+                    let created = |id: &str| serde_json::json!({"type":"response.created","response":{"id":id,"status":"in_progress","model":"gpt-5","output":[]}});
+                    let frames = match n {
+                        1 => vec![
+                            created("resp_1"),
+                            delta("one secret"),
+                            serde_json::json!({"type":"error","error":{"type":"server_error","message":"boom"},"response_id":"resp_1"}),
+                        ],
+                        _ => vec![
+                            created("resp_2"),
+                            delta("x "),
+                            serde_json::json!({"type":"response.failed","response":{"id":"resp_1","status":"failed","output":[item("msg", "one secret"), item("msg2", "late secret")]}}),
+                            delta("y"),
+                            serde_json::json!({"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[item("msg", "x y")]}}),
+                        ],
+                    };
+                    for f in frames {
+                        if sock.send(Message::Text(f.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// 收了尾的回答又来的帧里有从没流过的字：删掉的照样删，它的命中报在那一次回答那一轮上；
+/// 说过的那段（重复）不再算一次
+#[tokio::test]
+async fn new_text_in_a_late_frame_is_reported_on_its_own_answer() {
+    let up = late_with_new_text().await;
+    let (gw, mut rx, _state) = turns_gateway(
+        up,
+        move |cfg| {
+            cfg.security.content = tw_config::ContentPolicy {
+                mode: SecurityMode::Enforce,
+                custom: vec![tw_config::CustomContentRule {
+                    name: "r".into(),
+                    pattern: "secret".into(),
+                    scope: vec![tw_config::ContentScope::Response],
+                    matching: Default::default(),
+                    case_sensitive: false,
+                    action: tw_config::ContentAction::Strip,
+                    replacement: "***".into(),
+                    disabled: false,
+                }],
+                ..Default::default()
+            };
+        },
+        None,
+    )
+    .await;
+    let mut c = connect(gw).await;
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    for end in ["error", "response.completed"] {
+        c.send(create("hi")).await.unwrap();
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+                .await
+                .expect("the answer did not end")
+                .expect("the connection closed")
+                .unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            let done = v["type"] == end;
+            frames.push(v);
+            if done {
+                break;
+            }
+        }
+    }
+    let all = serde_json::to_string(&frames).unwrap();
+    assert!(!all.contains("secret"), "删掉的字到了客户端：{all}");
+    c.close(None).await.unwrap();
+    let evs = requests(&mut rx, 2).await;
+    let ids = started_ids(&evs);
+    let counts = |id: u64| -> Vec<u64> {
+        of(&evs, id)
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContentMatched { count, .. } => Some(*count),
+                _ => None,
+            })
+            .collect()
+    };
+    // 第一轮：流里的那一处，加上补来的帧里新的那一处；说过的那段不再算
+    assert_eq!(counts(ids[0]), [1, 1], "{evs:?}");
+    assert!(counts(ids[1]).is_empty(), "{evs:?}");
+}

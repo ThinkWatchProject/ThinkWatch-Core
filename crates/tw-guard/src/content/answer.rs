@@ -22,8 +22,12 @@
 //! 又是 `secret`。和请求那边一样，**删到不再冒出新命中为止**：删过、换过的字交给下一遍
 //! （`Pass`），下一遍只在改过的地方（接缝）附近再找 —— 一处命中要用到的字里没有接缝，它在
 //! 上一遍就在，上一遍认得出就已经改掉了。替换上去的字是规则写的，不再查。第一遍之后又过了
-//! [`MAX_ROUNDS`] 遍还在改字的只能是刻意一层套一层写出来的：这一路剩下的整个不发（请求那边
-//! 是那一段整段删掉）。
+//! [`MAX_ROUNDS`] 遍还在改字的只能是刻意一层套一层写出来的：从还在改的那一处起这一路不再发，
+//! 前面的照发（请求那边是那一段整段删掉）。
+//!
+//! 两样不再查：用到开头、结尾的规则（`^`、`$`、`\A`、`\z`）只在模型的原文上查一遍；删在这一路
+//! 开头、末尾的地方不算接缝。删掉末尾的一个字，`(?s).\z`、`.\b` 又认得出前一个字，一路删下去
+//! 整段就没了，而流着的那边早就发出去了 —— 两边都不这么删，整份的和流式的才一样。
 //!
 //! 接出来的命中起点最远在接缝前 `reach` 个字（会改字的规则要扣的取大的）。所以会改字的时候，
 //! 最后一遍发给客户端的再多扣 `reach` 个字：以后哪儿删了字，接缝前面这些字还在手里。
@@ -100,6 +104,9 @@ struct AnswerRule {
     bounded: bool,
     /// 要看命中前后的一个字（`\b`、`$` 这类断言）
     looks: bool,
+    /// 用到了正文或者一行的开头、结尾（`^`、`$`、`\A`、`\z`）：只在模型的原文上查一遍，
+    /// 删过之后不再查 —— 删掉末尾的一个字，前一个字就成了末尾，一路删下去整段就没了
+    anchored: bool,
 }
 
 impl Answer {
@@ -118,7 +125,9 @@ impl Answer {
             return None;
         }
         let editing = || out.iter().filter(|r| r.action.edits());
-        let looks = editing().any(|r| r.looks);
+        // 删过之后再查的：会改字、没有锚点的
+        let again = || editing().filter(|r| !r.anchored);
+        let looks = again().any(|r| r.looks);
         // 删掉字（删除，或者换成空的）才会让前后的字挨上；换成非空的替换文本，只有要看前后
         // 一个字的正则会因为它变
         let seams = looks || editing().any(|r| r.edit_with().is_none_or(str::is_empty));
@@ -126,7 +135,7 @@ impl Answer {
             hold: out.iter().map(|r| r.hold).max().unwrap_or(0),
             edits: editing().next().is_some(),
             reach: if seams {
-                editing().map(|r| r.hold).max().unwrap_or(0)
+                again().map(|r| r.hold).max().unwrap_or(0)
             } else {
                 0
             },
@@ -172,8 +181,13 @@ impl AnswerRule {
             return None;
         }
         let re = crate::bounded_with(&source, !r.case_sensitive).ok()?;
-        let (hold, bounded, looks) = if literal {
-            (r.pattern.chars().count().saturating_sub(1), true, false)
+        let (hold, bounded, looks, anchored) = if literal {
+            (
+                r.pattern.chars().count().saturating_sub(1),
+                true,
+                false,
+                false,
+            )
         } else {
             regex_hold(&source, !r.case_sensitive)
         };
@@ -190,6 +204,7 @@ impl AnswerRule {
             hold,
             bounded,
             looks,
+            anchored,
         })
     }
 
@@ -202,24 +217,26 @@ impl AnswerRule {
 /// 一条正则要扣几个字、一处命中的长度有没有上限、用没用到要看前后一个字的断言：最长能匹配
 /// 几个字，用到 `\b`、`$` 这类断言时多扣一个。算不出、超过上限的扣 [`REGEX_HOLD_MAX`]。
 ///
-/// 也是一处命中最多用到哪些字：从起点往后 `hold + 1` 个（断言要看起点前面那一个）
-fn regex_hold(source: &str, ignore_case: bool) -> (usize, bool, bool) {
+/// 也是一处命中最多用到哪些字：从起点往后 `hold + 1` 个（断言要看起点前面那一个）。最后
+/// 一个是用没用到开头、结尾这类锚点（见 `AnswerRule::anchored`）
+fn regex_hold(source: &str, ignore_case: bool) -> (usize, bool, bool, bool) {
     let parsed = regex_syntax::ParserBuilder::new()
         .case_insensitive(ignore_case)
         .build()
         .parse(source);
     let Ok(hir) = parsed else {
-        return (REGEX_HOLD_MAX, false, true);
+        return (REGEX_HOLD_MAX, false, true, true);
     };
-    let looks = !hir.properties().look_set().is_empty();
+    let set = hir.properties().look_set();
+    let (looks, anchored) = (!set.is_empty(), set.contains_anchor());
     let Some(max) = max_chars(&hir) else {
-        return (REGEX_HOLD_MAX, false, looks);
+        return (REGEX_HOLD_MAX, false, looks, anchored);
     };
     let hold = if looks { max } else { max.saturating_sub(1) };
     if hold > REGEX_HOLD_MAX {
-        (REGEX_HOLD_MAX, false, looks)
+        (REGEX_HOLD_MAX, false, looks, anchored)
     } else {
-        (hold, true, looks)
+        (hold, true, looks, anchored)
     }
 }
 
@@ -304,9 +321,12 @@ pub struct Lane {
     tally: Tally,
     /// 最近发给客户端的一小段（新起一遍时当它的前文：`\b` 要看前一个字）
     told: String,
-    /// 第一遍之后又过了 [`MAX_ROUNDS`] 遍还在改字：这一路剩下的整个不发
+    /// 第一遍之后又过了 [`MAX_ROUNDS`] 遍还在改字：这一路从还在改的那一处起不再发
     silent: bool,
     done: bool,
+    /// 最后交出去的那一段每个位置在原文里的位置（[`Lane::whole_split`] 要）
+    keep_map: bool,
+    map_out: Vec<(usize, usize)>,
 }
 
 /// 一路里认定了的命中，各遍共用
@@ -358,6 +378,9 @@ struct Pass {
     /// 后面几遍：`buf` 的每个位置（含末尾）在这一路原文里的位置，当起点用的和当终点用的
     /// （见 [`Piece::map`]）
     map: Vec<(usize, usize)>,
+    /// 这一遍之前已经有字了（交出去过字，或者新起时客户端已经收到过字）。没有的话，交出去的
+    /// 开头就是这一路的开头
+    started: bool,
 }
 
 /// 一遍交给下一遍的一段字。
@@ -391,6 +414,8 @@ impl Lane {
             told: String::new(),
             silent: false,
             done: false,
+            keep_map: false,
+            map_out: Vec::new(),
         }
     }
 
@@ -435,6 +460,37 @@ impl Lane {
         out
     }
 
+    /// 一路正文分在几个字段里（Gemini 的几个文字部分）：拼起来一次处理完，再按原文的位置分回
+    /// 各个字段 —— 每个字留在它原来所在的字段里，换上去的替换文本放在被换掉的那段开头所在的
+    /// 字段里。只处理一遍
+    pub fn whole_split(&mut self, fields: &[&str]) -> Vec<String> {
+        self.keep_map = true;
+        let out = self.whole(&fields.concat());
+        self.keep_map = false;
+        let map = std::mem::take(&mut self.map_out);
+        let mut parts = Vec::with_capacity(fields.len());
+        let (mut from, mut bound) = (0, 0);
+        for (i, f) in fields.iter().enumerate() {
+            bound += f.len();
+            // 对照不全（不该有）的话剩下的都放进最后一个字段
+            let to = if i + 1 == fields.len() {
+                out.len()
+            } else if map.len() != out.len() + 1 {
+                from
+            } else {
+                // 原文里从这个字段之后起的头一个字，落在字的边界上
+                let mut to = map.partition_point(|&(s, _)| s < bound).max(from);
+                while to < out.len() && !out.is_char_boundary(to) {
+                    to += 1;
+                }
+                to.min(out.len())
+            };
+            parts.push(out.get(from..to).unwrap_or_default().to_string());
+            from = to;
+        }
+        parts
+    }
+
     /// 认定了的命中，取走：留了前后文的那几处，和每条规则一共几处。后面的字还没收齐的那几处，
     /// 后面的字就到这里为止
     pub fn take(&mut self) -> Matches {
@@ -464,20 +520,26 @@ impl Lane {
         let mut k = 0;
         loop {
             if k == self.passes.len() {
-                let p = piece.unwrap_or_default();
+                let mut p = piece.unwrap_or_default();
+                // 接缝处还可能接出新命中：再过一遍。套了这么多层的只能是刻意写出来的：从还在改
+                // 的那一处（头一个接缝往前 `reach` 个字）起，这一路不再发
+                if let (Some(&first), true) = (p.seams.first(), k > MAX_ROUNDS) {
+                    self.silent = true;
+                    let keep = back_chars(&p.text, first, answer.reach);
+                    p.text.truncate(keep);
+                    p.map.truncate(keep + 1);
+                    p.seams.clear();
+                }
                 if p.seams.is_empty() {
                     if edits && answer.reach > 0 {
                         self.told.push_str(&p.text);
                         let drop = back_chars(&self.told, self.told.len(), CONTEXT);
                         self.told.drain(..drop);
                     }
+                    if self.keep_map {
+                        self.map_out = p.map;
+                    }
                     return p.text;
-                }
-                // 接缝处还可能接出新命中：再过一遍。套了这么多层的只能是刻意写出来的，这一路
-                // 剩下的整个不发（和请求那边整段删掉一样）
-                if k > MAX_ROUNDS {
-                    self.silent = true;
-                    return String::new();
                 }
                 self.passes
                     .push(Pass::after(k, answer.rules.len(), &self.told, p));
@@ -488,7 +550,8 @@ impl Lane {
             let Some(pass) = self.passes.get_mut(k) else {
                 return String::new();
             };
-            piece = Some(pass.step(&answer, &mut self.tally, edits, last, tail));
+            let mapped = tail && self.keep_map;
+            piece = Some(pass.step(&answer, &mut self.tally, edits, last, tail, mapped));
             k += 1;
         }
     }
@@ -507,6 +570,7 @@ impl Pass {
             kept: Vec::new(),
             seams: Vec::new(),
             map: Vec::new(),
+            started: false,
         }
     }
 
@@ -516,6 +580,7 @@ impl Pass {
         let mut p = Pass::new(round, rules);
         p.buf.push_str(told);
         p.sent = told.len();
+        p.started = !told.is_empty();
         // 前文的位置没有对照：都按这一段的开头算
         let first = piece.map.first().map_or((0, 0), |&(_, e)| (e, e));
         p.map = vec![first; told.len() + 1];
@@ -552,6 +617,7 @@ impl Pass {
         edits: bool,
         last: bool,
         tail: bool,
+        mapped: bool,
     ) -> Piece {
         let len = self.buf.len();
         // 从这儿起的字还可能是一处没收齐的命中的一部分：最后 `hold` 个字。会改字的时候交到的
@@ -587,9 +653,13 @@ impl Pass {
         };
         upto = straddle(upto).max(self.sent);
         let live = |w: &str| answer.reach > 0 && (w.is_empty() || answer.looks);
-        let seamed = merged
-            .iter()
-            .any(|(r, w)| r.start >= self.sent && r.end <= upto && live(w));
+        // 删在这一路开头的不算接缝：前面没有字可接（见 [`Pass::piece`]）
+        let seamed = merged.iter().any(|(r, w)| {
+            r.start >= self.sent
+                && r.end <= upto
+                && live(w)
+                && !(w.is_empty() && !self.started && r.start == self.sent)
+        });
         // 最后一遍交给客户端的，还要离以后的改动至少 `reach` 个字：以后在 `upto` 之后删了字，
         // 接缝前面这些字可能和后面的接成一处命中，得还在手里。这一次就有接缝的，整段交给下一遍
         if tail && !last && edits && answer.reach > 0 && !seamed {
@@ -604,8 +674,8 @@ impl Pass {
             Some(piece) => apply_edits(piece, &mine),
             None => String::new(),
         };
-        let out = if !tail || mine.iter().any(|(_, w)| live(w)) {
-            self.piece(text, &mine, upto, &live)
+        let out = if !tail || mapped || mine.iter().any(|(_, w)| live(w)) {
+            self.piece(text, &mine, upto, &live, last && upto == len)
         } else {
             Piece {
                 text,
@@ -614,6 +684,7 @@ impl Pass {
         };
         self.edits.retain(|(r, _)| r.start >= upto);
         self.sent = upto;
+        self.started |= !out.text.is_empty();
         self.fill(tally, last);
         self.trim();
         out
@@ -626,6 +697,7 @@ impl Pass {
         mine: &[(Range<usize>, &str)],
         upto: usize,
         live: &dyn Fn(&str) -> bool,
+        at_end: bool,
     ) -> Piece {
         let at = |i: usize| self.at(self.sent + i);
         let n = upto.saturating_sub(self.sent);
@@ -679,6 +751,10 @@ impl Pass {
             map.push((s, end_at.take().unwrap_or(e)));
         }
         seams.dedup();
+        // 这一路的开头、结尾不算接缝：那边没有字可接，只有要看开头、结尾的规则会因为它变 ——
+        // 删掉末尾的一个字，`.\b` 又认得出前一个字，一路删下去整段就没了
+        let (open, len) = (!self.started, text.len());
+        seams.retain(|&o| !(open && o == 0) && !(at_end && o == len));
         Piece {
             text,
             map,
@@ -737,7 +813,11 @@ impl Pass {
     fn recheck(&mut self, answer: &Answer, tally: &mut Tally, ri: usize, cut: usize, last: bool) {
         let len = self.buf.len();
         let limit = if last { len + 1 } else { cut };
-        let Some(rule) = answer.rules.get(ri).filter(|r| r.action.edits()) else {
+        let Some(rule) = answer
+            .rules
+            .get(ri)
+            .filter(|r| r.action.edits() && !r.anchored)
+        else {
             self.scan[ri] = cut;
             return;
         };
@@ -745,20 +825,25 @@ impl Pass {
         let mut k = self.seams.partition_point(|&j| j < p);
         while let Some(&j) = self.seams.get(k) {
             let mut q = back_chars(&self.buf, j, rule.hold).max(p);
+            // 只在一处命中够得着的那一段里找（接缝后面再多两个字：命中的最后一个字、断言要看
+            // 的下一个字）：找不到时不一路找到末尾。窗口末尾截住的命中不算 —— 只有长度没上限
+            // 的正则才会碰到那里
+            let stop = forward_chars(&self.buf, j, rule.hold + 2);
             while q <= j && q < limit {
-                match rule.re.find_at(&self.buf, q) {
-                    Some(m) if m.start() <= j && m.start() < limit => {
-                        q = m.start();
-                        let whole = last || rule.bounded || m.end() < len;
-                        if !m.is_empty() && whole && !super::overlaps(&self.kept, &m.range()) {
+                let hay = self.buf.get(..stop).unwrap_or(&self.buf);
+                match rule.re.find_at(hay, q).map(|m| m.range()) {
+                    Some(m) if m.start <= j && m.start < limit => {
+                        q = m.start;
+                        let clipped = m.end == stop && stop < len;
+                        let whole = !clipped && (last || rule.bounded || m.end < len);
+                        if !m.is_empty() && whole && !super::overlaps(&self.kept, &m) {
                             // 开头已经发出去了（只有新起的一遍、前文里才有）：发了的收不回来，
                             // 没发的那一截删掉，客户端收不到一整处
-                            let edit =
-                                (m.end() > self.sent).then(|| m.start().max(self.sent)..m.end());
-                            if m.start() < self.sent {
+                            let edit = (m.end > self.sent).then(|| m.start.max(self.sent)..m.end);
+                            if m.start < self.sent {
                                 tally.short = true;
                             }
-                            self.commit(tally, ri, m.range(), edit);
+                            self.commit(tally, ri, m, edit);
                         }
                         q = next_char(&self.buf, q);
                     }
@@ -925,6 +1010,13 @@ fn back_chars(s: &str, end: usize, n: usize) -> usize {
     s.get(..end)
         .and_then(|head| head.char_indices().rev().nth(n - 1))
         .map_or(0, |(i, _)| i)
+}
+
+/// `i` 往后数 `n` 个字的那个位置（不够就是末尾）。`i` 要在字符边界上
+fn forward_chars(s: &str, i: usize, n: usize) -> usize {
+    s.get(i..)
+        .and_then(|rest| rest.char_indices().nth(n))
+        .map_or(s.len(), |(k, _)| i + k)
 }
 
 /// `i` 之后的下一个字符边界。在末尾的话越过末尾一个字节（找的循环就此停下）

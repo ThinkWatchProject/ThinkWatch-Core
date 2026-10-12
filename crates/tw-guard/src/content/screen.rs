@@ -297,9 +297,11 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
         return e;
     }
     let mut texts: Vec<String> = segments.iter().map(|(t, _)| t.to_string()).collect();
-    // 每段正文每一遍改了哪些（按那一遍改之前的位置，和换上去的字有几个字节），把后来的位置
-    // 换算回原文用
-    let mut rounds: Vec<Vec<Round>> = vec![Vec::new(); segments.len()];
+    // 每段正文现在的位置换回原文用：每一遍的改动都并进去（见 [`Origins`]）
+    let mut origins: Vec<Origins> = vec![Origins::default(); segments.len()];
+    // 记过的那几处（[`Evaluation::all`]）：每一遍在改过的段上整段再查，先前就在的又会找到
+    let mut seen: std::collections::HashSet<(usize, usize, Range<usize>)> =
+        e.all.iter().cloned().collect();
     // 每段正文里换上去的替换文本在哪儿（按现在的位置）：再查时不算
     let mut kept: Vec<Vec<Range<usize>>> = vec![Vec::new(); segments.len()];
     for _ in 0..MAX_ROUNDS {
@@ -310,9 +312,9 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
             if !merged.is_empty() {
                 texts[si] = super::apply_edits(&texts[si], &merged);
                 kept[si] = shift_kept(&kept[si], &merged);
+                origins[si].apply(&merged);
                 changed[si] = true;
             }
-            rounds[si].push(merged.iter().map(|(r, w)| (r.clone(), w.len())).collect());
         }
         let now: Vec<(&str, bool)> = texts
             .iter()
@@ -336,7 +338,7 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
                     index.push(at);
                 }
                 None => {
-                    h.bytes = back(&rounds[next.segments[k]], h.bytes);
+                    h.bytes = origins[next.segments[k]].range(h.bytes);
                     if h.action == Action::Block && blocked.is_none() {
                         blocked = Some(e.hits.len());
                     }
@@ -349,8 +351,8 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
         // 先前就在的那几处换回原文还是原来的位置，只记新冒出来的
         for (k, s, ranges) in next.all {
             for r in ranges {
-                let item = (index[k], s, back(&rounds[s], r));
-                if !e.all.contains(&item) {
+                let item = (index[k], s, origins[s].range(r));
+                if seen.insert(item.clone()) {
                     e.all.push(item);
                 }
             }
@@ -373,9 +375,6 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
     e.texts = Some(texts);
     e
 }
-
-/// 一段正文一遍里的改动：改之前的区间，和换上去的字有几个字节（删掉是 0）
-type Round = Vec<(Range<usize>, usize)>;
 
 /// 这一遍改过之后，换上去的替换文本各在哪儿：先前的几段跟着前面的改动挪（改动从不和它们
 /// 重叠，见 [`Rules::detect`] 的 `kept`），这一遍换上去的接着记。按先后
@@ -401,38 +400,136 @@ fn shift_kept(kept: &[Range<usize>], edits: &[(Range<usize>, &str)]) -> Vec<Rang
     out
 }
 
-/// 改过几遍之后的一个区间，换算回改之前的原文：从最后一遍往回，一遍一遍地换。
+/// 一段正文改过几遍之后，现在的位置换回原文：每一遍的改动并进同一张表，查一个位置是一次
+/// 二分。
 ///
 /// 起点落在一处删掉的地方上时，换到删掉的那段**后面**（不把删掉的字算进命中）；终点
 /// 落在那里时换到**前面**。`jail‹U+200B›break` 删掉零宽字符后命中的 `jailbreak`，换回
 /// 原文是包括零宽字符在内的整段。落在换上去的替换文本里的，起点换到被换掉的那段的开头、
 /// 终点换到它的结尾。
-fn back(rounds: &[Round], r: Range<usize>) -> Range<usize> {
-    let mut r = r;
-    for edits in rounds.iter().rev() {
-        r = unshift(edits, r.start, false)..unshift(edits, r.end, true);
-    }
-    r
+///
+/// **不一遍一遍地往回换**：一层套一层的请求要删几十遍，每一处都往回换几十遍、每一遍在那
+/// 一遍的改动里找一次，几十万处的时候就是几秒。并进一张表的时候，删在同一个地方的几段
+/// 连成一段：套几十层的那一处，表里始终只有一条。
+#[derive(Debug, Clone, Default)]
+struct Origins {
+    /// 改过的地方，按现在的位置排
+    anchors: Vec<Anchor>,
 }
 
-/// 改过之后的位置 `p` 换回改之前的。`edits` 是那一遍的改动：改之前的区间，和换上去的字有
-/// 几个字节（删掉是 0）
-fn unshift(edits: &[(Range<usize>, usize)], p: usize, end: bool) -> usize {
-    // 改之后比改之前多出来的字节数（删掉的是负的）
-    let mut delta: isize = 0;
-    for (r, ins) in edits {
-        // 这一处改动在改过之后的文字里从哪儿到哪儿
-        let at = r.start.saturating_add_signed(delta);
-        let fin = at + ins;
-        if p < at || (end && p == at) {
-            break;
-        }
-        if p < fin {
-            return if end { r.end } else { r.start };
-        }
-        delta += *ins as isize - r.len() as isize;
+/// 现在的 `cur..cur + ins` 是原文里的一段改出来的（删掉的 `ins` 是 0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Anchor {
+    cur: usize,
+    ins: usize,
+    /// 起点落在换上去的字里（含开头）
+    start_in: usize,
+    /// 起点在改过的地方后面（删掉的地方本身也是）：之后到下一处改动，和原文一个字节对一个
+    start_after: usize,
+    /// 终点就在 `cur`
+    end_at: usize,
+    /// 终点落在换上去的字里（含结尾）
+    end_in: usize,
+}
+
+impl Origins {
+    /// 现在的一个区间在原文里
+    fn range(&self, r: Range<usize>) -> Range<usize> {
+        self.start(r.start)..self.end(r.end)
     }
-    p.saturating_add_signed(-delta)
+
+    fn start(&self, p: usize) -> usize {
+        // 同一个位置上有几条（删掉的、接着换上去的）：起点算最后那条的
+        let k = self.anchors.partition_point(|a| a.cur <= p);
+        let Some(a) = k.checked_sub(1).and_then(|k| self.anchors.get(k)) else {
+            return p;
+        };
+        if p < a.cur + a.ins {
+            a.start_in
+        } else {
+            a.start_after + (p - a.cur - a.ins)
+        }
+    }
+
+    fn end(&self, p: usize) -> usize {
+        // 同一个位置上有几条：终点算头一条的，停在它们前面
+        let j = self.anchors.partition_point(|a| a.cur < p);
+        if let Some(a) = self.anchors.get(j).filter(|a| a.cur == p) {
+            return a.end_at;
+        }
+        let Some(a) = j.checked_sub(1).and_then(|k| self.anchors.get(k)) else {
+            return p;
+        };
+        if p <= a.cur + a.ins {
+            a.end_in
+        } else {
+            a.start_after + (p - a.cur - a.ins)
+        }
+    }
+
+    /// 又改了一遍：`edits` 按现在的位置排好、合并好（[`Rules::merged`]），从不和换上去的
+    /// 替换文本重叠
+    fn apply(&mut self, edits: &[(Range<usize>, &str)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let prev = Origins {
+            anchors: std::mem::take(&mut self.anchors),
+        };
+        // 照挪的那几条（终点的样子可能要跟着改，见下面）
+        let mut old = prev.anchors.clone();
+        let mut out: Vec<Anchor> = Vec::with_capacity(old.len() + edits.len());
+        let mut i = 0;
+        // 改过之后比改之前多出来的字节数（删掉的是负的）
+        let mut delta: isize = 0;
+        let moved = |a: &Anchor, delta: isize| Anchor {
+            cur: a.cur.saturating_add_signed(delta),
+            ..*a
+        };
+        for (r, w) in edits {
+            // 前面的照挪
+            while let Some(a) = old.get(i).filter(|a| a.cur < r.start) {
+                out.push(moved(a, delta));
+                i += 1;
+            }
+            // 这一处盖住的：里面删掉的、两头删掉的，都并进这一处（它们的样子在下面四个数里）。
+            // 从 `r.end` 起换上去的替换文本不算（挨着，不重叠）
+            while old
+                .get(i)
+                .is_some_and(|a| a.cur < r.end || (a.cur == r.end && a.ins == 0))
+            {
+                i += 1;
+            }
+            // 挨着的那段替换文本：终点落在它开头的，现在停在这一处前面那些删掉的前面（并进
+            // 了这一处，它自己记的是删掉之后的）
+            if let Some(a) = old.get_mut(i).filter(|a| a.cur == r.end) {
+                a.end_at = prev.end(r.end);
+            }
+            let anchor = Anchor {
+                cur: r.start.saturating_add_signed(delta),
+                ins: w.len(),
+                start_in: prev.start(r.start),
+                start_after: prev.start(r.end),
+                end_at: prev.end(r.start),
+                end_in: prev.end(r.end),
+            };
+            match out.last_mut() {
+                // 删在同一个地方的连成一段
+                Some(last) if anchor.ins == 0 && last.ins == 0 && last.cur == anchor.cur => {
+                    last.start_after = anchor.start_after;
+                }
+                _ => out.push(anchor),
+            }
+            delta += w.len() as isize - r.len() as isize;
+        }
+        out.extend(
+            old.get(i..)
+                .unwrap_or_default()
+                .iter()
+                .map(|a| moved(a, delta)),
+        );
+        self.anchors = out;
+    }
 }
 
 #[cfg(test)]
@@ -667,29 +764,124 @@ mod tests {
 
     #[test]
     fn positions_are_mapped_back_through_each_deletion() {
+        let edits = |list: &[(Range<usize>, &'static str)]| {
+            let mut o = Origins::default();
+            o.apply(list);
+            o
+        };
         // 删掉了 2..5 和 8..9：删过之后，这两处在 2 和 5
-        let c1 = vec![(2..5, 0), (8..9, 0)];
-        assert_eq!(unshift(&c1, 2, false), 5, "起点越过删掉的");
-        assert_eq!(unshift(&c1, 2, true), 2, "终点停在删掉的前面");
-        assert_eq!(unshift(&c1, 6, true), 10);
-        assert_eq!(back(std::slice::from_ref(&c1), 0..2), 0..2);
+        let c1 = edits(&[(2..5, ""), (8..9, "")]);
+        assert_eq!(c1.start(2), 5, "起点越过删掉的");
+        assert_eq!(c1.end(2), 2, "终点停在删掉的前面");
+        assert_eq!(c1.end(6), 10);
+        assert_eq!(c1.range(0..2), 0..2);
         // 两遍：先删了 1..2，再删了 0..1
-        let once = |r: Range<usize>| vec![(r, 0)];
-        assert_eq!(back(&[once(1..2), once(0..1)], 0..1), 2..3);
+        let mut two = edits(&[(1..2, "")]);
+        two.apply(&[(0..1, "")]);
+        assert_eq!(two.range(0..1), 2..3);
+        assert_eq!(two.anchors.len(), 1, "删在同一个地方的连成一段");
         // 2..5 换成了三个字节、8..9 换成了一个：改过之后在 2..5 和 8..9
-        let c2 = vec![(2..5, 3), (8..9, 1)];
-        assert_eq!(unshift(&c2, 5, false), 5, "替换文本之后的起点");
-        assert_eq!(unshift(&c2, 2, true), 2, "替换文本之前的终点");
-        assert_eq!(
-            unshift(&c2, 3, false),
-            2,
-            "落在替换文本里的起点换到被换掉的开头"
-        );
-        assert_eq!(unshift(&c2, 4, true), 5, "终点换到结尾");
+        let c2 = edits(&[(2..5, "abc"), (8..9, "d")]);
+        assert_eq!(c2.start(5), 5, "替换文本之后的起点");
+        assert_eq!(c2.end(2), 2, "替换文本之前的终点");
+        assert_eq!(c2.start(3), 2, "落在替换文本里的起点换到被换掉的开头");
+        assert_eq!(c2.end(4), 5, "终点换到结尾");
         // 换得比原来长：1..2 换成了五个字节，之后的整体往后挪了四个
-        let c3 = vec![(1..2, 5)];
-        assert_eq!(unshift(&c3, 7, false), 3);
-        assert_eq!(back(&[c3], 6..8), 2..4);
+        let c3 = edits(&[(1..2, "abcde")]);
+        assert_eq!(c3.start(7), 3);
+        assert_eq!(c3.range(6..8), 2..4);
+        // 删掉的紧挨着一段替换文本：起点算进替换文本，终点停在删掉的前面
+        let c4 = edits(&[(1..3, ""), (3..4, "xy")]);
+        assert_eq!(c4.start(1), 3);
+        assert_eq!(c4.end(1), 1);
+        assert_eq!(c4.end(3), 4);
+        assert_eq!(c4.start(3), 4);
+    }
+
+    /// 并成一张表和一遍一遍往回换是一回事：随机删、换几遍，每个位置都和照定义一遍一遍换回去
+    /// 的一样
+    #[test]
+    fn merged_origins_agree_with_mapping_back_round_by_round() {
+        // 照定义：改过之后的位置 `p` 换回改之前的
+        fn unshift(edits: &[(Range<usize>, usize)], p: usize, end: bool) -> usize {
+            let mut delta: isize = 0;
+            for (r, ins) in edits {
+                let at = r.start.saturating_add_signed(delta);
+                let fin = at + ins;
+                if p < at || (end && p == at) {
+                    break;
+                }
+                if p < fin {
+                    return if end { r.end } else { r.start };
+                }
+                delta += *ins as isize - r.len() as isize;
+            }
+            p.saturating_add_signed(-delta)
+        }
+        let mut seed = 0x0123_4567_89ab_cdef_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        let words = ["", "", "x", "yz"];
+        for _ in 0..3000 {
+            let mut len = 1 + next(40);
+            let mut o = Origins::default();
+            let mut rounds: Vec<Vec<(Range<usize>, usize)>> = Vec::new();
+            // 换上去的替换文本：之后的改动不和它们重叠
+            let mut kept: Vec<Range<usize>> = Vec::new();
+            for _ in 0..1 + next(5) {
+                let mut list: Vec<(Range<usize>, &'static str)> = Vec::new();
+                let mut at = 0;
+                while at < len {
+                    let s = at + next(4);
+                    let e = s + 1 + next(3);
+                    if e > len {
+                        break;
+                    }
+                    if !kept.iter().any(|k| k.start < e && s < k.end) {
+                        list.push((s..e, words[next(words.len())]));
+                    }
+                    at = e + next(2);
+                }
+                if list.is_empty() {
+                    continue;
+                }
+                o.apply(&list);
+                // 替换文本跟着挪，这一遍换上去的接着记
+                let mut moved = Vec::new();
+                let mut delta: isize = 0;
+                let mut ks = kept.iter().peekable();
+                for (r, w) in &list {
+                    while let Some(k) = ks.next_if(|k| k.end <= r.start) {
+                        moved.push(
+                            k.start.saturating_add_signed(delta)
+                                ..k.end.saturating_add_signed(delta),
+                        );
+                    }
+                    let at = r.start.saturating_add_signed(delta);
+                    if !w.is_empty() {
+                        moved.push(at..at + w.len());
+                    }
+                    delta += w.len() as isize - r.len() as isize;
+                }
+                moved.extend(ks.map(|k| {
+                    k.start.saturating_add_signed(delta)..k.end.saturating_add_signed(delta)
+                }));
+                kept = moved;
+                len = len.saturating_add_signed(delta);
+                rounds.push(list.iter().map(|(r, w)| (r.clone(), w.len())).collect());
+            }
+            for p in 0..=len {
+                for end in [false, true] {
+                    let want = rounds.iter().rev().fold(p, |p, r| unshift(r, p, end));
+                    let got = if end { o.end(p) } else { o.start(p) };
+                    assert_eq!(got, want, "{p} end={end} {rounds:?}");
+                }
+            }
+        }
     }
 
     /// 替换文本不再查：一条把 `*` 换成 `***` 的规则换一遍就停，计数是原文里的几处
