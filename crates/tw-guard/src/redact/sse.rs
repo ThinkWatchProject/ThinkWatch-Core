@@ -26,7 +26,14 @@
 //! 不认识它，那几个字就丢了。
 //!
 //! **工具参数也要还原。**用户说「把我的 key 写进 .env」时，占位符会从工具参数
-//! 流过去 —— 不还原的话，客户端真的会把占位符写进文件。
+//! 流过去 —— 不还原的话，客户端真的会把占位符写进文件。Codex 的 `apply_patch` 这种
+//! 自由格式工具，输入是另一路（`custom_tool_call_input`）。
+//!
+//! # 放回去的样子
+//!
+//! 正文字段解码之后是一段话：原值放进去是它本来的样子，私钥块的换行就是换行。工具参数
+//! 不一样，解码之后还是一段 JSON（`{"content":"<<TW_SECRET_1>>"}`）：原值要转义一次再放，
+//! 不然客户端拿到的参数里夹着一个真的换行，解析不了。自由格式工具的输入是一段话，照正文。
 //!
 //! **思考过程不碰。**Anthropic 的 thinking 带签名，改一个字，下一轮请求就会
 //! 被上游拒绝。
@@ -40,7 +47,7 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 use tw_dialect::ir::Dialect;
 
-use crate::redact::replace::Ledger;
+use crate::redact::replace::{Form, Ledger};
 use crate::redact::stream::Restorer;
 
 /// 这几个键下面的东西不还原。思考过程和它的签名（改了下一轮就被拒），以及
@@ -66,13 +73,24 @@ enum Lane {
     /// 工具参数。Anthropic 是内容块的 index，Chat 是工具调用的 index，
     /// Responses 是 `output_index`
     Args(u64),
+    /// Responses 自由格式工具（Codex 的 `apply_patch`）的输入，`output_index`。是一段话，
+    /// 不是 JSON
+    Input(u64),
 }
 
 impl Lane {
     fn output_index(self) -> u64 {
         match self {
             Lane::Text(k) => k >> 32,
-            Lane::Args(k) => k,
+            Lane::Args(k) | Lane::Input(k) => k,
+        }
+    }
+
+    /// 这一路的字段解码之后是哪种写法：工具参数还是一段 JSON
+    fn form(self) -> Form {
+        match self {
+            Lane::Args(_) => Form::Json,
+            Lane::Text(_) | Lane::Input(_) => Form::Text,
         }
     }
 }
@@ -138,8 +156,11 @@ struct Open {
 /// 一条流上、按帧的还原器。
 pub struct FrameRestorer {
     dialect: Dialect,
-    /// 整帧的一次性还原。各路的还原器从它分出去，共用一本账（见 [`Restorer::fresh`]）
+    /// 整帧的一次性还原，正文字段用。各路的还原器从它分出去，共用一本账（见
+    /// [`Restorer::fresh_as`]）
     oneshot: Restorer,
+    /// 同一本账，放进工具参数那段 JSON 里的（见 [`json_text`]）
+    oneshot_json: Restorer,
     lanes: BTreeMap<Lane, Open>,
 }
 
@@ -147,9 +168,11 @@ impl FrameRestorer {
     /// `dialect` 是**这条流**的格式：还原放在转换之前就是上游的格式，放在转换
     /// 之后就是客户端的格式。
     pub fn new(ledger: &Ledger, dialect: Dialect) -> Self {
+        let oneshot = Restorer::text(ledger);
         Self {
             dialect,
-            oneshot: Restorer::new(ledger),
+            oneshot_json: oneshot.fresh_as(Form::Json),
+            oneshot,
             lanes: BTreeMap::new(),
         }
     }
@@ -159,20 +182,42 @@ impl FrameRestorer {
         self.oneshot.is_noop()
     }
 
+    /// 换成一本更全的账（WebSocket 的连接中途客户端又发来新的值）。**各路扣着的尾巴留着**，
+    /// 接着按新账还原：旧账里的占位符在新账里还是那个原值，补出来再换就晚了 —— 扣着的
+    /// `<<TW_SEC` 等不到下一帧的 `RET_1>>`
+    pub fn rebook(&mut self, ledger: &Ledger) {
+        self.oneshot.rebook(ledger);
+        self.oneshot_json.share_book(&self.oneshot);
+        for open in self.lanes.values_mut() {
+            open.restorer.share_book(&self.oneshot);
+        }
+    }
+
     /// 改写一帧。帧本身就地改，返回要先于它发出去的补帧。
     pub fn frame(&mut self, v: &mut Value) -> Rewritten {
         let mut out = Rewritten::default();
         if self.is_noop() {
             return out;
         }
+        // 流着的正文先拿出来，交给它那一路：一个增量里的参数片段（`"KEY=<<TW_SECRET_1>>"`）
+        // 看不出是 JSON，按键认的话会当成正文放进去
+        let fields = fields(self.dialect, v);
+        let streamed: Vec<Option<String>> = fields
+            .iter()
+            .map(|f| at(v, &f.path).map(std::mem::take))
+            .collect();
         // 完整的占位符，不管在哪个字段里：`output_text.done` 带着整段正文、
         // Gemini 的函数调用参数整个在一帧里
-        out.changed |= walk(v, &self.oneshot);
+        out.changed |= walk(v, &self.oneshot, &self.oneshot_json, Form::Text, None);
+        for (f, s) in fields.iter().zip(streamed) {
+            if let (Some(slot), Some(s)) = (at(v, &f.path), s) {
+                *slot = s;
+            }
+        }
         // 流着的正文，按路扣住半截的
-        let fields = fields(self.dialect, v);
         for f in &fields {
             let open = self.lanes.entry(f.lane).or_insert_with(|| Open {
-                restorer: self.oneshot.fresh(),
+                restorer: self.oneshot.fresh_as(f.lane.form()),
                 last: Value::Null,
             });
             open.last = v.clone();
@@ -232,20 +277,50 @@ impl FrameRestorer {
     }
 }
 
+/// `parent` 下面的 `key` 是不是装着一段 JSON 的字符串：工具调用的参数（Chat、Responses 的
+/// `arguments`，Anthropic 的 `partial_json`，Converse 的 `toolUse.input`），而且 `value` 真
+/// 长得像 JSON（工具自己的参数里叫 `arguments` 的字段放的可能是一句话）。原值放进去要转义
+/// 一次；别处的字符串是解码过的正文。Responses 自由格式工具的 `input` 是一段话，不算。
+///
+/// 和整份 JSON 原文的还原认的是同一批（见 `crate::redact::nest`）。流着的片段不走这里，
+/// 按它那一路认（[`Lane::form`]）
+fn json_text(key: &str, parent: Option<&str>, value: &Value) -> bool {
+    (matches!(key, "arguments" | "partial_json") || (key == "input" && parent == Some("toolUse")))
+        && value
+            .as_str()
+            .is_some_and(|s| s.trim_start().starts_with(['{', '[']))
+}
+
 /// 在一帧的每个字符串上做一次性还原，跳过 [`UNTOUCHED`] 下面的。返回改了没有。
-fn walk(v: &mut Value, r: &Restorer) -> bool {
+///
+/// `form` 是 `v` 这个值（是字符串的话）的写法，`parent` 是装着它的那个键：一个字符串按它
+/// 所在的键用 `text` 或 `json` 那个还原器（见 [`json_text`]）。
+fn walk(v: &mut Value, text: &Restorer, json: &Restorer, form: Form, parent: Option<&str>) -> bool {
     match v {
         Value::String(s) => {
+            let r = match form {
+                Form::Json => json,
+                Form::Text => text,
+            };
             let next = r.oneshot(s);
             let changed = next != *s;
             *s = next;
             changed
         }
-        Value::Array(items) => items.iter_mut().fold(false, |c, i| walk(i, r) | c),
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |c, i| walk(i, text, json, Form::Text, parent) | c),
         Value::Object(m) => m
             .iter_mut()
             .filter(|(k, _)| !UNTOUCHED.contains(&k.as_str()))
-            .fold(false, |c, (_, i)| walk(i, r) | c),
+            .fold(false, |c, (k, i)| {
+                let form = if json_text(k, parent, i) {
+                    Form::Json
+                } else {
+                    Form::Text
+                };
+                walk(i, text, json, form, Some(k)) | c
+            }),
         _ => false,
     }
 }
@@ -318,6 +393,10 @@ fn fields(d: Dialect, v: &Value) -> Vec<Field> {
             }),
             Some("response.function_call_arguments.delta") => out.push(Field {
                 lane: Lane::Args(u(v, "output_index")),
+                path: vec![Key("delta")],
+            }),
+            Some("response.custom_tool_call_input.delta") => out.push(Field {
+                lane: Lane::Input(u(v, "output_index")),
                 path: vec![Key("delta")],
             }),
             _ => {}
@@ -395,6 +474,9 @@ fn close(d: Dialect, v: &Value) -> Close {
             Some("response.function_call_arguments.done") => {
                 Close::Lanes(vec![Lane::Args(u(v, "output_index"))])
             }
+            Some("response.custom_tool_call_input.done") => {
+                Close::Lanes(vec![Lane::Input(u(v, "output_index"))])
+            }
             Some("response.output_item.done") => Close::Output(u(v, "output_index")),
             Some("response.completed")
             | Some("response.incomplete")
@@ -438,6 +520,16 @@ fn synth(d: Dialect, lane: Lane, last: &Value, tail: String) -> Synth {
         m
     };
     match (d, lane) {
+        // 只有 Responses 有这一路（见 `fields`）
+        (_, Lane::Input(oi)) => Synth {
+            event: Some("response.custom_tool_call_input.delta".into()),
+            data: json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": last.get("item_id").cloned().unwrap_or(Value::Null),
+                "output_index": oi,
+                "delta": tail,
+            }),
+        },
         (Dialect::Anthropic, Lane::Text(i)) => Synth {
             event: Some("content_block_delta".into()),
             data: json!({
@@ -456,10 +548,10 @@ fn synth(d: Dialect, lane: Lane, last: &Value, tail: String) -> Synth {
         },
         (Dialect::Chat, lane) => {
             let delta = match lane {
-                Lane::Text(_) => json!({ "content": tail }),
                 Lane::Args(i) => json!({
                     "tool_calls": [{ "index": i, "function": { "arguments": tail } }],
                 }),
+                Lane::Text(_) | Lane::Input(_) => json!({ "content": tail }),
             };
             let mut m = copy(&["id", "object", "created", "model", "system_fingerprint"]);
             m.insert(
@@ -1003,8 +1095,8 @@ mod tests {
 
     #[test]
     fn what_gets_replaced_never_carries_a_quote_so_restoring_keeps_json_valid() {
-        // 整包响应原样放回、不转义，靠的就是这一条：一条跨过引号的自定义规则，
-        // 换下来的那段止于引号之前
+        // 一条跨过引号的自定义规则，换下来的那段止于引号之前：整包响应放回去和发来的
+        // 逐字节相同
         let rules = RuleSet::none().with_custom("q", r#"id=\S+"#).unwrap();
         let body = r#"{"text":"id=abc\"x"}"#;
         let r = redact(body, &rules, Ledger::new(Scheme::SECRET));
@@ -1110,5 +1202,316 @@ mod tests {
         let out = run(Dialect::Bedrock, &frames);
         assert!(out.contains("<<TW_SECRET_1>>"), "{out}");
         assert!(!out.contains(KEY), "{out}");
+    }
+
+    const PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+
+    /// 请求体里写着一个私钥块（换行是 `\n` 两个字符）换下来的账
+    fn pem_ledger() -> Ledger {
+        let body = json!({ "input": format!("部署用这把 {PEM}") }).to_string();
+        let r = redact(
+            &body,
+            &RuleSet::only(&["private-key"]),
+            Ledger::new(Scheme::SECRET),
+        );
+        assert!(r.text.contains("<<TW_SECRET_1>>"), "{}", r.text);
+        r.ledger
+    }
+
+    fn run_with(l: &Ledger, d: Dialect, frames: &[String]) -> String {
+        let mut r = SseRestorer::new(l, d);
+        let mut raw = Vec::new();
+        for f in frames {
+            raw.extend_from_slice(&r.process(f.as_bytes()));
+        }
+        raw.extend_from_slice(&r.flush());
+        String::from_utf8(raw).unwrap()
+    }
+
+    fn joined(out: &str, t: &str, key: &str) -> String {
+        values(out)
+            .iter()
+            .filter(|v| v["type"] == t)
+            .filter_map(|v| v[key].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn a_private_key_echoed_in_streamed_text_comes_back_with_real_newlines() {
+        // 以前放进正文的是请求体里的写法：客户端看到的是一个反斜杠和一个 n
+        let l = pem_ledger();
+        let ev = |delta: &str| {
+            named(
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":delta}),
+            )
+        };
+        let frames = vec![ev("钥匙是 <<TW_SE"), ev("CRET_1>>"), ev(" 对吗")];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        assert_eq!(
+            joined(&out, "response.output_text.delta", "delta"),
+            format!("钥匙是 {PEM} 对吗")
+        );
+        // Anthropic 的正文同样
+        let frames: Vec<String> = ["<<TW_SECRET", "_1>>"].iter().map(|t| delta(t)).collect();
+        let out = run_with(&l, Dialect::Anthropic, &frames);
+        assert_eq!(blocks(&out)[&0].0, PEM);
+    }
+
+    #[test]
+    fn a_private_key_echoed_in_tool_arguments_parses_back_to_real_newlines() {
+        // 参数解码之后还是一段 JSON：原值转义一次再放，客户端解析参数拿到的是真的换行
+        let l = pem_ledger();
+        let ev = |t: &str, v: Value| named(t, v);
+        let frames = vec![
+            ev(
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"f1","output_index":1,"delta":"{\"pem\":\"<<TW_SE"}),
+            ),
+            ev(
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"f1","output_index":1,"delta":"CRET_1>>\"}"}),
+            ),
+            ev(
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"f1","output_index":1,"arguments":"{\"pem\":\"<<TW_SECRET_1>>\"}"}),
+            ),
+            ev(
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"f1","call_id":"c1","name":"write","arguments":"{\"pem\":\"<<TW_SECRET_1>>\"}"}}),
+            ),
+        ];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        let pem_of = |args: &str| -> String {
+            let v: Value = serde_json::from_str(args).expect("arguments are still JSON");
+            v["pem"].as_str().unwrap().to_string()
+        };
+        assert_eq!(
+            pem_of(&joined(
+                &out,
+                "response.function_call_arguments.delta",
+                "delta"
+            )),
+            PEM
+        );
+        assert_eq!(
+            pem_of(&joined(
+                &out,
+                "response.function_call_arguments.done",
+                "arguments"
+            )),
+            PEM
+        );
+        let item = values(&out)
+            .into_iter()
+            .find(|v| v["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(pem_of(item["item"]["arguments"].as_str().unwrap()), PEM);
+
+        // Chat 的参数、Anthropic 的 partial_json 同样
+        let frames = vec![
+            chat(
+                json!({"tool_calls":[{"index":0,"id":"t","function":{"name":"write","arguments":"{\"pem\":\"<<TW_SECRET_1>>"}}]}),
+                Value::Null,
+            ),
+            chat(
+                json!({"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}),
+                Value::Null,
+            ),
+            chat(json!({}), json!("tool_calls")),
+        ];
+        let out = run_with(&l, Dialect::Chat, &frames);
+        let args: String = values(&out)
+            .iter()
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(pem_of(&args), PEM);
+        let frames: Vec<String> = [r#"{"pem":"<<TW_SE"#, r#"CRET_1>>"}"#]
+            .iter()
+            .map(|s| args_at(1, s))
+            .collect();
+        let out = run_with(&l, Dialect::Anthropic, &frames);
+        assert_eq!(pem_of(&blocks(&out)[&1].1), PEM);
+    }
+
+    #[test]
+    fn a_whole_json_answer_gets_the_key_escaped_exactly_once() {
+        let l = pem_ledger();
+        let body =
+            json!({"choices":[{"message":{"content":"钥匙是 <<TW_SECRET_1>>"}}]}).to_string();
+        let mut b = Body::new(&l, false, Dialect::Chat);
+        let mut out = b.process(body.as_bytes());
+        out.extend(b.flush());
+        let v: Value = serde_json::from_slice(&out).expect("still JSON");
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            format!("钥匙是 {PEM}")
+        );
+    }
+
+    fn custom(t: &str, v: Value) -> String {
+        named(t, v)
+    }
+
+    fn input_delta(d: &str) -> String {
+        custom(
+            "response.custom_tool_call_input.delta",
+            json!({"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","output_index":2,"delta":d}),
+        )
+    }
+
+    #[test]
+    fn a_custom_tool_input_gets_a_split_placeholder_back() {
+        // Codex 的 `apply_patch` 输入走这一路：不还原的话，补丁里写进文件的是占位符
+        let l = pem_ledger();
+        let frames = vec![
+            input_delta("*** Begin Patch\n+key = \"\"\"<<TW_"),
+            input_delta("SECRET"),
+            input_delta("_1>>\"\"\"\n*** End Patch"),
+            custom(
+                "response.custom_tool_call_input.done",
+                json!({"type":"response.custom_tool_call_input.done","item_id":"ctc_1","output_index":2,"input":"*** Begin Patch\n+key = \"\"\"<<TW_SECRET_1>>\"\"\"\n*** End Patch"}),
+            ),
+            custom(
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":2,"item":{"type":"custom_tool_call","id":"ctc_1","call_id":"c2","name":"apply_patch","input":"+<<TW_SECRET_1>>"}}),
+            ),
+        ];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        // 输入是一段话：真的换行
+        let want = format!("*** Begin Patch\n+key = \"\"\"{PEM}\"\"\"\n*** End Patch");
+        assert_eq!(
+            joined(&out, "response.custom_tool_call_input.delta", "delta"),
+            want
+        );
+        assert_eq!(
+            joined(&out, "response.custom_tool_call_input.done", "input"),
+            want
+        );
+        let item = values(&out)
+            .into_iter()
+            .find(|v| v["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(item["item"]["input"], format!("+{PEM}"));
+        assert!(!out.contains("<<TW_SECRET_1>>"), "{out}");
+    }
+
+    #[test]
+    fn a_custom_tool_input_tail_is_flushed_as_a_custom_tool_input_delta() {
+        // 扣住的尾巴补成这一路自己的事件：补成函数参数的增量，Codex 会把它接到别处去
+        for end in [
+            "response.custom_tool_call_input.done",
+            "response.output_item.done",
+        ] {
+            let frames = vec![
+                input_delta("+key = <<TW_SEC"),
+                custom(
+                    end,
+                    json!({"type":end,"item_id":"ctc_1","output_index":2,"input":"+key = <<TW_SEC"}),
+                ),
+            ];
+            let out = run(Dialect::Responses, &frames);
+            assert_eq!(
+                joined(&out, "response.custom_tool_call_input.delta", "delta"),
+                "+key = <<TW_SEC",
+                "{end}"
+            );
+            assert!(!out.contains("function_call_arguments"), "{out}");
+            let vs = values(&out);
+            let synth = vs
+                .iter()
+                .position(|v| {
+                    v["type"] == "response.custom_tool_call_input.delta" && v["delta"] == "<<TW_SEC"
+                })
+                .expect("the held tail is sent");
+            assert_eq!(vs[synth]["item_id"], "ctc_1");
+            assert_eq!(vs[synth]["output_index"], 2);
+            let done = vs.iter().position(|v| v["type"] == end).unwrap();
+            assert!(synth < done, "{out}");
+        }
+        // 流断在半截：一样补成这一路的增量
+        let out = run(Dialect::Responses, &[input_delta("+<<TW_SECRET_")]);
+        assert_eq!(
+            joined(&out, "response.custom_tool_call_input.delta", "delta"),
+            "+<<TW_SECRET_"
+        );
+    }
+
+    #[test]
+    fn a_whole_placeholder_in_one_argument_delta_is_escaped_for_the_arguments() {
+        // 一个增量里整个占位符都在：片段看不出是 JSON，交给参数那一路，不按正文放
+        let l = pem_ledger();
+        let ev = |d: &str| {
+            named(
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"f1","output_index":1,"delta":d}),
+            )
+        };
+        let frames = vec![ev("{\"pem\":"), ev("\"<<TW_SECRET_1>>\""), ev("}")];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        let args = joined(&out, "response.function_call_arguments.delta", "delta");
+        let v: Value = serde_json::from_str(&args).expect("arguments are still JSON");
+        assert_eq!(v["pem"], PEM);
+        // 工具自己的参数里叫 `arguments` 的字段放的是一句话：整帧里按正文放
+        let frames = vec![named(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"<<TW_SECRET_1>>"}],"arguments":"照 <<TW_SECRET_1>>"}}),
+        )];
+        let out = run_with(&l, Dialect::Responses, &frames);
+        let v = &values(&out)[0]["item"];
+        assert_eq!(v["content"][0]["text"], PEM);
+        assert_eq!(v["arguments"], format!("照 {PEM}"));
+    }
+
+    #[test]
+    fn nested_arguments_stream_back_like_the_whole_answer_restores_them() {
+        // 工具的参数里又有个放 JSON 的 `arguments`：流式按路还原和整份还原转义的层数一样
+        let l = pem_ledger();
+        let args = json!({
+            "tool": "write_file",
+            "arguments": json!({ "content": "<<TW_SECRET_1>>" }).to_string(),
+        })
+        .to_string();
+        let whole = json!({"arguments": args}).to_string();
+        let whole: Value =
+            serde_json::from_str(&crate::redact::replace::restore(&whole, &l)).unwrap();
+        let whole = whole["arguments"].as_str().unwrap().to_string();
+        for size in [1, 3, 7, 16] {
+            let pieces: Vec<String> = args
+                .as_bytes()
+                .chunks(size)
+                .map(|c| String::from_utf8(c.to_vec()).unwrap())
+                .collect();
+            let mut frames: Vec<String> = pieces
+                .iter()
+                .map(|p| {
+                    chat(
+                        json!({"tool_calls":[{"index":0,"function":{"arguments":p}}]}),
+                        Value::Null,
+                    )
+                })
+                .collect();
+            frames.push(chat(json!({}), json!("tool_calls")));
+            let out = run_with(&l, Dialect::Chat, &frames);
+            let streamed: String = values(&out)
+                .iter()
+                .filter_map(|v| {
+                    v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+                })
+                .collect();
+            assert_eq!(streamed, whole, "{size}");
+            // 整帧里的完整参数（`.done`）也一样
+            let done = named(
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"f1","output_index":1,"arguments":args}),
+            );
+            let out = run_with(&l, Dialect::Responses, &[done]);
+            assert_eq!(values(&out)[0]["arguments"], whole);
+        }
+        let v: Value = serde_json::from_str(&whole).unwrap();
+        let inner: Value = serde_json::from_str(v["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["content"], PEM);
     }
 }

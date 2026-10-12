@@ -351,6 +351,53 @@ fn contexts_mask_every_other_secret_they_reach() {
     }
 }
 
+/// 客户端用别的写法转义（Python 把 `é` 写成 `\u00e9`）：前后文里照样是上游收到的占位符，
+/// 不是打码的样子；报出去的那一项也说得出它的占位符
+#[test]
+fn a_value_written_with_other_escapes_shows_its_placeholder() {
+    let text = format!(
+        r#"{{"messages":[{{"role":"user","content":"first {KEY} and postgres://app:hunter\u00e9hunter@db/x end"}}]}}"#
+    );
+    let rules = RuleSet::defaults();
+    let look = crate::guard::look_hits(Mode::Enforce, &rules, text.as_bytes());
+    let hits = look.hits.unwrap_or_default();
+    let redaction = Redaction {
+        rules: Arc::new(rules),
+        ledger: look.ledger,
+    };
+    let seen = Seen {
+        body: text.as_bytes(),
+        dialect: Some(Dialect::Anthropic),
+        hits: &hits,
+        redaction: &redaction,
+        replaced: true,
+    };
+    let d = secrets(&seen, &look.found);
+    assert_eq!(d.len(), 2, "{d:#?}");
+    let key = d
+        .iter()
+        .find(|x| x.rule_snapshot.id == "anthropic-api-key")
+        .unwrap();
+    assert_eq!(
+        key.locations[0].after,
+        " and postgres://app:<<TW_SECRET_2>>@db/x end"
+    );
+    let pw = d
+        .iter()
+        .find(|x| x.rule_snapshot.id == "conn-string-password")
+        .unwrap();
+    assert_eq!(
+        pw.outcome_detail,
+        OutcomeDetail::Replaced {
+            placeholders: vec!["<<TW_SECRET_2>>".into()]
+        }
+    );
+    assert_eq!(
+        pw.locations[0].before,
+        "first <<TW_SECRET_1>> and postgres://app:"
+    );
+}
+
 /// 一段很长的正文：前后文只取 80 个字符，截之前先打码 —— 截口落在一把密钥中间也只截出
 /// 半个打过码的样子
 #[test]
@@ -705,6 +752,32 @@ fn a_replaced_value_names_its_placeholder_and_an_observed_one_does_not() {
         d.iter()
             .all(|x| x.outcome_detail == OutcomeDetail::Recorded {})
     );
+}
+
+#[test]
+fn a_value_written_with_escapes_still_names_its_placeholder() {
+    // 私钥块在请求体里写着 `\n`，账里记的是解开的样子：按原文截下来的值也要找得到它的号
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+    let body = json!({"messages": [{"role": "user", "content": format!("{KEY}\n{pem}")}]});
+    let d = redacted(
+        Mode::Enforce,
+        Some(Dialect::Anthropic),
+        &body,
+        RuleSet::defaults(),
+    );
+    let placeholders: Vec<OutcomeDetail> = d.iter().map(|x| x.outcome_detail.clone()).collect();
+    assert_eq!(
+        placeholders,
+        [
+            OutcomeDetail::Replaced {
+                placeholders: vec!["<<TW_SECRET_1>>".into()]
+            },
+            OutcomeDetail::Replaced {
+                placeholders: vec!["<<TW_SECRET_2>>".into()]
+            }
+        ]
+    );
+    no_leak(&d, &["MIIBOgIBAAJBAKj34Gkx"]);
 }
 
 #[test]

@@ -179,8 +179,12 @@ fn redact(p: &RedactPolicy, req: &TrialRequest) -> Result<TrialResult, TrialErro
     // **按它在请求体里的样子找**，结论才和真的请求一致
     let hits = crate::redact::flow::hits_plain(sample, &rules);
     let output = (!hits.is_empty()).then(|| {
-        crate::redact::replace::apply(sample, &hits, Ledger::new(Scheme::SECRET).avoiding(sample))
-            .text
+        crate::redact::replace::apply_text(
+            sample,
+            &hits,
+            Ledger::new(Scheme::SECRET).avoiding(sample),
+        )
+        .text
     });
     Ok(TrialResult {
         hits: hits
@@ -406,6 +410,22 @@ mod tests {
         // 什么都没找到：没有发出去的样子可言
         let none = run(Guard::Redact, &s, &req("nothing here")).unwrap();
         assert!(none.hits.is_empty() && none.output.is_none());
+    }
+
+    #[test]
+    fn a_backslash_typed_into_the_sample_is_not_read_as_an_escape() {
+        // 贴进来的是正文：`p\u0041` 就是这六个字，和 `pA` 是两个口令，各占一个号
+        let s = Security::default();
+        let r = run(
+            Guard::Redact,
+            &s,
+            &req(r"postgres://u:p\u0041@h 和 postgres://u:pA@h"),
+        )
+        .unwrap();
+        assert_eq!(
+            r.output.as_deref(),
+            Some("postgres://u:<<TW_SECRET_1>>@h 和 postgres://u:<<TW_SECRET_2>>@h")
+        );
     }
 
     #[test]

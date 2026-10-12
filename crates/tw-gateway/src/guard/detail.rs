@@ -151,7 +151,7 @@ impl Source<'_> {
     }
 
     /// 一段原文打过码、解开转义之后的样子
-    fn show(&self, red: &Redaction, sent: &HashMap<&str, &str>, range: Range<usize>) -> String {
+    fn show(&self, red: &Redaction, sent: &crate::bodies::Sent<'_>, range: Range<usize>) -> String {
         let piece = red.piece(self.text, range, self.hits, sent);
         match &self.lit {
             Some(_) => locate::unescape(&piece),
@@ -165,7 +165,7 @@ impl Source<'_> {
         &self,
         m: Range<usize>,
         red: &Redaction,
-        sent: &HashMap<&str, &str>,
+        sent: &crate::bodies::Sent<'_>,
         matched: Option<String>,
         draw: &dyn Fn(&str) -> String,
     ) -> Excerpt {
@@ -416,7 +416,8 @@ fn secret_detail(
     let outcome_detail = if seen.replaced {
         OutcomeDetail::Replaced {
             placeholders: value
-                .and_then(|v| seen.redaction.ledger.placeholder_of(v))
+                // 账里记的是解开转义之后的样子，`v` 是请求体原文里截下来的
+                .and_then(|v| seen.redaction.ledger.placeholder_of(&locate::unescape(v)))
                 .map(str::to_string)
                 .into_iter()
                 .collect(),
