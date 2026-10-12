@@ -486,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             decl_of(&ts, "RuleAction"),
-            "export type RuleAction = \"cut\" | \"block\" | \"strip\" | \"record\""
+            "export type RuleAction = \"placeholder\" | \"cut\" | \"block\" | \"strip\" | \"replace\" | \"record\""
         );
         assert_eq!(
             decl_of(&ts, "ContentMatch"),
@@ -494,7 +494,7 @@ mod tests {
         );
         assert_eq!(
             decl_of(&ts, "ContentOutcome"),
-            "export type ContentOutcome = \"recorded\" | \"stripped\" | \"blocked\""
+            "export type ContentOutcome = \"recorded\" | \"stripped\" | \"replaced\" | \"blocked\""
         );
         assert_eq!(
             decl_of(&ts, "SecurityOutcome"),
@@ -512,9 +512,34 @@ mod tests {
             "why?: string",
             "action?: RuleAction",
             "matcher: Matcher",
+            "scope?: Array<ContentScope>",
+            "replacement?: string",
         ] {
             assert!(rule.contains(field), "{field}: {rule}");
         }
+        assert_eq!(
+            decl_of(&ts, "ContentScope"),
+            "export type ContentScope = \"request\" | \"response\""
+        );
+        let save = decl_of(&ts, "CustomRuleSave");
+        for field in [
+            "scope?: Array<ContentScope>",
+            "replacement?: string",
+            "case_sensitive?: boolean",
+        ] {
+            assert!(save.contains(field), "{field}: {save}");
+        }
+        let toggle = decl_of(&ts, "RulesToggle");
+        for field in [
+            "builtin: Array<string>",
+            "custom: Array<string>",
+            "enabled: boolean",
+        ] {
+            assert!(toggle.contains(field), "{field}: {toggle}");
+        }
+        assert!(ts.contains(
+            "  SetRulesEnabled: { method: \"PUT\", path: \"/security/{guard}/rules/enabled\", params: [\"guard\"], format: \"json\" },"
+        ));
         let matcher = decl_of(&ts, "Matcher");
         for kind in [
             "\"kind\": \"codepoints\", ranges: Array<string>",
@@ -531,6 +556,8 @@ mod tests {
             "match?: ContentMatch",
             "label?: string",
             "action?: RuleAction",
+            "scope?: ContentScope",
+            "replacement?: string",
         ] {
             assert!(req.contains(field), "{field}: {req}");
         }
@@ -563,7 +590,7 @@ mod tests {
         let outcome = decl_of(&ts, "OutcomeDetail");
         for shape in [
             "{ \"action\": \"recorded\", }",
-            "{ \"action\": \"replaced\", placeholders: Array<string>, }",
+            "{ \"action\": \"replaced\", placeholders: Array<string>, segments?: number, replacement?: string, }",
             "{ \"action\": \"stripped\", segments: number, }",
         ] {
             assert!(outcome.contains(shape), "{shape}: {outcome}");
@@ -574,11 +601,14 @@ mod tests {
         }
         let event = decl_of(&ts, "Event");
         assert!(event.contains("outcome: ContentOutcome"), "{event}");
+        assert!(event.contains("direction: SecurityDirection"), "{event}");
+        assert!(decl_of(&ts, "SecretItem").contains("replaced: boolean"));
         assert!(!event.contains("hidden_text_found") && !event.contains("output_limited"));
         assert!(!ts.contains("SetSecurityLimit") && !ts.contains("OutputLimitDetail"));
         assert!(!ts.contains("HiddenKind") && !ts.contains("HiddenItem"));
         let counts = decl_of(&ts, "SecurityCounts");
         assert!(counts.contains("content_stripped: number"), "{counts}");
+        assert!(counts.contains("content_replaced: number"), "{counts}");
         assert!(
             !counts.contains("hidden_text") && !counts.contains("output_limit"),
             "{counts}"

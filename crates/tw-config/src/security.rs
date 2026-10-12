@@ -12,8 +12,9 @@
 //! 住在这里白捡了变更历史和一键回滚。
 
 pub use tw_guard::policy::{
-    ContentAction, ContentMatch, ContentPolicy, CustomContentRule, CustomRedactRule,
-    CustomToolRule, Mode, PolicyError, RedactPolicy, Security, ToolAction, ToolPolicy,
+    ContentAction, ContentMatch, ContentPolicy, ContentScope, CustomContentRule, CustomRedactRule,
+    CustomToolRule, Mode, PolicyError, RedactAction, RedactPolicy, Security, ToolAction,
+    ToolPolicy,
 };
 use tw_types::{Msg, msg};
 
@@ -52,6 +53,20 @@ pub fn policy_msg(e: &PolicyError) -> Msg {
             "config.rule_match_bad", name = name.clone(), matching = matching.slug() =>
             "custom redaction rule `{name}` matches by `{matching}`; redaction rules match by \
              contains or regex"
+        ),
+        PolicyError::EmptyScope { name } => msg!(
+            "config.rule_scope_empty", name = name.clone() =>
+            "custom content rule `{name}` checks neither requests nor answers; its scope is empty"
+        ),
+        PolicyError::BlockInAnswer { name } => msg!(
+            "config.rule_scope_block", name = name.clone() =>
+            "custom content rule `{name}` checks answers and blocks; an answer is already on its \
+             way when a match is found, so a rule that checks answers strips, replaces or records"
+        ),
+        PolicyError::CodepointsInAnswer { name } => msg!(
+            "config.rule_scope_codepoints", name = name.clone() =>
+            "custom content rule `{name}` checks answers and matches by codepoints; code points are \
+             checked in requests only"
         ),
         PolicyError::UnknownRule { guard, id } => msg!(
             "config.unknown_rule", guard = guard.slug(), rule = id.clone() =>
@@ -110,6 +125,18 @@ mod tests {
                 "config.rule_label_bad",
             ),
             ("content:\n  disable: [jailbrake]", "config.unknown_rule"),
+            (
+                "content:\n  custom:\n    - { name: a, pattern: x, scope: [] }",
+                "config.rule_scope_empty",
+            ),
+            (
+                "content:\n  custom:\n    - { name: a, pattern: x, scope: [response], action: block }",
+                "config.rule_scope_block",
+            ),
+            (
+                "content:\n  custom:\n    - { name: a, pattern: 'U+200B', match: codepoints, scope: [response] }",
+                "config.rule_scope_codepoints",
+            ),
         ];
         for (yaml, code) in errors {
             let e = serde_yaml_ng::from_str::<Security>(yaml)

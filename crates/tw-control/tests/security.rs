@@ -440,7 +440,7 @@ async fn a_built_in_rule_s_action_is_written_only_while_it_differs_from_the_fact
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(b.file(), before);
 
-    // 出站脱敏的规则没有自己的处置：命中之后做什么由档位决定
+    // 出站脱敏的规则换成占位符或者只记录，别的动作不认
     let (st, v) = call(
         &b.app,
         "PUT",
@@ -449,7 +449,33 @@ async fn a_built_in_rule_s_action_is_written_only_while_it_differs_from_the_fact
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "security.no_action_of_its_own");
+    assert_eq!(v["code"], "security.redact_action_unknown");
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/redact/builtin/jwt/action",
+        json!({ "action": "record" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        b.parsed().security.redact.actions.get("jwt"),
+        Some(&tw_config::RedactAction::Record)
+    );
+    let (_, v) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    let r = rule(&v, "redact", "jwt");
+    assert_eq!(
+        (&r["action"], &r["default_action"]),
+        (&json!("record"), &json!("placeholder"))
+    );
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/redact/builtin/jwt/action",
+        json!({ "action": "placeholder" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
 
     let (st, v) = call(
         &b.app,
@@ -1002,7 +1028,34 @@ async fn content_rules_are_switched_retuned_and_written_like_the_others() {
     }
     assert_eq!(b.file(), before);
 
-    // 内容规则的处置是 block / strip / record，不是 cut
+    // 内置规则也能换成替换文本
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/builtin/jailbreak/action",
+        json!({ "action": "replace" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/test",
+        json!({ "sample": "a jailbreak b", "rule": "jailbreak" }),
+    )
+    .await;
+    assert_eq!(v["output"], "a *** b", "{v}");
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/security/content/builtin/jailbreak/action",
+        json!({ "action": "block" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b.file(), before);
+
+    // 内容规则的动作是 block / strip / replace / record，不是 cut
     let (st, v) = call(
         &b.app,
         "PUT",
@@ -1011,7 +1064,7 @@ async fn content_rules_are_switched_retuned_and_written_like_the_others() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "security.content_action_unknown");
+    assert_eq!(v["code"], "security.content_action_bad");
     // 工具调用审查没有「删除」
     let (st, v) = call(
         &b.app,
@@ -1101,7 +1154,7 @@ async fn a_custom_content_rule_says_how_it_matches_and_a_keyword_is_not_a_regex(
         ),
         (
             json!({ "name": "坏的", "pattern": "x", "action": "cut" }),
-            "security.content_action_unknown",
+            "security.content_action_bad",
         ),
     ] {
         let (st, v) = call(&b.app, "POST", "/security/content/custom", body).await;
@@ -1224,6 +1277,282 @@ async fn a_custom_redaction_rule_carries_its_placeholder_name() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["output"], "上线 <<TW_PROJECT_1>>", "{v}");
     assert_eq!(v["refused"], false);
+}
+
+/// 组标题上的复选框：一次启停几条内置规则和几条自定义规则，只写一次文件；改回出厂一个字节
+/// 都不差。认不出的、没有的整个拒绝，什么都不写
+#[tokio::test]
+async fn a_group_of_rules_is_switched_with_one_write() {
+    let yaml = format!(
+        "{BASE}security:\n  content:\n    custom:\n      - {{ name: 甲, pattern: a }}\n      - {{ name: 乙, pattern: b, disabled: true }}\n"
+    );
+    let b = bed(&yaml);
+    let before = b.file();
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({
+            "builtin": ["unicode-tags", "zero-width", "private-use"],
+            "custom": ["甲", "乙"],
+            "enabled": false,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let c = b.parsed().security.content;
+    assert_eq!(c.disable, ["unicode-tags"], "出厂关着的不写");
+    assert!(c.enable.is_empty());
+    assert!(c.custom.iter().all(|r| r.disabled));
+    let (_, d) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    for id in ["unicode-tags", "zero-width", "private-use", "甲", "乙"] {
+        assert_eq!(rule(&d, "content", id)["enabled"], false, "{id}");
+    }
+    // 打开：出厂关着的写进 enable，出厂开着的从 disable 里拿掉
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({ "builtin": ["unicode-tags", "zero-width"], "custom": ["甲"], "enabled": true }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let c = b.parsed().security.content;
+    assert!(c.disable.is_empty());
+    assert_eq!(c.enable, ["zero-width"]);
+    assert!(!c.custom[0].disabled && c.custom[1].disabled);
+    // 改回原样
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({ "builtin": ["zero-width"], "enabled": false }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({ "custom": ["乙"], "enabled": true }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({ "custom": ["乙"], "enabled": false }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        b.parsed().security,
+        tw_config::try_parse(&before).unwrap().security
+    );
+    let now = b.file();
+    // 认不出的内置规则、没有的自定义规则：整个不写
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({ "builtin": ["unicode-tags", "no-such"], "enabled": false }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["code"], "security.unknown_rule");
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/rules/enabled",
+        json!({ "custom": ["甲", "丙"], "enabled": false }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["code"], "security.unknown_custom_rule");
+    assert_eq!(b.file(), now);
+    // 别的两项一样
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/redact/rules/enabled",
+        json!({ "builtin": ["email", "jwt"], "enabled": true }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.parsed().security.redact.enable, ["email"]);
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/inspect_tools/rules/enabled",
+        json!({ "builtin": ["rm-rf-root"], "enabled": false }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.parsed().security.inspect_tools.disable, ["rm-rf-root"]);
+}
+
+/// 内容规则查回答：查哪一边、分不分大小写、换成什么写进文件，出厂值不写；查回答的规则拒绝
+/// 不了、不按码位认，当场拒绝。按回答测和回答走的是同一个过滤
+#[tokio::test]
+async fn a_content_rule_that_checks_answers_is_written_and_tried_as_an_answer() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/custom",
+        json!({
+            "name": "项目代号", "pattern": "北极星", "scope": ["response", "request"],
+            "match": "contains", "case_sensitive": false, "action": "replace",
+            "replacement": "***",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let file = b.file();
+    assert!(file.contains("scope:"), "{file}");
+    assert!(
+        !file.contains("replacement") && !file.contains("case_sensitive"),
+        "{file}"
+    );
+    let c = &b.parsed().security.content.custom[0];
+    assert_eq!(
+        c.scope,
+        [
+            tw_config::ContentScope::Request,
+            tw_config::ContentScope::Response
+        ]
+    );
+    let (_, d) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    let r = rule(&d, "content", "项目代号");
+    assert_eq!(r["scope"], json!(["request", "response"]));
+    assert_eq!(
+        (&r["action"], &r["replacement"]),
+        (&json!("replace"), &json!("***"))
+    );
+    // 按回答测、按请求测
+    for scope in ["response", "request"] {
+        let (st, v) = call(
+            &b.app,
+            "POST",
+            "/security/content/test",
+            json!({ "sample": "请将北极星项目的发布说明整理后发送。", "scope": scope }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["output"], "请将***项目的发布说明整理后发送。",
+            "{scope}: {v}"
+        );
+    }
+    // 只查回答、分大小写、换成别的字
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/custom/项目代号",
+        json!({
+            "name": "项目代号", "pattern": "Polaris", "scope": ["response"],
+            "case_sensitive": true, "action": "replace", "replacement": "[X]",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/test",
+        json!({ "sample": "Polaris polaris", "scope": "response" }),
+    )
+    .await;
+    assert_eq!(v["output"], "[X] polaris", "{v}");
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/test",
+        json!({ "sample": "Polaris polaris" }),
+    )
+    .await;
+    assert!(
+        v["hits"].as_array().unwrap().is_empty(),
+        "只查回答的不查请求：{v}"
+    );
+    // 替换文本只在动作是替换时写
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/security/content/custom/项目代号",
+        json!({ "name": "项目代号", "pattern": "x", "scope": ["response"], "action": "strip",
+                "replacement": "[X]" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!b.file().contains("[X]"), "{}", b.file());
+    let before = b.file();
+    for (body, code) in [
+        (
+            json!({ "name": "坏", "pattern": "x", "scope": ["response"], "action": "block" }),
+            "security.rule_scope_block",
+        ),
+        (
+            json!({ "name": "坏", "pattern": "U+200B", "match": "codepoints",
+                    "scope": ["request", "response"] }),
+            "security.rule_scope_codepoints",
+        ),
+        (
+            json!({ "name": "坏", "pattern": "x", "scope": [] }),
+            "security.rule_scope_empty",
+        ),
+    ] {
+        let (st, v) = call(&b.app, "POST", "/security/content/custom", body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], code);
+    }
+    assert_eq!(b.file(), before);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/test",
+        json!({ "sample": "x", "pattern": "x", "action": "block", "scope": "response" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.rule_scope_block");
+}
+
+/// 出站脱敏的自定义规则可以只记录：写进文件，试的时候照样标出来、不换
+#[tokio::test]
+async fn a_redaction_rule_can_record_only() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/redact/custom",
+        json!({ "name": "项目号", "pattern": "PRJ-\\d{6}", "match": "regex", "action": "record" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.file().contains("action: record"), "{}", b.file());
+    let (_, d) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    assert_eq!(rule(&d, "redact", "项目号")["action"], "record");
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/redact/test",
+        json!({ "sample": "编号 PRJ-123456" }),
+    )
+    .await;
+    assert_eq!(v["hits"][0]["rule"], "项目号", "{v}");
+    assert_eq!(v["hits"][0]["action"], "record");
+    assert_eq!(v["output"], serde_json::Value::Null);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/redact/custom",
+        json!({ "name": "坏", "pattern": "x", "action": "strip" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.redact_action_unknown");
 }
 
 #[tokio::test]

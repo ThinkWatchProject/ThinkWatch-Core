@@ -1,35 +1,49 @@
-//! 内容过滤：调用方发来的正文里出现了某个词、某种写法，或者某些字符。
+//! 内容过滤：调用方发来的正文里、或者模型回答的正文里出现了某个词、某种写法，或者某些字符。
 //!
 //! **引擎在这里，规则从哪来、命中之后怎么记由各自决定。**企业版的规则存在系统设置里，
 //! 桌面版的写在 `config.yaml`，形状都是 [`crate::policy::ContentPolicy`]；两边共用的是
-//! 「怎么匹配、查哪些正文、命中了怎么说、怎么删」，和一份出厂的规则（[`builtins`]，
+//! 「怎么匹配、查哪些正文、命中了怎么说、怎么删、怎么换」，和一份出厂的规则（[`builtins`]，
 //! `data/content.yaml`）。
 //!
 //! # 查哪些正文
 //!
-//! 调用方的消息，**连同其中的工具结果** —— 被注入的指令最常待的地方正是那里：
-//! 一个工具抓回来的网页、读到的文件。系统提示（配置网关的人写的）和模型自己说的
-//! 话不查。请求上的入口是 [`screen`]，它在原文上找这些正文（[`tw_dialect::caller`]），
-//! 删也删在原文上。
+//! 每条规则说它查哪一边（[`Sides`]）。
+//!
+//! 请求这一边查调用方的消息，**连同其中的工具结果** —— 被注入的指令最常待的地方正是那里：
+//! 一个工具抓回来的网页、读到的文件。系统提示（配置网关的人写的）和模型以前说的话不查。
+//! 请求上的入口是 [`screen`]，它在原文上找这些正文（[`tw_dialect::caller`]），删、换也在
+//! 原文上。
+//!
+//! 回答这一边查模型回答的正文：客户端看得到的文字，连同 Codex 自由格式工具的输入；工具调用
+//! 归工具调用审查，思考过程带着签名、改一个字下一轮就被上游拒绝，都不查。入口是
+//! [`answer`]：流着的回答只扣住可能还会长成一处命中的那一截尾巴，不攒整份回答。
 //!
 //! # 三种匹配
 //!
-//! - `contains`：不分大小写的子串。写起来最省事，也最不容易写错；
-//! - `regex`：不分大小写的正则，**编译后的大小有上限** —— 这条正则要在每个请求上
-//!   跑，一条病态写法不该拖慢所有请求；
+//! - `contains`：子串，按原样找（`.`、`*` 没有特殊含义）。写起来最省事，也最不容易写错；
+//! - `regex`：正则，**编译后的大小有上限** —— 这条正则要在每个请求上跑，一条病态写法
+//!   不该拖慢所有请求；
 //! - `codepoints`：按字符本身认（[`Codepoints`]）。看不见的字符写不成关键词，出厂的
-//!   「隐藏字符」一组（标签字符、双向控制符、零宽字符、私用区）就是这一种。
+//!   「隐藏字符」一组（标签字符、双向控制符、零宽字符、私用区）就是这一种。只查请求。
 //!
-//! # 三种处置
+//! 前两种默认不分大小写，规则可以写明要分（`case_sensitive`）。
 //!
-//! 按严重程度排：`block`（拒绝，请求不发出去）> `strip`（删掉命中的字再发）>
-//! `record`（照发，记一条）。一个请求命中几条时，有拒绝就拒绝；每条命中都报出来，
-//! 记不记、记在哪由调用方定。
+//! # 四种处置
+//!
+//! 按严重程度排：`block`（拒绝，请求不发出去）> `replace`（命中的字换成规则写的替换文本
+//! 再发）> `strip`（删掉命中的字再发）> `record`（照发，记一条）。一个请求命中几条时，有
+//! 拒绝就拒绝；每条命中都报出来，记不记、记在哪由调用方定。回答这一边没有拒绝：命中之前的字
+//! 已经到了客户端。
 
 use std::ops::Range;
 
+pub mod answer;
 mod codepoints;
 mod screen;
+
+/// 最多删、换几遍。正常的正文一两遍就干净了；到这么多遍还在冒出新命中的只能是刻意一层套
+/// 一层写出来的：请求那边那一段整段删掉，回答那边这一路剩下的整个不发
+pub(crate) const MAX_ROUNDS: usize = 64;
 
 pub(crate) use codepoints::visible as codepoints_visible;
 pub use codepoints::{CodepointError, Codepoints, MAX_ITEMS as MAX_CODEPOINT_ITEMS};
@@ -43,10 +57,10 @@ pub use screen::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Match {
-    /// 不分大小写的子串
+    /// 子串，按原样找
     #[default]
     Contains,
-    /// 不分大小写的正则
+    /// 正则
     Regex,
     /// 按字符本身认：`U+200B`、`U+E0000–U+E007F`
     Codepoints,
@@ -70,7 +84,7 @@ impl Match {
     }
 }
 
-/// 命中之后做什么。**按严重程度排序**：`Record < Strip < Block`。
+/// 命中之后做什么。**按严重程度排序**：`Record < Strip < Replace < Block`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -78,6 +92,8 @@ pub enum Action {
     Record,
     /// 把命中的字删掉再发
     Strip,
+    /// 把命中的字换成规则写的替换文本再发
+    Replace,
     /// 不发出去
     Block,
 }
@@ -87,6 +103,7 @@ impl Action {
         match self {
             Action::Record => "record",
             Action::Strip => "strip",
+            Action::Replace => "replace",
             Action::Block => "block",
         }
     }
@@ -94,8 +111,31 @@ impl Action {
         match s {
             "record" => Some(Action::Record),
             "strip" => Some(Action::Strip),
+            "replace" => Some(Action::Replace),
             "block" => Some(Action::Block),
             _ => None,
+        }
+    }
+    /// 改不改正文：删、换
+    pub fn edits(self) -> bool {
+        matches!(self, Action::Strip | Action::Replace)
+    }
+}
+
+/// 一条规则查哪一边。出厂的规则只查请求
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sides {
+    /// 调用方发来的请求：用户消息和其中的工具结果
+    pub request: bool,
+    /// 模型回答的正文（见 [`answer`]）
+    pub response: bool,
+}
+
+impl Default for Sides {
+    fn default() -> Self {
+        Sides {
+            request: true,
+            response: false,
         }
     }
 }
@@ -152,6 +192,28 @@ pub struct RuleInput<'a> {
     pub pattern: &'a str,
     pub matching: Match,
     pub action: Action,
+    /// 关键词、正则分大小写。码位规则不论
+    pub case_sensitive: bool,
+    pub sides: Sides,
+    /// 处置是替换时换成的文字
+    pub replacement: &'a str,
+}
+
+impl Default for RuleInput<'_> {
+    /// 一条只查请求、不分大小写、仅记录的关键词规则，替换文本是出厂的 `***`。各处按需改
+    fn default() -> Self {
+        RuleInput {
+            id: "",
+            name: "",
+            custom: false,
+            pattern: "",
+            matching: Match::Contains,
+            action: Action::Record,
+            case_sensitive: false,
+            sides: Sides::default(),
+            replacement: crate::policy::DEFAULT_REPLACEMENT,
+        }
+    }
 }
 
 impl<'a> From<&'a Builtin> for RuleInput<'a> {
@@ -163,6 +225,7 @@ impl<'a> From<&'a Builtin> for RuleInput<'a> {
             pattern: &b.pattern,
             matching: b.matching,
             action: b.action,
+            ..RuleInput::default()
         }
     }
 }
@@ -176,8 +239,12 @@ pub struct Rule {
     pub pattern: String,
     pub matching: Match,
     pub action: Action,
-    /// `contains` 用：小写过的样子
-    lower: String,
+    /// 关键词、正则分大小写
+    pub case_sensitive: bool,
+    pub sides: Sides,
+    /// 处置是替换时换成的文字
+    pub replacement: String,
+    /// 正则，和不分大小写的关键词（转义过的文字加上不分大小写）
     re: Option<regex::Regex>,
     points: Option<Codepoints>,
 }
@@ -201,9 +268,22 @@ impl Rule {
             return Err(bad("the pattern is empty".into()));
         }
         let (re, points) = match r.matching {
-            Match::Contains => (None, None),
+            // 分大小写的按字节找；不分的编成正则：和回答那一边（[`answer`]）同一个认法，一个字
+            // 对一个字（Unicode 的简单大小写对应）。以前在小写过的正文上找、再把位置对回原文，
+            // 碰上小写之后字节数变了的字（`Ⱥ`、开尔文符号）会切错地方
+            Match::Contains if r.case_sensitive => (None, None),
+            Match::Contains => (
+                Some(
+                    crate::bounded_with(&regex::escape(r.pattern), true)
+                        .map_err(|e| bad(e.to_string()))?,
+                ),
+                None,
+            ),
             Match::Regex => (
-                Some(crate::bounded(&format!("(?i:{pattern})")).map_err(|e| bad(e.to_string()))?),
+                Some(
+                    crate::bounded_with(pattern, !r.case_sensitive)
+                        .map_err(|e| bad(e.to_string()))?,
+                ),
                 None,
             ),
             Match::Codepoints => (
@@ -219,10 +299,17 @@ impl Rule {
             pattern: r.pattern.to_string(),
             matching: r.matching,
             action: r.action,
-            lower: r.pattern.to_lowercase(),
+            case_sensitive: r.case_sensitive,
+            sides: r.sides,
+            replacement: r.replacement.to_string(),
             re,
             points,
         })
+    }
+
+    /// 命中的字换成什么：替换是替换文本，删除是 `None`（删掉），别的不改
+    fn edit_with(&self) -> Option<&str> {
+        (self.action == Action::Replace).then_some(self.replacement.as_str())
     }
 
     /// 码位规则的那一组码位
@@ -260,10 +347,9 @@ impl Rule {
     }
 
     /// 在 `text` 里的全部命中：按先后、互不重叠的字节区间，和一共几处（码位规则是
-    /// 几个字符，连在一起的几个字符是一段区间）。`lower` 是 `text` 小写过的样子，
-    /// 只有 `contains` 用；`escapes`：码位规则也认 JSON 的 `\uXXXX` 写法（见
-    /// [`screen_text`]）。
-    fn find_all(&self, text: &str, lower: &mut Lower<'_>, escapes: bool) -> Found {
+    /// 几个字符，连在一起的几个字符是一段区间）。`escapes`：码位规则也认 JSON 的 `\uXXXX`
+    /// 写法（见 [`screen_text`]）。
+    fn find_all(&self, text: &str, escapes: bool) -> Found {
         if let Some(p) = &self.points {
             return find_points(p, text, escapes);
         }
@@ -276,48 +362,20 @@ impl Rule {
                 .collect();
             return Found::of(ranges);
         }
-        Found::of(find_contains(text, lower.get(), &self.lower))
+        Found::of(find_exact(text, &self.pattern))
     }
 }
 
-/// 一段正文小写过的样子，用到才算
-struct Lower<'a> {
-    text: &'a str,
-    lower: Option<String>,
-}
-
-impl<'a> Lower<'a> {
-    fn new(text: &'a str) -> Self {
-        Lower { text, lower: None }
+/// 按原样（分大小写）找一段文字，全部出现的地方，一个接一个、互不重叠。`text` 和 `needle`
+/// 都是 UTF-8，找到的位置一定落在字符边界上
+fn find_exact(text: &str, needle: &str) -> Vec<Range<usize>> {
+    if needle.is_empty() {
+        return Vec::new();
     }
-    fn get(&mut self) -> &str {
-        self.lower.get_or_insert_with(|| lowercase(self.text))
-    }
-}
-
-/// 和 `text.to_lowercase()` 一样的结果，快一些：ASCII 的一段整段转，别的字符逐个转（标准库
-/// 碰到头一个 ASCII 以外的字符之后就逐个字符地转了，夹着中文、`→` 的正文几乎整段都是）。
-///
-/// 按上下文转的只有 `Σ`（在词尾是 `ς`）：正文里有它就整段交给标准库。
-fn lowercase(text: &str) -> String {
-    if memchr::memmem::find(text.as_bytes(), "Σ".as_bytes()).is_some() {
-        return text.to_lowercase();
-    }
-    let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        i = ascii_end(b, i);
-        if i > start {
-            let at = out.len();
-            out.push_str(&text[start..i]);
-            out[at..].make_ascii_lowercase();
-        }
-        // 停在一个多字节字符的头一个字节上：字符边界
-        if let Some(c) = text.get(i..).and_then(|rest| rest.chars().next()) {
-            out.extend(c.to_lowercase());
-            i += c.len_utf8();
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for at in memchr::memmem::find_iter(text.as_bytes(), needle.as_bytes()) {
+        if out.last().is_none_or(|p| p.end <= at) {
+            out.push(at..at + needle.len());
         }
     }
     out
@@ -353,41 +411,6 @@ impl Found {
             ranges,
         }
     }
-}
-
-/// 不分大小写的子串，全部出现的地方。
-///
-/// 小写之后长度没变时在小写串上找、下标对回原文；变了（少数字母会）就在原文上逐个
-/// 字符地比，慢一点但对。
-fn find_contains(text: &str, lower: &str, needle: &str) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    if needle.is_empty() {
-        return out;
-    }
-    if lower.len() == text.len() {
-        // 按字节找（SIMD）：每段正文、每条规则都要从头找到尾。和 `match_indices` 一样是
-        // 一个接一个、互不重叠的
-        for at in memchr::memmem::find_iter(lower.as_bytes(), needle.as_bytes()) {
-            // 区间落回原文要对齐到字符边界
-            let start = floor(text, at);
-            let end = ceil(text, at + needle.len());
-            if out.last().is_none_or(|p: &Range<usize>| p.end <= start) {
-                out.push(start..end);
-            }
-        }
-        return out;
-    }
-    let mut from = 0;
-    while from < text.len() {
-        let Some(r) = find_folded(&text[from..], needle) else {
-            break;
-        };
-        let r = from + r.start..from + r.end;
-        from = r.end.max(r.start + 1);
-        from = ceil(text, from);
-        out.push(r);
-    }
-    out
 }
 
 /// 一段正文里每一个字符（按出现的先后）和它的字节区间。`escapes`：JSON 的 `\uXXXX`
@@ -535,6 +558,11 @@ impl Rules {
         Self::default()
     }
 
+    /// 编好的这几条
+    pub fn of(rules: Vec<Rule>) -> Self {
+        Self { rules }
+    }
+
     /// 编一组规则。**一条编不起来整组都不要** —— 静默跳过的话，它的表现是
     /// 「我明明写了这条规则，怎么不拦」。要跳过坏规则的调用方自己逐条 [`Rule::new`]。
     pub fn build<'a>(inputs: impl IntoIterator<Item = RuleInput<'a>>) -> Result<Self, BadRule> {
@@ -550,18 +578,34 @@ impl Rules {
         self.rules.is_empty()
     }
 
-    /// 一段文本里命中的规则，每条报第一处，按规则的顺序。请求上的入口是 [`screen`]。
+    /// 有没有查请求的规则。只查回答的规则不参与请求这一边
+    pub fn checks_requests(&self) -> bool {
+        self.rules.iter().any(|r| r.sides.request)
+    }
+
+    /// 一段文本里命中的规则，每条报第一处，按规则的顺序。只用查请求的规则。请求上的入口是
+    /// [`screen`]。
     pub fn scan_text(&self, text: &str) -> Vec<Hit> {
-        self.detect(&[(text, false)], Scope::default()).hits
+        self.detect(&[(text, false)], Scope::default(), &[]).hits
     }
 
     /// 查一遍：每条命中的规则一处，按发现的先后（正文的先后，同一段里按规则的顺序）。
-    fn detect(&self, segments: &[(&str, bool)], scope: Scope) -> Detection {
+    /// **只用查请求的规则。**
+    ///
+    /// `kept` 是每段里不算命中的地方（前几遍换上去的替换文本，按先后）：和它们重叠的命中
+    /// 不算 —— 替换文本是规则写的，不是调用方的话，再查一遍就会换它自己（`*` 换成 `***`、
+    /// 再换成九个……）。没有的段可以不给。
+    fn detect(
+        &self,
+        segments: &[(&str, bool)],
+        scope: Scope,
+        kept: &[Vec<Range<usize>>],
+    ) -> Detection {
         let mut d = Detection {
             hits: Vec::new(),
             rules: Vec::new(),
             segments: Vec::new(),
-            strips: vec![Vec::new(); segments.len()],
+            edits: vec![Vec::new(); segments.len()],
             all: Vec::new(),
         };
         let mut seen: Vec<Option<usize>> = vec![None; self.rules.len()];
@@ -569,12 +613,23 @@ impl Rules {
             if text.is_empty() {
                 continue;
             }
-            let mut lower = Lower::new(text);
+            let keep = kept.get(si).map_or(&[][..], Vec::as_slice);
             for (ri, r) in self.rules.iter().enumerate() {
-                if scope.codepoints_only && r.points.is_none() {
+                if !r.sides.request || (scope.codepoints_only && r.points.is_none()) {
                     continue;
                 }
-                let f = r.find_all(text, &mut lower, scope.escapes);
+                let mut f = r.find_all(text, scope.escapes);
+                if !keep.is_empty() {
+                    f.ranges.retain(|m| !overlaps(keep, m));
+                    f.count = match r.points {
+                        Some(_) => f
+                            .ranges
+                            .iter()
+                            .map(|m| chars(&text[m.clone()], scope.escapes).count())
+                            .sum(),
+                        None => f.ranges.len(),
+                    };
+                }
                 let Some(first) = f.ranges.first().cloned() else {
                     continue;
                 };
@@ -608,17 +663,27 @@ impl Rules {
                 if r.points.is_some() {
                     reveal(&mut d.hits[at].revealed, text, &f.ranges, scope.escapes);
                 }
-                if r.action == Action::Strip {
-                    d.strips[si].extend(f.ranges.iter().cloned());
+                if r.action.edits() {
+                    d.edits[si].extend(f.ranges.iter().map(|m| (m.clone(), ri)));
                 }
                 if scope.keep_all {
                     d.all.push((at, si, f.ranges));
                 }
             }
-            d.strips[si] = merge(std::mem::take(&mut d.strips[si]));
         }
         d
     }
+
+    /// 一段正文里要改的地方（[`Detection::edits`] 的一段）排好、合并好，各换成什么
+    pub(crate) fn merged(&self, edits: Vec<(Range<usize>, usize)>) -> Vec<(Range<usize>, &str)> {
+        merge_edits(edits, |ri| self.rules.get(ri).and_then(Rule::edit_with))
+    }
+}
+
+/// `m` 和 `spans`（按先后、互不重叠）里的哪一段重叠
+pub(crate) fn overlaps(spans: &[Range<usize>], m: &Range<usize>) -> bool {
+    let k = spans.partition_point(|s| s.end <= m.start);
+    spans.get(k).is_some_and(|s| s.start < m.end)
 }
 
 /// 一遍查的范围。
@@ -641,22 +706,54 @@ struct Detection {
     rules: Vec<usize>,
     /// `hits` 里每一处在第几段正文里
     segments: Vec<usize>,
-    /// 每段正文里要删的区间（处置为 `strip` 的规则命中的全部地方），按先后、已合并
-    strips: Vec<Vec<Range<usize>>>,
+    /// 每段正文里要改的地方：处置为删除、替换的规则命中的全部地方，和是第几条规则。没排序、
+    /// 没合并（见 [`merge_edits`]）
+    edits: Vec<Vec<(Range<usize>, usize)>>,
     /// `keep_all` 时：每条规则在每段里的全部区间，`(hits 的下标, 第几段, 区间)`
     all: Vec<(usize, usize, Vec<Range<usize>>)>,
 }
 
-/// 排序、合并重叠和相接的区间
-fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    ranges.sort_by_key(|r| r.start);
-    let mut out: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
-    for r in ranges {
+/// 要改的地方排好、合并好：按起点排（同一处按规则的顺序），**重叠的合成一段**（只挨着的
+/// 不合：两个挨着的词各换各的），每段换成什么。`with` 说一条规则换成什么：`None` 是删掉。
+/// 合成的一段里有替换规则的，换成头一条替换规则的替换文本，都是删除的就删掉。
+///
+/// 请求和回答两边用的是这一个：同一组命中，改出来的一样。
+pub(crate) fn merge_edits<'r>(
+    mut edits: Vec<(Range<usize>, usize)>,
+    with: impl Fn(usize) -> Option<&'r str>,
+) -> Vec<(Range<usize>, &'r str)> {
+    edits.sort_by_key(|(r, ri)| (r.start, *ri));
+    let mut out: Vec<(Range<usize>, Option<&'r str>)> = Vec::with_capacity(edits.len());
+    for (r, ri) in edits {
         match out.last_mut() {
-            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
-            _ => out.push(r),
+            Some((last, w)) if r.start < last.end => {
+                last.end = last.end.max(r.end);
+                if w.is_none() {
+                    *w = with(ri);
+                }
+            }
+            _ => out.push((r, with(ri))),
         }
     }
+    out.into_iter()
+        .map(|(r, w)| (r, w.unwrap_or_default()))
+        .collect()
+}
+
+/// 照 `edits`（[`merge_edits`] 排好、合并好的，区间都在字符边界上）改过的文字
+pub(crate) fn apply_edits(text: &str, edits: &[(Range<usize>, &str)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (r, with) in edits {
+        // 区间来自在这段文字上的查找，落在字符边界上；万一不在，宁可这一处不改，也不切坏一个字
+        let (Some(keep), true) = (text.get(at..r.start), text.is_char_boundary(r.end)) else {
+            continue;
+        };
+        out.push_str(keep);
+        out.push_str(with);
+        at = r.end;
+    }
+    out.push_str(text.get(at..).unwrap_or_default());
     out
 }
 
@@ -687,32 +784,6 @@ fn floor(text: &str, mut i: usize) -> usize {
         i -= 1;
     }
     i
-}
-
-/// `i` 往后挪到字符边界上
-fn ceil(text: &str, mut i: usize) -> usize {
-    i = i.min(text.len());
-    while !text.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-/// 小写之后长度对不上时的子串查找：逐个字符起点比。
-fn find_folded(text: &str, needle_lower: &str) -> Option<Range<usize>> {
-    for (i, _) in text.char_indices() {
-        let mut folded = String::new();
-        for (j, c) in text[i..].char_indices() {
-            folded.extend(c.to_lowercase());
-            if folded.len() >= needle_lower.len() {
-                if folded.starts_with(needle_lower) {
-                    return Some(i..i + j + c.len_utf8());
-                }
-                break;
-            }
-        }
-    }
-    None
 }
 
 /// 命中处前后的一小段：前面带十个字节，整段不超过 [`SNIPPET_MAX`] 个字符，
@@ -796,6 +867,7 @@ mod tests {
             pattern,
             matching,
             action,
+            ..RuleInput::default()
         }
     }
 
@@ -859,7 +931,10 @@ mod tests {
         let hits = rs.scan_text("show the system prompt and jailbreak");
         let ids: Vec<&str> = hits.iter().map(|h| h.rule.as_str()).collect();
         assert_eq!(ids, ["r", "b", "s"]);
-        assert!(Record < Strip && Strip < Block, "处置按严重程度排");
+        assert!(
+            Record < Strip && Strip < Action::Replace && Action::Replace < Block,
+            "处置按严重程度排"
+        );
     }
 
     #[test]
@@ -1062,7 +1137,7 @@ mod tests {
 
     #[test]
     fn slugs_round_trip() {
-        for a in [Record, Strip, Block] {
+        for a in [Record, Strip, Action::Replace, Block] {
             assert_eq!(Action::from_slug(a.slug()), Some(a));
         }
         for m in [Contains, Regex, Points] {
@@ -1151,40 +1226,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// 快一些的小写和标准库的一字不差：`Σ` 在词尾、词中，会变长的（`İ`）、四个字节的、
-    /// 组合字符、开尔文符号这类转成 ASCII 的
-    #[test]
-    fn lowercasing_by_runs_gives_what_the_standard_library_gives() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = |n: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % n as u64) as usize
-        };
-        // 码位用 `char::from_u32` 拼：测试里直接写出来的转义，经过某些编辑工具会变成真字符
-        let ch = |n: u32| char::from_u32(n).unwrap().to_string();
-        let pieces: Vec<String> = ["A", "z", " ", "IGNORE", "Previous", ".", "→", "密钥", "😀"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain(
-                [
-                    0x03A3, 0x0391, 0x0130, 0x212A, 0x1E9E, 0x00DF, 0x01C5, 0xFB00, 0x0301, 0x2167,
-                    0x10400, 0x00C9, 0x0049, 0x0131, 0x03C2,
-                ]
-                .into_iter()
-                .map(ch),
-            )
-            .collect();
-        for _ in 0..20_000 {
-            let text: String = (0..next(30))
-                .map(|_| pieces[next(pieces.len())].as_str())
-                .collect();
-            assert_eq!(lowercase(&text), text.to_lowercase(), "{text:?}");
-        }
-        let long = format!("{}{}", "Ignore Previous ".repeat(10), ch(0x212A));
-        assert_eq!(lowercase(&long), long.to_lowercase());
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! 流式：**不缓冲**。整块缓冲会把 SSE 变成一次性交付，客户端那边看起来
 //! 就是「卡住很久然后一下全出来」。每一块依次经过：留档与嗅探 → 回显
-//! 还原 → 格式转换 → 模型名换回客户端用的名称 → 回答钩子 → 工具调用审查，然后才写给
-//! 客户端。
+//! 还原 → 格式转换 → 模型名换回客户端用的名称 → 回答钩子 → 回答正文的内容过滤 → 工具调用
+//! 审查，然后才写给客户端。
 //!
 //! 这些步骤要不要做、怎么做，在响应头到手的那一刻就全定了（[`Plan`]）；
 //! 流里每一块怎么处理在 [`Relay`] 上，`respond` 里的流只剩一个循环。
@@ -90,10 +90,16 @@ pub(super) fn respond(
     if let Some(r) = &rename {
         r.headers(&mut out_headers);
     }
+    // 回答正文的内容过滤（见 `tw_guard::content::answer`）：生成回答的、成功的才有
+    let answer = crate::guard::AnswerFilter::of(rt).filter(|_| generates && status.is_success());
     // 报文记录（见 `crate::content`）：从这里起喂进结局的是这一跳的回答。客户端收到的和它的
-    // 原话是一回事时（同格式、没有回答钩子），客户端那一边不另攒。**只差模型名不算**：为它
-    // 另存一整份回答不值，模型名在尝试链上
-    let transforms = session.is_some() || plugins.is_some();
+    // 原话是一回事时（同格式、没有回答钩子、回答过滤不改字），客户端那一边不另攒。**只差模型名
+    // 不算**：为它另存一整份回答不值，模型名在尝试链上
+    let transforms = session.is_some()
+        || plugins.is_some()
+        || answer
+            .as_ref()
+            .is_some_and(crate::guard::AnswerFilter::changes_text);
     ending.serving(attempt as u32 + 1, !transforms);
 
     // **Bedrock 的流不是 SSE**，是 AWS eventstream 的二进制帧。在字节进门的地方就转成
@@ -160,6 +166,7 @@ pub(super) fn respond(
         upstream_dialect,
         plugins,
         rename,
+        answer,
     );
     let chunks = upstream.bytes_stream();
     let dialect = req.dialect;
@@ -311,6 +318,8 @@ pub(super) fn respond(
             }
         }
         let (tail, denied) = relay.finish(broke.is_some()).await;
+        // 回答里的命中这时报：一次回答一条规则一条
+        relay.report_answer();
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }
@@ -544,6 +553,50 @@ struct Relay {
     /// 回答钩子之前**：改的是客户端那种格式的字段，插件补出来的帧抄到的已经是换过的。
     /// 发出去的就是客户端要的那个名称（绝大多数请求）时是 None，整段零成本
     rename: Option<crate::answer_model::Body>,
+    /// 回答正文的内容过滤（见 [`tw_guard::content::answer`]）。**排在回答钩子之后、工具调用
+    /// 审查之前**：查的是插件改过、客户端将要看到的那一版。没有查回答的规则时是 None，整段
+    /// 零成本
+    answer: Option<Answering>,
+    /// 客户端收到的格式
+    client: tw_dialect::ir::Dialect,
+}
+
+/// 回答正文的过滤在这条中继上怎么跑，和攒着的命中。
+///
+/// **命中在回答结束时报**（[`Relay::report_answer`]）；客户端中途走掉、流被丢掉时，丢掉的
+/// 那一刻报（`Drop`）—— 命中了就要留下记录，哪怕回答没交完。
+struct Answering {
+    filter: crate::guard::AnswerFilter,
+    /// 流着的回答边流边改；整包的、上游给整包客户端要流的是 None，收尾时一次处理。被工具调用
+    /// 审查切断之后也是 None：切断之后一个字都不再发
+    stream: Option<tw_guard::content::answer::Body>,
+    /// 攒着、还没报的命中
+    hits: Vec<tw_guard::content::answer::AnswerHit>,
+    bus: tw_observe::EventBus,
+    id: u64,
+    provider: String,
+    redaction: crate::bodies::Redaction,
+}
+
+impl Answering {
+    /// 流里的命中收进来
+    fn harvest(&mut self) {
+        if let Some(b) = self.stream.as_mut() {
+            self.hits.extend(b.take_hits());
+        }
+    }
+
+    fn report(&mut self) {
+        self.harvest();
+        let hits = std::mem::take(&mut self.hits);
+        crate::guard::report_answer(&self.bus, self.id, &self.provider, hits, &self.redaction);
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        self.report();
+    }
 }
 
 /// 回答钩子在这条中继上怎么跑。
@@ -569,6 +622,7 @@ impl Relay {
         upstream_dialect: tw_dialect::ir::Dialect,
         plugins: Option<crate::plugin::reply::Chain>,
         rename: Option<crate::answer_model::Rename>,
+        answer: Option<crate::guard::AnswerFilter>,
     ) -> Self {
         // 还原看的是**上游的原话**（转换之前），所以按上游的格式认帧
         let restorer = tw_guard::redact::sse::Body::new(ledger, plan.is_sse, upstream_dialect);
@@ -615,14 +669,35 @@ impl Relay {
                 ReplyStage::Whole(chain)
             }
         });
-        // 整包要看完才发得出去：工具调用在整份里，看完之前一个字节都不能发。插件要改整包
-        // 也一样，改完了才知道发什么
-        let hold = (wall.is_some() || matches!(plugins, Some(ReplyStage::Whole(_))))
-            && plan.whole_body()
-            && !plan.convert_whole
-            && !plan.collect;
         // 客户端收到的格式：转换过的是会话里客户端那一种，直通的就是上游那一种
         let client = session.as_ref().map_or(upstream_dialect, |s| s.client);
+        // 回答过滤按客户端收到的样子分：流的边流边改，整包的收齐了再改
+        let answer = answer.map(|filter| Answering {
+            stream: (plan.client_sse || plan.client_json_stream).then(|| {
+                tw_guard::content::answer::Body::new(
+                    filter.answer.clone(),
+                    filter.acts,
+                    client,
+                    plan.client_sse,
+                )
+            }),
+            filter,
+            hits: Vec::new(),
+            bus: state.bus.clone(),
+            id,
+            provider: provider.name.clone(),
+            redaction: crate::bodies::Redaction {
+                rules: rt.redact.clone(),
+                ledger: ledger.clone(),
+            },
+        });
+        // 整包要看完才发得出去：工具调用在整份里，看完之前一个字节都不能发。插件要改整包、
+        // 回答过滤要查整包也一样，查完、改完了才知道发什么
+        let hold =
+            (wall.is_some() || matches!(plugins, Some(ReplyStage::Whole(_))) || answer.is_some())
+                && plan.whole_body()
+                && !plan.convert_whole
+                && !plan.collect;
         let last =
             (plan.client_sse && plan.status.is_success()).then(|| (client, Default::default()));
         Self {
@@ -650,6 +725,8 @@ impl Relay {
             provider: provider.name.clone(),
             plugins,
             rename: rename.map(crate::answer_model::Rename::body),
+            answer,
+            client,
         }
     }
 
@@ -684,8 +761,68 @@ impl Relay {
             Some(ReplyStage::Stream(s)) => s.feed(&out).await,
             _ => (out, None),
         };
+        // 回答正文的过滤：扣住可能还会长成一处命中的那一截，命中的字不发
+        let out = match self.answer.as_mut().and_then(|a| a.stream.as_mut()) {
+            Some(b) => b.process(&out),
+            None => out,
+        };
         let (out, cut) = self.guard(out);
         (out, cut.or(failed))
+    }
+
+    /// 回答过滤的收尾：流的补上扣着的尾巴，整包的这时才查、才改。`tail` 是回答钩子之后的
+    /// 那一段，返回客户端将要收到的
+    fn answer_tail(&mut self, tail: Vec<u8>, broke: bool) -> Vec<u8> {
+        let Some(a) = self.answer.as_mut() else {
+            return tail;
+        };
+        if let Some(b) = a.stream.as_mut() {
+            // 断了也补：扣着的是模型说过的字
+            let mut out = b.process(&tail);
+            out.extend(b.flush());
+            a.harvest();
+            return out;
+        }
+        if broke || tail.is_empty() || !self.plan.status.is_success() {
+            return tail;
+        }
+        // 上游给了整包、客户端要流：写给客户端的是转出来的流，按流的形状查
+        let streamed = self
+            .session
+            .as_ref()
+            .filter(|s| self.plan.convert_whole && s.stream)
+            .map(|s| s.client_sse());
+        match streamed {
+            Some(sse) => {
+                let mut b = tw_guard::content::answer::Body::new(
+                    a.filter.answer.clone(),
+                    a.filter.acts,
+                    self.client,
+                    sse,
+                );
+                let mut out = b.process(&tail);
+                out.extend(b.flush());
+                a.hits.extend(b.take_hits());
+                out
+            }
+            None => {
+                let (changed, hits) = tw_guard::content::answer::whole(
+                    &a.filter.answer,
+                    a.filter.acts,
+                    self.client,
+                    &tail,
+                );
+                a.hits.extend(hits);
+                changed.unwrap_or(tail)
+            }
+        }
+    }
+
+    /// 回答里的命中报出去（见 [`Answering`]）
+    fn report_answer(&mut self) {
+        if let Some(a) = self.answer.as_mut() {
+            a.report();
+        }
     }
 
     /// 工具调用审查：看的是客户端将要收到的这一段
@@ -736,6 +873,11 @@ impl Relay {
                 // 字节都不发 —— 「尽力阻断」的要点是客户端拼不出
                 // 完整的工具调用
                 let safe = v.safe_prefix.min(out.len());
+                // 切断之后回答过滤不再补任何字：攒着的命中留着报
+                if let Some(a) = self.answer.as_mut() {
+                    a.harvest();
+                    a.stream = None;
+                }
                 return Some((out[..safe].to_vec(), Some(err)));
             }
         }
@@ -805,53 +947,64 @@ impl Relay {
         // 模型名：整包的这时才见到，流的补上扣着的那半个名字
         let tail = self.renamed(tail);
         // 回答钩子的收尾：流的补上扣着的，整包的这时才改
-        let tail = match self.plugins.as_mut() {
-            None => tail,
+        let (tail, failed, hooked) = match self.plugins.as_mut() {
+            None => (tail, None, false),
             Some(ReplyStage::Stream(s)) => {
                 let (mut out, failed) = s.feed(&tail).await;
-                if failed.is_none() {
-                    let (more, failed) = s.finish(broke).await;
-                    out.extend(more);
-                    if let Some(e) = failed {
-                        return self.guard_tail(out, e);
+                let failed = match failed {
+                    Some(e) => Some(e),
+                    None => {
+                        let (more, failed) = s.finish(broke).await;
+                        out.extend(more);
+                        failed
                     }
-                } else if let Some(e) = failed {
-                    return self.guard_tail(out, e);
-                }
-                // 插件在收尾时补出来的（扣着的文字、攒着的工具调用）也要过审查
-                let (out, cut) = self.guard(out);
-                if let Some(e) = cut {
-                    return (out, Some(e));
-                }
-                out
+                };
+                (out, failed, true)
             }
             Some(ReplyStage::AtFinish(s)) if !broke && status.is_success() => {
                 let (mut out, failed) = s.feed(&tail).await;
+                let failed = match failed {
+                    Some(e) => Some(e),
+                    None => {
+                        let (more, failed) = s.finish(false).await;
+                        out.extend(more);
+                        failed
+                    }
+                };
                 if let Some(e) = failed {
-                    return (out, Some(e));
+                    // 出错之前插件交出来的，照样过一遍回答过滤
+                    return (self.answer_tail(out, false), Some(e));
                 }
-                let (more, failed) = s.finish(false).await;
-                out.extend(more);
-                if let Some(e) = failed {
-                    return (out, Some(e));
-                }
-                out
+                (out, None, false)
             }
             Some(ReplyStage::Whole(c)) if !broke && status.is_success() && !tail.is_empty() => {
                 match crate::plugin::reply::whole(c, &tail).await {
-                    Ok(b) => b,
+                    Ok(b) => (b, None, false),
                     // 整份还一个字节都没发：换成错误
                     Err(e) => return (Vec::new(), Some(e)),
                 }
             }
             Some(ReplyStage::Whole(c)) => {
                 c.finish();
-                tail
+                (tail, None, false)
             }
             Some(ReplyStage::AtFinish(s)) => {
                 let _ = s.finish(true).await;
-                tail
+                (tail, None, false)
             }
+        };
+        // 回答正文的过滤：插件改过的才是客户端将要看到的；审查看的是过滤之后的
+        let tail = self.answer_tail(tail, broke);
+        // 插件在收尾时补出来的（扣着的文字、攒着的工具调用）也要过审查。插件出错的，出错
+        // 之前能发的过一遍审查，再报这个错
+        let tail = if hooked {
+            let (out, cut) = self.guard(tail);
+            if let Some(e) = cut.or(failed) {
+                return (out, Some(e));
+            }
+            out
+        } else {
+            tail
         };
         /*
           非流式：**整份到手了才看得见工具调用，而它一个字节都还没发出去。**
@@ -915,12 +1068,6 @@ impl Relay {
             );
         }
         err
-    }
-
-    /// 插件在收尾时出错：出错之前能发的过一遍审查，再报这个错
-    fn guard_tail(&mut self, out: Vec<u8>, e: GatewayError) -> (Vec<u8>, Option<GatewayError>) {
-        let (out, cut) = self.guard(out);
-        (out, Some(cut.unwrap_or(e)))
     }
 
     /// 切断之后的收尾经过回答钩子那一层：不再交给插件，但 JSON 数组要按那一层发过的

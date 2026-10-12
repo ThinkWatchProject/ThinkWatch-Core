@@ -33,6 +33,7 @@ use tw_api::{
 };
 use tw_dialect::ir::Dialect;
 use tw_guard::locate::{self, Literal, Part, Place};
+use tw_guard::redact::replace::{Form, ValueSpans};
 use tw_guard::redact::rules::{Finding, Hit, Rule};
 
 use crate::bodies::Redaction;
@@ -64,6 +65,8 @@ struct Source<'a> {
     hits: &'a [Hit],
     /// `span` 是一个 JSON 字符串的原文：取出来的要解开转义，切口不落在转义中间
     lit: Option<Literal>,
+    /// `text` 里账本记着的原值（[`Redaction::values`]）：一段文字只找一遍
+    values: &'a ValueSpans<'a>,
 }
 
 /// 一处命中打过码的前后文
@@ -136,6 +139,14 @@ impl Source<'_> {
             if let Some(h) = straddling(self.hits, m.end) {
                 m.end = h.bytes.end;
             }
+            // 账本里的原值也一样：一处命中落在一个原值中间时，命中的那一段、前后两段各分到
+            // 原值的一截，各自打码也拼得出它
+            if let Some(v) = self.values.across(m.start) {
+                m.start = v.start;
+            }
+            if let Some(v) = self.values.across(m.end) {
+                m.end = v.end;
+            }
             if let Some(t) = self.token_across(m.start).filter(masks) {
                 m = t.start..m.end.max(t.end);
             }
@@ -152,7 +163,7 @@ impl Source<'_> {
 
     /// 一段原文打过码、解开转义之后的样子
     fn show(&self, red: &Redaction, sent: &crate::bodies::Sent<'_>, range: Range<usize>) -> String {
-        let piece = red.piece(self.text, range, self.hits, sent);
+        let piece = red.piece(self.text, range, self.hits, self.values, sent);
         match &self.lit {
             Some(_) => locate::unescape(&piece),
             None => piece,
@@ -179,6 +190,9 @@ impl Source<'_> {
         if let Some(h) = straddling(self.hits, start) {
             start = h.bytes.end.min(m.start);
         }
+        if let Some(v) = self.values.across(start) {
+            start = v.end.min(m.start);
+        }
         if start > self.span.start {
             while start < m.start && is_tok(b[start - 1]) && is_tok(b[start]) {
                 start += 1;
@@ -189,6 +203,9 @@ impl Source<'_> {
         let mut end = self.snap(m.end + WINDOW, false).max(m.end);
         if let Some(h) = straddling(self.hits, end) {
             end = h.bytes.start.max(m.end);
+        }
+        if let Some(v) = self.values.across(end) {
+            end = v.start.max(m.end);
         }
         if end < self.span.end {
             while end > m.end && is_tok(b[end - 1]) && is_tok(b[end]) {
@@ -314,6 +331,8 @@ pub fn secrets(seen: &Seen<'_>, found: &[Finding]) -> Vec<SecurityHitDetail> {
         .filter(|_| !shown.is_empty())
         .and_then(|_| serde_json::from_slice(seen.body).ok());
     let sent = seen.redaction.sent();
+    // 整份原文只找一遍原值：每一处前后文都从这里取
+    let values = seen.redaction.values(text, Form::Json);
     let mut literals: HashMap<usize, Literal> = HashMap::new();
     found
         .iter()
@@ -345,6 +364,7 @@ pub fn secrets(seen: &Seen<'_>, found: &[Finding]) -> Vec<SecurityHitDetail> {
                                 span: scalar.raw,
                                 hits: seen.hits,
                                 lit,
+                                values: &values,
                             };
                             (place, locate::path_text(&path), src)
                         }
@@ -355,6 +375,7 @@ pub fn secrets(seen: &Seen<'_>, found: &[Finding]) -> Vec<SecurityHitDetail> {
                                 span: 0..text.len(),
                                 hits: seen.hits,
                                 lit: None,
+                                values: &values,
                             };
                             (Place::of(Part::Message), String::new(), src)
                         }
@@ -413,7 +434,8 @@ fn secret_detail(
             }
         }
     };
-    let outcome_detail = if seen.replaced {
+    // 动作是「仅记录」的规则拦截档下也原样发出
+    let outcome_detail = if seen.replaced && !rules.records(&f.rule) {
         OutcomeDetail::Replaced {
             placeholders: value
                 // 账里记的是解开转义之后的样子，`v` 是请求体原文里截下来的
@@ -421,6 +443,8 @@ fn secret_detail(
                 .map(str::to_string)
                 .into_iter()
                 .collect(),
+            segments: None,
+            replacement: None,
         }
     } else {
         OutcomeDetail::Recorded {}
@@ -468,10 +492,14 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
         .refusal()
         .map(|r| crate::error::client_notice(&super::refusal(&r.hit)));
     // 每个字符串编一次、找一次：几条规则命中在同一个字符串里时共用
-    let mut encoded: HashMap<usize, (String, Vec<Hit>)> = HashMap::new();
+    let mut encoded: HashMap<usize, (String, Vec<Hit>, ValueSpans<'_>)> = HashMap::new();
     let raw_hits = match src.dialect {
         None => crate::guard::hits(&text, &src.redaction.rules),
         Some(_) => Vec::new(),
+    };
+    let raw_values = match src.dialect {
+        None => src.redaction.values(&text, Form::Json),
+        Some(_) => ValueSpans::default(),
     };
     sc.hits
         .iter()
@@ -493,10 +521,11 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
                         let decoded = s.get(v).unwrap_or_default();
                         // 解开的字符串重新写成 JSON 字符串：和存下来的正文一样按 JSON 原文找、
                         // 打码，位置换算回去
-                        let (enc, hits) = encoded.entry(*spot).or_insert_with(|| {
+                        let (enc, hits, values) = encoded.entry(*spot).or_insert_with(|| {
                             let enc = serde_json::to_string(decoded).unwrap_or_default();
                             let hits = crate::guard::hits(&enc, &src.redaction.rules);
-                            (enc, hits)
+                            let values = src.redaction.values(&enc, Form::Json);
+                            (enc, hits, values)
                         });
                         let lit = Literal::new(enc, 1..enc.len().saturating_sub(1).max(1));
                         let m = lit.raw_at(range.start)..lit.raw_at(range.end);
@@ -505,6 +534,7 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
                             span: lit.range.clone(),
                             hits,
                             lit: Some(lit),
+                            values,
                         };
                         let e = source.excerpt(m, src.redaction, &sent, None, &|t| match rule {
                             Some(r) => r.draw(t, false),
@@ -520,6 +550,7 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
                             span: 0..text.len(),
                             hits: &raw_hits,
                             lit: None,
+                            values: &raw_values,
                         };
                         let e = source.excerpt(range.clone(), src.redaction, &sent, None, &|t| {
                             match rule {
@@ -538,13 +569,17 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
                 name: h.hit.name.clone(),
                 pattern: rule.filter(|r| r.custom).map(|r| r.pattern.clone()),
                 matching: Some(tw_api::ContentMatch::of(h.hit.matching)),
-                case_sensitive: false,
+                case_sensitive: rule.is_some_and(|r| r.case_sensitive),
                 core_version: core_version(),
             };
+            let segments = u32::try_from(at.len()).unwrap_or(u32::MAX);
             let outcome_detail = match h.outcome {
                 tw_guard::content::Outcome::Recorded => OutcomeDetail::Recorded {},
-                tw_guard::content::Outcome::Stripped => OutcomeDetail::Stripped {
-                    segments: u32::try_from(at.len()).unwrap_or(u32::MAX),
+                tw_guard::content::Outcome::Stripped => OutcomeDetail::Stripped { segments },
+                tw_guard::content::Outcome::Replaced => OutcomeDetail::Replaced {
+                    placeholders: Vec::new(),
+                    segments: Some(segments),
+                    replacement: rule.map(|r| r.replacement.clone()),
                 },
                 tw_guard::content::Outcome::Blocked => OutcomeDetail::Blocked {
                     client_notice: notice.clone().unwrap_or_default(),
@@ -559,6 +594,67 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------- 回答正文
+
+/// 回答里一条内容规则的命中的细节（[`tw_guard::content::answer`]）：每一处在哪一路正文里
+/// （`path`）、前后的字，都按这个请求的 [`Redaction`] 打码 —— 回答里的占位符已经换回了原值，
+/// 前后文里可能就有一把真的密钥。
+pub fn answer(h: &tw_guard::content::answer::AnswerHit, red: &Redaction) -> SecurityHitDetail {
+    // 前后文是解开了的正文，不是 JSON 原文：原值按正文的样子找，引号外面也找
+    let sent = red.sent_as(Form::Text);
+    let locations = h
+        .places
+        .iter()
+        .take(HIT_LOCATIONS_MAX)
+        .map(|(path, p)| {
+            // 前后文和命中的那一段拼成一段一起打码：一把密钥跨在两段的交界上，分开打哪一半
+            // 都认不出它
+            let text = format!("{}{}{}", p.before, p.matched, p.after);
+            let m = p.before.len()..p.before.len() + p.matched.len();
+            let hits = crate::guard::hits(&text, &red.rules);
+            let values = red.values(&text, Form::Text);
+            let source = Source {
+                text: &text,
+                span: 0..text.len(),
+                hits: &hits,
+                lit: None,
+                values: &values,
+            };
+            let e = source.excerpt(m, red, &sent, None, &|s| s.to_string());
+            location(red, Place::of(Part::ResponseText), path, e)
+        })
+        .collect();
+    let rule_snapshot = RuleSnapshot {
+        builtin: !h.custom,
+        id: h.rule.clone(),
+        name: h.name.clone(),
+        pattern: h.custom.then(|| h.pattern.clone()),
+        matching: Some(tw_api::ContentMatch::of(h.matching)),
+        case_sensitive: h.case_sensitive,
+        core_version: core_version(),
+    };
+    let segments = u32::try_from(h.count).unwrap_or(u32::MAX);
+    let outcome_detail = match h.outcome {
+        tw_guard::content::Outcome::Stripped => OutcomeDetail::Stripped { segments },
+        tw_guard::content::Outcome::Replaced => OutcomeDetail::Replaced {
+            placeholders: Vec::new(),
+            segments: Some(segments),
+            replacement: Some(h.replacement.clone()),
+        },
+        // 回答拒绝不了：只会是上面两种或者只记录
+        tw_guard::content::Outcome::Recorded | tw_guard::content::Outcome::Blocked => {
+            OutcomeDetail::Recorded {}
+        }
+    };
+    SecurityHitDetail {
+        direction: SecurityDirection::Response,
+        locations,
+        more_locations: more(h.count),
+        rule_snapshot,
+        outcome_detail,
+    }
 }
 
 // ---------------------------------------------------------------- 工具调用审查
@@ -576,11 +672,13 @@ pub fn tool_call(
     let args = v.arguments.as_str();
     let hits = crate::guard::hits(args, &redaction.rules);
     let sent = redaction.sent();
+    let values = redaction.values(args, Form::Json);
     let source = Source {
         text: args,
         span: 0..args.len(),
         hits: &hits,
         lit: None,
+        values: &values,
     };
     let locations = v
         .places

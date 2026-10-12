@@ -42,6 +42,9 @@ pub struct Runtime {
     pub tools: Arc<tw_guard::tools::rules::Rules>,
     /// 内容过滤的规则（隐藏字符那一组也在里面）。同上
     pub content: Arc<tw_guard::content::Rules>,
+    /// 内容过滤里查回答正文的那几条，编好的（见 [`tw_guard::content::answer`]）。一条都没有是
+    /// None：回答那一边整段零成本
+    pub answer: Option<Arc<tw_guard::content::answer::Answer>>,
     /// 脚本插件，按配置里的顺序。**和配置一起建、一起换**：一个请求从头到尾看到的是
     /// 同一份，请求钩子和回答钩子之间换了配置也不会跨在两份上
     pub plugins: Arc<crate::plugin::PluginSet>,
@@ -96,6 +99,7 @@ impl Runtime {
         let redact = sec.redact.rules().map_err(bad)?;
         let tools = sec.inspect_tools.rules().map_err(bad)?;
         let content = sec.content.rules().map_err(bad)?;
+        let answer = tw_guard::content::answer::Answer::build(&content);
         let plugins = Arc::new(plugins.build(&config));
         Ok(Self {
             engine: Arc::new(config.engine()),
@@ -105,6 +109,7 @@ impl Runtime {
             redact: Arc::new(redact),
             tools: Arc::new(tools),
             content: Arc::new(content),
+            answer,
             plugins,
         })
     }
@@ -119,6 +124,7 @@ impl Runtime {
             redact: self.redact.clone(),
             tools: self.tools.clone(),
             content: self.content.clone(),
+            answer: self.answer.clone(),
             plugins: Arc::new(plugins),
         }
     }

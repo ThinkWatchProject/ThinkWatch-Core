@@ -459,6 +459,8 @@ pub fn compile(name: &str, pattern: &str) -> Result<regex::Regex, BadPattern> {
 pub struct RuleSet {
     on: HashSet<&'static str>,
     custom: Vec<Custom>,
+    /// 动作是「仅记录」的规则：照样找、照样报，不换成占位符（见 [`RuleSet::records`]）
+    record: HashSet<Rule>,
 }
 
 impl Default for RuleSet {
@@ -477,6 +479,7 @@ impl RuleSet {
                 .map(|b| b.id)
                 .collect(),
             custom: Vec::new(),
+            record: HashSet::new(),
         }
     }
 
@@ -485,6 +488,7 @@ impl RuleSet {
         Self {
             on: HashSet::new(),
             custom: Vec::new(),
+            record: HashSet::new(),
         }
     }
 
@@ -497,6 +501,7 @@ impl RuleSet {
                 .map(|b| b.id)
                 .collect(),
             custom: Vec::new(),
+            record: HashSet::new(),
         }
     }
 
@@ -555,6 +560,53 @@ impl RuleSet {
 
     pub fn is_on(&self, id: &str) -> bool {
         self.on.contains(id)
+    }
+
+    /// 这条规则只记录：动作是「仅记录」
+    pub fn recording(mut self, rule: Rule) -> Self {
+        self.record.insert(rule);
+        self
+    }
+
+    /// 这条规则只记录、不换。**照样找、照样报**：命中报出去，只是原值照发，不进账本
+    pub fn records(&self, rule: &Rule) -> bool {
+        !self.record.is_empty() && self.record.contains(rule)
+    }
+
+    /// 只有只记录的那几条规则（内置的照这一份的开关）。没有只记录的规则是 `None`
+    pub fn recording_only(&self) -> Option<RuleSet> {
+        if self.record.is_empty() {
+            return None;
+        }
+        Some(RuleSet {
+            on: self
+                .on
+                .iter()
+                .copied()
+                .filter(|id| self.record.contains(&Rule::Builtin(id)))
+                .collect(),
+            custom: self
+                .custom
+                .iter()
+                .filter(|c| self.record.contains(&Rule::Custom(c.name.clone())))
+                .cloned()
+                .collect(),
+            record: self.record.clone(),
+        })
+    }
+
+    /// 要换成占位符的那几处：去掉只记录的规则命中的（见 [`Self::records`]）。没有只记录的
+    /// 规则时原样借出去，不抄一份
+    pub fn to_replace<'h>(&self, hits: &'h [Hit]) -> std::borrow::Cow<'h, [Hit]> {
+        if self.record.is_empty() || !hits.iter().any(|h| self.records(&h.rule)) {
+            return std::borrow::Cow::Borrowed(hits);
+        }
+        std::borrow::Cow::Owned(
+            hits.iter()
+                .filter(|h| !self.records(&h.rule))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// 名字是 `name` 的自定义规则**写的样子和怎么认**。没有这条规则是 `None`。安全日志记下
@@ -1370,15 +1422,81 @@ fn json_safe(text: &str, m: Range<usize>) -> Option<Range<usize>> {
     (end > m.start).then_some(m.start..end)
 }
 
-fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
+/// `text` 是不是一整段合规的 JSON（请求体、存下来的回答）。**看开头不够**：解码过的正文也
+/// 可能以引号、括号开头（`"quoted" then MYCORP-222222`、`[555-1234]`），当成 JSON 的话只在
+/// 引号里面找，引号外面的值就漏了。开头像的才真的解一遍（不建树）；一个光秃秃的数也是 JSON，
+/// 可那是一段话（「620102198811110554」）
+pub(crate) fn is_json(text: &str) -> bool {
+    text.trim_start().starts_with(['{', '[', '"'])
+        && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+}
+
+/// 出站的请求体是不是 JSON：和 [`is_json`] 一样，只是字符串里原样写着的控制字符（换行、
+/// 制表符）不挑 —— 有的客户端这么发，上游也收；把它当成一段话的话，`"seed":42` 里的数值会被
+/// 换成占位符，请求就坏了。落盘打码用严格的 [`is_json`]：那边认不准时宁可多换
+pub(crate) fn json_like(text: &str) -> bool {
+    if is_json(text) {
+        return true;
+    }
+    if !text.trim_start().starts_with(['{', '[', '"']) || !text.bytes().any(|b| b < 0x20) {
+        return false;
+    }
+    // 控制字符换成空格再解一遍：字符串里外都还是合规的样子，结构不变
+    let spaced: String = text
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    serde_json::from_str::<serde::de::IgnoredAny>(&spaced).is_ok()
+}
+
+/// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
+pub(crate) fn json_string_spans(text: &str) -> Vec<Range<usize>> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && b[j] != b'"' {
+            j += if b[j] == b'\\' { 2 } else { 1 };
+        }
+        let end = j.min(b.len());
+        out.push(start..end);
+        i = end + 1;
+    }
+    out
+}
+
+fn custom_hits(text: &str, set: &RuleSet, json: bool, out: &mut Vec<Hit>) {
+    if set.custom.is_empty() {
+        return;
+    }
+    // 是 JSON 的话（请求体、编成 JSON 字符串的一段正文）**一个字符串一个字符串地找**：
+    // 用户的正则（`\S+`）在整段原文上会从 `{`、`:` 这些结构上的字开始，一路吃过引号 ——
+    // 换掉结构上的字，请求体就不是 JSON 了；而它吃掉的那一段里真正该换的字也就没换
+    let spans = if json {
+        json_string_spans(text)
+    } else {
+        std::iter::once(0..text.len()).collect()
+    };
     for c in &set.custom {
-        for m in c.re.find_iter(text) {
-            if let Some(bytes) = json_safe(text, m.range()) {
-                out.push(Hit {
-                    bytes,
-                    rule: Rule::Custom(c.name.clone()),
-                    label: c.label.clone(),
-                });
+        for span in &spans {
+            let Some(piece) = text.get(span.clone()) else {
+                continue;
+            };
+            for m in c.re.find_iter(piece) {
+                let m = span.start + m.start()..span.start + m.end();
+                if let Some(bytes) = json_safe(text, m) {
+                    out.push(Hit {
+                        bytes,
+                        rule: Rule::Custom(c.name.clone()),
+                        label: c.label.clone(),
+                    });
+                }
             }
         }
     }
@@ -1389,15 +1507,22 @@ fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
 /// 按 `set` 里开着的规则扫一段文本。
 ///
 /// 返回的区间**按起点排序且互不重叠** —— 替换要从后往前做，重叠会让
-/// 偏移全乱。
+/// 偏移全乱（重叠的怎么合见 [`resolve`]）。
 pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
+    resolve(scan_unresolved(text, set), set)
+}
+
+/// [`scan`] 还没合并重叠之前的样子：每条规则各自的命中，可能重叠、没排序。要先去掉一些
+/// 命中再合并的调用方（[`crate::redact::flow::hits`]：压在占位符上的、载荷里的）用它 ——
+/// 先合并的话，一处要换的值会跟着一处该去掉的命中一起被去掉
+pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     let mut out = Vec::new();
     if set.is_empty() {
         return out;
     }
     // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
     // JSON 的文本（直接拿来扫的一段话）不分里外
-    let json = text.trim_start().starts_with(['{', '[', '"']);
+    let json = json_like(text);
     if set.is_on("private-key") {
         private_keys(text, json, &mut out);
     }
@@ -1451,22 +1576,73 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
         }
     });
     spaced.finish(text, &mut out);
-    custom_hits(text, set, &mut out);
-    disjoint(out)
+    custom_hits(text, set, json, &mut out);
+    out
 }
 
-/// 排好序、去掉重叠的。**重叠的只留第一个。**私钥块里的 base64 会被 token
-/// 扫描当成别的东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段。
-fn disjoint(mut out: Vec<Hit>) -> Vec<Hit> {
+/// 排好序、互不重叠的命中（见 [`united`]）。**要换成占位符的命中说了算**：
+///
+/// - 换成占位符的规则之间重叠的，合成一处、换成一个占位符 —— 只留其中一处的话，另一处
+///   多出来的那一截（`aaa<<TW_SECRET_1>>ccc` 的 `ccc`）就原样发出去了；
+/// - 只记录的规则（[`RuleSet::records`]）的命中让开它们：和要换的重叠的那一截不算它的，
+///   剩下的几截照样是它的命中 —— 存下来、写进日志之前照样打码。反过来的话，一条只记录的
+///   规则会把一处本该换掉的值整个盖住，那个值就原样发出去了。
+///
+/// 报出去的记录不按截开的几截算，见 [`crate::redact::flow::reported`]。
+pub(crate) fn resolve(out: Vec<Hit>, set: &RuleSet) -> Vec<Hit> {
+    if set.record.is_empty() {
+        return united(out);
+    }
+    let (rec, rep): (Vec<Hit>, Vec<Hit>) = out.into_iter().partition(|h| set.records(&h.rule));
+    let rep = united(rep);
+    let mut all = Vec::with_capacity(rep.len());
+    for h in united(rec) {
+        all.extend(outside_of(&rep, h));
+    }
+    all.extend(rep);
+    all.sort_by_key(|h| h.bytes.start);
+    all
+}
+
+/// 排好序、重叠的合成一处：起点是最早的、终点是最远的，规则和标签照最先（同一个起点上最长）
+/// 的那一处。私钥块里的 base64 会被 token 扫描当成别的东西，两段嵌在一起替换会把偏移彻底
+/// 搞乱；合成一处之后整块换成一个占位符。只是挨着的不合
+fn united(mut out: Vec<Hit>) -> Vec<Hit> {
     out.sort_by_key(|h| (h.bytes.start, std::cmp::Reverse(h.bytes.end)));
     let mut kept: Vec<Hit> = Vec::with_capacity(out.len());
     for h in out {
-        if kept.last().is_some_and(|p| p.bytes.end > h.bytes.start) {
-            continue;
+        match kept.last_mut() {
+            Some(p) if p.bytes.end > h.bytes.start => p.bytes.end = p.bytes.end.max(h.bytes.end),
+            _ => kept.push(h),
         }
-        kept.push(h);
     }
     kept
+}
+
+/// `h` 去掉和 `hits`（按起点排好、互不重叠）重叠的那几段之后剩下的几截，按先后
+fn outside_of(hits: &[Hit], h: Hit) -> Vec<Hit> {
+    let mut out = Vec::new();
+    let mut at = h.bytes.start;
+    let first = hits.partition_point(|x| x.bytes.end <= h.bytes.start);
+    for x in hits[first..]
+        .iter()
+        .take_while(|x| x.bytes.start < h.bytes.end)
+    {
+        if x.bytes.start > at {
+            out.push(Hit {
+                bytes: at..x.bytes.start,
+                ..h.clone()
+            });
+        }
+        at = at.max(x.bytes.end);
+    }
+    if at < h.bytes.end {
+        out.push(Hit {
+            bytes: at..h.bytes.end,
+            ..h
+        });
+    }
+    out
 }
 
 /// 一个字符在 JSON 字符串里写出来有几个字节。**和 serde_json 的转义一致。**
@@ -1531,6 +1707,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
     let builtins = RuleSet {
         on: set.on.clone(),
         custom: Vec::new(),
+        record: set.record.clone(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
@@ -1542,7 +1719,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
             });
         }
     }
-    disjoint(out)
+    resolve(out, set)
 }
 
 /// 报出去的样子。**一律打码** —— 「发现了 sk-ant-xxx」这句话本身就是一次
@@ -1776,6 +1953,51 @@ mod tests {
         );
     }
 
+    /// 解码过的正文以引号、括号开头也不是 JSON：自定义规则照样在整段上找，不只在引号里
+    #[test]
+    fn decoded_text_that_starts_like_json_is_still_searched_whole() {
+        let rules = RuleSet::none()
+            .with_custom("corp", r"MYCORP-\d{6}")
+            .unwrap();
+        for t in [
+            "said MYCORP-111111 and \"x\" then MYCORP-222222",
+            "\"quoted\" then MYCORP-222222",
+            "{ see } MYCORP-222222",
+            "[1] MYCORP-222222",
+        ] {
+            let got: Vec<&str> = scan(t, &rules)
+                .iter()
+                .map(|h| &t[h.bytes.clone()])
+                .collect();
+            assert!(got.contains(&"MYCORP-222222"), "{t:?} → {got:?}");
+        }
+        // 一整段 JSON 还是只在字符串里找（结构上的字不换）
+        let body = r#"{"a":"MYCORP-333333","n":1}"#;
+        assert_eq!(scan(body, &rules).len(), 1);
+        assert!(is_json(body) && is_json("[1, \"x\"]") && is_json("\"s\""));
+        assert!(!is_json("\"quoted\" then") && !is_json("{ see }") && !is_json("[1] x"));
+        assert!(!is_json("620102198811110554"), "光秃秃的一个数是一段话");
+        assert!(
+            !is_json("[555-1234]") && !is_json("{\"p\":555-1234}"),
+            "要合规"
+        );
+    }
+
+    /// 出站的请求体字符串里原样写着换行（不合规、上游也收）：照样当 JSON 读，字符串外面的
+    /// 数值不换成占位符
+    #[test]
+    fn a_request_with_raw_newlines_in_strings_is_still_read_as_json() {
+        let rules = RuleSet::none().with_custom("ids", r"\d{6,}").unwrap();
+        let body = "{\"seed\":1234567,\"messages\":[{\"content\":\"line one\nmy id 7654321\"}]}";
+        let got: Vec<&str> = crate::redact::flow::hits(body, &rules)
+            .iter()
+            .map(|h| &body[h.bytes.clone()])
+            .collect();
+        assert_eq!(got, ["7654321"]);
+        assert!(json_like(body) && !is_json(body));
+        assert!(!json_like("[555-1234]") && !json_like("\"quoted\" then\n x"));
+    }
+
     #[test]
     fn a_pem_does_not_reach_into_the_next_string() {
         // 一条工具输出里只有半截的头（读的是讲这条规则的代码），END 在后面另一条消息里：
@@ -1788,8 +2010,7 @@ mod tests {
         .to_string();
         assert!(found(&body).is_empty(), "{:?}", found(&body));
         // 头在一个字符串里、END 在下一个字符串里也不算
-        let body = r#"{"a":"-----BEGIN RSA PRIVATE KEY-----
-MIIEow","b":"-----END RSA PRIVATE KEY-----"}"#;
+        let body = r#"{"a":"-----BEGIN RSA PRIVATE KEY-----\nMIIEow","b":"-----END RSA PRIVATE KEY-----"}"#;
         assert!(found(body).is_empty(), "{:?}", found(body));
     }
 

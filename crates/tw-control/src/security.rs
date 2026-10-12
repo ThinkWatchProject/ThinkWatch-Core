@@ -17,7 +17,9 @@
 //!
 //! - **一条规则在保存时就按读配置的那套校验查一遍**，写错当场说清楚，而不是写进去
 //!   之后整份配置加载不了；
-//! - **内置规则只记改过默认开关、默认处置的那几条**，没改过的不写进文件；
+//! - **内置规则只记改过默认开关、默认动作的那几条**，没改过的不写进文件；
+//! - **一组规则一次启停只写一次文件**（组标题上的复选框，[`set_rules_enabled`]）：一条一条地
+//!   写，几十条就是几十次热重载、几十个版本；
 //! - **自定义规则写成配置里那个类型序列化出来的样子**，默认值不写 —— 写进去的就是
 //!   读回来的那一份。
 
@@ -28,8 +30,8 @@ use serde_yaml_ng::{Mapping, Value};
 use tw_config::edit;
 use tw_config::history::Origin;
 use tw_config::{
-    ContentAction, CustomContentRule, CustomRedactRule, CustomToolRule, PolicyError, SecurityMode,
-    ToolAction,
+    ContentAction, CustomContentRule, CustomRedactRule, CustomToolRule, PolicyError, RedactAction,
+    SecurityMode, ToolAction,
 };
 use tw_guard::trial::TrialError;
 use tw_types::msg;
@@ -46,6 +48,7 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::SetSecurityMode, set_mode)
         .at(ep::ToggleBuiltinRule, toggle_builtin)
         .at(ep::SetBuiltinRuleAction, set_builtin_action)
+        .at(ep::SetRulesEnabled, set_rules_enabled)
         .at(ep::CreateCustomRule, create_custom)
         .at(ep::UpdateCustomRule, update_custom)
         .at(ep::DeleteCustomRule, delete_custom)
@@ -59,6 +62,13 @@ trait GuardExt: Sized {
     fn path(self, leaf: &str) -> Vec<Step>;
     fn lists(self, cfg: &tw_config::Config) -> (&[String], &[String]);
     fn on_by_default(self, id: &str) -> Option<bool>;
+    fn custom_names(self, cfg: &tw_config::Config) -> Vec<String>;
+    fn toggled_custom(
+        self,
+        cfg: &tw_config::Config,
+        name: &str,
+        enabled: bool,
+    ) -> Option<Result<Mapping, Fail>>;
 }
 
 impl GuardExt for Guard {
@@ -121,6 +131,51 @@ impl GuardExt for Guard {
                 .then_some(true),
             Guard::Content => tw_guard::content::builtin(id).map(|b| b.on_by_default),
         }
+    }
+    /// 这一项自定义规则的名字，按配置里的顺序
+    fn custom_names(self, cfg: &tw_config::Config) -> Vec<String> {
+        let s = &cfg.security;
+        match self {
+            Guard::Redact => s.redact.custom.iter().map(|c| c.name.clone()).collect(),
+            Guard::InspectTools => s
+                .inspect_tools
+                .custom
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            Guard::Content => s.content.custom.iter().map(|c| c.name.clone()).collect(),
+        }
+    }
+    /// 名字是 `name` 的自定义规则启用或停用之后写成配置里的样子。没有这条是 `None`
+    fn toggled_custom(
+        self,
+        cfg: &tw_config::Config,
+        name: &str,
+        enabled: bool,
+    ) -> Option<Result<Mapping, Fail>> {
+        let s = &cfg.security;
+        Some(match self {
+            Guard::Redact => {
+                let mut c = s.redact.custom.iter().find(|c| c.name == name)?.clone();
+                c.disabled = !enabled;
+                item(&c)
+            }
+            Guard::InspectTools => {
+                let mut c = s
+                    .inspect_tools
+                    .custom
+                    .iter()
+                    .find(|c| c.name == name)?
+                    .clone();
+                c.disabled = !enabled;
+                item(&c)
+            }
+            Guard::Content => {
+                let mut c = s.content.custom.iter().find(|c| c.name == name)?.clone();
+                c.disabled = !enabled;
+                item(&c)
+            }
+        })
     }
 }
 
@@ -213,6 +268,101 @@ async fn toggle_builtin(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
+/// 一次启用或停用几条规则（组标题上的复选框）：内置的按 id 改启停名单，自定义的改各自的
+/// `disabled`，**写一次文件**。和出厂一样的不写。认不出的内置规则、没有的自定义规则是 404，
+/// 一条都不改。
+async fn set_rules_enabled(
+    State(s): State<ControlState>,
+    Path(guard): Path<String>,
+    Json(req): Json<tw_api::RulesToggle>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let guard = Guard::parse(&guard)?;
+    let mut defaults = Vec::with_capacity(req.builtin.len());
+    for id in &req.builtin {
+        defaults.push((
+            id.clone(),
+            guard.on_by_default(id).ok_or_else(|| unknown_rule(id))?,
+        ));
+    }
+    // 自定义规则先按现在的配置查一遍：没有的当场说，不写半截
+    let known = guard.custom_names(&s.config());
+    if let Some(missing) = req.custom.iter().find(|n| !known.contains(n)) {
+        return Err(unknown_custom_rule(missing));
+    }
+    let version = s
+        .cfg
+        .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
+            let (enable, disable) = guard.lists(cfg);
+            let ids: Vec<&String> = defaults.iter().map(|(id, _)| id).collect();
+            let mut enable: Vec<String> = enable
+                .iter()
+                .filter(|x| !ids.contains(x))
+                .cloned()
+                .collect();
+            let mut disable: Vec<String> = disable
+                .iter()
+                .filter(|x| !ids.contains(x))
+                .cloned()
+                .collect();
+            for (id, on_by_default) in &defaults {
+                // **只记和出厂不一样的**
+                if req.enabled != *on_by_default {
+                    let list = if req.enabled {
+                        &mut enable
+                    } else {
+                        &mut disable
+                    };
+                    if !list.contains(id) {
+                        list.push(id.clone());
+                    }
+                }
+            }
+            let mut text = if defaults.is_empty() {
+                text.to_string()
+            } else {
+                let text = put_list(text, &guard.path("enable"), &enable)?;
+                put_list(&text, &guard.path("disable"), &disable)?
+            };
+            for name in &req.custom {
+                // 查过之后被别处删掉的，跳过
+                let Some(m) = guard.toggled_custom(cfg, name, req.enabled) else {
+                    continue;
+                };
+                let m = m.map_err(|f| ApplyError::Invalid(f.1.0))?;
+                text = edit::upsert(&text, guard.custom_section(), Some(name), &m)?;
+            }
+            Ok(text)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+fn unknown_custom_rule(name: &str) -> Fail {
+    fail(
+        StatusCode::NOT_FOUND,
+        msg!(
+            "security.unknown_custom_rule", rule = name.to_string() =>
+            "There is no custom rule `{rule}`."
+        ),
+    )
+}
+
+/// 契约里的规则动作，出站脱敏认的那两个。
+fn redact_action_of(a: RuleAction) -> Result<RedactAction, Fail> {
+    a.redact().ok_or_else(|| not_a_redact_action(a))
+}
+
+fn not_a_redact_action(a: RuleAction) -> Fail {
+    fail(
+        StatusCode::BAD_REQUEST,
+        msg!(
+            "security.redact_action_unknown", action = a.slug() =>
+            "`{action}` is not an action; it is placeholder or record."
+        ),
+    )
+}
+
 /// 契约里的规则动作，工具调用审查认的那两个。
 fn tool_action_of(a: RuleAction) -> Result<ToolAction, Fail> {
     a.tool().ok_or_else(|| not_a_tool_action(a))
@@ -228,7 +378,7 @@ fn not_a_tool_action(a: RuleAction) -> Fail {
     )
 }
 
-/// 契约里的规则动作，内容过滤认的那三个。
+/// 契约里的规则动作，内容过滤认的那四个。
 fn content_action_of(a: RuleAction) -> Result<ContentAction, Fail> {
     a.content().ok_or_else(|| not_a_content_action(a))
 }
@@ -237,28 +387,16 @@ fn not_a_content_action(a: RuleAction) -> Fail {
     fail(
         StatusCode::BAD_REQUEST,
         msg!(
-            "security.content_action_unknown", action = a.slug() =>
-            "`{action}` is not an action; it is block, strip or record."
-        ),
-    )
-}
-
-/// 出站脱敏的规则命中就替换，没有处置可言。
-fn no_action_of_its_own(guard: Guard) -> Fail {
-    fail(
-        StatusCode::BAD_REQUEST,
-        msg!(
-            "security.no_action_of_its_own", guard = guard.slug() =>
-            "The rules of `{guard}` have no action of their own; the mode decides what \
-             happens to a match."
+            "security.content_action_bad", action = a.slug() =>
+            "`{action}` is not an action; it is block, strip, replace or record."
         ),
     )
 }
 
 /// 改一条内置规则在第三档下做什么。
 ///
-/// **内置规则提供的只是一条判据。**命中之后怎么处置，和自定义规则一样由用户
-/// 定 —— 不必为了改处置先复制成一条自定义规则。和出厂一样的就把那一行删掉。
+/// **内置规则提供的只是一条判据。**命中之后怎么处理，和自定义规则一样由用户
+/// 定 —— 不必为了改动作先复制成一条自定义规则。和出厂一样的就把那一行删掉。
 async fn set_builtin_action(
     State(s): State<ControlState>,
     Path((guard, id)): Path<(String, String)>,
@@ -285,7 +423,13 @@ async fn set_builtin_action(
                 ContentAction::factory(b).slug(),
             )
         }
-        Guard::Redact => return Err(no_action_of_its_own(guard)),
+        Guard::Redact => {
+            tw_guard::redact::rules::builtin(&id).ok_or_else(|| unknown_rule(&id))?;
+            (
+                redact_action_of(req.action)?.slug(),
+                RedactAction::default().slug(),
+            )
+        }
     };
     let version = s
         .cfg
@@ -334,6 +478,11 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
                     .label
                     .clone()
                     .filter(|l| l != tw_guard::policy::DEFAULT_LABEL),
+                action: req
+                    .action
+                    .map(redact_action_of)
+                    .transpose()?
+                    .unwrap_or_default(),
                 disabled,
             };
             let m = item(&rule)?;
@@ -356,15 +505,29 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
             m
         }
         Guard::Content => {
+            let action = req
+                .action
+                .map(content_action_of)
+                .transpose()?
+                .unwrap_or_default();
             let rule = CustomContentRule {
                 name,
                 pattern,
+                scope: req
+                    .scope
+                    .clone()
+                    .map(dedup_scope)
+                    .unwrap_or_else(tw_guard::policy::request_only),
                 matching: req.matching.unwrap_or_default(),
-                action: req
-                    .action
-                    .map(content_action_of)
-                    .transpose()?
-                    .unwrap_or_default(),
+                case_sensitive: req.case_sensitive.unwrap_or(false),
+                action,
+                // 替换文本只在动作是替换时有意义：别的动作不写进文件（界面把出厂的 `***` 填在
+                // 框里交上来，写进去就是多出来的一行）
+                replacement: req
+                    .replacement
+                    .clone()
+                    .filter(|_| action == ContentAction::Replace)
+                    .unwrap_or_else(|| tw_guard::policy::DEFAULT_REPLACEMENT.to_string()),
                 disabled,
             };
             let m = item(&rule)?;
@@ -374,6 +537,13 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
     };
     one.check().map_err(rule_fail)?;
     Ok(m)
+}
+
+/// 查哪一边：按 `request`、`response` 的顺序，重复的只留一个
+fn dedup_scope(mut scope: Vec<tw_api::ContentScope>) -> Vec<tw_api::ContentScope> {
+    scope.sort();
+    scope.dedup();
+    scope
 }
 
 /// 一条自定义规则过不了校验。
@@ -387,6 +557,9 @@ fn rule_fail(e: PolicyError) -> Fail {
         PolicyError::BadCodepoints { reason, .. } => bad_codepoints(reason),
         PolicyError::BadLabel { label, .. } => bad_label(label),
         PolicyError::BadMatch { matching, .. } => bad_match(matching),
+        PolicyError::EmptyScope { .. } => scope_empty(),
+        PolicyError::BlockInAnswer { .. } => block_in_answer(),
+        PolicyError::CodepointsInAnswer { .. } => codepoints_in_answer(),
         // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id 不在这里写
         e @ (PolicyError::DuplicateName { .. } | PolicyError::UnknownRule { .. }) => {
             tw_config::policy_msg(&e)
@@ -400,6 +573,29 @@ fn bad_match(matching: tw_api::ContentMatch) -> tw_types::Msg {
     msg!(
         "security.redact_match_bad", matching = matching.slug() =>
         "A redaction rule matches by contains or regex, not `{matching}`."
+    )
+}
+
+fn scope_empty() -> tw_types::Msg {
+    msg!(
+        "security.rule_scope_empty" =>
+        "A content rule checks requests, answers or both; choose at least one."
+    )
+}
+
+fn block_in_answer() -> tw_types::Msg {
+    msg!(
+        "security.rule_scope_block" =>
+        "A rule that checks answers cannot block: an answer is already on its way when a match is \
+         found. Choose strip, replace or record."
+    )
+}
+
+fn codepoints_in_answer() -> tw_types::Msg {
+    msg!(
+        "security.rule_scope_codepoints" =>
+        "Code points are checked in requests only; a rule that checks answers matches by contains \
+         or regex."
     )
 }
 
@@ -524,7 +720,7 @@ fn trial_fail(guard: Guard, e: TrialError) -> Fail {
             return match guard {
                 Guard::InspectTools => not_a_tool_action(action),
                 Guard::Content => not_a_content_action(action),
-                Guard::Redact => no_action_of_its_own(guard),
+                Guard::Redact => not_a_redact_action(action),
             };
         }
         // 配置读进来时校验过，到这里还编不起来是绕过校验写进去的：那是这边的问题
@@ -534,6 +730,8 @@ fn trial_fail(guard: Guard, e: TrialError) -> Fail {
         TrialError::BadCodepoints { reason } => bad_codepoints(reason),
         TrialError::BadLabel { label } => bad_label(label),
         TrialError::BadMatch { matching } => bad_match(matching),
+        TrialError::BlockInAnswer => block_in_answer(),
+        TrialError::CodepointsInAnswer => codepoints_in_answer(),
     };
     fail(StatusCode::BAD_REQUEST, m)
 }
@@ -549,6 +747,8 @@ mod tests {
             action: None,
             matching: None,
             case_sensitive: None,
+            scope: None,
+            replacement: None,
             label: None,
             enabled: true,
             base_version: None,
@@ -631,6 +831,46 @@ mod tests {
         let back: tw_config::CustomContentRule =
             serde_yaml_ng::from_value(Value::Mapping(m)).unwrap();
         assert_eq!(back.action, ContentAction::Strip);
+        // 查哪一边按 request、response 的顺序写，重复的去掉；替换文本只在动作是替换时写
+        let m = custom_item(
+            Guard::Content,
+            &tw_api::CustomRuleSave {
+                scope: Some(vec![
+                    tw_api::ContentScope::Response,
+                    tw_api::ContentScope::Request,
+                    tw_api::ContentScope::Response,
+                ]),
+                case_sensitive: Some(true),
+                action: Some(RuleAction::Replace),
+                replacement: Some("[X]".into()),
+                ..save("代号", "北极星")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            yaml(&m),
+            "name: 代号\npattern: 北极星\nscope:\n- request\n- response\ncase_sensitive: true\naction: replace\nreplacement: '[X]'\n"
+        );
+        let m = custom_item(
+            Guard::Content,
+            &tw_api::CustomRuleSave {
+                scope: Some(vec![tw_api::ContentScope::Request]),
+                action: Some(RuleAction::Strip),
+                replacement: Some("[X]".into()),
+                ..save("代号", "北极星")
+            },
+        )
+        .unwrap();
+        assert_eq!(yaml(&m), "name: 代号\npattern: 北极星\naction: strip\n");
+        let m = custom_item(
+            Guard::Redact,
+            &tw_api::CustomRuleSave {
+                action: Some(RuleAction::Record),
+                ..save("a", "x")
+            },
+        )
+        .unwrap();
+        assert_eq!(yaml(&m), "name: a\npattern: x\naction: record\n");
         let m = custom_item(
             Guard::InspectTools,
             &tw_api::CustomRuleSave {
@@ -704,7 +944,7 @@ mod tests {
                     action: Some(RuleAction::Cut),
                     ..save("a", "x")
                 },
-                "security.content_action_unknown",
+                "security.content_action_bad",
             ),
         ];
         for (guard, req, want) in cases {
@@ -773,11 +1013,22 @@ mod tests {
             run(
                 Guard::Redact,
                 tw_api::SecurityTestRequest {
-                    action: Some(RuleAction::Record),
+                    action: Some(RuleAction::Cut),
                     ..req("x")
                 }
             ),
-            "security.no_action_of_its_own"
+            "security.redact_action_unknown"
+        );
+        assert_eq!(
+            run(
+                Guard::Content,
+                tw_api::SecurityTestRequest {
+                    action: Some(RuleAction::Block),
+                    scope: Some(tw_api::ContentScope::Response),
+                    ..req("x")
+                }
+            ),
+            "security.rule_scope_block"
         );
         assert_eq!(
             run(
@@ -787,7 +1038,7 @@ mod tests {
                     ..req("x")
                 }
             ),
-            "security.content_action_unknown"
+            "security.content_action_bad"
         );
         let f = trial_fail(
             Guard::Content,

@@ -414,7 +414,8 @@ impl Recorder {
                         guard: tw_api::Guard::Redact,
                         rule: it.rule.clone(),
                         custom: it.custom,
-                        action: if *replaced { tw_api::SecurityOutcome::Replaced } else { tw_api::SecurityOutcome::Recorded },
+                        // 拦截档下动作是「仅记录」的规则原样发了出去：这一项说了算
+                        action: if *replaced && it.replaced { tw_api::SecurityOutcome::Replaced } else { tw_api::SecurityOutcome::Recorded },
                         provider: provider.clone(),
                         client: client.clone().unwrap_or_default(),
                         tool: None,
@@ -429,10 +430,11 @@ impl Recorder {
                     });
                 }
             }
-            // 内容过滤：一条规则一条，`count` 是几处（码位规则是几个字符）
+            // 内容过滤：一条规则一条，`count` 是几处（码位规则是几个字符）。回答里的在回答结束时报
             Event::ContentMatched {
                 id,
                 provider,
+                direction,
                 rule,
                 custom,
                 matching,
@@ -456,6 +458,7 @@ impl Recorder {
                     action: match outcome {
                         tw_api::ContentOutcome::Recorded => tw_api::SecurityOutcome::Recorded,
                         tw_api::ContentOutcome::Stripped => tw_api::SecurityOutcome::Stripped,
+                        tw_api::ContentOutcome::Replaced => tw_api::SecurityOutcome::Replaced,
                         tw_api::ContentOutcome::Blocked => tw_api::SecurityOutcome::Blocked,
                     },
                     provider: provider.clone(),
@@ -466,8 +469,15 @@ impl Recorder {
                     matching: Some(*matching),
                     revealed: revealed.clone(),
                     session,
-                    // 请求还没发出去
-                    sent_model: None,
+                    // 请求里的：还没发出去。回答里的：发给回答它的那一跳的名字
+                    sent_model: match direction {
+                        tw_api::SecurityDirection::Request => None,
+                        tw_api::SecurityDirection::Response => self
+                            .inflight
+                            .get(id)
+                            .map(|p| p.sent_model().to_string())
+                            .filter(|m| !m.is_empty()),
+                    },
                     detail: detail.clone(),
                 });
             }
@@ -2005,6 +2015,7 @@ mod security_tests {
                     kind: tw_api::SecretKind::ApiKeys,
                     masked: "sk-an…AAAA".into(),
                     count: 2,
+                    replaced,
                     detail: Default::default(),
                 },
                 tw_api::SecretItem {
@@ -2013,6 +2024,7 @@ mod security_tests {
                     kind: tw_api::SecretKind::Custom,
                     masked: "corp_…1234".into(),
                     count: 1,
+                    replaced,
                     detail: Default::default(),
                 },
             ],
@@ -2096,6 +2108,7 @@ mod security_tests {
             tw_api::Event::ContentMatched {
                 id: 1,
                 provider: "relay".into(),
+                direction: tw_api::SecurityDirection::Request,
                 rule: rule.into(),
                 custom: false,
                 matching,
@@ -2226,6 +2239,7 @@ mod security_detail_tests {
                 kind: tw_api::SecretKind::Custom,
                 masked: "corp_…3456".into(),
                 count: 8,
+                replaced: true,
                 detail,
             }],
             at_ms: 10,
@@ -2291,6 +2305,8 @@ mod security_detail_tests {
             r"corp_[A-Z0-9]{12}",
             OutcomeDetail::Replaced {
                 placeholders: vec!["<<TW_SECRET_1>>".into()],
+                segments: None,
+                replacement: None,
             },
         );
         r.on_event(&started_in(1, "s-1"));
@@ -2316,6 +2332,86 @@ mod security_detail_tests {
         assert_eq!(page.events, vec![done]);
     }
 
+    /// 回答里的命中：方向是回答，发给上游的模型名是服务它的那一跳发的；内容过滤换掉的记成
+    /// `replaced`，计数里单独数
+    #[test]
+    fn an_answer_hit_is_logged_as_a_response_with_what_it_was_replaced_by() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(3, "s-3"));
+        r.on_event(&served_as(3, "claude-haiku-4-5"));
+        let d = SecurityHitDetail {
+            direction: SecurityDirection::Response,
+            locations: vec![HitLocation {
+                part: HitPart::ResponseText,
+                message_index: None,
+                role: None,
+                tool: None,
+                path: "content[0].text".into(),
+                before: "关于".into(),
+                matched: "北极星".into(),
+                after: "的说明".into(),
+            }],
+            more_locations: 0,
+            rule_snapshot: RuleSnapshot {
+                builtin: false,
+                id: "项目代号".into(),
+                name: "项目代号".into(),
+                pattern: Some("北极星".into()),
+                matching: Some(tw_api::ContentMatch::Contains),
+                case_sensitive: false,
+                core_version: "0.72.0".into(),
+            },
+            outcome_detail: OutcomeDetail::Replaced {
+                placeholders: vec![],
+                segments: Some(2),
+                replacement: Some("***".into()),
+            },
+        };
+        r.on_event(&Event::ContentMatched {
+            id: 3,
+            provider: "relay".into(),
+            direction: SecurityDirection::Response,
+            rule: "项目代号".into(),
+            custom: true,
+            matching: tw_api::ContentMatch::Contains,
+            action: tw_api::RuleAction::Replace,
+            outcome: tw_api::ContentOutcome::Replaced,
+            in_tool_result: false,
+            excerpt: "关于北极星的说明".into(),
+            count: 2,
+            revealed: None,
+            detail: d.clone(),
+            at_ms: 5,
+        });
+        let e = only(&r, 3);
+        assert_eq!(e.direction, SecurityDirection::Response);
+        assert_eq!(e.action, tw_api::SecurityOutcome::Replaced);
+        assert_eq!(e.sent_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(e.tool, None);
+        assert_eq!(e.outcome_detail, d.outcome_detail);
+        assert_eq!(e.locations[0].part, HitPart::ResponseText);
+        let c = r.db().security_counts(0, i64::MAX).unwrap();
+        assert_eq!(
+            (c.content, c.content_replaced, c.content_stripped),
+            (1, 1, 0)
+        );
+    }
+
+    /// 拦截档下动作是「仅记录」的脱敏规则：这一项原样发了出去，记成只记录
+    #[test]
+    fn a_record_only_secret_under_enforce_is_logged_as_recorded() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(4, "s-4"));
+        let mut e = secrets(4, detail("corp_[A-Z0-9]{12}", OutcomeDetail::Recorded {}));
+        if let Event::SecretsFound { items, .. } = &mut e {
+            items[0].replaced = false;
+        }
+        r.on_event(&e);
+        assert_eq!(only(&r, 4).action, tw_api::SecurityOutcome::Recorded);
+        let c = r.db().security_counts(0, i64::MAX).unwrap();
+        assert_eq!((c.secrets, c.secrets_replaced), (1, 0));
+    }
+
     /// 被拒的请求一个字节都没发出去：那一行记着的名字是它要发的，不是发了的
     #[test]
     fn a_refused_request_sent_no_model() {
@@ -2324,6 +2420,7 @@ mod security_detail_tests {
         r.on_event(&Event::ContentMatched {
             id: 2,
             provider: "relay".into(),
+            direction: SecurityDirection::Request,
             rule: "no plan".into(),
             custom: true,
             matching: tw_api::ContentMatch::Contains,

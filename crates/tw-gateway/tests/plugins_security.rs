@@ -306,6 +306,9 @@ export function onRequest(req) {
             custom: vec![CustomContentRule {
                 name: "内部代号".into(),
                 pattern: "Project Falcon".into(),
+                scope: vec![tw_config::ContentScope::Request],
+                case_sensitive: false,
+                replacement: "***".into(),
                 matching: Default::default(),
                 action: ContentAction::Block,
                 disabled: false,

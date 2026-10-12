@@ -99,9 +99,11 @@ pub fn replace_found(
     ledger: &Ledger,
     found: Option<&[Hit]>,
 ) -> (bytes::Bytes, Ledger) {
-    let Some(hits) = found.filter(|_| mode.acts() && !rules.is_empty()) else {
+    let Some(found) = found.filter(|_| mode.acts() && !rules.is_empty()) else {
         return replace(mode, rules, body, ledger);
     };
+    // 只记录的规则命中的不换
+    let hits = rules.to_replace(found);
     // 没命中就原样返回，连一次拷贝都不做
     if hits.is_empty() {
         return (body, ledger.clone());
@@ -110,7 +112,7 @@ pub fn replace_found(
     let Ok(text) = std::str::from_utf8(&body) else {
         return replace(mode, rules, body, ledger);
     };
-    let r = tw_guard::redact::replace::apply(text, hits, ledger.clone());
+    let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
     (bytes::Bytes::from(r.text), r.ledger)
 }
 
@@ -160,6 +162,8 @@ pub fn items(
             kind: crate::wire::secret_kind(f.rule.kind()),
             masked: f.masked.clone(),
             count: f.count,
+            // 拦截档下，动作是「仅记录」的规则原样发出
+            replaced: seen.replaced && !seen.redaction.rules.records(&f.rule),
             detail,
         })
         .collect()
@@ -240,6 +244,7 @@ pub fn report_with(
         bus.emit(tw_api::Event::ContentMatched {
             id,
             provider: provider.to_string(),
+            direction: tw_api::SecurityDirection::Request,
             rule: hit.rule.clone(),
             custom: hit.custom,
             matching: tw_api::ContentMatch::of(hit.matching),
@@ -262,6 +267,72 @@ pub fn report_with(
         "the request matched content rules"
     );
     sc.refusal().map(|r| refusal(&r.hit))
+}
+
+/// 回答里的命中报出去：每条规则一条 [`tw_api::Event::ContentMatched`]（方向是回答），挂在请求
+/// `id` 上。片段和细节按这个请求的脱敏规则和账本打码（[`detail::answer`]）。
+pub fn report_answer(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    hits: Vec<tw_guard::content::answer::AnswerHit>,
+    red: &crate::bodies::Redaction,
+) {
+    if hits.is_empty() {
+        return;
+    }
+    let at_ms = crate::server::now_ms();
+    for h in &hits {
+        bus.emit(tw_api::Event::ContentMatched {
+            id,
+            provider: provider.to_string(),
+            direction: tw_api::SecurityDirection::Response,
+            rule: h.rule.clone(),
+            custom: h.custom,
+            matching: tw_api::ContentMatch::of(h.matching),
+            action: tw_guard::policy::ContentAction::of(h.action).into(),
+            outcome: h.outcome,
+            in_tool_result: false,
+            excerpt: red.apply(&h.snippet),
+            count: h.count as u64,
+            revealed: None,
+            detail: detail::answer(h, red),
+            at_ms,
+        });
+    }
+    // 命中的原文是回答的正文，**不进应用日志**：日志只说哪条规则、做了什么
+    tracing::info!(
+        provider,
+        rules = ?hits.iter().map(|h| h.rule.as_str()).collect::<Vec<_>>(),
+        "the answer matched content rules"
+    );
+}
+
+/// 回答过滤此刻的档位和规则（见 [`tw_guard::content::answer`]）。没有查回答的规则、或者内容
+/// 过滤关着时是 `None`：**调用方据此整条短路**
+#[derive(Clone)]
+pub struct AnswerFilter {
+    pub answer: std::sync::Arc<tw_guard::content::answer::Answer>,
+    /// 第三档：规则按各自的动作改字。观察档只记录
+    pub acts: bool,
+}
+
+impl AnswerFilter {
+    pub fn of(rt: &crate::state::Runtime) -> Option<Self> {
+        let mode = rt.config.security.content.mode;
+        if !mode.detects() {
+            return None;
+        }
+        Some(Self {
+            answer: rt.answer.clone()?,
+            acts: mode.acts(),
+        })
+    }
+
+    /// 会不会改客户端收到的字：第三档、有删除或替换规则
+    pub fn changes_text(&self) -> bool {
+        self.acts && self.answer.changes_text()
+    }
 }
 
 /// 插件改过的请求再查一遍：**只报插件加进来的，也只按插件加进来的拒绝**。`before` 是插件
@@ -312,7 +383,7 @@ pub fn rescreen(
             })
             .cloned()
             .collect();
-        s.rules = std::sync::Arc::new(tw_guard::content::Rules { rules });
+        s.rules = std::sync::Arc::new(tw_guard::content::Rules::of(rules));
     }
 }
 
@@ -682,6 +753,9 @@ mod tests {
     fn filter(mode: Mode) -> Screen {
         use tw_guard::content::{Action, Match, RuleInput, Rules};
         let rule = |id, pattern, matching, action| RuleInput {
+            case_sensitive: false,
+            sides: Default::default(),
+            replacement: "***",
             id,
             name: id,
             custom: true,

@@ -61,6 +61,9 @@ fn config(up: SocketAddr) -> Config {
                 custom: vec![CustomContentRule {
                     name: "falcon".into(),
                     pattern: "falcon".into(),
+                    scope: vec![tw_config::ContentScope::Request],
+                    case_sensitive: false,
+                    replacement: "***".into(),
                     matching: Default::default(),
                     action: tw_config::ContentAction::Record,
                     disabled: false,

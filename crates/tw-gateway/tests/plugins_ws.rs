@@ -427,6 +427,9 @@ async fn content_a_plugin_adds_to_a_response_create_is_screened() {
             custom: vec![tw_config::CustomContentRule {
                 name: "no plan".into(),
                 pattern: "forbidden-plan".into(),
+                scope: vec![tw_config::ContentScope::Request],
+                case_sensitive: false,
+                replacement: "***".into(),
                 matching: Default::default(),
                 action: tw_config::ContentAction::Block,
                 disabled: false,

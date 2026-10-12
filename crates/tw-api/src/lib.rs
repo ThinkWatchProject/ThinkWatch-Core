@@ -26,7 +26,7 @@ pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 // `SecurityTestRequest`……）
 pub use tw_guard::content::Outcome as ContentOutcome;
 pub use tw_guard::locate::{Direction as SecurityDirection, Part as HitPart};
-pub use tw_guard::policy::{ContentMatch, Guard, Mode as GuardMode};
+pub use tw_guard::policy::{ContentMatch, ContentScope, Guard, Mode as GuardMode};
 pub use tw_guard::trial::{
     TrialHit as SecurityTestHit, TrialRequest as SecurityTestRequest,
     TrialResult as SecurityTestResult,
@@ -912,7 +912,35 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 ///
 /// 出站脱敏不再碰请求体的键；自定义规则也不碰协议里的 id、类型、角色、工具名、模型名这些值
 /// （内置规则照找）。
-pub const CONTROL_API_VERSION: u32 = 47;
+///
+/// **48 起每条规则都有自己的动作，内容过滤也查回答的正文**：[`RuleAction`] 多了 `placeholder`
+/// （出站脱敏换成占位符）和 `replace`（内容过滤换成规则的替换文本，不可还原）。出站脱敏的规则
+/// 视图带 `action` / `default_action`（`placeholder` / `record`，出厂是 `placeholder`），
+/// `SetBuiltinRuleAction` 和 [`CustomRuleSave`] 的 `action` 出站脱敏也认这两个，别的动作交给它
+/// 是 400（`security.redact_action_unknown`；`security.no_action_of_its_own` 不再有）。内容过滤
+/// 不认的动作换成了 `security.content_action_bad`（句子里多了 `replace`，原来的
+/// `security.content_action_unknown` 不再有）。内容过滤的规则视图多了 `scope`（`request` /
+/// `response`，两边都查的两个都在；内置规则是 `["request"]`）和 `replacement`（内置规则是
+/// `***`），关键词和正则的 [`Matcher`] 带上了它真的 `case_sensitive`；[`CustomRuleSave`] 多了
+/// `scope`（不给是 `["request"]`）、`replacement`（不给是 `***`），`case_sensitive` 内容过滤也认。
+/// 查回答的规则拒绝不了、不能按码位认：交上来是 400（`security.rule_scope_block`、
+/// `security.rule_scope_codepoints`，`scope` 是空的是 `security.rule_scope_empty`），配置里写了是
+/// `config.rule_scope_block` / `config.rule_scope_codepoints` / `config.rule_scope_empty`。
+/// [`SecurityTestRequest`] 多了 `scope`（样本当成请求还是回答的正文测，不给是 `request`）和
+/// `replacement`；出站脱敏试的时候认 `action`。新端点 `PUT /security/{guard}/rules/enabled`
+/// （`SetRulesEnabled`，[`RulesToggle`] → [`ConfigWritten`]）：一次启用或停用几条内置规则和几条
+/// 自定义规则，写一次配置；认不出的内置规则是 404（`security.unknown_rule`），没有的自定义规则
+/// 也是 404（`security.unknown_custom_rule`）。
+///
+/// 事件跟着改：[`Event::ContentMatched`] 多了 `direction`（命中在请求里还是回答里），`outcome`
+/// 多了 `replaced`；回答里的命中在这次回答结束时报，一条规则一条，`in_tool_result` 是 false，
+/// 位置的 `part` 是 `response_text`、`path` 是这一路正文在整份回答里的位置（`content[0].text`、
+/// `output[1].input`……）。[`SecretItem`] 多了 `replaced`：拦截档下这个值换成了占位符，还是
+/// 规则只记录、原样发了出去（事件的 `replaced` 说的还是档位）。安全日志里内容过滤换掉的记成
+/// `replaced`，[`OutcomeDetail`] 的 `replaced` 多了可选的 `segments`（换了几段）和
+/// `replacement`（换成的文字），回答里的命中 `direction` 是 `response`；[`SecurityCounts`] 多了
+/// `content_replaced`。照 47 写的界面不认 `placeholder`、`replace` 这两个动作。
+pub const CONTROL_API_VERSION: u32 = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1256,32 +1284,37 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         egress: Option<String>,
     },
-    /// 调用方发来的正文里（连同工具结果）命中了内容规则。**一条规则一条事件**，在请求
-    /// 开始之后报（结论在开始之前就定了：删过的请求，开始事件和存下来的就是删过的那一份）。
+    /// 调用方发来的正文里（连同工具结果）、或者模型回答的正文里命中了内容规则。**一条规则
+    /// 一条事件**。请求里的在请求开始之后报（结论在开始之前就定了：删过的请求，开始事件和存下来
+    /// 的就是删过的那一份）；回答里的在这次回答结束时报（客户端中途走掉的，走掉时报）。
     ///
     /// 处置档下：拒绝的那几条是 `blocked`，请求没有发出去，随后是一条来源为 `denied` 的
     /// 失败（别的命中是 `recorded`：没发出去也就没删）；不拒绝时删除规则命中的是
-    /// `stripped`，命中的字已经删掉。观察档一律 `recorded`。
+    /// `stripped`、替换规则命中的是 `replaced`，命中的字已经删掉、换掉。观察档一律 `recorded`。
+    /// 回答没有 `blocked`。
     ContentMatched {
         id: u64,
-        /// 这时要发往的上游（故障转移之前的首选）
+        /// 请求里的：这时要发往的上游（故障转移之前的首选）。回答里的：回答它的那一家
         provider: String,
+        /// 命中在请求里（`request`）还是回答的正文里（`response`）
+        #[serde(default = "request_side")]
+        direction: SecurityDirection,
         /// 内置规则的 id，或者自定义规则的名字
         rule: String,
         custom: bool,
         /// 这条规则怎么认：码位规则命中的是看不见的字符，`count` 是几个字符
         #[serde(rename = "match")]
         matching: ContentMatch,
-        /// 这条规则在处置档下做什么：`block` / `strip` / `record`
+        /// 这条规则在处置档下做什么：`block` / `strip` / `replace` / `record`
         action: RuleAction,
         /// 实际做了什么
         outcome: ContentOutcome,
-        /// 第一处在工具结果里，而不是调用方自己打的字
+        /// 第一处在工具结果里，而不是调用方自己打的字。回答里的是 false
         in_tool_result: bool,
-        /// 第一处前后的一小段，**已截断**。码位规则命中的字符画成 `‹U+E0049›`，连成一串
-        /// 的写成 `‹U+E0049 ×12›`
+        /// 第一处前后的一小段，**已截断、已打码**。码位规则命中的字符画成 `‹U+E0049›`，连成
+        /// 一串的写成 `‹U+E0049 ×12›`
         excerpt: String,
-        /// 这条规则在整个请求里命中了几处；码位规则是几个字符
+        /// 这条规则在整个请求（或者这次回答）里命中了几处；码位规则是几个字符
         count: u64,
         /// 码位规则命中了标签字符时，它们解出来的 ASCII 原文（最多 120 个字符）。别的时候
         /// 没有
@@ -5760,6 +5793,10 @@ pub struct SecretItem {
     /// 只留最后四位（`…1234`），邮箱只留第一个字和域名（`z…@example.com`）
     pub masked: String,
     pub count: u64,
+    /// 换成了占位符：拦截档下、规则的动作是换成占位符。`false` 是只记录（观察档，或者规则的
+    /// 动作是「仅记录」），原值照发
+    #[serde(default)]
+    pub replaced: bool,
     /// 每一处在哪儿、当时的规则、具体做了什么（见 [`SecurityHitDetail`]）
     pub detail: SecurityHitDetail,
 }
@@ -5782,13 +5819,15 @@ pub struct SecurityCounts {
     pub content_blocked: i64,
     /// 其中命中的文字删掉之后发出的
     pub content_stripped: i64,
+    /// 其中命中的文字换成替换文本之后发出的
+    pub content_replaced: i64,
 }
 
 /// 安全日志的一条。
 ///
 /// **一条是一次命中**：出站脱敏是「一个请求里的一个值」（出现几次合成
 /// 一条，`count` 说几次），工具调用审查是「一个工具调用命中一条规则」，内容过滤是
-/// 「一个请求命中一条规则」。
+/// 「一个请求（或者一次回答）命中一条规则」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityEventView {
@@ -5800,8 +5839,9 @@ pub struct SecurityEventView {
     pub rule: String,
     #[serde(default)]
     pub custom: bool,
-    /// 做了什么：`recorded`（只记录）/ `replaced`（已替换）/ `cut`（已切断）/
-    /// `stripped`（命中的文字删掉之后发出）/ `blocked`（请求被拒，没有发出去）
+    /// 做了什么：`recorded`（只记录）/ `replaced`（出站脱敏换成了占位符，内容过滤换成了
+    /// 替换文本）/ `cut`（已切断）/ `stripped`（命中的文字删掉之后发出）/ `blocked`（请求被拒，
+    /// 没有发出去）
     pub action: SecurityOutcome,
     /// 请求最终由哪个上游服务；还没结束的是当时的首选
     pub provider: String,
@@ -5844,7 +5884,7 @@ pub struct SecurityEventView {
     /// （被拒、被规则挡下）没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_model: Option<String>,
-    /// 查的是请求（出站脱敏、内容过滤）还是回答（工具调用审查）
+    /// 查的是请求（出站脱敏、内容过滤）还是回答（工具调用审查、查回答的内容过滤）
     pub direction: SecurityDirection,
     /// 这条规则在这个请求里命中的每一处，按先后，**最多 [`HIT_LOCATIONS_MAX`] 处**。出站
     /// 脱敏是这个值出现的每一处，内容过滤是这条规则的每一处，工具调用审查是这个调用的参数里
@@ -5928,8 +5968,18 @@ pub struct RuleSnapshot {
 pub enum OutcomeDetail {
     /// 只记录，什么都没动
     Recorded {},
-    /// 换成了占位符：发出去的、存下来的那一份里写的就是它们
-    Replaced { placeholders: Vec<String> },
+    /// 出站脱敏换成了占位符：发出去的、存下来的那一份里写的就是它们（`placeholders`）。内容
+    /// 过滤换成了规则的替换文本：换了几段（`segments`）、换成了什么（`replacement`），这时
+    /// `placeholders` 是空的
+    Replaced {
+        placeholders: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        segments: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        replacement: Option<String>,
+    },
     /// 切断了这个工具调用。`arguments` 是它的参数（打过码，最多 4 KiB，`truncated` 说截没
     /// 截过），`client_notice` 是客户端在它的位置上收到的那句话
     Cut {
@@ -5940,7 +5990,7 @@ pub enum OutcomeDetail {
     },
     /// 请求被拒：客户端收到的那句话
     Blocked { client_notice: String },
-    /// 命中的文字删掉了几段之后发出（码位规则连在一起的几个字符是一段）
+    /// 命中的文字删掉了几段之后发出（码位规则连在一起的几个字符是一段）。请求和回答一样
     Stripped { segments: u32 },
 }
 
@@ -6028,12 +6078,28 @@ pub struct RuleToggle {
     pub base_version: Option<String>,
 }
 
-/// 改一条内置规则在第三档下做什么。只有工具调用审查和内容过滤的规则有这一项 ——
-/// 出站脱敏的规则命中就替换。
+/// 一次启用或停用一项防护里的几条规则（组标题上的复选框）：内置的按 id，自定义的按名字，
+/// **写一次配置**。和出厂一样的不写进文件。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RulesToggle {
+    /// 内置规则的 id
+    #[serde(default)]
+    pub builtin: Vec<String>,
+    /// 自定义规则的名字
+    #[serde(default)]
+    pub custom: Vec<String>,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 改一条内置规则在第三档下做什么。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActionSave {
-    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `strip` / `record`
+    /// 出站脱敏：`placeholder` / `record`；工具调用审查：`cut` / `record`；内容过滤：`block` /
+    /// `strip` / `replace` / `record`
     pub action: RuleAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -6047,16 +6113,25 @@ pub struct CustomRuleSave {
     /// 工具调用审查是正则；出站脱敏和内容过滤按 `match`：要找的那段文字、正则，或者码位
     /// （`U+200B, U+E0000–U+E007F`，只有内容过滤）
     pub pattern: String,
-    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `strip` / `record`。不给按 `record`
+    /// 出站脱敏：`placeholder` / `record`，不给按 `placeholder`；工具调用审查：`cut` /
+    /// `record`；内容过滤：`block` / `strip` / `replace` / `record`（查回答的不能 `block`）。
+    /// 后两项不给按 `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RuleAction>,
-    /// 怎么认。内容过滤：`contains`（不分大小写的子串）/ `regex` / `codepoints`；出站脱敏：
-    /// `contains`（按原样找这段文字）/ `regex`。不给按 `contains`。工具调用审查的都是正则
+    /// 怎么认。内容过滤：`contains`（按原样找这段文字）/ `regex` / `codepoints`（只查请求）；
+    /// 出站脱敏：`contains` / `regex`。不给按 `contains`。工具调用审查的都是正则
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub matching: Option<ContentMatch>,
-    /// 出站脱敏才有：分大小写。不给是不分
+    /// 出站脱敏、内容过滤：分大小写。不给是不分
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_sensitive: Option<bool>,
+    /// 内容过滤才有：查哪一边，`request` / `response`，两边都查的两个都给。不给是
+    /// `["request"]`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<ContentScope>>,
+    /// 内容过滤才有：动作是替换时换成的文字。不给是 `***`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
     /// 出站脱敏才有：占位符名称，`PROJECT` 换成 `<<TW_PROJECT_1>>`。大写字母开头，其余是
     /// 大写字母、数字、下划线，最多 24 个字符。不给是 `SECRET`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6069,6 +6144,11 @@ pub struct CustomRuleSave {
 
 fn yes() -> bool {
     true
+}
+
+/// 老的事件里没有 `direction`：那时只查请求
+fn request_side() -> SecurityDirection {
+    SecurityDirection::Request
 }
 
 // ---------------------------------------------------------------- 脚本插件
@@ -6800,6 +6880,7 @@ mod tests {
         let e = Event::ContentMatched {
             id: 7,
             provider: "p".into(),
+            direction: SecurityDirection::Request,
             rule: "unicode-tags".into(),
             custom: false,
             matching: ContentMatch::Codepoints,
@@ -6827,7 +6908,12 @@ mod tests {
             (Some(9), Some("ignore me"))
         );
         assert!(v.get("blocked").is_none());
-        let Event::ContentMatched { revealed, .. } = serde_json::from_value(serde_json::json!({
+        assert_eq!(v["direction"], "request");
+        let Event::ContentMatched {
+            revealed,
+            direction,
+            ..
+        } = serde_json::from_value(serde_json::json!({
             "kind": "content_matched", "id": 1, "provider": "p", "rule": "r", "custom": true,
             "match": "contains", "action": "record", "outcome": "recorded", "in_tool_result": false,
             "excerpt": "x", "count": 1, "at_ms": 1,
@@ -6837,10 +6923,16 @@ mod tests {
                 "outcome_detail": {"action": "recorded"}
             }
         }))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("not a content match");
         };
         assert!(revealed.is_none(), "没有隐藏内容时不写这一项");
+        assert_eq!(
+            direction,
+            SecurityDirection::Request,
+            "老的事件没有方向：是请求"
+        );
     }
 
     /// 安全记录的细节在线上的样子：结局按 `action` 分，和 [`SecurityOutcome`] 同一套词；
@@ -6855,8 +6947,19 @@ mod tests {
             (
                 OutcomeDetail::Replaced {
                     placeholders: vec!["<<TW_SECRET_1>>".into()],
+                    segments: None,
+                    replacement: None,
                 },
                 serde_json::json!({"action": "replaced", "placeholders": ["<<TW_SECRET_1>>"]}),
+            ),
+            (
+                OutcomeDetail::Replaced {
+                    placeholders: vec![],
+                    segments: Some(2),
+                    replacement: Some("***".into()),
+                },
+                serde_json::json!({"action": "replaced", "placeholders": [], "segments": 2,
+                    "replacement": "***"}),
             ),
             (
                 OutcomeDetail::Cut {

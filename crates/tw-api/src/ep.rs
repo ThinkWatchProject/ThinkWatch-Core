@@ -171,6 +171,8 @@ endpoints! {
     SetSecurityMode: PUT "/security/{guard}/mode" [guard], api::ModeSave => api::ConfigWritten;
     ToggleBuiltinRule: PUT "/security/{guard}/builtin/{id}" [guard, id], api::RuleToggle => api::ConfigWritten;
     SetBuiltinRuleAction: PUT "/security/{guard}/builtin/{id}/action" [guard, id], api::ActionSave => api::ConfigWritten;
+    /// 一次启用或停用几条规则（内置的、自定义的），写一次配置
+    SetRulesEnabled: PUT "/security/{guard}/rules/enabled" [guard], api::RulesToggle => api::ConfigWritten;
     CreateCustomRule: POST "/security/{guard}/custom" [guard], api::CustomRuleSave => api::ConfigWritten;
     UpdateCustomRule: PUT "/security/{guard}/custom/{name}" [guard, name], api::CustomRuleSave => api::ConfigWritten;
     DeleteCustomRule: DELETE "/security/{guard}/custom/{name}" [guard, name], api::BaseVersion => api::ConfigWritten;
