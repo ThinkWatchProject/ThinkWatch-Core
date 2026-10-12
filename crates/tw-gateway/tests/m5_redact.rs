@@ -238,6 +238,43 @@ async fn a_placeholder_cut_into_single_characters_still_comes_back_whole() {
     assert!(!got.contains("<<TW_SECRET_"), "占位符漏给客户端了：{got}");
 }
 
+/// 一个私钥块：请求体里它的换行是 `\n` 两个字符
+const PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+
+fn body_with_pem() -> String {
+    serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": format!("钥匙：{PEM}") }],
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_private_key_comes_back_with_real_newlines_streamed_or_whole() {
+    // 以前流里放回去的是请求体里的写法：客户端看到的是一个反斜杠和一个 n
+    for stream in [true, false] {
+        let (up, seen) = start_upstream(stream).await;
+        let gw = start_gateway(vec![provider("relay", up)], SecurityMode::Enforce).await;
+        let got = ask(gw, &body_with_pem(), stream).await;
+
+        let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+        assert!(!sent.contains("MIIBOgIBAAJB"), "{sent}");
+        assert!(sent.contains("<<TW_SECRET_1>>"), "{sent}");
+        let text = if stream {
+            got.lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                .filter_map(|v| v["delta"]["text"].as_str().map(|s| s.to_string()))
+                .collect::<String>()
+        } else {
+            let v: serde_json::Value = serde_json::from_str(&got).expect("还是 JSON");
+            v["text"].as_str().unwrap().to_string()
+        };
+        assert_eq!(text, format!("钥匙：{PEM}"), "stream={stream}");
+    }
+}
+
 #[tokio::test]
 async fn observe_mode_changes_nothing_on_the_wire() {
     // 观察态**只记录，不改变任何行为**。出厂默认停在这里。

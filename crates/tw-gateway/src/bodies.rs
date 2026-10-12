@@ -23,13 +23,14 @@
 //!
 //! 以前存的是客户端发来的原文，密钥只在读出来的时候才打码：磁盘上躺着的一直是真值。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use tw_guard::redact::replace::{Ledger, Scheme};
+use tw_guard::redact::replace::{Form, Ledger, Scheme};
 use tw_guard::redact::rules::{Hit, Kind, Rule, RuleSet};
 
 /// 打码要多看的那一截。
@@ -114,12 +115,13 @@ impl Redaction {
     ///
     /// **读的时候还会再打一遍**，打第二遍不再改动什么（`mask_body` 认得自己打过的码）。
     pub fn apply(&self, text: &str) -> String {
-        self.apply_found(text, None)
+        self.apply_found(text, None, Form::Json)
     }
 
     /// [`apply`](Self::apply)，`found` 是按这套规则在 `text` 上已经找过的命中（[`crate::guard::hits`]
-    /// 的结果）：不再找一遍。没找过的是 `None`
-    fn apply_found(&self, text: &str, found: Option<&[Hit]>) -> String {
+    /// 的结果）：不再找一遍。没找过的是 `None`。`form` 是 `text` 的写法：存下来的正文是 JSON
+    /// 原文，解开的摘要是正文（见 [`Self::sent_as`]）
+    fn apply_found(&self, text: &str, found: Option<&[Hit]>, form: Form) -> String {
         // 我们自己的占位符不算（见 `crate::guard::hits`）：回答里回显的、重放过来的，原样存
         let fresh;
         let hits = match found {
@@ -129,22 +131,35 @@ impl Redaction {
                 &fresh[..]
             }
         };
-        let sent = self.sent();
+        let sent = self.sent_as(form);
         // 摘要以外的各段照常（找过的命中照用）；摘要解开了重新找、换、打码，再包回去
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         for (span, summary) in carried_summaries(text) {
             out.push_str(&self.piece(text, at..span.start, hits, &sent));
-            out.push_str(&tw_dialect::compaction::carry(&self.apply(&summary)));
+            out.push_str(&tw_dialect::compaction::carry(&self.apply_found(
+                &summary,
+                None,
+                Form::Text,
+            )));
             at = span.end;
         }
         out.push_str(&self.piece(text, at..text.len(), hits, &sent));
         out
     }
 
-    /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表）
-    pub(crate) fn sent(&self) -> HashMap<&str, &str> {
-        self.ledger.replacements().collect()
+    /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表），在 JSON 原文里找。存下来的
+    /// 正文、安全日志的前后文都是 JSON 原文
+    pub(crate) fn sent(&self) -> Sent<'_> {
+        self.sent_as(Form::Json)
+    }
+
+    /// [`Self::sent`]，在按 `form` 写的文字里找
+    fn sent_as(&self, form: Form) -> Sent<'_> {
+        Sent {
+            by_value: self.ledger.replacements().collect(),
+            form,
+        }
     }
 
     /// `text` 里的一段：落在这一段里的命中换掉或打码，再按形状打一遍。各段在 token 的边界上
@@ -158,7 +173,7 @@ impl Redaction {
         text: &str,
         range: Range<usize>,
         hits: &[Hit],
-        sent: &HashMap<&str, &str>,
+        sent: &Sent<'_>,
     ) -> String {
         let mut out = String::with_capacity(range.len());
         let mut at = range.start;
@@ -178,6 +193,28 @@ impl Redaction {
         }
         out.push_str(&text[at..range.end]);
         tw_secret::mask_body(&out)
+    }
+}
+
+/// 原值 → 发给上游的占位符，见 [`Redaction::sent`]。
+///
+/// **按解开转义之后的值比**：账里记的就是那个样子，而原文里的写法不止一种 —— 私钥块的换行
+/// 是 `\n`，Python 发来的 `é` 是 `\u00e9`，PHP 发来的斜杠是 `\/`。按某一种转义写法比的话，
+/// 换一种写法的客户端，它的值存下来是打了码的，上游收到的却是占位符。
+pub(crate) struct Sent<'a> {
+    by_value: HashMap<&'a str, &'a str>,
+    /// 要找的那段文字是哪种写法
+    form: Form,
+}
+
+impl Sent<'_> {
+    /// 从文字里截下来的 `raw` 换成了哪个占位符
+    fn get(&self, raw: &str) -> Option<&str> {
+        let value = match self.form {
+            Form::Json if raw.contains('\\') => Cow::Owned(tw_guard::locate::unescape(raw)),
+            _ => Cow::Borrowed(raw),
+        };
+        self.by_value.get(value.as_ref()).copied()
     }
 }
 
@@ -296,7 +333,8 @@ impl BodyRecord {
         let body = if self.kind == BodyKind::Heads {
             text.into_owned()
         } else {
-            self.redaction.apply_found(&text, found.as_deref())
+            self.redaction
+                .apply_found(&text, found.as_deref(), Form::Json)
         };
         // 截过的（交来的只是开头）报原本的长度。没截过的就是换过、打过码的这一份的长度：
         // 比存储层的上限还长的，由存储层截、由它记下（`tw_store::Blobs::put_with_len`）
@@ -525,6 +563,56 @@ mod tests {
             rules: Arc::new(rules),
             ledger,
         }
+    }
+
+    #[test]
+    fn a_value_written_with_escapes_is_stored_as_its_placeholder() {
+        // 账里记的是解开转义的样子，存下来的正文是 JSON 原文：私钥块的换行在这儿是 `\n`
+        // 两个字符，比的时候按原文的写法比，不然它被当成没换过的值打码
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": format!("{pem} 和 postgres://app:p\\w@db/x") }],
+        })
+        .to_string();
+        let r = enforced(&body);
+        assert_eq!(r.ledger.len(), 2);
+        let (sent, _) = crate::guard::replace(
+            tw_config::SecurityMode::Enforce,
+            &r.rules,
+            Bytes::from(body.clone()),
+            &r.ledger,
+        );
+        let stored = written(record(BodyKind::Request, &body, r));
+        assert_eq!(stored.as_bytes(), &sent[..]);
+        assert!(
+            stored.contains("<<TW_SECRET_1>> 和 postgres://app:<<TW_SECRET_2>>@db"),
+            "{stored}"
+        );
+    }
+
+    #[test]
+    fn a_value_written_with_other_escapes_is_still_stored_as_its_placeholder() {
+        // Python 把 `é` 写成 `\u00e9`，PHP 把斜杠写成 `\/`：和 serde 的写法不一样，比的是解开
+        // 之后的值，存下来的才是上游收到的那一份
+        let body = concat!(
+            r#"{"model":"m","messages":[{"role":"user","content":"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj\/p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY----- "#,
+            r#"\u548c postgres://app:p\u00e9w@db/x"}]}"#
+        );
+        let r = enforced(body);
+        assert_eq!(r.ledger.len(), 2);
+        let (sent, _) = crate::guard::replace(
+            tw_config::SecurityMode::Enforce,
+            &r.rules,
+            Bytes::from(body),
+            &r.ledger,
+        );
+        let stored = written(record(BodyKind::Request, body, r));
+        assert_eq!(stored.as_bytes(), &sent[..]);
+        assert!(
+            stored.contains(r#"<<TW_SECRET_1>> \u548c postgres://app:<<TW_SECRET_2>>@db"#),
+            "{stored}"
+        );
     }
 
     #[test]

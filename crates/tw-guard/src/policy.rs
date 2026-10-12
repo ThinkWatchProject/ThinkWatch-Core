@@ -1031,7 +1031,7 @@ content:
         assert!(rs.is_on("internal-ip") && !rs.is_on("jwt") && rs.is_on("anthropic-api-key"));
         let text = "PRJ-123456 corp_abcd zzz";
         let hits = crate::redact::rules::scan_plain(text, &rs);
-        let r = crate::redact::replace::apply(
+        let r = crate::redact::replace::apply_text(
             text,
             &hits,
             crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),

@@ -58,6 +58,9 @@ impl Bridge {
 
     /// 按客户端发来的那份 JSON 请求体编号：认得出的值按出现的先后发号，让开原文里本来
     /// 就写着的占位符。**和拦截档下出站脱敏编的是同一套号**（同一个找法、同一个起点）。
+    ///
+    /// 账里记的是值解开转义之后的样子（见 [`Ledger`]）：插件看到的是解码过的正文，请求体
+    /// 里写着 `\n` 的私钥块在那儿是真的换行，照样认得出、换成同一个号。
     pub fn learn(&mut self, body: &[u8]) {
         let Ok(text) = std::str::from_utf8(body) else {
             return;
@@ -116,7 +119,8 @@ impl Bridge {
             return cur;
         }
         let ledger = std::mem::replace(&mut self.ledger, Ledger::new(Scheme::SECRET));
-        let r = tw_guard::redact::replace::apply(&cur, &hits, ledger);
+        // 找的是解码过的正文：值原样记账，不再解一次转义
+        let r = tw_guard::redact::replace::apply_text(&cur, &hits, ledger);
         self.ledger = r.ledger;
         self.reindex();
         r.text
@@ -162,9 +166,9 @@ impl Bridge {
         out
     }
 
-    /// 占位符换回原值
+    /// 占位符换回原值。插件交回来的是解码过的正文：放回去的是原值本来的样子
     pub fn reveal(&self, s: &str) -> String {
-        tw_guard::redact::replace::restore(s, &self.ledger)
+        tw_guard::redact::replace::restore_text(s, &self.ledger)
     }
 
     /// 一个 JSON 值里的每个字符串（连同对象的键）都换成占位符。
@@ -393,6 +397,43 @@ mod tests {
         assert_eq!(b.reveal(&shown), format!("新的 {OTHER}"));
     }
 
+    const PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+
+    #[test]
+    fn a_key_written_with_escapes_in_the_body_is_the_same_key_in_decoded_text() {
+        // 请求体里私钥块的换行是 `\n` 两个字符，插件看到的正文里是真的换行：还是 1 号，
+        // 换回来的是真的换行，不是一个反斜杠和一个 n
+        let mut b = Bridge::new(rules());
+        b.learn(serde_json::json!({ "content": PEM }).to_string().as_bytes());
+        assert_eq!(b.ledger().len(), 1);
+        let shown = b.hide(&format!("钥匙：{PEM}"));
+        assert_eq!(shown, "钥匙：<<TW_SECRET_1>>");
+        assert_eq!(b.ledger().len(), 1, "同一个值又占了一个号");
+        assert_eq!(b.reveal("用 <<TW_SECRET_1>>"), format!("用 {PEM}"));
+        // 流式扣住的也按正文里的样子比
+        let head = &PEM[..40];
+        assert!(head.contains('\n'));
+        assert_eq!(b.hold_from(&format!("好 {head}")), "好 ".len());
+    }
+
+    #[test]
+    fn a_backslash_in_what_the_plugin_sees_survives_the_round_trip() {
+        // 正文里新找到的值原样记账：`a\nb` 是一个反斜杠和一个 n，换回来还是
+        let custom = RuleSet::none()
+            .with_custom("pw", r"pw=\S+")
+            .expect("a valid pattern");
+        let mut b = Bridge::new(Arc::new(custom));
+        let text = r#"登录用 pw=a\nb\"c"#;
+        let shown = b.hide(text);
+        assert_eq!(shown, "登录用 <<TW_SECRET_1>>");
+        assert_eq!(b.reveal(&shown), text);
+        let mut v = serde_json::json!({ "cmd": text });
+        b.hide_value(&mut v);
+        assert_eq!(v["cmd"], "登录用 <<TW_SECRET_1>>");
+        b.reveal_value(&mut v);
+        assert_eq!(v["cmd"], text);
+    }
+
     #[test]
     fn values_inside_json_including_keys_are_hidden_and_restored() {
         let mut b = Bridge::new(rules());
@@ -438,7 +479,7 @@ mod tests {
             at += v.len() + 1;
         }
         let ledger =
-            tw_guard::redact::replace::apply(&text, &hits, Ledger::new(Scheme::SECRET)).ledger;
+            tw_guard::redact::replace::apply_text(&text, &hits, Ledger::new(Scheme::SECRET)).ledger;
         Bridge::new(Arc::new(RuleSet::none())).with_ledger(ledger)
     }
 
