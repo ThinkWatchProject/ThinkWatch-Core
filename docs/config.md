@@ -759,7 +759,8 @@ Before a request leaves, the whole request (system prompt, earlier answers
 and tool calls included) is searched for credentials and personal
 information. Under `enforce` what is found is replaced with placeholders, and
 put back where the answer repeats them. Images, files and other base64
-payloads are not searched, nor are field names and identifiers such as ids,
+payloads are not searched, nor are field names; custom rules also leave alone
+the identifiers a protocol needs as they are, such as item and call ids,
 types, roles, tool names and model names.
 
 <!-- generated: table security.redact -->

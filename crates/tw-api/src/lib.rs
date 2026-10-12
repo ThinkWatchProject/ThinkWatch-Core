@@ -905,12 +905,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`SecurityTestRequest`] 的 `match` 出站脱敏也认（`contains` 按原样找这段文字、`regex`；
 /// 不给是 `contains`，**以前是正则**），多了 `case_sensitive`（不给是不分）。规则视图里
 /// 出站脱敏的自定义规则是 [`Matcher`] 的 `contains` 或 `regex`，两者都多了
-/// `case_sensitive`（工具调用审查的正则是 `true`）。安全日志的 [`RuleSnapshot`] 多了
+/// `case_sensitive`（工具调用审查的正则开头写了 `(?i)` 的是 `false`，别的是 `true`）。安全日志的 [`RuleSnapshot`] 多了
 /// `case_sensitive`，出站脱敏的自定义规则也带 `matching`。码位交给出站脱敏是 400
 /// （`security.redact_match_bad`），配置里写了是 `config.rule_match_bad`。配置里不写
 /// `match` 的老规则从此按原样找。
 ///
-/// 出站脱敏不再碰请求体的结构：键，和 id、类型、角色、工具名、模型名这些值。
+/// 出站脱敏不再碰请求体的键；自定义规则也不碰协议里的 id、类型、角色、工具名、模型名这些值
+/// （内置规则照找）。
 pub const CONTROL_API_VERSION: u32 = 47;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
