@@ -99,6 +99,7 @@ config.rotate.no_provider
 config.rotate.read_back_differs
 config.rule_codepoints_bad
 config.rule_label_bad
+config.rule_match_bad
 config.rule_name_empty
 config.rule_name_taken
 config.rule_pattern_bad
@@ -500,6 +501,7 @@ security.bad_pattern
 security.content_action_unknown
 security.no_action_of_its_own
 security.pattern_empty
+security.redact_match_bad
 security.rule_name_empty
 security.unknown_action
 security.unknown_guard

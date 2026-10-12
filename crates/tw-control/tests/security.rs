@@ -540,7 +540,7 @@ async fn a_broken_pattern_is_refused_before_anything_is_written() {
         &b.app,
         "POST",
         "/security/redact/custom",
-        json!({ "name": "写坏了", "pattern": "(" }),
+        json!({ "name": "写坏了", "pattern": "(", "match": "regex" }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
@@ -587,7 +587,7 @@ async fn trying_a_pattern_reports_where_it_matched_in_javascript_offsets() {
         &b.app,
         "POST",
         "/security/redact/test",
-        json!({ "sample": sample, "pattern": "corp_[A-Za-z0-9]{12}" }),
+        json!({ "sample": sample, "pattern": "corp_[A-Za-z0-9]{12}", "match": "regex" }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -605,7 +605,7 @@ async fn trying_a_pattern_reports_where_it_matched_in_javascript_offsets() {
         &b.app,
         "POST",
         "/security/redact/test",
-        json!({ "sample": "pw=hunter2\n下一行", "pattern": "pw=\\S+" }),
+        json!({ "sample": "pw=hunter2\n下一行", "pattern": "pw=\\S+", "match": "regex" }),
     )
     .await;
     assert_eq!(v["hits"][0]["end"], 10, "{v}");
@@ -1181,7 +1181,7 @@ async fn a_custom_redaction_rule_carries_its_placeholder_name() {
         &b.app,
         "POST",
         "/security/redact/custom",
-        json!({ "name": "项目代号", "pattern": "Project-[A-Z]+", "label": "PROJECT" }),
+        json!({ "name": "项目代号", "pattern": "Project-[A-Z]+", "match": "regex", "label": "PROJECT" }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -1194,7 +1194,7 @@ async fn a_custom_redaction_rule_carries_its_placeholder_name() {
         &b.app,
         "PUT",
         "/security/redact/custom/项目代号",
-        json!({ "name": "项目代号", "pattern": "Project-[A-Z]+", "label": "SECRET" }),
+        json!({ "name": "项目代号", "pattern": "Project-[A-Z]+", "match": "regex", "label": "SECRET" }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -1218,7 +1218,7 @@ async fn a_custom_redaction_rule_carries_its_placeholder_name() {
         &b.app,
         "POST",
         "/security/redact/test",
-        json!({ "sample": "上线 Project-ORION", "pattern": "Project-[A-Z]+", "label": "PROJECT" }),
+        json!({ "sample": "上线 Project-ORION", "pattern": "Project-[A-Z]+", "match": "regex", "label": "PROJECT" }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");

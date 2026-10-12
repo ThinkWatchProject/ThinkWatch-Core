@@ -759,7 +759,8 @@ Before a request leaves, the whole request (system prompt, earlier answers
 and tool calls included) is searched for credentials and personal
 information. Under `enforce` what is found is replaced with placeholders, and
 put back where the answer repeats them. Images, files and other base64
-payloads are not searched.
+payloads are not searched, nor are field names and identifiers such as ids,
+types, roles, tool names and model names.
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
@@ -769,7 +770,7 @@ payloads are not searched.
 | `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
 | `enable` | list of strings | `[]` | Built-in rules to switch on that are off out of the box, by id. |
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
-| `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a pattern matches is replaced like a credential. |
+| `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a rule matches is replaced like a credential. |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -778,8 +779,10 @@ payloads are not searched.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name shown in logs and in the app; it identifies the rule and has to be unique within this guard. |
-| `pattern` | string | **required** | Regular expression. |
-| `label` | string | `SECRET` | Placeholder name: what the pattern matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters. |
+| `pattern` | string | **required** | The text to look for; a regular expression with `match: regex`. |
+| `match` | `contains` \| `regex` | `contains` | `contains`: `pattern` is looked for as written; characters such as `.` and `*` have no special meaning. `regex`: `pattern` is a regular expression. |
+| `case_sensitive` | bool | `false` | Tell capital letters from small ones. Off by default: `ABC` and `abc` both match. |
+| `label` | string | `SECRET` | Placeholder name: what the rule matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters. |
 | `disabled` | bool | `false` | Switches the rule off and keeps it in the file. |
 <!-- /generated -->
 

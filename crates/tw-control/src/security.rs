@@ -327,6 +327,8 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
             let rule = CustomRedactRule {
                 name,
                 pattern,
+                matching: req.matching.unwrap_or_default(),
+                case_sensitive: req.case_sensitive.unwrap_or(false),
                 // 出厂的标签和没写一样，不写进文件
                 label: req
                     .label
@@ -384,12 +386,21 @@ fn rule_fail(e: PolicyError) -> Fail {
         PolicyError::BadPattern { guard, detail, .. } => bad_pattern(guard, detail),
         PolicyError::BadCodepoints { reason, .. } => bad_codepoints(reason),
         PolicyError::BadLabel { label, .. } => bad_label(label),
+        PolicyError::BadMatch { matching, .. } => bad_match(matching),
         // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id 不在这里写
         e @ (PolicyError::DuplicateName { .. } | PolicyError::UnknownRule { .. }) => {
             tw_config::policy_msg(&e)
         }
     };
     fail(StatusCode::BAD_REQUEST, m)
+}
+
+/// 出站脱敏的规则按原样找或者按正则，码位只有内容过滤认
+fn bad_match(matching: tw_api::ContentMatch) -> tw_types::Msg {
+    msg!(
+        "security.redact_match_bad", matching = matching.slug() =>
+        "A redaction rule matches by contains or regex, not `{matching}`."
+    )
 }
 
 fn pattern_empty() -> tw_types::Msg {
@@ -522,6 +533,7 @@ fn trial_fail(guard: Guard, e: TrialError) -> Fail {
         TrialError::BadPattern { detail } => bad_pattern(guard, detail),
         TrialError::BadCodepoints { reason } => bad_codepoints(reason),
         TrialError::BadLabel { label } => bad_label(label),
+        TrialError::BadMatch { matching } => bad_match(matching),
     };
     fail(StatusCode::BAD_REQUEST, m)
 }
@@ -536,6 +548,7 @@ mod tests {
             pattern: pattern.into(),
             action: None,
             matching: None,
+            case_sensitive: None,
             label: None,
             enabled: true,
             base_version: None,
@@ -565,6 +578,30 @@ mod tests {
         )
         .unwrap();
         assert!(!yaml(&m).contains("label"), "{}", yaml(&m));
+        // 怎么认、分不分大小写：和出厂（按原样找、不分）不一样才写
+        let m = custom_item(
+            Guard::Redact,
+            &tw_api::CustomRuleSave {
+                matching: Some(tw_api::ContentMatch::Regex),
+                case_sensitive: Some(true),
+                ..save("a", "x+")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            yaml(&m),
+            "name: a\npattern: x+\nmatch: regex\ncase_sensitive: true\n"
+        );
+        let m = custom_item(
+            Guard::Redact,
+            &tw_api::CustomRuleSave {
+                matching: Some(tw_api::ContentMatch::Contains),
+                case_sensitive: Some(false),
+                ..save("a", "x+")
+            },
+        )
+        .unwrap();
+        assert_eq!(yaml(&m), "name: a\npattern: x+\n");
         let m = custom_item(
             Guard::Redact,
             &tw_api::CustomRuleSave {
@@ -612,7 +649,22 @@ mod tests {
             (Guard::Redact, save("  ", "x"), "security.rule_name_empty"),
             (Guard::Redact, save("a", ""), "security.pattern_empty"),
             (Guard::Content, save("a", "  "), "security.pattern_empty"),
-            (Guard::Redact, save("a", "("), "security.bad_pattern"),
+            (
+                Guard::Redact,
+                tw_api::CustomRuleSave {
+                    matching: Some(tw_api::ContentMatch::Regex),
+                    ..save("a", "(")
+                },
+                "security.bad_pattern",
+            ),
+            (
+                Guard::Redact,
+                tw_api::CustomRuleSave {
+                    matching: Some(tw_api::ContentMatch::Codepoints),
+                    ..save("a", "x")
+                },
+                "security.redact_match_bad",
+            ),
             (Guard::InspectTools, save("a", "("), "security.bad_pattern"),
             (
                 Guard::Content,
@@ -676,7 +728,26 @@ mod tests {
             pattern: Some(pattern.into()),
             ..Default::default()
         };
-        assert_eq!(run(Guard::Redact, req("(")), "security.bad_pattern");
+        assert_eq!(
+            run(
+                Guard::Redact,
+                tw_api::SecurityTestRequest {
+                    matching: Some(tw_api::ContentMatch::Regex),
+                    ..req("(")
+                }
+            ),
+            "security.bad_pattern"
+        );
+        assert_eq!(
+            run(
+                Guard::Redact,
+                tw_api::SecurityTestRequest {
+                    matching: Some(tw_api::ContentMatch::Codepoints),
+                    ..req("x")
+                }
+            ),
+            "security.redact_match_bad"
+        );
         assert_eq!(run(Guard::Redact, req("")), "security.pattern_empty");
         assert_eq!(
             run(

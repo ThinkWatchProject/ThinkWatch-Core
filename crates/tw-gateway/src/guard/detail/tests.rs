@@ -610,6 +610,7 @@ fn rule_snapshots_say_what_the_rule_was_when_it_matched() {
             name: "Anthropic API key".into(),
             pattern: None,
             matching: None,
+            case_sensitive: false,
             core_version: env!("CARGO_PKG_VERSION").into(),
         }
     );

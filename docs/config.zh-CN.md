@@ -561,7 +561,7 @@ pricing:
 
 #### `security.redact`
 
-请求发出前，在整个请求中（包括系统提示、之前的回答和工具调用）查找凭据和个人信息。`enforce` 下将其替换为占位符，回答中重复出现时再换回原值。图片、文件等 base64 内容不查。
+请求发出前，在整个请求中（包括系统提示、之前的回答和工具调用）查找凭据和个人信息。`enforce` 下将其替换为占位符，回答中重复出现时再换回原值。图片、文件等 base64 内容不查；字段名，以及 id、类型、角色、工具名、模型名等标识也不查。
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
@@ -571,7 +571,7 @@ pricing:
 | `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
 | `enable` | 字符串列表 | `[]` | 打开出厂时关着的内置规则，按 id。 |
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
-| `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：正则匹配到的内容和凭据一样替换。 |
+| `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：匹配到的内容和凭据一样替换。 |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -580,8 +580,10 @@ pricing:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和应用里显示的名字，也是规则的标识；同一项防护里不能重名。 |
-| `pattern` | 字符串 | **必填** | 正则表达式。 |
-| `label` | 字符串 | `SECRET` | 占位符名称：正则匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。 |
+| `pattern` | 字符串 | **必填** | 要查找的文字；`match: regex` 时为正则表达式。 |
+| `match` | `contains` \| `regex` | `contains` | `contains`：按原样查找 `pattern`，`.`、`*` 等字符没有特殊含义。`regex`：`pattern` 是正则表达式。 |
+| `case_sensitive` | 布尔 | `false` | 区分大小写。默认不区分：`ABC` 和 `abc` 都会匹配。 |
+| `label` | 字符串 | `SECRET` | 占位符名称：匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。 |
 | `disabled` | 布尔 | `false` | 停用这条规则，规则本身留在文件里。 |
 <!-- /generated -->
 
