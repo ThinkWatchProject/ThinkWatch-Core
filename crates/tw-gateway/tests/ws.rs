@@ -2233,3 +2233,120 @@ async fn a_late_frame_of_the_last_answer_does_not_touch_the_current_one() {
         "{all}"
     );
 }
+
+/// 三次回答：前两次都报了 `error`，第三次说到一半，前两次各补来一个带着整段正文的
+/// `response.failed`（一个是上一次的，一个更早）
+async fn three_answers() -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut sock: WebSocket| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(_) = m else { continue };
+                    n += 1;
+                    let delta = |d: &str| serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":d});
+                    let message = |t: &str| serde_json::json!([{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":t}]}]);
+                    let created = |id: &str| serde_json::json!({"type":"response.created","response":{"id":id,"status":"in_progress","model":"gpt-5","output":[]}});
+                    let error = |id: &str| serde_json::json!({"type":"error","error":{"type":"server_error","message":"boom"},"response_id":id});
+                    let failed = |id: &str, t: &str| serde_json::json!({"type":"response.failed","response":{"id":id,"status":"failed","output":message(t)}});
+                    let frames = match n {
+                        1 => vec![created("resp_1"), delta("one secret"), error("resp_1")],
+                        2 => vec![created("resp_2"), delta("two secret"), error("resp_2")],
+                        _ => vec![
+                            created("resp_3"),
+                            delta("x sec"),
+                            failed("resp_1", "one secret"),
+                            failed("resp_2", "two secret"),
+                            delta("ret y"),
+                            serde_json::json!({"type":"response.completed","response":{"id":"resp_3","status":"completed","output":message("x secret y")}}),
+                        ],
+                    };
+                    for f in frames {
+                        if sock.send(Message::Text(f.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// 更早的一次回答补来的帧也按它自己的过滤处理：删掉的字不到客户端，这一次回答扣着的字不提前
+/// 交出去；它的命中不挂到这一轮上
+#[tokio::test]
+async fn late_frames_of_older_answers_keep_to_themselves() {
+    let up = three_answers().await;
+    let pattern = "secret".to_string();
+    let (gw, mut rx, _state) = turns_gateway(
+        up,
+        move |cfg| {
+            cfg.security.content = tw_config::ContentPolicy {
+                mode: SecurityMode::Enforce,
+                custom: vec![tw_config::CustomContentRule {
+                    name: "r".into(),
+                    pattern,
+                    scope: vec![tw_config::ContentScope::Response],
+                    matching: Default::default(),
+                    case_sensitive: false,
+                    action: tw_config::ContentAction::Strip,
+                    replacement: "***".into(),
+                    disabled: false,
+                }],
+                ..Default::default()
+            };
+        },
+        None,
+    )
+    .await;
+    let mut c = connect(gw).await;
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    for end in ["error", "error", "response.completed"] {
+        c.send(create("hi")).await.unwrap();
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+                .await
+                .expect("the answer did not end")
+                .expect("the connection closed")
+                .unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            let done = v["type"] == end;
+            frames.push(v);
+            if done {
+                break;
+            }
+        }
+    }
+    let all = serde_json::to_string(&frames).unwrap();
+    assert!(!all.contains("secret"), "删掉的字到了客户端：{all}");
+    let created = frames
+        .iter()
+        .position(|f| f["type"] == "response.created" && f["response"]["id"] == "resp_3")
+        .unwrap();
+    let third: String = frames[created..]
+        .iter()
+        .filter(|f| f["type"] == "response.output_text.delta")
+        .map(|f| f["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(third, "x  y", "{all}");
+    c.close(None).await.unwrap();
+    // 第三轮只报它自己的那一处
+    let evs = requests(&mut rx, 3).await;
+    let third_id = *started_ids(&evs).last().unwrap();
+    let counts: Vec<u64> = of(&evs, third_id)
+        .iter()
+        .filter_map(|e| match e {
+            Event::ContentMatched { count, .. } => Some(*count),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(counts, [1], "{evs:?}");
+}

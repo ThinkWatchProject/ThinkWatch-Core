@@ -16,7 +16,8 @@
 //!   后面，跨过它的两段字也不算一处命中。`finishReason` 结束；
 //! - Bedrock Converse：一个内容块一路（`delta.text`），`contentBlockStop` 结束。
 //!
-//! 报错的一帧（顶层带着 `error` 的，Anthropic、Responses 的 `error` 事件）结束所有的路。
+//! 报错的一帧（顶层的 `error` 是一个带着 `message` 或 `code` 的对象，Anthropic、Responses
+//! 的 `error` 事件）结束所有的路。
 //!
 //! 一路结束时扣着的尾巴：那一帧里正好有这一路的字段就接在后面，没有就按这一路自己的格式
 //! 补一帧，**先于**结束的那一帧发出去（和占位符的还原同一个办法，见
@@ -801,9 +802,9 @@ enum Close {
 }
 
 fn close(d: Dialect, v: &Value) -> Close {
-    // 一帧错误（Chat、Gemini 在流里报的 `{"error": …}`，别的格式也可能这么写）：回答到此
-    // 为止，扣着的尾巴赶在它前面补出来
-    if v.get("error").is_some_and(|e| !e.is_null()) {
+    // 一帧错误（Chat、Gemini 在流里报的 `{"error": {"message": …}}`，别的格式也可能这么
+    // 写）：回答到此为止，扣着的尾巴赶在它前面补出来
+    if v.get("error").is_some_and(real_error) {
         return Close::All;
     }
     match d {
@@ -888,6 +889,18 @@ fn close(d: Dialect, v: &Value) -> Close {
             }
         }
     }
+}
+
+/// 顶层的 `error` 是不是一个真的错误：OpenAI（Chat）和 Gemini 写的都是一个对象，带着
+/// `message` 或者 `code`。`null`、`false`、空串、空对象不算 —— 把它们当成错误会让一路正文
+/// 提前结束，一个切在两帧里的词就认不出来了
+fn real_error(e: &Value) -> bool {
+    e.as_object().is_some_and(|o| {
+        o.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|m| !m.is_empty())
+            || o.get("code").is_some_and(|c| !c.is_null())
+    })
 }
 
 /// 补帧要从这一路最近的一帧上抄的那几个字段

@@ -1422,15 +1422,54 @@ fn json_safe(text: &str, m: Range<usize>) -> Option<Range<usize>> {
     (end > m.start).then_some(m.start..end)
 }
 
+/// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
+fn json_string_spans(text: &str) -> Vec<Range<usize>> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && b[j] != b'"' {
+            j += if b[j] == b'\\' { 2 } else { 1 };
+        }
+        let end = j.min(b.len());
+        out.push(start..end);
+        i = end + 1;
+    }
+    out
+}
+
 fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
+    if set.custom.is_empty() {
+        return;
+    }
+    // 是 JSON 的话（请求体、编成 JSON 字符串的一段正文）**一个字符串一个字符串地找**：
+    // 用户的正则（`\S+`）在整段原文上会从 `{`、`:` 这些结构上的字开始，一路吃过引号 ——
+    // 换掉结构上的字，请求体就不是 JSON 了；而它吃掉的那一段里真正该换的字也就没换
+    let spans = if text.trim_start().starts_with(['{', '[', '"']) {
+        json_string_spans(text)
+    } else {
+        std::iter::once(0..text.len()).collect()
+    };
     for c in &set.custom {
-        for m in c.re.find_iter(text) {
-            if let Some(bytes) = json_safe(text, m.range()) {
-                out.push(Hit {
-                    bytes,
-                    rule: Rule::Custom(c.name.clone()),
-                    label: c.label.clone(),
-                });
+        for span in &spans {
+            let Some(piece) = text.get(span.clone()) else {
+                continue;
+            };
+            for m in c.re.find_iter(piece) {
+                let m = span.start + m.start()..span.start + m.end();
+                if let Some(bytes) = json_safe(text, m) {
+                    out.push(Hit {
+                        bytes,
+                        rule: Rule::Custom(c.name.clone()),
+                        label: c.label.clone(),
+                    });
+                }
             }
         }
     }
@@ -1441,8 +1480,15 @@ fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
 /// 按 `set` 里开着的规则扫一段文本。
 ///
 /// 返回的区间**按起点排序且互不重叠** —— 替换要从后往前做，重叠会让
-/// 偏移全乱。
+/// 偏移全乱（重叠的怎么合见 [`resolve`]）。
 pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
+    resolve(scan_unresolved(text, set), set)
+}
+
+/// [`scan`] 还没合并重叠之前的样子：每条规则各自的命中，可能重叠、没排序。要先去掉一些
+/// 命中再合并的调用方（[`crate::redact::flow::hits`]：压在占位符上的、载荷里的）用它 ——
+/// 先合并的话，一处要换的值会跟着一处该去掉的命中一起被去掉
+pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     let mut out = Vec::new();
     if set.is_empty() {
         return out;
@@ -1504,7 +1550,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     });
     spaced.finish(text, &mut out);
     custom_hits(text, set, &mut out);
-    disjoint(out, set)
+    out
 }
 
 /// 排好序、互不重叠的命中（见 [`united`]）。**要换成占位符的命中说了算**：
@@ -1516,7 +1562,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
 ///   规则会把一处本该换掉的值整个盖住，那个值就原样发出去了。
 ///
 /// 报出去的记录不按截开的几截算，见 [`crate::redact::flow::reported`]。
-fn disjoint(out: Vec<Hit>, set: &RuleSet) -> Vec<Hit> {
+pub(crate) fn resolve(out: Vec<Hit>, set: &RuleSet) -> Vec<Hit> {
     if set.record.is_empty() {
         return united(out);
     }
@@ -1646,7 +1692,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
             });
         }
     }
-    disjoint(out, set)
+    resolve(out, set)
 }
 
 /// 报出去的样子。**一律打码** —— 「发现了 sk-ant-xxx」这句话本身就是一次

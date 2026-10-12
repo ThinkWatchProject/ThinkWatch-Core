@@ -1323,3 +1323,50 @@ fn held_text_comes_before_an_error_frame_in_every_format() {
         );
     }
 }
+
+/// 顶层的 `error` 只有是一个带着 `message` 或 `code` 的对象才算报错：`null`、`false`、空串、
+/// 下面某一层里的 `error` 都不结束一路正文，切在两帧里的词照样认得出
+#[test]
+fn only_a_real_error_object_ends_the_lanes() {
+    let a = star("k", "secret");
+    let chat = |t: &str, extra: Value| {
+        let mut v =
+            json!({"id":"c","choices":[{"index":0,"delta":{"content":t},"finish_reason":null}]});
+        if let (Some(m), Value::Object(e)) = (v.as_object_mut(), extra) {
+            m.extend(e);
+        }
+        data(v)
+    };
+    for extra in [
+        json!({"error": null}),
+        json!({"error": false}),
+        json!({"error": ""}),
+        json!({"error": {}}),
+        json!({"usage": {"error": {"message": "x"}}}),
+    ] {
+        let stream = [
+            chat("a se", extra.clone()),
+            chat("cret b", json!({})),
+            chat("", json!({})),
+        ]
+        .concat();
+        let mut b = Body::new(a.clone(), true, Dialect::Chat, true);
+        let out = through(&mut b, &stream, 5);
+        assert!(
+            !out.contains("secret") && !out.contains("cret"),
+            "{extra}: {out}"
+        );
+    }
+    let g = |t: &str, extra: Value| {
+        let mut v =
+            json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":t}]}}]});
+        if let (Some(m), Value::Object(e)) = (v.as_object_mut(), extra) {
+            m.extend(e);
+        }
+        data(v)
+    };
+    let stream = [g("a se", json!({"error": null})), g("cret b", json!({}))].concat();
+    let mut b = Body::new(a, true, Dialect::Gemini, true);
+    let out = through(&mut b, &stream, 4);
+    assert!(!out.contains("cret"), "{out}");
+}

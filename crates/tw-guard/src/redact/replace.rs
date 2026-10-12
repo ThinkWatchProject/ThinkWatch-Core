@@ -290,6 +290,72 @@ pub fn redact_text(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     apply_text(text, &hits, ledger)
 }
 
+/// 账本里记着的每个原值，在 `text` 里**照字面**出现的每一处都换回它的占位符。
+///
+/// 回答里的占位符换回了原值之后，那份回答要存下来、写进日志时，按规则再找一遍不一定认得出
+/// 原值：连接串的口令要有 `postgres://app:` 在前面才认得出，模型单独复述一遍口令，规则就
+/// 认不出了；正则写成 `OPENAI_API_KEY=…` 的自定义规则，单独出现的那串值也一样。账本里记着
+/// 原值本身，按字面找一遍，哪种都漏不掉。**落盘、写日志之前用**，不用在发出去的请求上（那里
+/// 按规则找、按账本编号，见 [`crate::redact::flow`]）。
+///
+/// `form` 是 `text` 的写法：JSON 原文里原值写成转义过的样子（工具参数那段 JSON 里转义两次），
+/// 两种都找；解码过的正文找原样。已经写着的占位符里面不动，空的值不找。重叠的几处先到先得，
+/// 同一个起点上长的那个先。没有可换的时候原样借出去
+pub fn hide_values<'a>(text: &'a str, ledger: &Ledger, form: Form) -> Cow<'a, str> {
+    if ledger.is_empty() || text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut found: Vec<(Range<usize>, &str)> = Vec::new();
+    for (value, placeholder) in ledger.replacements() {
+        if value.is_empty() {
+            continue;
+        }
+        let mut needles: Vec<Cow<'_, str>> = vec![Cow::Borrowed(value)];
+        if form == Form::Json {
+            for times in [1, 2] {
+                let e = escaped_times(value, times);
+                if !needles.contains(&e) {
+                    needles.push(e);
+                }
+            }
+        }
+        for n in &needles {
+            for at in memchr::memmem::find_iter(text.as_bytes(), n.as_bytes()) {
+                found.push((at..at + n.len(), placeholder));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let ours: Vec<Range<usize>> = ledger
+        .scheme
+        .find_in(text)
+        .into_iter()
+        .map(|(r, _, _)| r)
+        .collect();
+    found.sort_by_key(|(r, _)| (r.start, std::cmp::Reverse(r.end)));
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (r, placeholder) in found {
+        if r.start < at || ours.iter().any(|o| o.start < r.end && r.start < o.end) {
+            continue;
+        }
+        // 找到的是 UTF-8 的原值在 UTF-8 的文字里：两头都在字符边界上；万一不在，这一处不换
+        let (Some(keep), true) = (text.get(at..r.start), text.is_char_boundary(r.end)) else {
+            continue;
+        };
+        out.push_str(keep);
+        out.push_str(placeholder);
+        at = r.end;
+    }
+    if at == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(text.get(at..).unwrap_or_default());
+    Cow::Owned(out)
+}
+
 /// 一次性还原一份 **JSON 原文**（非流式响应、WebSocket 的一帧、存下来的回答）：原值按它
 /// 所在的那一层转义再放回去。私钥块里的换行回到 `\n`，和请求体里写的一样；一个带引号的
 /// 值原样塞回去，整份 JSON 就坏了。
@@ -394,6 +460,48 @@ pub(crate) fn swap_with<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// 账本里的原值照字面换回占位符：JSON 原文里转义过的写法也认，已经写着的占位符里面不动，
+    /// 没有可换的原样借出
+    #[test]
+    fn values_in_the_ledger_are_hidden_as_written() {
+        let pem = "line1\nline2";
+        let text = format!("k=hunter2 pw {pem}");
+        let hits = vec![
+            Hit {
+                bytes: 2..9,
+                rule: crate::redact::rules::Rule::Custom("a".into()),
+                label: None,
+            },
+            Hit {
+                bytes: 13..text.len(),
+                rule: crate::redact::rules::Rule::Custom("b".into()),
+                label: None,
+            },
+        ];
+        let ledger = apply_text(&text, &hits, Ledger::new(Scheme::SECRET)).ledger;
+        // 回答复述了口令，规则单独认不出它
+        let answer = r#"{"content":"The password hunter2 is wrong; key line1\nline2"}"#;
+        assert_eq!(
+            hide_values(answer, &ledger, Form::Json),
+            r#"{"content":"The password <<TW_SECRET_1>> is wrong; key <<TW_SECRET_2>>"}"#
+        );
+        // 解码过的正文按原样找
+        assert_eq!(
+            hide_values("say hunter2 and line1\nline2", &ledger, Form::Text),
+            "say <<TW_SECRET_1>> and <<TW_SECRET_2>>"
+        );
+        // 占位符里面不动，没有可换的原样借出
+        assert!(matches!(
+            hide_values("<<TW_SECRET_1>> clean", &ledger, Form::Json),
+            Cow::Borrowed(_)
+        ));
+        let empty = Ledger::new(Scheme::SECRET);
+        assert!(matches!(
+            hide_values("hunter2", &empty, Form::Text),
+            Cow::Borrowed(_)
+        ));
+    }
+
     use super::*;
     use crate::redact::rules::{BUILTINS, RuleSet};
 

@@ -110,8 +110,10 @@ impl Default for Redaction {
 impl Redaction {
     /// 换过、打过码的样子。
     ///
-    /// 两道：脱敏规则认出的每一处，账本里有的换成那个占位符（上游收到的就是它），没有的
-    /// 打码；然后整段再按形状打一遍（[`tw_secret::mask_body`]）兜住规则没认出来的。
+    /// 三道：脱敏规则认出的每一处，账本里有的换成那个占位符（上游收到的就是它），没有的
+    /// 打码；账本里的原值照字面再找一遍，换成占位符（规则要靠前后文才认得出的值单独出现时，
+    /// 比如回答里复述的口令）；然后整段再按形状打一遍（[`tw_secret::mask_body`]）兜住规则
+    /// 没认出来的。
     ///
     /// **读的时候还会再打一遍**，打第二遍不再改动什么（`mask_body` 认得自己打过的码）。
     pub fn apply(&self, text: &str) -> String {
@@ -192,6 +194,9 @@ impl Redaction {
             at = h.bytes.end;
         }
         out.push_str(&text[at..range.end]);
+        // 规则认不出的原值也换掉：回答里换回来的口令单独出现时，没有前后文，规则认不出它
+        // （见 [`tw_guard::redact::replace::hide_values`]）
+        let out = tw_guard::redact::replace::hide_values(&out, &self.ledger, sent.form);
         tw_secret::mask_body(&out)
     }
 }
@@ -518,6 +523,28 @@ mod tests {
         for clear in ["hunter2", "appuser", "db-primary.internal", "orders"] {
             assert!(!stored.contains(clear), "{clear} 原样落盘：{stored}");
         }
+    }
+
+    /// 存下来的客户端那一份回答里换回了原值：规则要靠前后文才认得出的（连接串的口令、写成
+    /// `OPENAI_API_KEY=…` 的自定义规则），单独复述的时候规则认不出 —— 照账本里的原值照字面
+    /// 换回占位符，不原样落盘
+    #[test]
+    fn a_restored_value_without_its_context_is_not_stored_in_clear() {
+        let rules = RuleSet::defaults()
+            .with_custom("env", r"OPENAI_API_KEY=\S+")
+            .unwrap();
+        let request = r#"{"messages":[{"role":"user","content":"postgres://app:hunter2@db.internal:5432/orders and OPENAI_API_KEY=abc123xyz"}]}"#;
+        let (_, ledger) =
+            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, request.as_bytes());
+        let red = Redaction {
+            rules: Arc::new(rules),
+            ledger,
+        };
+        let answer = r#"{"choices":[{"index":0,"message":{"content":"The password hunter2 is wrong; the value OPENAI_API_KEY=abc123xyz was set. Again: OPENAI_API_KEY=abc123xyz"}}]}"#;
+        let stored = red.apply(answer);
+        assert!(!stored.contains("hunter2"), "{stored}");
+        assert!(!stored.contains("abc123xyz"), "{stored}");
+        assert!(stored.contains("<<TW_SECRET_1>>"), "{stored}");
     }
 
     #[test]

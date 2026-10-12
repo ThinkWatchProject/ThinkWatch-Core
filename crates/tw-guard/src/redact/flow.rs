@@ -43,8 +43,12 @@ use crate::redact::rules::{Finding, Hit, RuleSet};
 /// 一个口令 —— 可它是我们换上去的：存下来的请求拿去重放、用户把详情里看到的东西贴回
 /// 对话，都会带着它。当成凭据的话，它会被再换一次、在安全日志里报一次、落盘时被打成
 /// `<<TW_…_2>>`。压在一个占位符上的命中都不算。
+///
+/// **先去掉、再合并**：每条规则各自的命中先去掉不算的那些，剩下的才合并重叠的（见
+/// [`crate::redact::rules::resolve`]）。反过来的话，一处要换的值和一处压在占位符上（或者
+/// 落在协议的 id 里）的命中合成一处之后，会跟着它一起被去掉，原样发出去。
 pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
-    let mut hits = crate::redact::rules::scan(text, rules);
+    let mut hits = crate::redact::rules::scan_unresolved(text, rules);
     if hits.is_empty() {
         return hits;
     }
@@ -59,10 +63,9 @@ pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
             outside(&mut mine, custom);
             hits = builtin;
             hits.extend(mine);
-            hits.sort_by_key(|h| h.bytes.start);
         }
     }
-    hits
+    crate::redact::rules::resolve(hits, rules)
 }
 
 /// 去掉压在我们自己的占位符上的命中（见 [`hits`]）。在解码过的正文上找的调用方（桌面版的
@@ -851,6 +854,9 @@ mod tests {
             (seed % n.max(1) as u64) as usize
         };
         let patterns = [
+            r"\S+",
+            r"[a-z]+@",
+            r"@[a-z0-9.]+",
             r"a[b1]{1,3}",
             r"b+a",
             r"[ab]{3}",
@@ -893,7 +899,15 @@ mod tests {
             if next(2) == 0 {
                 text.push_str(" a1@x.example.com sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd");
             }
-            let body = serde_json::json!({"messages":[{"role":"user","content":text}]}).to_string();
+            if next(3) == 0 {
+                text.push_str("<<TW_SECRET_1>>");
+            }
+            let body = serde_json::json!({"messages":[
+                {"role":"user","content":text},
+                {"role":"assistant","tool_calls":[{"id":format!("x{text}"),"type":"function",
+                    "function":{"name":"f","arguments":serde_json::json!({"q":text}).to_string()}}]}
+            ]})
+            .to_string();
             // 不带只记录的规则：内置的关掉、自定义的去掉
             let mut bare = p.clone();
             bare.custom
@@ -946,6 +960,14 @@ mod tests {
             assert!(
                 all.windows(2).all(|w| w[0].bytes.end <= w[1].bytes.start),
                 "命中要排好、互不重叠：{all:?}"
+            );
+            // 发出去的照样是 JSON，回答里原样复述的话能一字不差地换回来
+            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+            let (sent, ledger) = replace(Mode::Enforce, &rules, body.clone().into(), &l.ledger);
+            serde_json::from_slice::<serde_json::Value>(&sent).expect("still JSON");
+            assert_eq!(
+                crate::redact::replace::restore(std::str::from_utf8(&sent).unwrap(), &ledger),
+                body
             );
         }
     }
@@ -1001,6 +1023,78 @@ mod tests {
             .map(|f| f.rule.id().to_string())
             .collect();
         assert_eq!(reported, ["库", "conn-string-password"]);
+    }
+
+    /// 先去掉压在占位符上的、落在协议 id 里的命中，再合并：一处要换的值不会跟着一处该去掉的
+    /// 命中一起被去掉
+    #[test]
+    fn hits_that_do_not_count_are_dropped_before_overlaps_merge() {
+        use crate::policy::{ContentMatch, CustomRedactRule, RedactAction, RedactPolicy};
+        let custom = |pattern: &str| CustomRedactRule {
+            name: "c".into(),
+            pattern: pattern.into(),
+            matching: ContentMatch::Regex,
+            case_sensitive: false,
+            label: None,
+            action: RedactAction::Placeholder,
+            disabled: false,
+        };
+        let send = |p: &RedactPolicy, body: &str| {
+            let rules = p.rules().unwrap();
+            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+            let (out, _) = replace(Mode::Enforce, &rules, body.to_string().into(), &l.ledger);
+            String::from_utf8(out.to_vec()).unwrap()
+        };
+        // 邮箱和一处一直连到已经写着的占位符上的自定义命中
+        let p = RedactPolicy {
+            enable: vec!["email".into()],
+            custom: vec![custom(r"example\.org\S*")],
+            ..Default::default()
+        };
+        let body = r#"{"messages":[{"role":"user","content":"mail alice@corp.example.org<<TW_SECRET_1>> now"}]}"#;
+        let out = send(&p, body);
+        assert!(!out.contains("alice@corp.example.org"), "{out}");
+        assert!(out.contains("<<TW_SECRET_1>>"), "写着的占位符原样：{out}");
+        // 连接串的口令一样
+        let p = RedactPolicy {
+            custom: vec![custom(r"@db\S*")],
+            ..Default::default()
+        };
+        let body = r#"{"messages":[{"role":"user","content":"use postgres://app:hunter2@db.internal/x<<TW_SECRET_1>> now"}]}"#;
+        assert!(!send(&p, body).contains("hunter2"));
+        // 工具调用的 id 里的一把内置认得的密钥，和一处更早开始的自定义命中交叠：自定义规则不碰
+        // 协议的 id，内置规则照换
+        let key = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdEFGH";
+        let p = RedactPolicy {
+            custom: vec![custom(r"x sk-proj")],
+            ..Default::default()
+        };
+        let body = serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+            {"id": format!("x {key}"), "type":"function","function":{"name":"f","arguments":"{}"}}]}]})
+        .to_string();
+        let out = send(&p, &body);
+        assert!(!out.contains(key), "{out}");
+    }
+
+    /// 自定义规则的正则（`\S+`）从结构上的字开始匹配、或者一路吃过引号：只换字符串里面的那一段，
+    /// 请求体照样是 JSON
+    #[test]
+    fn a_greedy_custom_rule_never_touches_json_structure() {
+        let rules = RuleSet::none().with_custom("all", r"\S+").unwrap();
+        let body =
+            r#"{"messages":[{"role":"user","content":"a-b c"},{"role":"user","content":"d"}]}"#;
+        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+        let (out, ledger) = replace(Mode::Enforce, &rules, body.into(), &l.ledger);
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
+        assert_eq!(
+            v["messages"][0]["content"],
+            "<<TW_SECRET_1>> <<TW_SECRET_2>>"
+        );
+        assert_eq!(v["messages"][0]["role"], "user", "协议的值不碰");
+        assert_eq!(
+            crate::redact::replace::restore(std::str::from_utf8(&out).unwrap(), &ledger),
+            body
+        );
     }
 
     /// 原文里装着 base64 载荷的那些字符串

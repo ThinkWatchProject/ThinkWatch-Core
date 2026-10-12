@@ -1765,7 +1765,8 @@ fn filter_answer(f: &mut tw_guard::content::answer::FrameFilter, msgs: Vec<Strin
 }
 
 /// 收了尾的那一次回答又来的几帧：按**那一次回答自己的**过滤处理 —— 还是此刻这一次的就用
-/// 此刻的，是上一次的就用留着的那个，更早的（或者认不出是哪一次的）另起一个只管这几帧的。
+/// 此刻的（命中挂在这一次上报），是上一次的就用留着的那个，更早的（或者认不出是哪一次的）
+/// 另起一个只管这几帧的；后两种的命中不报，见下面。
 /// **不碰此刻这一次回答的路**：它的 `response.failed` 会结束所有的路，套在此刻的过滤上就把
 /// 这一次扣着的字提前交了出去
 fn filter_late(
@@ -1788,8 +1789,7 @@ fn filter_late(
     {
         // 那一次回答的路都已经结束、整段正文记着：照记下的写，不会多出命中
         let out = filter_answer(f, msgs);
-        let hits = f.take_hits();
-        report_hits(state, p, hits);
+        let _ = f.take_hits();
         return out;
     }
     let Some(rules) = p.rules.answer.as_ref().filter(|_| p.turns.is_some()) else {
@@ -1804,17 +1804,10 @@ fn filter_late(
     // 只管这几帧：扣着的不留到以后
     let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
     out.extend(f.drain().iter().map(text));
-    let hits = f.take_hits();
-    report_hits(state, p, hits);
+    // 命中不报：这几帧说的是那一次回答早先说过的话（命中在它那时报过），它那一轮已经收场，
+    // 挂到此刻在答的这一轮上就是记错了地方
+    let _ = f.take_hits();
     out
-}
-
-fn report_hits(state: &AppState, p: &Pipes, hits: Vec<tw_guard::content::answer::AnswerHit>) {
-    if hits.is_empty() {
-        return;
-    }
-    let redaction = p.redaction();
-    crate::guard::report_answer(&state.bus, p.event_id(), &p.provider, hits, &redaction);
 }
 
 /// 这一次回答里认定的命中报出去，挂在此刻在回答的那一轮上

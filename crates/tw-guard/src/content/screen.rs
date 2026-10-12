@@ -15,9 +15,10 @@
 //!
 //! 零宽字符拆开的关键词（`jail\u{200B}break`），删掉零宽字符就拼回来了 —— 而拒绝规则
 //! 查的是删之前的样子，拼回来的这一句会原样、干干净净地发给模型。所以删过之后再查一
-//! 遍：这时才命中的拒绝规则照样拒绝，这时才冒出来的「删除」规则命中接着删，最多
-//! [`MAX_ROUNDS`] 遍。观察档也照这样查一遍（在一份副本上），报的和处置档下会发生的
-//! 一样。
+//! 遍：这时才命中的拒绝规则照样拒绝，这时才冒出来的「删除」「替换」规则命中接着删、
+//! 接着换，**直到再查不出可改的为止**。再查只查上一遍改过的那几段。一层套一层写到
+//! [`MAX_ROUNDS`] 遍还没删干净的，那一段整段删掉：发出去的正文里不留一处命中。观察档也照
+//! 这样查一遍（在一份副本上），报的和处置档下会发生的一样。
 //!
 //! 换上去的替换文本不再查：它是规则写的，不是调用方的话。和它重叠的命中不算，不然一条
 //! 把 `*` 换成 `***` 的规则会一遍一遍地换它自己。
@@ -37,9 +38,9 @@ use tw_dialect::ir::Dialect;
 use super::{Action, Hit, Rules, Scope};
 use crate::policy::Mode;
 
-/// 删过几遍之后还在冒出新的命中的，不再删了。正常的正文删一遍就干净了；要删到第四遍
-/// 的只能是刻意一层套一层写出来的
-const MAX_ROUNDS: usize = 4;
+/// 最多删、换几遍。正常的正文一两遍就干净了；到这么多遍还在冒出新命中的只能是刻意一层套
+/// 一层写出来的，那一段整段删掉（见模块说明）
+const MAX_ROUNDS: usize = 64;
 
 /// 一条命中最后怎么样了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -306,18 +307,24 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
     // 每段正文里换上去的替换文本在哪儿（按现在的位置）：再查时不算
     let mut kept: Vec<Vec<Range<usize>>> = vec![Vec::new(); segments.len()];
     for _ in 0..MAX_ROUNDS {
+        // 这一遍改过的那几段：只有它们会冒出新的命中
+        let mut changed = vec![false; segments.len()];
         for (si, todo) in edits.into_iter().enumerate() {
             let merged = rules.merged(todo);
             if !merged.is_empty() {
                 texts[si] = super::apply_edits(&texts[si], &merged);
                 kept[si] = shift_kept(&kept[si], &merged);
+                changed[si] = true;
             }
             rounds[si].push(merged.iter().map(|(r, w)| (r.clone(), w.len())).collect());
         }
         let now: Vec<(&str, bool)> = texts
             .iter()
             .zip(segments)
-            .map(|(t, (_, in_tool_result))| (t.as_str(), *in_tool_result))
+            .zip(&changed)
+            .map(|((t, (_, in_tool_result)), &c)| {
+                (if c { t.as_str() } else { "" }, *in_tool_result)
+            })
             .collect();
         let next = rules.detect(&now, scope, &kept);
         let mut blocked = None;
@@ -359,6 +366,12 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
         edits = next.edits;
         if edits.iter().all(Vec::is_empty) {
             break;
+        }
+    }
+    // 到头了还有可改的：那几段整段删掉，不留一处命中发出去
+    for (si, todo) in edits.iter().enumerate() {
+        if !todo.is_empty() {
+            texts[si].clear();
         }
     }
     e.texts = Some(texts);
@@ -807,6 +820,39 @@ mod tests {
             body(json!({"messages": [{"role": "user", "content": format!("{kelvin}{a_bar}k")}]}));
         let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
         assert_eq!(sent(&s)["messages"][0]["content"], a_bar.to_string());
+    }
+
+    /// 一层套一层写出来的：删到不再冒出新命中为止；套到 [`MAX_ROUNDS`] 层还没删干净的，那一段
+    /// 整段删掉，发出去的正文里不留一处命中
+    #[test]
+    fn nested_matches_are_removed_until_none_is_left() {
+        let rs = rules(&[("ab", "ab", Contains, Strip)]);
+        let nested = |depth: usize| format!("x{}{}y", "a".repeat(depth), "b".repeat(depth));
+        let b = body(json!({"messages": [
+            {"role": "user", "content": nested(10)},
+            {"role": "user", "content": "untouched"},
+        ]}));
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(sent(&s)["messages"][0]["content"], "xy");
+        assert_eq!(sent(&s)["messages"][1]["content"], "untouched");
+        assert_eq!(s.hits[0].hit.count, 10);
+        let b = body(json!({"messages": [{"role": "user", "content": nested(MAX_ROUNDS + 5)}]}));
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(sent(&s)["messages"][0]["content"], "");
+        // 替换也一样，换上去的字不再查：`aabb` 换一遍是 `a#b`，`#` 和两边拼不成新的命中
+        let rs = Rules::build([RuleInput {
+            id: "ab",
+            name: "ab",
+            custom: true,
+            pattern: "ab",
+            action: Action::Replace,
+            replacement: "#",
+            ..RuleInput::default()
+        }])
+        .unwrap();
+        let b = body(json!({"messages": [{"role": "user", "content": "aabb"}]}));
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(sent(&s)["messages"][0]["content"], "a#b");
     }
 
     /// 分大小写的规则只认写的那样
