@@ -660,6 +660,9 @@ struct Pipes {
     /// 这一次回答的回答过滤（Responses 的连接、有查回答的规则时）：`response.created` 起一个，
     /// 回答收尾时报命中
     answer: Option<tw_guard::content::answer::FrameFilter>,
+    /// 上一次回答的过滤，连同那次回答的 id：它收了尾之后又来的一帧（`error` 之后补的
+    /// `response.failed`）按它自己的过滤处理，**不碰这一次回答的**
+    answered: Option<(Option<String>, tw_guard::content::answer::FrameFilter)>,
 }
 
 impl Pipes {
@@ -859,6 +862,7 @@ pub(crate) async fn proxy(
         reply: None,
         rename: None,
         answer: None,
+        answered: None,
     };
     pump(state.clone(), client, up, &mut p, ending).await;
     // 连接断在一次回答中间：这次回答里已经认定的命中照样报
@@ -1616,10 +1620,13 @@ async fn forward(
     if late {
         // 原样往下走
     } else if kind == Some("response.created") {
-        p.response = response_id(&restored);
+        let previous = std::mem::replace(&mut p.response, response_id(&restored));
         p.dropping = false;
-        // 回答过滤：这一次回答起一个（上一次没收尾的先报掉）。只有 Responses 的连接按回答分
+        // 回答过滤：这一次回答起一个。上一次的命中先报掉，过滤留着给它收尾之后又来的帧
         report_answer(state, p);
+        if let Some(old) = p.answer.take() {
+            p.answered = Some((previous, old));
+        }
         p.answer = p.turns.as_ref().and(p.rules.answer.as_ref()).map(|f| {
             tw_guard::content::answer::FrameFilter::new(
                 f.answer.clone(),
@@ -1665,10 +1672,18 @@ async fn forward(
     };
     // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的。收了尾的
     // 那一次回答又来的一帧也过（上游先报 `error` 再补一个带着整段正文的 `response.failed`）
-    let outgoing = filter_answer(p, outgoing);
-    if terminal || kind == Some("error") {
-        report_answer(state, p);
-    }
+    let outgoing = if late {
+        filter_late(state, p, outgoing, response_id(&restored).as_deref())
+    } else {
+        let out = match p.answer.as_mut() {
+            Some(f) => filter_answer(f, outgoing),
+            None => outgoing,
+        };
+        if terminal || kind == Some("error") {
+            report_answer(state, p);
+        }
+        out
+    };
     for msg in outgoing {
         let hits = match p.wall.as_mut() {
             Some(w) => w.feed(as_sse(&msg).as_bytes()),
@@ -1730,10 +1745,7 @@ async fn forward(
 
 /// 回答过滤这一次回答里的几帧：每一帧前面可能多出扣着的尾巴补成的帧。不是 JSON 的一帧，
 /// 先把扣着的补出来
-fn filter_answer(p: &mut Pipes, msgs: Vec<String>) -> Vec<String> {
-    let Some(f) = p.answer.as_mut() else {
-        return msgs;
-    };
+fn filter_answer(f: &mut tw_guard::content::answer::FrameFilter, msgs: Vec<String>) -> Vec<String> {
     let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
@@ -1750,6 +1762,59 @@ fn filter_answer(p: &mut Pipes, msgs: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+/// 收了尾的那一次回答又来的几帧：按**那一次回答自己的**过滤处理 —— 还是此刻这一次的就用
+/// 此刻的，是上一次的就用留着的那个，更早的（或者认不出是哪一次的）另起一个只管这几帧的。
+/// **不碰此刻这一次回答的路**：它的 `response.failed` 会结束所有的路，套在此刻的过滤上就把
+/// 这一次扣着的字提前交了出去
+fn filter_late(
+    state: &AppState,
+    p: &mut Pipes,
+    msgs: Vec<String>,
+    response: Option<&str>,
+) -> Vec<String> {
+    if p.answer.is_some() && response.is_some() && response == p.response.as_deref() {
+        let out = match p.answer.as_mut() {
+            Some(f) => filter_answer(f, msgs),
+            None => msgs,
+        };
+        report_answer(state, p);
+        return out;
+    }
+    if let Some((id, f)) = p.answered.as_mut()
+        && response.is_some()
+        && response == id.as_deref()
+    {
+        // 那一次回答的路都已经结束、整段正文记着：照记下的写，不会多出命中
+        let out = filter_answer(f, msgs);
+        let hits = f.take_hits();
+        report_hits(state, p, hits);
+        return out;
+    }
+    let Some(rules) = p.rules.answer.as_ref().filter(|_| p.turns.is_some()) else {
+        return msgs;
+    };
+    let mut f = tw_guard::content::answer::FrameFilter::new(
+        rules.answer.clone(),
+        rules.acts,
+        tw_dialect::ir::Dialect::Responses,
+    );
+    let mut out = filter_answer(&mut f, msgs);
+    // 只管这几帧：扣着的不留到以后
+    let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
+    out.extend(f.drain().iter().map(text));
+    let hits = f.take_hits();
+    report_hits(state, p, hits);
+    out
+}
+
+fn report_hits(state: &AppState, p: &Pipes, hits: Vec<tw_guard::content::answer::AnswerHit>) {
+    if hits.is_empty() {
+        return;
+    }
+    let redaction = p.redaction();
+    crate::guard::report_answer(&state.bus, p.event_id(), &p.provider, hits, &redaction);
 }
 
 /// 这一次回答里认定的命中报出去，挂在此刻在回答的那一轮上

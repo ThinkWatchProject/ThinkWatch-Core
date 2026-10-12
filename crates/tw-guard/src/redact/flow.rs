@@ -121,21 +121,21 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
 /// 只记录的规则的命中**。
 ///
 /// 一处值两条规则都认得、一条换成占位符一条只记录时，换的那条说了算（见
-/// [`crate::redact::rules::scan`]）：发出去的是占位符。只记录的那条照样命中了，照样报 ——
-/// 用户要看得见它在认哪些值。没有只记录的规则时就是 `found` 的那些
+/// [`crate::redact::rules::scan`]）：发出去的是占位符，`found` 里只记录的那条只剩让开之后的
+/// 几截（存下来时照样打码）。报的时候它整个算一处、照样报 —— 用户要看得见它在认哪些值。
+/// 没有只记录的规则时就是 `found` 的那些
 pub fn reported(text: &str, rules: &RuleSet, found: &[Hit]) -> Vec<Finding> {
     let Some(rec) = rules.recording_only() else {
         return crate::redact::rules::findings(text, found);
     };
-    let extra: Vec<Hit> = hits(text, &rec)
-        .into_iter()
-        .filter(|h| !found.contains(h))
+    // 只记录的规则的命中在 `found` 里可能被截成了几截（让开要换的那几处，见
+    // `crate::redact::rules::scan`）：报的是它整个认出来的那一处，另找一遍
+    let mut all: Vec<Hit> = found
+        .iter()
+        .filter(|h| !rules.records(&h.rule))
+        .cloned()
         .collect();
-    if extra.is_empty() {
-        return crate::redact::rules::findings(text, found);
-    }
-    let mut all = found.to_vec();
-    all.extend(extra);
+    all.extend(hits(text, &rec));
     all.sort_by_key(|h| h.bytes.start);
     crate::redact::rules::findings(text, &all)
 }
@@ -914,7 +914,93 @@ mod tests {
                 String::from_utf8(out.to_vec()).unwrap()
             };
             assert_eq!(out(&p), out(&bare), "{text:?} {p:?}");
+            // 每条规则单独认出来的每一个字节：都在合起来找到的命中里（存下来时打码）；要换的
+            // 规则认出来的，都在要换的那几处里（一个字节都不原样发出去）
+            let rules = p.rules().unwrap();
+            let all = hits(&body, &rules);
+            let replaced = rules.to_replace(&all);
+            let covered = |hs: &[Hit], at: usize| hs.iter().any(|h| h.bytes.contains(&at));
+            for c in &p.custom {
+                let one = RedactPolicy {
+                    custom: vec![c.clone()],
+                    disable: crate::redact::rules::BUILTINS
+                        .iter()
+                        .filter(|b| b.on_by_default)
+                        .map(|b| b.id.to_string())
+                        .collect(),
+                    ..Default::default()
+                };
+                for h in hits(&body, &one.rules().unwrap()) {
+                    for at in h.bytes.clone() {
+                        assert!(covered(&all, at), "{} 认的 {at} 没打码：{body}", c.name);
+                        if c.action == RedactAction::Placeholder {
+                            assert!(
+                                covered(&replaced, at),
+                                "{} 认的 {at} 原样发出：{body}",
+                                c.name
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                all.windows(2).all(|w| w[0].bytes.end <= w[1].bytes.start),
+                "命中要排好、互不重叠：{all:?}"
+            );
         }
+    }
+
+    /// 两条要换的规则认的地方交叠：合成一处、换成一个占位符，两头多出来的都不原样发出去
+    #[test]
+    fn overlapping_placeholder_hits_become_one_placeholder() {
+        let rules = RuleSet::none()
+            .with_custom("左", "aaabbb")
+            .unwrap()
+            .with_custom("右", "bbbccc")
+            .unwrap();
+        let body = r#"{"content":"x aaabbbccc y"}"#;
+        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+        let (out, ledger) = replace(Mode::Enforce, &rules, body.into(), &l.ledger);
+        assert_eq!(&out[..], br#"{"content":"x <<TW_SECRET_1>> y"}"#);
+        assert_eq!(
+            crate::redact::replace::restore(std::str::from_utf8(&out).unwrap(), &ledger),
+            body
+        );
+    }
+
+    /// 一条只记录的规则认得比要换的那条宽：发出去的只换要换的那一截，存下来时整段都打码
+    #[test]
+    fn a_wider_record_only_hit_is_still_masked_around_the_placeholder() {
+        let mut rules = RuleSet::defaults()
+            .with_custom("库", r"postgres://[^\s\x22]+")
+            .unwrap();
+        rules = rules.recording(crate::redact::rules::Rule::Custom("库".into()));
+        let body = r#"{"content":"use postgres://app:hunter2@db.internal:5432/orders now"}"#;
+        let found = hits(body, &rules);
+        // 口令那一截换成占位符，前后两截还是只记录的那条规则的，存下来时打码
+        let pieces: Vec<(&str, bool)> = found
+            .iter()
+            .map(|h| (&body[h.bytes.clone()], rules.records(&h.rule)))
+            .collect();
+        assert_eq!(
+            pieces,
+            [
+                ("postgres://app:", true),
+                ("hunter2", false),
+                ("@db.internal:5432/orders", true)
+            ]
+        );
+        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh());
+        assert_eq!(
+            &out[..],
+            br#"{"content":"use postgres://app:<<TW_SECRET_1>>@db.internal:5432/orders now"}"#
+        );
+        // 报的时候只记录的那条整个算一处
+        let reported: Vec<String> = reported(body, &rules, &found)
+            .iter()
+            .map(|f| f.rule.id().to_string())
+            .collect();
+        assert_eq!(reported, ["库", "conn-string-password"]);
     }
 
     /// 原文里装着 base64 载荷的那些字符串

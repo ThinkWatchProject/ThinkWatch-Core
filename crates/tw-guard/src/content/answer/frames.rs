@@ -16,6 +16,8 @@
 //!   后面，跨过它的两段字也不算一处命中。`finishReason` 结束；
 //! - Bedrock Converse：一个内容块一路（`delta.text`），`contentBlockStop` 结束。
 //!
+//! 报错的一帧（顶层带着 `error` 的，Anthropic、Responses 的 `error` 事件）结束所有的路。
+//!
 //! 一路结束时扣着的尾巴：那一帧里正好有这一路的字段就接在后面，没有就按这一路自己的格式
 //! 补一帧，**先于**结束的那一帧发出去（和占位符的还原同一个办法，见
 //! [`crate::redact::sse`]）。工具调用、思考过程不碰。
@@ -799,6 +801,11 @@ enum Close {
 }
 
 fn close(d: Dialect, v: &Value) -> Close {
+    // 一帧错误（Chat、Gemini 在流里报的 `{"error": …}`，别的格式也可能这么写）：回答到此
+    // 为止，扣着的尾巴赶在它前面补出来
+    if v.get("error").is_some_and(|e| !e.is_null()) {
+        return Close::All;
+    }
     match d {
         Dialect::Anthropic => match kind(v) {
             Some("content_block_stop") => Close::Lanes(vec![LaneKey::Text(u(v, "index"))]),

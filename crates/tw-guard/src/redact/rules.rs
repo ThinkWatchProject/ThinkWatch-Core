@@ -1507,41 +1507,69 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     disjoint(out, set)
 }
 
-/// 排好序、去掉重叠的（见 [`first_wins`]）。**要换成占位符的命中先挑**：只记录的规则
-/// （[`RuleSet::records`]）的命中和它们重叠就让开 —— 反过来的话，一条只记录的规则会把
-/// 一处本该换掉的值整个盖住，那个值就原样发出去了。只记录的规则之间照样先到先得。
+/// 排好序、互不重叠的命中（见 [`united`]）。**要换成占位符的命中说了算**：
+///
+/// - 换成占位符的规则之间重叠的，合成一处、换成一个占位符 —— 只留其中一处的话，另一处
+///   多出来的那一截（`aaa<<TW_SECRET_1>>ccc` 的 `ccc`）就原样发出去了；
+/// - 只记录的规则（[`RuleSet::records`]）的命中让开它们：和要换的重叠的那一截不算它的，
+///   剩下的几截照样是它的命中 —— 存下来、写进日志之前照样打码。反过来的话，一条只记录的
+///   规则会把一处本该换掉的值整个盖住，那个值就原样发出去了。
+///
+/// 报出去的记录不按截开的几截算，见 [`crate::redact::flow::reported`]。
 fn disjoint(out: Vec<Hit>, set: &RuleSet) -> Vec<Hit> {
     if set.record.is_empty() {
-        return first_wins(out);
+        return united(out);
     }
     let (rec, rep): (Vec<Hit>, Vec<Hit>) = out.into_iter().partition(|h| set.records(&h.rule));
-    let rep = first_wins(rep);
-    let mut rec = first_wins(rec);
-    rec.retain(|h| !overlaps_any(&rep, &h.bytes));
-    let mut all = rep;
-    all.extend(rec);
+    let rep = united(rep);
+    let mut all = Vec::with_capacity(rep.len());
+    for h in united(rec) {
+        all.extend(outside_of(&rep, h));
+    }
+    all.extend(rep);
     all.sort_by_key(|h| h.bytes.start);
     all
 }
 
-/// 排好序、去掉重叠的。**重叠的只留第一个。**私钥块里的 base64 会被 token
-/// 扫描当成别的东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段。
-fn first_wins(mut out: Vec<Hit>) -> Vec<Hit> {
+/// 排好序、重叠的合成一处：起点是最早的、终点是最远的，规则和标签照最先（同一个起点上最长）
+/// 的那一处。私钥块里的 base64 会被 token 扫描当成别的东西，两段嵌在一起替换会把偏移彻底
+/// 搞乱；合成一处之后整块换成一个占位符。只是挨着的不合
+fn united(mut out: Vec<Hit>) -> Vec<Hit> {
     out.sort_by_key(|h| (h.bytes.start, std::cmp::Reverse(h.bytes.end)));
     let mut kept: Vec<Hit> = Vec::with_capacity(out.len());
     for h in out {
-        if kept.last().is_some_and(|p| p.bytes.end > h.bytes.start) {
-            continue;
+        match kept.last_mut() {
+            Some(p) if p.bytes.end > h.bytes.start => p.bytes.end = p.bytes.end.max(h.bytes.end),
+            _ => kept.push(h),
         }
-        kept.push(h);
     }
     kept
 }
 
-/// `r` 和 `hits`（按起点排好、互不重叠）里的哪一处重叠
-pub(crate) fn overlaps_any(hits: &[Hit], r: &Range<usize>) -> bool {
-    let k = hits.partition_point(|h| h.bytes.end <= r.start);
-    hits.get(k).is_some_and(|h| h.bytes.start < r.end)
+/// `h` 去掉和 `hits`（按起点排好、互不重叠）重叠的那几段之后剩下的几截，按先后
+fn outside_of(hits: &[Hit], h: Hit) -> Vec<Hit> {
+    let mut out = Vec::new();
+    let mut at = h.bytes.start;
+    let first = hits.partition_point(|x| x.bytes.end <= h.bytes.start);
+    for x in hits[first..]
+        .iter()
+        .take_while(|x| x.bytes.start < h.bytes.end)
+    {
+        if x.bytes.start > at {
+            out.push(Hit {
+                bytes: at..x.bytes.start,
+                ..h.clone()
+            });
+        }
+        at = at.max(x.bytes.end);
+    }
+    if at < h.bytes.end {
+        out.push(Hit {
+            bytes: at..h.bytes.end,
+            ..h
+        });
+    }
+    out
 }
 
 /// 一个字符在 JSON 字符串里写出来有几个字节。**和 serde_json 的转义一致。**

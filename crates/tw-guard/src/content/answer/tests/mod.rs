@@ -1210,3 +1210,116 @@ fn many_matches_keep_counts_not_every_place() {
     assert_eq!(hits[0].count, 5_000);
     assert_eq!(hits[0].places.len(), PLACES_MAX);
 }
+
+/// 每种格式在流里报错：扣着的尾巴补在错误那一帧**前面**，客户端拼出来的字一个不少
+#[test]
+fn held_text_comes_before_an_error_frame_in_every_format() {
+    let a = star("k", "secret");
+    let anthropic = |t: &str| {
+        named(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":t}}),
+        )
+    };
+    let chat = |t: &str| {
+        data(json!({"id":"c","choices":[{"index":0,"delta":{"content":t},"finish_reason":null}]}))
+    };
+    let responses = |t: &str| {
+        responses_event(
+            "response.output_text.delta",
+            json!({"item_id":"m","output_index":0,"content_index":0,"delta":t}),
+        )
+    };
+    let gemini = |t: &str| json!({"candidates":[{"index":0,"content":{"parts":[{"text":t}]}}]});
+    let cases: Vec<(Dialect, bool, String, String)> = vec![
+        (
+            Dialect::Anthropic,
+            true,
+            [
+                anthropic("so se"),
+                named(
+                    "error",
+                    json!({"type":"error","error":{"type":"overloaded_error"}}),
+                ),
+            ]
+            .concat(),
+            "\"overloaded_error\"".into(),
+        ),
+        (
+            Dialect::Chat,
+            true,
+            [
+                chat("so se"),
+                data(json!({"error":{"message":"boom","type":"server_error"}})),
+            ]
+            .concat(),
+            "\"boom\"".into(),
+        ),
+        (
+            Dialect::Responses,
+            true,
+            [
+                responses("so se"),
+                responses_event("error", json!({"code":"server_error","message":"boom"})),
+            ]
+            .concat(),
+            "\"boom\"".into(),
+        ),
+        (
+            Dialect::Gemini,
+            true,
+            [
+                data(gemini("so se")),
+                data(json!({"error":{"code":500,"message":"boom"}})),
+            ]
+            .concat(),
+            "\"boom\"".into(),
+        ),
+        (
+            Dialect::Gemini,
+            false,
+            format!(
+                "[{},\r\n{}]",
+                gemini("so se"),
+                json!({"error":{"code":500,"message":"boom"}})
+            ),
+            "\"boom\"".into(),
+        ),
+    ];
+    for (d, sse, stream, error) in cases {
+        let mut b = Body::new(a.clone(), true, d, sse);
+        let out = through(&mut b, &stream, 3);
+        let at = out.find(&error).unwrap_or_else(|| panic!("{d:?}: {out}"));
+        let before = &out[..at];
+        let text: String = if sse {
+            frames_of(before)
+                .iter()
+                .filter_map(|f| {
+                    f["delta"]["text"]
+                        .as_str()
+                        .or(f["choices"][0]["delta"]["content"].as_str())
+                        .or(f["delta"].as_str())
+                        .or(f["candidates"][0]["content"]["parts"][0]["text"].as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        } else {
+            let v: Value = serde_json::from_str(&out).expect("still one array");
+            v.as_array()
+                .unwrap()
+                .iter()
+                .take_while(|e| e.get("error").is_none())
+                .filter_map(|e| {
+                    e["candidates"][0]["content"]["parts"][0]["text"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        assert_eq!(text, "so se", "{d:?} sse={sse}: {out}");
+        assert!(
+            !out[at..].contains("so se") && !out[at..].contains("\"se\""),
+            "{d:?}: 尾巴补在了错误之后：{out}"
+        );
+    }
+}

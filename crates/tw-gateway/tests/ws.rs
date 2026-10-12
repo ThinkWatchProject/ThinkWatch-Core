@@ -2134,3 +2134,102 @@ async fn a_late_failed_frame_after_an_error_is_filtered_too() {
         "删掉的字到了客户端：{frames:#?}"
     );
 }
+
+/// 两次回答交错的上游：第一次回答报了 `error`；第二次回答开始、说了半句之后，第一次回答补的
+/// `response.failed` 才到，然后第二次回答说完
+async fn interleaving() -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut sock: WebSocket| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(_) = m else { continue };
+                    n += 1;
+                    let delta = |d: &str| serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":d});
+                    let message = |t: &str| serde_json::json!([{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":t}]}]);
+                    let frames = if n == 1 {
+                        vec![
+                            serde_json::json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"gpt-5","output":[]}}),
+                            delta("a secret"),
+                            serde_json::json!({"type":"error","error":{"type":"server_error","message":"boom"},"response_id":"resp_1"}),
+                        ]
+                    } else {
+                        vec![
+                            serde_json::json!({"type":"response.created","response":{"id":"resp_2","status":"in_progress","model":"gpt-5","output":[]}}),
+                            delta("x sec"),
+                            serde_json::json!({"type":"response.failed","response":{"id":"resp_1","status":"failed","output":message("a secret")}}),
+                            delta("ret y"),
+                            serde_json::json!({"type":"response.completed","response":{"id":"resp_2","status":"completed","output":message("x secret y")}}),
+                        ]
+                    };
+                    for f in frames {
+                        if sock.send(Message::Text(f.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// 上一次回答收了尾之后又来的一帧按它自己的过滤处理：不把这一次回答扣着的字提前交出去，
+/// 也不让这一次回答的字跑进上一次的整段正文里
+#[tokio::test]
+async fn a_late_frame_of_the_last_answer_does_not_touch_the_current_one() {
+    let gw = stripping_gateway(interleaving().await, "secret").await;
+    let mut c = connect(gw).await;
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    for (create_text, end) in [("one", "error"), ("two", "response.completed")] {
+        c.send(create(create_text)).await.unwrap();
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+                .await
+                .expect("the answer did not end")
+                .expect("the connection closed")
+                .unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            let done = v["type"] == end;
+            frames.push(v);
+            if done {
+                break;
+            }
+        }
+    }
+    let all = serde_json::to_string(&frames).unwrap();
+    assert!(!all.contains("secret"), "删掉的字到了客户端：{all}");
+    // 第二次回答的增量拼起来：中间那一帧上一次回答的收尾没把扣着的「sec」提前交出去
+    let created = frames
+        .iter()
+        .position(|f| f["type"] == "response.created" && f["response"]["id"] == "resp_2")
+        .unwrap();
+    let second: String = frames[created..]
+        .iter()
+        .filter(|f| f["type"] == "response.output_text.delta")
+        .map(|f| f["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(second, "x  y", "{all}");
+    let text_of = |id: &str| {
+        frames
+            .iter()
+            .find(|f| f["response"]["id"] == id && f["type"] == "response.failed")
+            .map(|f| f["response"]["output"][0]["content"][0]["text"].clone())
+    };
+    assert_eq!(text_of("resp_1"), Some(serde_json::json!("a ")), "{all}");
+    let completed = frames
+        .iter()
+        .find(|f| f["type"] == "response.completed")
+        .unwrap();
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"], "x  y",
+        "{all}"
+    );
+}

@@ -497,6 +497,29 @@ mod tests {
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
+    /// 一条只记录的规则认得比要换的那条宽：存下来的正文里口令是发给上游的那个占位符，只记录的
+    /// 那条认出来的其余部分（用户、主机、库名）照样打码，哪一截都不原样落盘
+    #[test]
+    fn a_record_only_hit_around_a_placeholder_is_masked_on_disk() {
+        let rules = RuleSet::defaults()
+            .with_custom("库", r"postgres://[^\s\x22]+")
+            .unwrap()
+            .recording(Rule::Custom("库".into()));
+        let body =
+            r#"{"content":"use postgres://appuser:hunter2@db-primary.internal:5432/orders now"}"#;
+        let (_, ledger) =
+            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, body.as_bytes());
+        let red = Redaction {
+            rules: Arc::new(rules),
+            ledger,
+        };
+        let stored = red.apply(body);
+        assert!(stored.contains("<<TW_SECRET_1>>"), "{stored}");
+        for clear in ["hunter2", "appuser", "db-primary.internal", "orders"] {
+            assert!(!stored.contains(clear), "{clear} 原样落盘：{stored}");
+        }
+    }
+
     #[test]
     fn a_short_response_is_kept_whole() {
         let mut t = ResponseTap::new();
