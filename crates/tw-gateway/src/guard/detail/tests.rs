@@ -389,7 +389,9 @@ fn a_value_written_with_other_escapes_shows_its_placeholder() {
     assert_eq!(
         pw.outcome_detail,
         OutcomeDetail::Replaced {
-            placeholders: vec!["<<TW_SECRET_2>>".into()]
+            placeholders: vec!["<<TW_SECRET_2>>".into()],
+            segments: None,
+            replacement: None,
         }
     );
     assert_eq!(
@@ -484,6 +486,7 @@ fn rules_of(list: &[(&str, &str, Match, Action)]) -> Rules {
                 pattern,
                 matching,
                 action,
+                ..RuleInput::default()
             }),
     )
     .unwrap()
@@ -678,6 +681,7 @@ fn rule_snapshots_say_what_the_rule_was_when_it_matched() {
             pattern: " dan ",
             matching: Match::Contains,
             action: Action::Record,
+            ..RuleInput::default()
         },
         tw_guard::content::builtin("unicode-tags").unwrap().into(),
     ])
@@ -735,10 +739,14 @@ fn a_replaced_value_names_its_placeholder_and_an_observed_one_does_not() {
         placeholders,
         [
             OutcomeDetail::Replaced {
-                placeholders: vec!["<<TW_SECRET_1>>".into()]
+                placeholders: vec!["<<TW_SECRET_1>>".into()],
+                segments: None,
+                replacement: None,
             },
             OutcomeDetail::Replaced {
-                placeholders: vec!["<<TW_SECRET_2>>".into()]
+                placeholders: vec!["<<TW_SECRET_2>>".into()],
+                segments: None,
+                replacement: None,
             }
         ]
     );
@@ -770,10 +778,14 @@ fn a_value_written_with_escapes_still_names_its_placeholder() {
         placeholders,
         [
             OutcomeDetail::Replaced {
-                placeholders: vec!["<<TW_SECRET_1>>".into()]
+                placeholders: vec!["<<TW_SECRET_1>>".into()],
+                segments: None,
+                replacement: None,
             },
             OutcomeDetail::Replaced {
-                placeholders: vec!["<<TW_SECRET_2>>".into()]
+                placeholders: vec!["<<TW_SECRET_2>>".into()],
+                segments: None,
+                replacement: None,
             }
         ]
     );

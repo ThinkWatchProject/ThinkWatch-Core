@@ -1190,7 +1190,8 @@ impl Db {
                 COALESCE(SUM(guard = 'inspect_tools' AND action = 'cut'), 0),
                 COALESCE(SUM(guard = 'content'), 0),
                 COALESCE(SUM(guard = 'content' AND action = 'blocked'), 0),
-                COALESCE(SUM(guard = 'content' AND action = 'stripped'), 0)
+                COALESCE(SUM(guard = 'content' AND action = 'stripped'), 0),
+                COALESCE(SUM(guard = 'content' AND action = 'replaced'), 0)
              FROM security_events WHERE at_ms >= ?1 AND at_ms < ?2",
             params![since_ms, until_ms],
             |r| {
@@ -1202,6 +1203,7 @@ impl Db {
                     content: r.get(4)?,
                     content_blocked: r.get(5)?,
                     content_stripped: r.get(6)?,
+                    content_replaced: r.get(7)?,
                 })
             },
         )?)

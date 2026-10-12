@@ -413,7 +413,8 @@ fn secret_detail(
             }
         }
     };
-    let outcome_detail = if seen.replaced {
+    // 动作是「仅记录」的规则拦截档下也原样发出
+    let outcome_detail = if seen.replaced && !rules.records(&f.rule) {
         OutcomeDetail::Replaced {
             placeholders: value
                 // 账里记的是解开转义之后的样子，`v` 是请求体原文里截下来的
@@ -421,6 +422,8 @@ fn secret_detail(
                 .map(str::to_string)
                 .into_iter()
                 .collect(),
+            segments: None,
+            replacement: None,
         }
     } else {
         OutcomeDetail::Recorded {}
@@ -538,13 +541,17 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
                 name: h.hit.name.clone(),
                 pattern: rule.filter(|r| r.custom).map(|r| r.pattern.clone()),
                 matching: Some(tw_api::ContentMatch::of(h.hit.matching)),
-                case_sensitive: false,
+                case_sensitive: rule.is_some_and(|r| r.case_sensitive),
                 core_version: core_version(),
             };
+            let segments = u32::try_from(at.len()).unwrap_or(u32::MAX);
             let outcome_detail = match h.outcome {
                 tw_guard::content::Outcome::Recorded => OutcomeDetail::Recorded {},
-                tw_guard::content::Outcome::Stripped => OutcomeDetail::Stripped {
-                    segments: u32::try_from(at.len()).unwrap_or(u32::MAX),
+                tw_guard::content::Outcome::Stripped => OutcomeDetail::Stripped { segments },
+                tw_guard::content::Outcome::Replaced => OutcomeDetail::Replaced {
+                    placeholders: Vec::new(),
+                    segments: Some(segments),
+                    replacement: rule.map(|r| r.replacement.clone()),
                 },
                 tw_guard::content::Outcome::Blocked => OutcomeDetail::Blocked {
                     client_notice: notice.clone().unwrap_or_default(),
@@ -559,6 +566,64 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------- 回答正文
+
+/// 回答里一条内容规则的命中的细节（[`tw_guard::content::answer`]）：每一处在哪一路正文里
+/// （`path`）、前后的字，都按这个请求的 [`Redaction`] 打码 —— 回答里的占位符已经换回了原值，
+/// 前后文里可能就有一把真的密钥。
+pub fn answer(h: &tw_guard::content::answer::AnswerHit, red: &Redaction) -> SecurityHitDetail {
+    let sent = red.sent();
+    let locations = h
+        .places
+        .iter()
+        .take(HIT_LOCATIONS_MAX)
+        .map(|(path, p)| {
+            // 前后文和命中的那一段拼成一段一起打码：一把密钥跨在两段的交界上，分开打哪一半
+            // 都认不出它
+            let text = format!("{}{}{}", p.before, p.matched, p.after);
+            let m = p.before.len()..p.before.len() + p.matched.len();
+            let hits = crate::guard::hits(&text, &red.rules);
+            let source = Source {
+                text: &text,
+                span: 0..text.len(),
+                hits: &hits,
+                lit: None,
+            };
+            let e = source.excerpt(m, red, &sent, None, &|s| s.to_string());
+            location(red, Place::of(Part::ResponseText), path, e)
+        })
+        .collect();
+    let rule_snapshot = RuleSnapshot {
+        builtin: !h.custom,
+        id: h.rule.clone(),
+        name: h.name.clone(),
+        pattern: h.custom.then(|| h.pattern.clone()),
+        matching: Some(tw_api::ContentMatch::of(h.matching)),
+        case_sensitive: h.case_sensitive,
+        core_version: core_version(),
+    };
+    let segments = u32::try_from(h.count).unwrap_or(u32::MAX);
+    let outcome_detail = match h.outcome {
+        tw_guard::content::Outcome::Stripped => OutcomeDetail::Stripped { segments },
+        tw_guard::content::Outcome::Replaced => OutcomeDetail::Replaced {
+            placeholders: Vec::new(),
+            segments: Some(segments),
+            replacement: Some(h.replacement.clone()),
+        },
+        // 回答拒绝不了：只会是上面两种或者只记录
+        tw_guard::content::Outcome::Recorded | tw_guard::content::Outcome::Blocked => {
+            OutcomeDetail::Recorded {}
+        }
+    };
+    SecurityHitDetail {
+        direction: SecurityDirection::Response,
+        locations,
+        more_locations: more(h.count),
+        rule_snapshot,
+        outcome_detail,
+    }
 }
 
 // ---------------------------------------------------------------- 工具调用审查

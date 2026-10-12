@@ -6,8 +6,10 @@
 //! - `observe`：照样查，**每条命中都只记录**，请求原样发出 —— 处置档下会拒、会删的，
 //!   这里一样报出来，结论和切过去之后得到的一致；
 //! - `enforce`：命中了「拒绝」规则的，请求不发出去（拒绝的那几条记「已拒绝」，别的
-//!   记「仅记录」，没发出去也就没删）；否则「删除」规则命中的字全部删掉再发（记「已
-//!   删除」），「仅记录」规则照常记。
+//!   记「仅记录」，没发出去也就没删）；否则「删除」规则命中的字全部删掉、「替换」规则命中
+//!   的字换成它的替换文本再发（记「已删除」「已替换」），「仅记录」规则照常记。
+//!
+//! 只用查请求的规则（[`super::Sides::request`]）；只查回答的规则在 [`super::answer`]。
 //!
 //! # 删掉之后再查一遍
 //!
@@ -16,6 +18,9 @@
 //! 遍：这时才命中的拒绝规则照样拒绝，这时才冒出来的「删除」规则命中接着删，最多
 //! [`MAX_ROUNDS`] 遍。观察档也照这样查一遍（在一份副本上），报的和处置档下会发生的
 //! 一样。
+//!
+//! 换上去的替换文本不再查：它是规则写的，不是调用方的话。和它重叠的命中不算，不然一条
+//! 把 `*` 换成 `***` 的规则会一遍一遍地换它自己。
 //!
 //! # 删在原文上
 //!
@@ -45,6 +50,8 @@ pub enum Outcome {
     Recorded,
     /// 命中的字删掉之后发出
     Stripped,
+    /// 命中的字换成规则的替换文本之后发出
+    Replaced,
     /// 请求被拒，没有发出去
     Blocked,
 }
@@ -52,6 +59,7 @@ pub enum Outcome {
 words!(Outcome {
     Recorded = "recorded",
     Stripped = "stripped",
+    Replaced = "replaced",
     Blocked = "blocked",
 });
 
@@ -85,7 +93,7 @@ impl Screening {
 /// 解不开（不是 JSON、不是对象）的请求体没有调用方的正文可言，什么都不报。没法按消息
 /// 结构读的文字（WebSocket 上一帧解不开的）用 [`screen_text`]。
 pub fn screen(mode: Mode, rules: &Rules, dialect: Dialect, body: &[u8]) -> Screening {
-    if !mode.detects() || rules.is_empty() {
+    if !mode.detects() || !rules.checks_requests() {
         return Screening::default();
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
@@ -97,7 +105,7 @@ pub fn screen(mode: Mode, rules: &Rules, dialect: Dialect, body: &[u8]) -> Scree
 /// [`screen`]，请求体已经解析好了（调用方为别的事解过一遍）：`v` 是它解出来的样子，不再
 /// 解一遍。删过的请求体照它写出来，和 [`screen`] 写的一样。
 pub fn screen_value(mode: Mode, rules: &Rules, dialect: Dialect, v: &Value) -> Screening {
-    if !mode.detects() || rules.is_empty() {
+    if !mode.detects() || !rules.checks_requests() {
         return Screening::default();
     }
     let spots = tw_dialect::caller::spots(dialect, v);
@@ -141,7 +149,7 @@ pub fn screen_value(mode: Mode, rules: &Rules, dialect: Dialect, v: &Value) -> S
 /// 转义（`\u200b`、代理对写的 `\udb40\udc49`），这里也认；删的时候整个转义序列一起删。
 /// 删过之后的文字在 [`Screening::body`] 里。
 pub fn screen_text(mode: Mode, rules: &Rules, text: &str) -> Screening {
-    if !mode.detects() || rules.is_empty() {
+    if !mode.detects() || !rules.checks_requests() {
         return Screening::default();
     }
     let scope = Scope {
@@ -183,7 +191,7 @@ pub fn places(
     v: &Value,
 ) -> (Vec<tw_dialect::caller::Spot>, Vec<RulePlaces>) {
     let spots = tw_dialect::caller::spots(dialect, v);
-    if spots.is_empty() || rules.is_empty() {
+    if spots.is_empty() || !rules.checks_requests() {
         return (spots, Vec::new());
     }
     let segments: Vec<(&str, bool)> = spots
@@ -201,7 +209,7 @@ pub fn places(
 /// [`places`]，查的是一段没法按消息结构读的文字（同 [`screen_text`]：只用码位规则，认得
 /// JSON 的 `\uXXXX` 写法）。只有一段，下标都是 0，区间是原文里的（转义序列整个算）。
 pub fn places_text(rules: &Rules, text: &str) -> Vec<RulePlaces> {
-    if rules.is_empty() {
+    if !rules.checks_requests() {
         return Vec::new();
     }
     let scope = Scope {
@@ -244,6 +252,7 @@ fn conclude(mode: Mode, hits: Vec<Hit>, refused: Option<usize>) -> Screening {
             let outcome = match (enforce, refused.is_some(), hit.action) {
                 (true, true, Action::Block) => Outcome::Blocked,
                 (true, false, Action::Strip) => Outcome::Stripped,
+                (true, false, Action::Replace) => Outcome::Replaced,
                 _ => Outcome::Recorded,
             };
             ScreenHit { hit, outcome }
@@ -271,7 +280,7 @@ pub(crate) struct Evaluation {
 
 /// 查、删、再查，直到没有可删的（见模块说明）。
 pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -> Evaluation {
-    let first = rules.detect(segments, scope);
+    let first = rules.detect(segments, scope, &[]);
     let mut by_rule: Vec<Option<usize>> = vec![None; rules.rules.len()];
     for (h, &r) in first.rules.iter().enumerate() {
         by_rule[r] = Some(h);
@@ -286,40 +295,45 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
             .flat_map(|(h, s, ranges)| ranges.into_iter().map(move |r| (h, s, r)))
             .collect(),
     };
-    let mut strips = first.strips;
-    if e.refused.is_some() || strips.iter().all(Vec::is_empty) {
+    let mut edits = first.edits;
+    if e.refused.is_some() || edits.iter().all(Vec::is_empty) {
         return e;
     }
     let mut texts: Vec<String> = segments.iter().map(|(t, _)| t.to_string()).collect();
-    // 每段正文每一遍删掉了哪些（按那一遍删之前的位置），把后来的位置换算回原文用
-    let mut cuts: Vec<Vec<Vec<Range<usize>>>> = vec![Vec::new(); segments.len()];
+    // 每段正文每一遍改了哪些（按那一遍改之前的位置，和换上去的字有几个字节），把后来的位置
+    // 换算回原文用
+    let mut rounds: Vec<Vec<Round>> = vec![Vec::new(); segments.len()];
+    // 每段正文里换上去的替换文本在哪儿（按现在的位置）：再查时不算
+    let mut kept: Vec<Vec<Range<usize>>> = vec![Vec::new(); segments.len()];
     for _ in 0..MAX_ROUNDS {
-        for (si, s) in strips.iter().enumerate() {
-            if !s.is_empty() {
-                texts[si] = cut(&texts[si], s);
+        for (si, todo) in edits.into_iter().enumerate() {
+            let merged = rules.merged(todo);
+            if !merged.is_empty() {
+                texts[si] = super::apply_edits(&texts[si], &merged);
+                kept[si] = shift_kept(&kept[si], &merged);
             }
-            cuts[si].push(s.clone());
+            rounds[si].push(merged.iter().map(|(r, w)| (r.clone(), w.len())).collect());
         }
         let now: Vec<(&str, bool)> = texts
             .iter()
             .zip(segments)
             .map(|(t, (_, in_tool_result))| (t.as_str(), *in_tool_result))
             .collect();
-        let next = rules.detect(&now, scope);
+        let next = rules.detect(&now, scope, &kept);
         let mut blocked = None;
         let mut index = Vec::with_capacity(next.hits.len());
         for (k, mut h) in next.hits.into_iter().enumerate() {
             let r = next.rules[k];
             match by_rule[r] {
-                // 先前就命中的规则：删除规则又冒出来的几处算进去
+                // 先前就命中的规则：删除、替换规则又冒出来的几处算进去
                 Some(at) => {
-                    if h.action == Action::Strip {
+                    if h.action.edits() {
                         e.hits[at].count += h.count;
                     }
                     index.push(at);
                 }
                 None => {
-                    h.bytes = back(&cuts[next.segments[k]], h.bytes);
+                    h.bytes = back(&rounds[next.segments[k]], h.bytes);
                     if h.action == Action::Block && blocked.is_none() {
                         blocked = Some(e.hits.len());
                     }
@@ -332,7 +346,7 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
         // 先前就在的那几处换回原文还是原来的位置，只记新冒出来的
         for (k, s, ranges) in next.all {
             for r in ranges {
-                let item = (index[k], s, back(&cuts[s], r));
+                let item = (index[k], s, back(&rounds[s], r));
                 if !e.all.contains(&item) {
                     e.all.push(item);
                 }
@@ -342,8 +356,8 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
             e.refused = blocked;
             return e;
         }
-        strips = next.strips;
-        if strips.iter().all(Vec::is_empty) {
+        edits = next.edits;
+        if edits.iter().all(Vec::is_empty) {
             break;
         }
     }
@@ -351,43 +365,65 @@ pub(crate) fn evaluate(rules: &Rules, segments: &[(&str, bool)], scope: Scope) -
     e
 }
 
-/// 删掉 `ranges`（按先后、互不重叠）之后的文字
-fn cut(text: &str, ranges: &[Range<usize>]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    for r in ranges {
-        out.push_str(&text[at..r.start]);
-        at = r.end;
+/// 一段正文一遍里的改动：改之前的区间，和换上去的字有几个字节（删掉是 0）
+type Round = Vec<(Range<usize>, usize)>;
+
+/// 这一遍改过之后，换上去的替换文本各在哪儿：先前的几段跟着前面的改动挪（改动从不和它们
+/// 重叠，见 [`Rules::detect`] 的 `kept`），这一遍换上去的接着记。按先后
+fn shift_kept(kept: &[Range<usize>], edits: &[(Range<usize>, &str)]) -> Vec<Range<usize>> {
+    let mut out = Vec::with_capacity(kept.len() + edits.len());
+    // 改之前的位置 → 改之后的：前面每一处改动让后面挪了多少
+    let mut delta: isize = 0;
+    let mut k = kept.iter().peekable();
+    let moved = |r: &Range<usize>, delta: isize| {
+        r.start.saturating_add_signed(delta)..r.end.saturating_add_signed(delta)
+    };
+    for (r, with) in edits {
+        while let Some(old) = k.next_if(|old| old.end <= r.start) {
+            out.push(moved(old, delta));
+        }
+        let at = r.start.saturating_add_signed(delta);
+        if !with.is_empty() {
+            out.push(at..at + with.len());
+        }
+        delta += with.len() as isize - r.len() as isize;
     }
-    out.push_str(&text[at..]);
+    out.extend(k.map(|old| moved(old, delta)));
     out
 }
 
-/// 删过几遍之后的一个区间，换算回删之前的原文：从最后一遍往回，一遍一遍地换。
+/// 改过几遍之后的一个区间，换算回改之前的原文：从最后一遍往回，一遍一遍地换。
 ///
 /// 起点落在一处删掉的地方上时，换到删掉的那段**后面**（不把删掉的字算进命中）；终点
 /// 落在那里时换到**前面**。`jail‹U+200B›break` 删掉零宽字符后命中的 `jailbreak`，换回
-/// 原文是包括零宽字符在内的整段。
-fn back(cuts: &[Vec<Range<usize>>], r: Range<usize>) -> Range<usize> {
+/// 原文是包括零宽字符在内的整段。落在换上去的替换文本里的，起点换到被换掉的那段的开头、
+/// 终点换到它的结尾。
+fn back(rounds: &[Round], r: Range<usize>) -> Range<usize> {
     let mut r = r;
-    for cut in cuts.iter().rev() {
-        r = unshift(cut, r.start, false)..unshift(cut, r.end, true);
+    for edits in rounds.iter().rev() {
+        r = unshift(edits, r.start, false)..unshift(edits, r.end, true);
     }
     r
 }
 
-fn unshift(cut: &[Range<usize>], p: usize, end: bool) -> usize {
-    let mut removed = 0;
-    for c in cut {
-        // 这一处删掉的地方在删过之后的文字里的位置
-        let at = c.start - removed;
-        if at < p || (!end && at == p) {
-            removed += c.len();
-        } else {
+/// 改过之后的位置 `p` 换回改之前的。`edits` 是那一遍的改动：改之前的区间，和换上去的字有
+/// 几个字节（删掉是 0）
+fn unshift(edits: &[(Range<usize>, usize)], p: usize, end: bool) -> usize {
+    // 改之后比改之前多出来的字节数（删掉的是负的）
+    let mut delta: isize = 0;
+    for (r, ins) in edits {
+        // 这一处改动在改过之后的文字里从哪儿到哪儿
+        let at = r.start.saturating_add_signed(delta);
+        let fin = at + ins;
+        if p < at || (end && p == at) {
             break;
         }
+        if p < fin {
+            return if end { r.end } else { r.start };
+        }
+        delta += *ins as isize - r.len() as isize;
     }
-    p + removed
+    p.saturating_add_signed(-delta)
 }
 
 #[cfg(test)]
@@ -408,6 +444,7 @@ mod tests {
                     pattern,
                     matching,
                     action,
+                    ..RuleInput::default()
                 }),
         )
         .unwrap()
@@ -622,14 +659,138 @@ mod tests {
     #[test]
     fn positions_are_mapped_back_through_each_deletion() {
         // 删掉了 2..5 和 8..9：删过之后，这两处在 2 和 5
-        let c1 = vec![2..5, 8..9];
+        let c1 = vec![(2..5, 0), (8..9, 0)];
         assert_eq!(unshift(&c1, 2, false), 5, "起点越过删掉的");
         assert_eq!(unshift(&c1, 2, true), 2, "终点停在删掉的前面");
         assert_eq!(unshift(&c1, 6, true), 10);
         assert_eq!(back(std::slice::from_ref(&c1), 0..2), 0..2);
         // 两遍：先删了 1..2，再删了 0..1
-        let once = |r: Range<usize>| std::iter::once(r).collect::<Vec<_>>();
+        let once = |r: Range<usize>| vec![(r, 0)];
         assert_eq!(back(&[once(1..2), once(0..1)], 0..1), 2..3);
+        // 2..5 换成了三个字节、8..9 换成了一个：改过之后在 2..5 和 8..9
+        let c2 = vec![(2..5, 3), (8..9, 1)];
+        assert_eq!(unshift(&c2, 5, false), 5, "替换文本之后的起点");
+        assert_eq!(unshift(&c2, 2, true), 2, "替换文本之前的终点");
+        assert_eq!(
+            unshift(&c2, 3, false),
+            2,
+            "落在替换文本里的起点换到被换掉的开头"
+        );
+        assert_eq!(unshift(&c2, 4, true), 5, "终点换到结尾");
+        // 换得比原来长：1..2 换成了五个字节，之后的整体往后挪了四个
+        let c3 = vec![(1..2, 5)];
+        assert_eq!(unshift(&c3, 7, false), 3);
+        assert_eq!(back(&[c3], 6..8), 2..4);
+    }
+
+    /// 替换文本不再查：一条把 `*` 换成 `***` 的规则换一遍就停，计数是原文里的几处
+    #[test]
+    fn a_replacement_is_not_matched_again() {
+        let rs = Rules::build([RuleInput {
+            id: "star",
+            name: "star",
+            custom: true,
+            pattern: "*",
+            action: Action::Replace,
+            ..RuleInput::default()
+        }])
+        .unwrap();
+        let b = body(json!({"messages": [{"role": "user", "content": "a*b**c"}]}));
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(sent(&s)["messages"][0]["content"], "a***b******c");
+        assert_eq!(outcomes(&s), [("star", Outcome::Replaced)]);
+        assert_eq!(s.hits[0].hit.count, 3);
+    }
+
+    /// 替换规则命中的字换成它的替换文本；和删除规则重叠的合成一段，换成替换文本。只查回答的
+    /// 规则不参与请求这一边
+    #[test]
+    fn replace_writes_the_replacement_and_answer_only_rules_stay_out() {
+        let rs = Rules::build([
+            RuleInput {
+                id: "code",
+                name: "code",
+                custom: true,
+                pattern: "北极星",
+                action: Action::Replace,
+                replacement: "[已隐去]",
+                ..RuleInput::default()
+            },
+            RuleInput {
+                id: "star",
+                name: "star",
+                custom: true,
+                pattern: "星项",
+                action: Action::Strip,
+                ..RuleInput::default()
+            },
+            RuleInput {
+                id: "answer-only",
+                name: "answer-only",
+                custom: true,
+                pattern: "发布",
+                action: Action::Strip,
+                sides: super::super::Sides {
+                    request: false,
+                    response: true,
+                },
+                ..RuleInput::default()
+            },
+        ])
+        .unwrap();
+        let b = body(
+            json!({"messages": [{"role": "user", "content": "请把北极星项目的发布说明发来"}]}),
+        );
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(
+            sent(&s)["messages"][0]["content"],
+            "请把[已隐去]目的发布说明发来"
+        );
+        assert_eq!(
+            outcomes(&s),
+            [("code", Outcome::Replaced), ("star", Outcome::Stripped)]
+        );
+        // 观察档照样报，只是都只记录
+        let o = screen(Mode::Observe, &rs, Dialect::Anthropic, &b);
+        assert!(o.body.is_none());
+        assert!(o.hits.iter().all(|h| h.outcome == Outcome::Recorded));
+        // 只有只查回答的规则：请求这一边什么都不查
+        let only = Rules::of(rs.rules[2..].to_vec());
+        assert_eq!(
+            screen(Mode::Enforce, &only, Dialect::Anthropic, &b),
+            Screening::default()
+        );
+    }
+
+    /// 分大小写的规则只认写的那样
+    #[test]
+    fn a_case_sensitive_rule_matches_only_as_written() {
+        let rs = Rules::build([
+            RuleInput {
+                id: "exact",
+                name: "exact",
+                custom: true,
+                pattern: "Polaris",
+                action: Action::Strip,
+                case_sensitive: true,
+                ..RuleInput::default()
+            },
+            RuleInput {
+                id: "re",
+                name: "re",
+                custom: true,
+                pattern: "TKT-[0-9]+",
+                matching: Regex,
+                action: Action::Strip,
+                case_sensitive: true,
+                ..RuleInput::default()
+            },
+        ])
+        .unwrap();
+        let b =
+            body(json!({"messages": [{"role": "user", "content": "Polaris polaris TKT-1 tkt-2"}]}));
+        let s = screen(Mode::Enforce, &rs, Dialect::Anthropic, &b);
+        assert_eq!(sent(&s)["messages"][0]["content"], " polaris  tkt-2");
     }
 
     /// 每条命中的规则的每一处：哪个字符串、在它里面的哪一段。删过一遍之后才拼出来的也在，

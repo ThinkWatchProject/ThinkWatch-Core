@@ -3331,6 +3331,7 @@ dependencies = [
  "bytes",
  "memchr",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "serde_yaml_ng",

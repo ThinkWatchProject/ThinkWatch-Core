@@ -104,6 +104,9 @@ config.rule_name_empty
 config.rule_name_taken
 config.rule_pattern_bad
 config.rule_pattern_empty
+config.rule_scope_block
+config.rule_scope_codepoints
+config.rule_scope_empty
 config.schema_too_new
 config.secret.empty_name
 config.secret.env_missing
@@ -499,12 +502,16 @@ security.bad_codepoints
 security.bad_content_pattern
 security.bad_label
 security.bad_pattern
-security.content_action_unknown
-security.no_action_of_its_own
+security.content_action_bad
 security.pattern_empty
+security.redact_action_unknown
 security.redact_match_bad
 security.rule_name_empty
+security.rule_scope_block
+security.rule_scope_codepoints
+security.rule_scope_empty
 security.unknown_action
+security.unknown_custom_rule
 security.unknown_guard
 security.unknown_rule
 t.auth test

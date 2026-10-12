@@ -1137,7 +1137,8 @@ fn id_of(e: &Event) -> Option<u64> {
         | Event::RequestFirstToken { id, .. }
         | Event::RequestFinished { id, .. }
         | Event::RequestFailed { id, .. }
-        | Event::RequestCancelled { id, .. } => Some(*id),
+        | Event::RequestCancelled { id, .. }
+        | Event::ContentMatched { id, .. } => Some(*id),
         _ => None,
     }
 }
@@ -1936,4 +1937,82 @@ async fn a_turns_key_limit_wait_and_slot_wait_share_one_budget() {
         took >= Duration::from_millis(1_800) && took < Duration::from_millis(2_600),
         "等了 {took:?}：两段该共用 2 秒"
     );
+}
+
+/// 内容过滤查回答：Responses 的连接上一次回答一个过滤，命中的字换掉、一个都不到客户端，扣着的
+/// 尾巴在这次回答收尾之前补出来；命中挂在这一轮上报
+#[tokio::test]
+async fn an_answer_on_a_websocket_is_filtered_and_its_hit_is_reported_on_its_turn() {
+    let (up, _seen) = responder(None).await;
+    let (gw, mut rx, _state) = turns_gateway(
+        up,
+        |cfg| {
+            cfg.security.content = tw_config::ContentPolicy {
+                mode: SecurityMode::Enforce,
+                custom: vec![tw_config::CustomContentRule {
+                    name: "ell".into(),
+                    pattern: "ELL".into(),
+                    scope: vec![tw_config::ContentScope::Response],
+                    matching: Default::default(),
+                    case_sensitive: false,
+                    action: tw_config::ContentAction::Replace,
+                    replacement: "[x]".into(),
+                    disabled: false,
+                }],
+                ..Default::default()
+            };
+        },
+        None,
+    )
+    .await;
+    let mut c = connect(gw).await;
+    for _ in 0..2 {
+        c.send(create("hi")).await.unwrap();
+        let frames = one_answer(&mut c).await;
+        let text: String = frames
+            .iter()
+            .filter(|f| f["type"] == "response.output_text.delta")
+            .map(|f| f["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "h[x]o", "{frames:?}");
+        let last_delta = frames
+            .iter()
+            .rposition(|f| f["type"] == "response.output_text.delta")
+            .unwrap();
+        assert_eq!(frames.last().unwrap()["type"], "response.completed");
+        assert!(last_delta < frames.len() - 1);
+    }
+    c.close(None).await.unwrap();
+    let evs = requests(&mut rx, 2).await;
+    for id in started_ids(&evs) {
+        let mine = of(&evs, id);
+        let hits: Vec<_> = mine
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContentMatched {
+                    direction,
+                    outcome,
+                    count,
+                    detail,
+                    ..
+                } => Some((
+                    *direction,
+                    *outcome,
+                    *count,
+                    detail.locations[0].path.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            [(
+                tw_api::SecurityDirection::Response,
+                tw_api::ContentOutcome::Replaced,
+                1,
+                "output[0].content[0].text".to_string()
+            )],
+            "{mine:?}"
+        );
+    }
 }

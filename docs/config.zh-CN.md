@@ -547,31 +547,32 @@ pricing:
 
 ### `security`
 
-三项防护，对所有上游一视同仁。每一项都有 `mode`：`off`、`observe`（检测并记录，不改变任何行为）、`enforce`（处置）。出厂时三项都是 `observe`。各项在 `enforce` 下的处置不同：出站脱敏替换，工具调用审查切断响应，内容过滤按每条规则的处置拒绝、删除或只记录。
+三项防护，对所有上游一视同仁。每一项都有 `mode`：`off`、`observe`（检测并记录，不改变任何行为）、`enforce`（按每条规则的动作处理）。出厂时三项都是 `observe`。每条规则各有动作：出站脱敏替换为占位符或只记录，工具调用审查切断响应或只记录，内容过滤拒绝、删除、替换或只记录。
 
 <!-- generated: table security -->
 <a id="cfg-security"></a>
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏：请求发出前，把其中任何位置的凭据和个人信息替换掉。 |
-| `inspect_tools` | 对象，见 [`security.inspect_tools`](#cfg-security-inspect_tools) | — | 工具调用审查：模型返回的工具调用中出现危险命令时切断响应。 |
-| `content` | 对象，见 [`security.content`](#cfg-security-content) | — | 内容过滤：调用方发送的内容中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除命中的内容或只记录。 |
+| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏（应用里叫「密钥与隐私」）：请求发出前，按每条规则把其中任何位置的凭据和个人信息替换为占位符，或只记录。 |
+| `inspect_tools` | 对象，见 [`security.inspect_tools`](#cfg-security-inspect_tools) | — | 工具调用审查（应用里叫「危险命令」）：模型返回的工具调用中出现危险命令时切断响应。 |
+| `content` | 对象，见 [`security.content`](#cfg-security-content) | — | 内容过滤：调用方发送的内容中、或模型回答的正文中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除或替换命中的内容，或只记录。 |
 <!-- /generated -->
 
 #### `security.redact`
 
-请求发出前，在整个请求中（包括系统提示、之前的回答和工具调用）查找凭据和个人信息。`enforce` 下将其替换为占位符，回答中重复出现时再换回原值。图片、文件等 base64 内容不查，字段名也不查；自定义规则还不查协议要求原样保留的标识，如条目和调用的 id、类型、角色、工具名、模型名。
+请求发出前，在整个请求中（包括系统提示、之前的回答和工具调用）查找凭据和个人信息。`enforce` 下将规则找到的内容替换为占位符，回答中重复出现时再换回原值；`action: record` 的规则找到的内容原样发送，只作记录。图片、文件等 base64 内容不查，字段名也不查；自定义规则还不查协议要求原样保留的标识，如条目和调用的 id、类型、角色、工具名、模型名。
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
+| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测（应用里叫「关闭」）；`observe` 检测并记录，不改变任何行为（「监控」）；`enforce` 检测并按每条规则的动作处理（「开启」）。 |
 | `enable` | 字符串列表 | `[]` | 打开出厂时关着的内置规则，按 id。 |
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
-| `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：匹配到的内容和凭据一样替换。 |
+| `actions` | 映射： 内置规则 id → `placeholder` \| `record` | `{}` | 内置规则在 `enforce` 下的动作，只写与出厂不同的（`email: record`）。`placeholder` 将值替换为占位符后发送，回答中出现该占位符时还原为原值；`record` 原样发送，记录命中。 |
+| `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：匹配到的内容和凭据一样替换，或只记录。 |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -584,6 +585,7 @@ pricing:
 | `match` | `contains` \| `regex` | `contains` | `contains`：按原样查找 `pattern`，`.`、`*` 等字符没有特殊含义。`regex`：`pattern` 是正则表达式。 |
 | `case_sensitive` | 布尔 | `false` | 区分大小写。默认不区分：`ABC` 和 `abc` 都会匹配。 |
 | `label` | 字符串 | `SECRET` | 占位符名称：匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。 |
+| `action` | `placeholder` \| `record` | `placeholder` | `enforce` 下将匹配到的内容替换为占位符（`placeholder`），或只记录、原样发送（`record`）。 |
 | `disabled` | 布尔 | `false` | 停用这条规则，规则本身留在文件里。 |
 <!-- /generated -->
 
@@ -645,7 +647,7 @@ pricing:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
+| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测（应用里叫「关闭」）；`observe` 检测并记录，不改变任何行为（「监控」）；`enforce` 检测并按每条规则的动作处理（「开启」）。 |
 | `enable` | 字符串列表 | `[]` | 打开出厂时关着的内置规则，按 id。 |
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
 | `actions` | 映射： 内置规则 id → `cut` \| `record` | `{}` | 内置规则在 `enforce` 下的处置，只写与出厂不同的（`rm-rf-root: record`）。 |
@@ -685,18 +687,18 @@ pricing:
 
 #### `security.content`
 
-调用方发送的内容中（用户消息及其中的工具结果，不含系统提示和模型自己的回答）出现的词、写法或字符。每条规则按关键词（`contains`）、正则（`regex`）或码位（`codepoints`）匹配，并写明 `enforce` 下的处置：`block` 拒绝请求，`strip` 把命中的内容从调用方的正文中全部删除后发出，`record` 只记录。删除之后会再检查一遍：被隐藏字符拆开的关键词，删掉隐藏字符后照样命中。
+调用方发送的内容中（用户消息及其中的工具结果，不含系统提示和模型自己的回答）出现的词、写法或字符；`scope` 含 `response` 的自定义规则还检查模型回答的正文。每条规则按关键词（`contains`）、正则（`regex`）或码位（`codepoints`，仅用于请求）匹配，并写明 `enforce` 下的动作：`block` 拒绝请求（仅用于请求），`strip` 删除全部命中的内容后发出，`replace` 将全部命中的内容替换为规则的 `replacement` 后发出，`record` 只记录。请求中删除或替换之后会再检查一遍：被隐藏字符拆开的关键词，删掉隐藏字符后照样命中；替换上去的文字不再检查。回答中删除或替换的内容不会送达客户端，请求记录中保存客户端实际收到的回答。
 
 <!-- generated: table security.content -->
 <a id="cfg-security-content"></a>
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
+| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测（应用里叫「关闭」）；`observe` 检测并记录，不改变任何行为（「监控」）；`enforce` 检测并按每条规则的动作处理（「开启」）。 |
 | `enable` | 字符串列表 | `[]` | 打开出厂时关着的内置规则，按 id。 |
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
-| `actions` | 映射： 内置规则 id → `block` \| `strip` \| `record` | `{}` | 内置规则在 `enforce` 下的处置，只写与出厂不同的。 |
-| `custom` | 对象列表，见 [`security.content.custom[]`](#cfg-security-content-custom) | `[]` | 自定义规则。 |
+| `actions` | 映射： 内置规则 id → `block` \| `strip` \| `replace` \| `record` | `{}` | 内置规则在 `enforce` 下的动作，只写与出厂不同的。内置规则只检查请求；`replace` 将命中的内容替换为 `***`。 |
+| `custom` | 对象列表，见 [`security.content.custom[]`](#cfg-security-content-custom) | `[]` | 自定义规则，每条可检查请求、回答或两者。 |
 <!-- /generated -->
 
 <!-- generated: table security.content.custom[] -->
@@ -705,9 +707,12 @@ pricing:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和应用里显示的名字，也是规则的标识；同一项防护里不能重名。 |
-| `pattern` | 字符串 | **必填** | 关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。关键词和正则不区分大小写。 |
-| `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`：正文包含 `pattern`。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔。 |
-| `action` | `block` \| `strip` \| `record` | `record` | `enforce` 下拒绝请求（`block`）、删除命中的内容后发出（`strip`），或只记录（`record`）。 |
+| `pattern` | 字符串 | **必填** | 关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。 |
+| `scope` | 列表，每项是 `request` \| `response` | `[request]` | 检查对象：`request` 为调用方发送的内容（用户消息及其中的工具结果）；`response` 为客户端看到的回答正文，包含 Codex `apply_patch` 等自由格式工具的输入，不含工具调用与思考过程。两项可同时列出。流式回答不整体缓冲，只暂缓发送可能构成命中的末尾片段：「包含」规则不超过最长匹配内容的字符数减一，正则规则最多 256 个字符；超过此长度的正则命中，其起始部分可能已送达客户端。检查回答的规则不能用 `block`，也不能按 `codepoints` 匹配。 |
+| `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`：正文按原样包含 `pattern`，`.`、`*` 等字符没有特殊含义。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔；仅用于请求。 |
+| `case_sensitive` | 布尔 | `false` | 区分大小写。默认不区分：`ABC` 和 `abc` 都会匹配。码位不受此项影响。 |
+| `action` | `block` \| `strip` \| `replace` \| `record` | `record` | `enforce` 下拒绝请求（`block`，仅用于请求）、删除命中的内容后发出（`strip`）、将命中的内容替换为 `replacement` 后发出（`replace`），或只记录（`record`）。替换不可还原，回答中不换回原文。 |
+| `replacement` | 字符串 | `"***"` | 动作为 `replace` 时替换成的文字。 |
 | `disabled` | 布尔 | `false` | 停用这条规则，规则本身留在文件里。 |
 <!-- /generated -->
 
@@ -764,6 +769,11 @@ security:
       - name: project-x
         pattern: project-x
         action: strip
+      - name: codename
+        pattern: polaris
+        scope: [request, response]
+        action: replace
+        replacement: "[codename]"
 ```
 
 ### `retention`

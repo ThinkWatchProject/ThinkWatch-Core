@@ -15,7 +15,8 @@
 //!
 //! - 客户端 → 上游：内容过滤和出站脱敏，和普通请求同一套函数、同一份全局规则 ——
 //!   观察档记录，处置档拒绝、删除或替换；
-//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
+//! - 上游 → 客户端：先把占位符换回去，回答钩子之后按内容过滤里查回答的规则查正文（Responses
+//!   的连接，一次回答一个过滤，见 [`tw_guard::content::answer`]），再喂给工具调用审查。
 //!
 //! 每个 `response.create` 发出去的模型名**和 HTTP 那条路的一跳同一套**（见 [`Naming`]）：
 //! 规则给这一家指定的模型原样发，阶段二改的名字原样发，别的 —— 这一帧写的、阶段一改写成的、
@@ -221,6 +222,8 @@ pub struct Rules {
     pub tools: Arc<tw_guard::tools::rules::Rules>,
     /// 内容过滤
     pub screen: crate::guard::Screen,
+    /// 内容过滤里查回答正文的那几条。没有、或者内容过滤关着是 None
+    pub answer: Option<crate::guard::AnswerFilter>,
 }
 
 /// 这条连接上的插件：**升级那一刻取的那一份表**，一条连接活多久就用它多久。
@@ -654,6 +657,9 @@ struct Pipes {
     /// 发出去的模型名和客户端要的不一样时，回答里的模型名换回客户端用的（见
     /// [`crate::answer_model`]）
     rename: Option<crate::answer_model::Body>,
+    /// 这一次回答的回答过滤（Responses 的连接、有查回答的规则时）：`response.created` 起一个，
+    /// 回答收尾时报命中
+    answer: Option<tw_guard::content::answer::FrameFilter>,
 }
 
 impl Pipes {
@@ -852,8 +858,11 @@ pub(crate) async fn proxy(
         bridge: None,
         reply: None,
         rename: None,
+        answer: None,
     };
-    pump(state, client, up, &mut p, ending).await;
+    pump(state.clone(), client, up, &mut p, ending).await;
+    // 连接断在一次回答中间：这次回答里已经认定的命中照样报
+    report_answer(&state, &mut p);
 }
 
 /// 为什么没连上。
@@ -1397,9 +1406,10 @@ fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     }
     let found = tw_guard::redact::rules::findings(&text, &hits);
     let replaced = mode.acts().then(|| {
+        // 只记录的规则命中的不换
         let r = tw_guard::redact::replace::apply(
             &text,
-            &hits,
+            &p.rules.redact.to_replace(&hits),
             std::mem::replace(
                 &mut p.ledger,
                 tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
@@ -1592,6 +1602,15 @@ async fn forward(
     } else if kind == Some("response.created") {
         p.response = response_id(&restored);
         p.dropping = false;
+        // 回答过滤：这一次回答起一个（上一次没收尾的先报掉）。只有 Responses 的连接按回答分
+        report_answer(state, p);
+        p.answer = p.turns.as_ref().and(p.rules.answer.as_ref()).map(|f| {
+            tw_guard::content::answer::FrameFilter::new(
+                f.answer.clone(),
+                f.acts,
+                tw_dialect::ir::Dialect::Responses,
+            )
+        });
         // 回答钩子：这一次回答起一组实例
         if let Err(why) = start_reply(state, p).await {
             return fail_response(p, c_tx, why).await;
@@ -1627,6 +1646,16 @@ async fn forward(
             }
             (msgs, err)
         }
+    };
+    // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的
+    let outgoing = if late {
+        outgoing
+    } else {
+        let out = filter_answer(p, outgoing);
+        if terminal || kind == Some("error") {
+            report_answer(state, p);
+        }
+        out
     };
     for msg in outgoing {
         let hits = match p.wall.as_mut() {
@@ -1685,6 +1714,43 @@ async fn forward(
         return fail_response(p, c_tx, e.detail).await;
     }
     Flow::Sent
+}
+
+/// 回答过滤这一次回答里的几帧：每一帧前面可能多出扣着的尾巴补成的帧。不是 JSON 的一帧，
+/// 先把扣着的补出来
+fn filter_answer(p: &mut Pipes, msgs: Vec<String>) -> Vec<String> {
+    let Some(f) = p.answer.as_mut() else {
+        return msgs;
+    };
+    let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
+    let mut out = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        match serde_json::from_str::<serde_json::Value>(&m) {
+            Ok(mut v) => {
+                let rw = f.frame(&mut v);
+                out.extend(rw.before.iter().map(text));
+                out.push(if rw.changed { v.to_string() } else { m });
+            }
+            Err(_) => {
+                out.extend(f.drain().iter().map(text));
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// 这一次回答里认定的命中报出去，挂在此刻在回答的那一轮上
+fn report_answer(state: &AppState, p: &mut Pipes) {
+    let Some(f) = p.answer.as_mut() else {
+        return;
+    };
+    let hits = f.take_hits();
+    if hits.is_empty() {
+        return;
+    }
+    let redaction = p.redaction();
+    crate::guard::report_answer(&state.bus, p.event_id(), &p.provider, hits, &redaction);
 }
 
 /// 上游的一帧还原占位符：要发给客户端的几帧，这一帧在最后，前面是扣着的尾巴补成的帧。

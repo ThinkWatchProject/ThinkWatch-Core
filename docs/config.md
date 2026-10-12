@@ -738,27 +738,29 @@ The defaults intercept only what nobody would miss.
 ### `security`
 
 Three guards, applied to every upstream alike. Each has a `mode`: `off`,
-`observe` (detect and record, change nothing) or `enforce` (act). All three
-start in `observe`. What `enforce` does differs per guard: redaction replaces,
-tool-call inspection cuts the response off, and the content filter does what
-each rule says (refuse, delete or record).
+`observe` (detect and record, change nothing) or `enforce` (handle each match
+by its rule's action). All three start in `observe`. Every rule has an
+action: redaction replaces with a placeholder or only records, tool-call
+inspection cuts the response off or only records, and the content filter
+refuses, deletes, replaces or only records.
 
 <!-- generated: table security -->
 <a id="cfg-security"></a>
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction: credentials and personal information anywhere in a request are replaced before it leaves. |
-| `inspect_tools` | object, [`security.inspect_tools`](#cfg-security-inspect_tools) | — | Tool-call inspection: dangerous commands in the tool calls a model returns cut the response off. |
-| `content` | object, [`security.content`](#cfg-security-content) | — | Content filter: words, patterns or characters (hidden ones among them) in what the caller sends; each rule refuses the request, deletes what it matched, or only records it. |
+| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction (Secrets & privacy in the app): credentials and personal information anywhere in a request are replaced with placeholders before it leaves, or only recorded, rule by rule. |
+| `inspect_tools` | object, [`security.inspect_tools`](#cfg-security-inspect_tools) | — | Tool-call inspection (Dangerous commands in the app): dangerous commands in the tool calls a model returns cut the response off. |
+| `content` | object, [`security.content`](#cfg-security-content) | — | Content filter: words, patterns or characters (hidden ones among them) in what the caller sends, and words or patterns in the text of the answer; each rule refuses the request, deletes or replaces what it matched, or only records it. |
 <!-- /generated -->
 
 #### `security.redact`
 
 Before a request leaves, the whole request (system prompt, earlier answers
 and tool calls included) is searched for credentials and personal
-information. Under `enforce` what is found is replaced with placeholders, and
-put back where the answer repeats them. Images, files and other base64
+information. Under `enforce` what a rule finds is replaced with placeholders,
+and put back where the answer repeats them; what a rule with `action: record`
+finds is sent as it is and only recorded. Images, files and other base64
 payloads are not searched, nor are field names; custom rules also leave alone
 the identifiers a protocol needs as they are, such as item and call ids,
 types, roles, tool names and model names.
@@ -768,10 +770,11 @@ types, roles, tool names and model names.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
+| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing (Off in the app); `observe` detects and records only, and changes nothing (Monitor); `enforce` detects and handles each match by its rule's action (On). |
 | `enable` | list of strings | `[]` | Built-in rules to switch on that are off out of the box, by id. |
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
-| `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a rule matches is replaced like a credential. |
+| `actions` | map of built-in rule id → `placeholder` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting (`email: record`). `placeholder` sends a placeholder in place of the value and puts the value back where the answer repeats the placeholder; `record` sends the value as it is and records the match. |
+| `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a rule matches is replaced like a credential, or only recorded. |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -784,6 +787,7 @@ types, roles, tool names and model names.
 | `match` | `contains` \| `regex` | `contains` | `contains`: `pattern` is looked for as written; characters such as `.` and `*` have no special meaning. `regex`: `pattern` is a regular expression. |
 | `case_sensitive` | bool | `false` | Tell capital letters from small ones. Off by default: `ABC` and `abc` both match. |
 | `label` | string | `SECRET` | Placeholder name: what the rule matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters. |
+| `action` | `placeholder` \| `record` | `placeholder` | Under `enforce`: replace what the rule matches with a `placeholder`, or only `record` the match and send it as it is. |
 | `disabled` | bool | `false` | Switches the rule off and keeps it in the file. |
 <!-- /generated -->
 
@@ -871,7 +875,7 @@ receives a complete call to run.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
+| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing (Off in the app); `observe` detects and records only, and changes nothing (Monitor); `enforce` detects and handles each match by its rule's action (On). |
 | `enable` | list of strings | `[]` | Built-in rules to switch on that are off out of the box, by id. |
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
 | `actions` | map of built-in rule id → `cut` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting (`rm-rf-root: record`). |
@@ -911,24 +915,30 @@ Built-in rules:
 
 #### `security.content`
 
-Words, patterns or characters in what the caller sends: user messages and
-the tool results in them, not the system prompt or the model's own turns.
-Each rule matches a keyword (`contains`), a regular expression (`regex`) or
-code points (`codepoints`), and says what happens under `enforce`: `block`
-refuses the request, `strip` deletes every match from the caller's text and
-sends the rest, `record` only records it. After deleting, the text is checked
-again, so a keyword split by hidden characters is caught once they are gone.
+Words, patterns or characters in what the caller sends (user messages and
+the tool results in them, not the system prompt or the model's own turns),
+and, for custom rules with `response` in their `scope`, words or patterns in
+the text of the answer. Each rule matches a keyword (`contains`), a regular
+expression (`regex`) or code points (`codepoints`, requests only), and says
+what happens under `enforce`: `block` refuses the request (requests only),
+`strip` deletes every match and sends the rest, `replace` puts the rule's
+`replacement` in place of every match and sends the rest, `record` only
+records it. In a request, the text is checked again after deleting or
+replacing, so a keyword split by hidden characters is caught once they are
+gone; a replacement is not checked again. In an answer, what a rule deletes
+or replaces never reaches the client, and the request record keeps the answer
+the client received.
 
 <!-- generated: table security.content -->
 <a id="cfg-security-content"></a>
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
+| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing (Off in the app); `observe` detects and records only, and changes nothing (Monitor); `enforce` detects and handles each match by its rule's action (On). |
 | `enable` | list of strings | `[]` | Built-in rules to switch on that are off out of the box, by id. |
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
-| `actions` | map of built-in rule id → `block` \| `strip` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting. |
-| `custom` | list of [`security.content.custom[]`](#cfg-security-content-custom) | `[]` | Rules of your own. |
+| `actions` | map of built-in rule id → `block` \| `strip` \| `replace` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting. Built-in rules check requests only; `replace` puts `***` in place of a match. |
+| `custom` | list of [`security.content.custom[]`](#cfg-security-content-custom) | `[]` | Rules of your own, each checking requests, answers or both. |
 <!-- /generated -->
 
 <!-- generated: table security.content.custom[] -->
@@ -937,9 +947,12 @@ again, so a keyword split by hidden characters is caught once they are gone.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name shown in logs and in the app; it identifies the rule and has to be unique within this guard. |
-| `pattern` | string | **required** | A keyword; a regular expression with `match: regex`; code points with `match: codepoints` (`U+200B, U+E0000–U+E007F`). Keywords and regular expressions are case-insensitive. |
-| `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`: the text contains `pattern`. `regex`: `pattern` is a regular expression. `codepoints`: the text has a character among the code points or ranges listed in `pattern`, separated by commas. |
-| `action` | `block` \| `strip` \| `record` | `record` | Under `enforce`: `block` the request, `strip` what matched and send the rest, or only `record` the match. |
+| `pattern` | string | **required** | A keyword; a regular expression with `match: regex`; code points with `match: codepoints` (`U+200B, U+E0000–U+E007F`). |
+| `scope` | list of `request` \| `response` | `[request]` | What the rule checks: `request` is what the caller sends (its messages and the tool results in them); `response` is the text of the answer the client sees, the input of free-form tools such as Codex's `apply_patch` included, and neither tool calls nor reasoning. Both may be listed. A streamed answer is never held back whole: only the last few characters that could still grow into a match wait for the next piece, at most one fewer than the longest keyword, and at most 256 for a regular expression; a match longer than that may have its beginning sent already. A rule that checks answers cannot `block`, and cannot match by `codepoints`. |
+| `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`: the text contains `pattern` as written; characters such as `.` and `*` have no special meaning. `regex`: `pattern` is a regular expression. `codepoints`: the text has a character among the code points or ranges listed in `pattern`, separated by commas; requests only. |
+| `case_sensitive` | bool | `false` | Tell capital letters from small ones. Off by default: `ABC` and `abc` both match. Code points are what they are either way. |
+| `action` | `block` \| `strip` \| `replace` \| `record` | `record` | Under `enforce`: `block` the request (requests only), `strip` what matched and send the rest, `replace` what matched with `replacement` and send the rest, or only `record` the match. Replacing cannot be undone: the answer does not get the original back. |
+| `replacement` | string | `"***"` | What `replace` puts in place of a match. |
 | `disabled` | bool | `false` | Switches the rule off and keeps it in the file. |
 <!-- /generated -->
 
@@ -1001,6 +1014,11 @@ security:
       - name: project-x
         pattern: project-x
         action: strip
+      - name: codename
+        pattern: polaris
+        scope: [request, response]
+        action: replace
+        replacement: "[codename]"
 ```
 
 ### `retention`

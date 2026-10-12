@@ -1380,6 +1380,7 @@ groups:
                 matching: crate::ContentMatch::Regex,
                 case_sensitive: true,
                 label: None,
+                action: Default::default(),
                 disabled: false,
             })
             .collect();
@@ -1444,8 +1445,11 @@ groups:
         let rule = |name: &str, pattern: &str, matching| crate::CustomContentRule {
             name: name.into(),
             pattern: pattern.into(),
+            scope: tw_guard::policy::request_only(),
             matching,
+            case_sensitive: false,
             action: crate::ContentAction::Block,
+            replacement: tw_guard::policy::DEFAULT_REPLACEMENT.into(),
             disabled: false,
         };
         // 子串里的括号不是正则

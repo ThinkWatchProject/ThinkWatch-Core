@@ -13,6 +13,11 @@
 //! - **请求体的结构**：键；自定义规则也不找协议里的 id、类型、角色、工具名、模型名
 //!   （见 [`untouched`]）。
 //!
+//! # 仅记录的规则
+//!
+//! 动作是「仅记录」的规则（[`RuleSet::records`]）照样找、照样报，只是不换：原值照发，不进
+//! 账本，回答里也就没有要换回来的。
+//!
 //! # 观察档和替换档用同一套规则
 //!
 //! 以前观察档按全部类别检测、替换档按上游的类别替换，于是同一个请求观察时报「检测
@@ -176,8 +181,9 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> Look
     let ledger = if !mode.acts() {
         Ledger::new(Scheme::SECRET)
     } else {
-        // 只要账本：换过的那一份在每一跳发出去之前才写（见 `replace`），这里不抄一份
-        crate::redact::replace::number(text, &hits, seed.avoiding(text))
+        // 只要账本：换过的那一份在每一跳发出去之前才写（见 `replace`），这里不抄一份。只记录
+        // 的规则命中的值不编号：它们原样发出
+        crate::redact::replace::number(text, &rules.to_replace(&hits), seed.avoiding(text))
     };
     Look {
         found,
@@ -201,7 +207,9 @@ pub fn replace(
     let Ok(text) = std::str::from_utf8(&body) else {
         return (body, ledger.clone());
     };
-    let hits = hits(text, rules);
+    let found = hits(text, rules);
+    // 只记录的规则命中的不换
+    let hits = rules.to_replace(&found);
     if hits.is_empty() {
         // 没命中就原样返回，连一次拷贝都不做
         return (body, ledger.clone());

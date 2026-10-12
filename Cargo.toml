@@ -103,6 +103,8 @@ flate2 = "1"
 # regex-automata / regex-syntax 已经在依赖树里（tracing 的 EnvFilter），
 # 所以加它的增量很小
 regex = "1"
+# 回答过滤要知道一条正则最长能匹配多少（流里扣住多长的尾巴）。regex 本来就依赖它
+regex-syntax = "0.8"
 # 在整个请求体里找一小段字节（SIMD）。serde_json、regex 本来就依赖它，不多编任何东西
 memchr = "2"
 # 保格式地改 TOML。接管 Codex 要写它的 config.toml，而重新序列化

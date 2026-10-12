@@ -459,6 +459,8 @@ pub fn compile(name: &str, pattern: &str) -> Result<regex::Regex, BadPattern> {
 pub struct RuleSet {
     on: HashSet<&'static str>,
     custom: Vec<Custom>,
+    /// 动作是「仅记录」的规则：照样找、照样报，不换成占位符（见 [`RuleSet::records`]）
+    record: HashSet<Rule>,
 }
 
 impl Default for RuleSet {
@@ -477,6 +479,7 @@ impl RuleSet {
                 .map(|b| b.id)
                 .collect(),
             custom: Vec::new(),
+            record: HashSet::new(),
         }
     }
 
@@ -485,6 +488,7 @@ impl RuleSet {
         Self {
             on: HashSet::new(),
             custom: Vec::new(),
+            record: HashSet::new(),
         }
     }
 
@@ -497,6 +501,7 @@ impl RuleSet {
                 .map(|b| b.id)
                 .collect(),
             custom: Vec::new(),
+            record: HashSet::new(),
         }
     }
 
@@ -555,6 +560,31 @@ impl RuleSet {
 
     pub fn is_on(&self, id: &str) -> bool {
         self.on.contains(id)
+    }
+
+    /// 这条规则只记录：动作是「仅记录」
+    pub fn recording(mut self, rule: Rule) -> Self {
+        self.record.insert(rule);
+        self
+    }
+
+    /// 这条规则只记录、不换。**照样找、照样报**：命中报出去，只是原值照发，不进账本
+    pub fn records(&self, rule: &Rule) -> bool {
+        !self.record.is_empty() && self.record.contains(rule)
+    }
+
+    /// 要换成占位符的那几处：去掉只记录的规则命中的（见 [`Self::records`]）。没有只记录的
+    /// 规则时原样借出去，不抄一份
+    pub fn to_replace<'h>(&self, hits: &'h [Hit]) -> std::borrow::Cow<'h, [Hit]> {
+        if self.record.is_empty() || !hits.iter().any(|h| self.records(&h.rule)) {
+            return std::borrow::Cow::Borrowed(hits);
+        }
+        std::borrow::Cow::Owned(
+            hits.iter()
+                .filter(|h| !self.records(&h.rule))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// 名字是 `name` 的自定义规则**写的样子和怎么认**。没有这条规则是 `None`。安全日志记下
@@ -1531,6 +1561,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
     let builtins = RuleSet {
         on: set.on.clone(),
         custom: Vec::new(),
+        record: HashSet::new(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
