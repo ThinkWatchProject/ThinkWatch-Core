@@ -110,6 +110,135 @@ fn a_match_split_at_every_position_is_still_caught() {
     assert_eq!(streamed(&a, true, &refs), want);
 }
 
+/// 每种切法（切成三块的每一种，和一个字一块）流着处理，交回切法、发出去的和是不是
+/// 「开头已经发了」的那种
+fn cuts_of(a: &Arc<Answer>, text: &str) -> Vec<(String, String, bool)> {
+    let cuts: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let mut ways: Vec<(String, Vec<&str>)> = Vec::new();
+    for &i in &cuts {
+        for &j in cuts.iter().filter(|&&j| j >= i) {
+            ways.push((
+                format!("切在 {i} 和 {j}"),
+                vec![&text[..i], &text[i..j], &text[j..]],
+            ));
+        }
+    }
+    let chars: Vec<String> = text.chars().map(String::from).collect();
+    ways.push((
+        "一个字一块".into(),
+        chars.iter().map(String::as_str).collect(),
+    ));
+    ways.into_iter()
+        .map(|(how, pieces)| {
+            let mut lane = a.lane(true);
+            let mut out = String::new();
+            for p in &pieces {
+                out.push_str(&lane.push(p));
+            }
+            out.push_str(&lane.finish());
+            (how, out, lane.tally.short)
+        })
+        .collect()
+}
+
+/// 切在哪儿都和整份的一样
+fn every_cut(a: &Arc<Answer>, text: &str, want: &str) {
+    assert_eq!(whole_text(a, true, text), want, "{text:?}");
+    for (how, out, _) in cuts_of(a, text) {
+        assert_eq!(out, want, "{text:?} {how}");
+    }
+}
+
+/// 套得比扣住的字还深：整份的删干净；流着的，开头已经发了的那几处没发的那一截删掉，发出去
+/// 的里面找不到 `strip`；其余的切法和整份的一样
+fn every_cut_safe(a: &Arc<Answer>, text: &str, want: &str, strip: &str) {
+    assert_eq!(whole_text(a, true, text), want, "{text:?}");
+    for (how, out, short) in cuts_of(a, text) {
+        assert!(!out.contains(strip), "{text:?} {how} → {out:?}");
+        if !short {
+            assert_eq!(out, want, "{text:?} {how}");
+        }
+    }
+}
+
+/// 删掉一处之后前后的字接成了新的一处（`sesecretcret` 删掉中间的 `secret` 又是一个
+/// `secret`）：接着删，直到不再冒出新的。整份的和流式的一样，切在哪儿都一样
+#[test]
+fn nested_strips_are_removed_until_none_is_left_wherever_the_text_is_cut() {
+    let a = answer(vec![rule("s", "secret", Match::Contains, Action::Strip)]);
+    for (text, want) in [
+        ("sesecretcret", ""),
+        ("前sesecretcret后", "前后"),
+        ("sesesecretcretcret and SeSECRETcret!", " and !"),
+        ("se secret cret", "se  cret"),
+        ("secsecretret secretsecret", " "),
+    ] {
+        every_cut(&a, text, want);
+    }
+    // 两条规则互相接出来的：删掉 `X` 之后是 `ab`，删掉 `ab` 之后又是 `X`
+    let b = answer(vec![
+        rule("x", "X", Match::Contains, Action::Strip),
+        rule("ab", "ab", Match::Contains, Action::Strip),
+    ]);
+    every_cut(&b, "1aXb2", "12");
+    every_cut(&b, "1aabXbb2", "1b2");
+    // 接了两层，外层的 `a` 可能在第二层接上之前就发出去了
+    every_cut_safe(&b, "1aaXbb2", "12", "ab");
+    // 要看前后一个字的正则：删掉 `X` 之后 `cat` 后面不再是字母
+    let c = answer(vec![
+        rule("x", "X", Match::Contains, Action::Strip),
+        rule("w", r"\bcat\b", Match::Regex, Action::Strip),
+    ]);
+    every_cut(&c, "catX dog", " dog");
+    every_cut(&c, "a catX", "a ");
+    // 换成的字不再查：换上去的 `[x]` 和两边拼不成新的命中
+    let r = answer(vec![RuleInput {
+        replacement: "[x]",
+        ..rule("s", "secret", Match::Contains, Action::Replace)
+    }]);
+    every_cut(&r, "sesecretcret", "se[x]cret");
+    // 换成空的就是删掉
+    let e = answer(vec![RuleInput {
+        replacement: "",
+        ..rule("s", "secret", Match::Contains, Action::Replace)
+    }]);
+    every_cut(&e, "sesecretcret", "");
+    // 接出来的那一处也算一处命中，位置是原文里从外层的 `se` 到外层的 `cret`
+    let mut lane = a.lane(true);
+    lane.whole("前sesecretcret后");
+    let m = lane.take();
+    assert_eq!(m.counts, vec![2]);
+    let outer = m.found.iter().find(|f| f.at.start == "前".len()).unwrap();
+    assert_eq!(outer.at, "前".len().."前sesecretcret".len());
+    let p = outer.place.as_ref().unwrap();
+    assert_eq!(
+        (p.before.as_str(), p.matched.as_str(), p.after.as_str()),
+        ("前", "secret", "后")
+    );
+}
+
+/// 套得太深（第一遍之后又过了 [`MAX_ROUNDS`] 遍还在改字）：这一路剩下的整个不发，和请求
+/// 那边整段删掉一样；发出去的里面一处命中都没有。套得浅的整份删干净，流着的发出去的里面也
+/// 找不到
+#[test]
+fn nesting_beyond_the_bound_silences_the_rest_of_the_lane() {
+    let a = answer(vec![rule("ab", "ab", Match::Contains, Action::Strip)]);
+    let nested = |depth: usize| format!("x{}{}y", "a".repeat(depth), "b".repeat(depth));
+    assert_eq!(whole_text(&a, true, &nested(MAX_ROUNDS)), "xy");
+    assert_eq!(whole_text(&a, true, &nested(MAX_ROUNDS + 1)), "");
+    let text = format!("{}tail", nested(MAX_ROUNDS + 5));
+    assert_eq!(whole_text(&a, true, &text), "");
+    let pieces: Vec<String> = text.chars().map(String::from).collect();
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    let out = streamed(&a, true, &refs);
+    assert!(!out.contains("ab") && !out.contains("tail"), "{out}");
+    every_cut_safe(&a, &nested(6), "xy", "ab");
+}
+
 #[test]
 fn case_variants_beyond_ascii_are_the_same_word() {
     // 开尔文符号 K 和 k、带重音的大小写、希腊字母的 Σ 和 σ
@@ -210,10 +339,10 @@ fn the_held_tail_comes_out_when_the_lane_ends() {
     let mut lane = a.lane(true);
     assert_eq!(
         lane.push("this is sec"),
-        "this i",
-        "最后五个字可能是命中的开头：扣着"
+        "t",
+        "最后五个字可能是命中的开头，再往前五个字可能和删掉之后的字接成一处：扣着"
     );
-    assert_eq!(lane.finish(), "s sec", "到头了也没成命中：照发");
+    assert_eq!(lane.finish(), "his is sec", "到头了也没成命中：照发");
     assert_eq!(lane.push("more"), "more", "结束之后的原样");
 }
 
@@ -235,17 +364,152 @@ fn context_around_a_match_is_kept_for_the_log() {
     assert_eq!(p.after, "后".repeat(80));
 }
 
-/// 随机的正文、随机的规则、随机地切：流着处理出来的和整份一次处理的一模一样，和直接按
-/// 正则找出来再改的也一样；不 panic
-#[test]
-fn streaming_agrees_with_the_whole_text_for_random_text_rules_and_cuts() {
-    let mut seed = 0x51f1_5eed_c0de_2026_u64;
-    let mut next = |n: usize| {
+/// 照定义直接算：第一遍每条删除、替换规则在原文上从头找（`find_iter`），之后每一遍在改过
+/// 的整段上每个位置都试一次（和换上去的替换文本重叠的不算），合并、改，直到一处都没有。
+/// 交回改出来的，和替换文本在哪儿。第一遍之后又过了 [`MAX_ROUNDS`] 遍还在改的是空的
+fn reference(a: &Answer, text: &str) -> (String, Vec<Range<usize>>) {
+    let mut t = text.to_string();
+    let mut kept: Vec<Range<usize>> = Vec::new();
+    for round in 0..=MAX_ROUNDS {
+        let mut edits = Vec::new();
+        for (ri, r) in a.rules.iter().enumerate() {
+            if !r.action.edits() {
+                continue;
+            }
+            if round == 0 {
+                let found = r.re.find_iter(&t).filter(|m| !m.is_empty());
+                edits.extend(found.map(|m| (m.range(), ri)));
+            } else {
+                let found = every_match(&r.re, &t).into_iter();
+                edits.extend(found.filter(|m| !overlapping(&kept, m)).map(|m| (m, ri)));
+            }
+        }
+        if edits.is_empty() {
+            return (t, kept);
+        }
+        if round == MAX_ROUNDS {
+            break;
+        }
+        let merged = merge_edits(edits, |ri| a.rules[ri].edit_with());
+        // 替换文本跟着改动挪，这一遍换上去的接着记
+        let mut next = Vec::new();
+        let mut delta: isize = 0;
+        let mut old = kept.into_iter().peekable();
+        for (r, w) in &merged {
+            while let Some(k) = old.next_if(|k| k.end <= r.start) {
+                next.push(k.start.saturating_add_signed(delta)..k.end.saturating_add_signed(delta));
+            }
+            let at = r.start.saturating_add_signed(delta);
+            if !w.is_empty() {
+                next.push(at..at + w.len());
+            }
+            delta += w.len() as isize - r.len() as isize;
+        }
+        next.extend(
+            old.map(|k| k.start.saturating_add_signed(delta)..k.end.saturating_add_signed(delta)),
+        );
+        kept = next;
+        t = apply_edits(&t, &merged);
+    }
+    (String::new(), Vec::new())
+}
+
+/// 每个位置上（从那儿起）的那一处命中，空的不算。互相重叠的都在
+fn every_match(re: &regex::Regex, t: &str) -> Vec<Range<usize>> {
+    t.char_indices()
+        .filter_map(|(i, _)| re.find_at(t, i).filter(|m| m.start() == i && !m.is_empty()))
+        .map(|m| m.range())
+        .collect()
+}
+
+fn overlapping(spans: &[Range<usize>], m: &Range<usize>) -> bool {
+    spans.iter().any(|s| s.start < m.end && m.start < s.end)
+}
+
+/// 一段正文按定义算出来的、整份一次处理的、随机切开流着处理的，三个一样；认出来的命中一样
+/// 多；交出去的正文里，删除、替换规则在哪个位置上都找不到一处不和替换文本重叠的命中。
+///
+/// 流着处理的套得比扣住的字还深（开头已经发了）的时候只查发出去的里面没有命中，交回 `true`
+fn agree(
+    a: &Arc<Answer>,
+    text: &str,
+    acts: bool,
+    next: &mut dyn FnMut(usize) -> usize,
+    why: &str,
+) -> bool {
+    let whole = whole_text(a, acts, text);
+    if acts {
+        let (want, kept) = reference(a, text);
+        assert_eq!(whole, want, "{text:?} {why}");
+        for r in a.rules.iter().filter(|r| r.action.edits()) {
+            let left: Vec<_> = every_match(&r.re, &want)
+                .into_iter()
+                .filter(|m| !overlapping(&kept, m))
+                .collect();
+            assert!(left.is_empty(), "{text:?} → {want:?} 还有 {left:?} {why}");
+        }
+    } else {
+        assert_eq!(whole, text);
+    }
+    // 随机切成几块（切在字符边界上：一路正文是解析好的字符串）
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let mut cuts: Vec<usize> = (0..next(8)).map(|_| bounds[next(bounds.len())]).collect();
+    cuts.sort_unstable();
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    for c in cuts {
+        pieces.push(&text[at..c]);
+        at = c;
+    }
+    pieces.push(&text[at..]);
+    let mut lane = a.lane(acts);
+    let mut out = String::new();
+    for p in &pieces {
+        out.push_str(&lane.push(p));
+    }
+    out.push_str(&lane.finish());
+    let short = lane.tally.short;
+    // 只有删除规则的：发出去的正文里一处都找不到。套得比扣住的字还深的时候，要看前后一个字
+    // 的正则整个落在已经发出去的字里的那种收不回来（模块说明里那条明说的边界）
+    let looks = a.rules.iter().any(|r| r.action.edits() && r.looks);
+    if acts && a.rules.iter().all(|r| r.action != Action::Replace) && !(short && looks) {
+        for r in a.rules.iter().filter(|r| r.action == Action::Strip) {
+            assert!(
+                r.re.find(&out).is_none(),
+                "{text:?} {pieces:?} → {out:?} {why}"
+            );
+        }
+    }
+    if short {
+        return true;
+    }
+    assert_eq!(out, whole, "{text:?} {pieces:?} {why}");
+    // 认出来的命中也一样多
+    let streamed_found = lane.take().counts;
+    let mut once = a.lane(acts);
+    once.whole(text);
+    assert_eq!(streamed_found, once.take().counts, "{text:?} {why}");
+    false
+}
+
+fn xorshift(mut seed: u64) -> impl FnMut(usize) -> usize {
+    move |n: usize| {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
         (seed % n.max(1) as u64) as usize
-    };
+    }
+}
+
+/// 随机的正文、随机的规则、随机地切：流着处理出来的和整份一次处理的一模一样，和照定义算的
+/// 也一样（[`agree`]）；不 panic
+#[test]
+fn streaming_agrees_with_the_whole_text_for_random_text_rules_and_cuts() {
+    let mut next = xorshift(0x51f1_5eed_c0de_2026);
     let alphabet: Vec<String> = [
         "a", "b", "A", "B", "é", "É", "中", "文", " ", "1", "2", "😀", "ß",
     ]
@@ -265,6 +529,7 @@ fn streaming_agrees_with_the_whole_text_for_random_text_rules_and_cuts() {
         r"\bab\b",
         r"[aA]{2}",
     ];
+    let mut shorts = 0;
     for round in 0..400 {
         let word = |next: &mut dyn FnMut(usize) -> usize| -> String {
             (0..1 + next(3))
@@ -291,66 +556,89 @@ fn streaming_agrees_with_the_whole_text_for_random_text_rules_and_cuts() {
             let with = ["***", "", "x", "中"][next(4)].to_string();
             patterns.push((p, m, action, next(2) == 0, with));
         }
-        let names: Vec<String> = (0..patterns.len()).map(|i| format!("r{i}")).collect();
-        let inputs: Vec<RuleInput<'_>> = patterns
-            .iter()
-            .zip(&names)
-            .map(|((p, m, action, cs, with), name)| RuleInput {
-                case_sensitive: *cs,
-                replacement: with,
-                ..rule(name, p, *m, *action)
-            })
-            .collect();
-        let rules = Rules::build(inputs).unwrap();
-        let a = Answer::build(&rules).unwrap();
+        let a = build(&patterns);
         let text: String = (0..next(60))
             .map(|_| alphabet[next(alphabet.len())].as_str())
             .collect();
-        let acts = round % 5 != 0;
-        let whole = whole_text(&a, acts, &text);
-        // 直接按正则在整段上找、合并、改：和引擎认的一样
-        if acts {
-            let mut edits = Vec::new();
-            for (ri, r) in a.rules.iter().enumerate() {
-                for m in r.re.find_iter(&text).filter(|m| !m.is_empty()) {
-                    if r.action.edits() {
-                        edits.push((m.range(), ri));
-                    }
-                }
-            }
-            let merged = merge_edits(edits, |ri| a.rules[ri].edit_with());
-            assert_eq!(whole, apply_edits(&text, &merged), "{text:?} {patterns:?}");
-        } else {
-            assert_eq!(whole, text);
-        }
-        // 随机切成几块（切在字符边界上：一路正文是解析好的字符串）
-        let bounds: Vec<usize> = text
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain([text.len()])
-            .collect();
-        let mut cuts: Vec<usize> = (0..next(8)).map(|_| bounds[next(bounds.len())]).collect();
-        cuts.sort_unstable();
-        let mut pieces = Vec::new();
-        let mut at = 0;
-        for c in cuts {
-            pieces.push(&text[at..c]);
-            at = c;
-        }
-        pieces.push(&text[at..]);
-        let mut lane = a.lane(acts);
-        let mut out = String::new();
-        for p in &pieces {
-            out.push_str(&lane.push(p));
-        }
-        out.push_str(&lane.finish());
-        assert_eq!(out, whole, "{text:?} {pieces:?} {patterns:?}");
-        // 认出来的命中也一样多
-        let streamed_found = lane.take().counts;
-        let mut once = a.lane(acts);
-        once.whole(&text);
-        assert_eq!(streamed_found, once.take().counts, "{text:?}");
+        shorts += usize::from(agree(
+            &a,
+            &text,
+            round % 5 != 0,
+            &mut next,
+            &format!("{patterns:?}"),
+        ));
     }
+    // 套得比扣住的字还深的要是常见，和整份的比对就没测到什么
+    assert!(shorts * 20 < 400, "{shorts}");
+}
+
+fn build(patterns: &[(String, Match, Action, bool, String)]) -> Arc<Answer> {
+    let names: Vec<String> = (0..patterns.len()).map(|i| format!("r{i}")).collect();
+    let inputs: Vec<RuleInput<'_>> = patterns
+        .iter()
+        .zip(&names)
+        .map(|((p, m, action, cs, with), name)| RuleInput {
+            case_sensitive: *cs,
+            replacement: with,
+            ..rule(name, p, *m, *action)
+        })
+        .collect();
+    Answer::build(&Rules::build(inputs).unwrap()).unwrap()
+}
+
+/// 专找一层套一层的：字母少、关键词短，正文是把命中塞进命中中间拼出来的。删掉一处之后前后
+/// 接成的新命中都删干净，流着的和整份的一样
+#[test]
+fn nested_matches_agree_for_random_rules_texts_and_cuts() {
+    let mut next = xorshift(0x0e57_ed5e_eded_2026);
+    let letters = ["a", "b", "c", "X", " "];
+    let regexes = [r"a[bc]", r"\bab\b", r"a.?c", r"(?:ab|b)c", r"\bX", r"c$"];
+    let mut shorts = 0;
+    for round in 0..3000 {
+        let mut patterns: Vec<(String, Match, Action, bool, String)> = Vec::new();
+        for _ in 0..1 + next(3) {
+            let (p, m) = if next(3) != 0 {
+                let w: String = (0..1 + next(3))
+                    .map(|_| letters[next(letters.len() - 1)])
+                    .collect();
+                (w, Match::Contains)
+            } else {
+                (regexes[next(regexes.len())].to_string(), Match::Regex)
+            };
+            let action = [
+                Action::Strip,
+                Action::Strip,
+                Action::Replace,
+                Action::Record,
+            ][next(4)];
+            let with = ["#", "", "a", "c"][next(4)].to_string();
+            patterns.push((p, m, action, next(2) == 0, with));
+        }
+        let a = build(&patterns);
+        // 先随便写一段，再挑一条规则的样子往随机的位置里一层一层地塞
+        let mut text: String = (0..next(12))
+            .map(|_| letters[next(letters.len())])
+            .collect();
+        for _ in 0..next(6) {
+            let (p, m, ..) = &patterns[next(patterns.len())];
+            let w = if *m == Match::Contains {
+                p.clone()
+            } else {
+                ["ab", "ac", "abc", "bc", "X", "c"][next(6)].to_string()
+            };
+            let at = next(text.len() + 1);
+            text.insert_str(at, &w);
+        }
+        shorts += usize::from(agree(
+            &a,
+            &text,
+            round % 7 != 0,
+            &mut next,
+            &format!("{patterns:?}"),
+        ));
+    }
+    eprintln!("流着的开头已经发了的：{shorts} / 3000");
+    assert!(shorts * 10 < 3000, "{shorts}");
 }
 
 // ───────────────────────────────────────────────────────── 按格式

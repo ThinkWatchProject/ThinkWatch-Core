@@ -708,10 +708,10 @@ pricing:
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和应用里显示的名字，也是规则的标识；同一项防护里不能重名。 |
 | `pattern` | 字符串 | **必填** | 关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。 |
-| `scope` | 列表，每项是 `request` \| `response` | `[request]` | 检查对象：`request` 为调用方发送的内容（用户消息及其中的工具结果）；`response` 为客户端看到的回答正文，包含 Codex `apply_patch` 等自由格式工具的输入，不含工具调用与思考过程。两项可同时列出。流式回答不整体缓冲，只暂缓发送可能构成命中的末尾片段：「包含」规则不超过最长匹配内容的字符数减一，正则规则最多 256 个字符；超过此长度的正则命中，其起始部分可能已送达客户端。`enforce` 下有检查回答的规则删除或替换内容时，流式回答中的 logprobs 一律去掉，非流式回答在正文有改动时去掉：logprobs 按 token 重复了正文。检查回答的规则不能用 `block`，也不能按 `codepoints` 匹配。 |
+| `scope` | 列表，每项是 `request` \| `response` | `[request]` | 检查对象：`request` 为调用方发送的内容（用户消息及其中的工具结果）；`response` 为客户端看到的回答正文，包含 Codex `apply_patch` 等自由格式工具的输入，不含工具调用与思考过程。两项可同时列出。流式回答不整体缓冲，只暂缓发送可能构成命中的末尾片段：「包含」规则不超过最长匹配内容的字符数减一，正则规则最多 256 个字符；超过此长度的正则命中，其起始部分可能已送达客户端。`enforce` 下有删除内容的规则时，再多暂缓同样多的字符：删除处前后拼接成的文字重新检查，直到不再有命中。嵌套层数超出暂缓范围的命中，其起始部分可能已送达客户端，其余部分删除。`enforce` 下有检查回答的规则删除或替换内容时，流式回答中的 logprobs 一律去掉，非流式回答在正文有改动时去掉：logprobs 按 token 重复了正文。检查回答的规则不能用 `block`，也不能按 `codepoints` 匹配。 |
 | `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`：正文按原样包含 `pattern`，`.`、`*` 等字符没有特殊含义。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔；仅用于请求。 |
 | `case_sensitive` | 布尔 | `false` | 区分大小写。默认不区分：`ABC` 和 `abc` 都会匹配。码位不受此项影响。 |
-| `action` | `block` \| `strip` \| `replace` \| `record` | `record` | `enforce` 下拒绝请求（`block`，仅用于请求）、删除命中的内容后发出（`strip`）、将命中的内容替换为 `replacement` 后发出（`replace`），或只记录（`record`）。替换不可还原，回答中不换回原文。 |
+| `action` | `block` \| `strip` \| `replace` \| `record` | `record` | `enforce` 下拒绝请求（`block`，仅用于请求）、删除命中的内容后发出（`strip`）、将命中的内容替换为 `replacement` 后发出（`replace`），或只记录（`record`）。删除处前后拼接成的文字重新检查，直到不再有命中；替换上的文字不再检查。替换不可还原，回答中不换回原文。 |
 | `replacement` | 字符串 | `"***"` | 动作为 `replace` 时替换成的文字。 |
 | `disabled` | 布尔 | `false` | 停用这条规则，规则本身留在文件里。 |
 <!-- /generated -->

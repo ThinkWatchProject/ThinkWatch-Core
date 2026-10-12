@@ -35,12 +35,8 @@ use std::ops::Range;
 use serde_json::Value;
 use tw_dialect::ir::Dialect;
 
-use super::{Action, Hit, Rules, Scope};
+use super::{Action, Hit, MAX_ROUNDS, Rules, Scope};
 use crate::policy::Mode;
-
-/// 最多删、换几遍。正常的正文一两遍就干净了；到这么多遍还在冒出新命中的只能是刻意一层套
-/// 一层写出来的，那一段整段删掉（见模块说明）
-const MAX_ROUNDS: usize = 64;
 
 /// 一条命中最后怎么样了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

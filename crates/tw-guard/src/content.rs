@@ -41,6 +41,10 @@ pub mod answer;
 mod codepoints;
 mod screen;
 
+/// 最多删、换几遍。正常的正文一两遍就干净了；到这么多遍还在冒出新命中的只能是刻意一层套
+/// 一层写出来的：请求那边那一段整段删掉，回答那边这一路剩下的整个不发
+pub(crate) const MAX_ROUNDS: usize = 64;
+
 pub(crate) use codepoints::visible as codepoints_visible;
 pub use codepoints::{CodepointError, Codepoints, MAX_ITEMS as MAX_CODEPOINT_ITEMS};
 pub(crate) use screen::evaluate;
@@ -677,7 +681,7 @@ impl Rules {
 }
 
 /// `m` 和 `spans`（按先后、互不重叠）里的哪一段重叠
-fn overlaps(spans: &[Range<usize>], m: &Range<usize>) -> bool {
+pub(crate) fn overlaps(spans: &[Range<usize>], m: &Range<usize>) -> bool {
     let k = spans.partition_point(|s| s.end <= m.start);
     spans.get(k).is_some_and(|s| s.start < m.end)
 }
