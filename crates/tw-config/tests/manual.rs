@@ -168,6 +168,8 @@ pub enum Kind {
     Headers,
     /// 可选值由枚举生成
     Enum(fn() -> Vec<&'static str>),
+    /// 一组取值，每一个由枚举生成
+    Enums(fn() -> Vec<&'static str>),
     /// 键 → 枚举值
     EnumMap(T2, fn() -> Vec<&'static str>),
     /// 一个对象，见那一节
@@ -293,6 +295,7 @@ fn kind(k: &Kind, l: Lang) -> String {
         ),
         Kind::Headers => pick("map of header name → value", "请求头名 → 值的映射"),
         Kind::Enum(f) => values(&f()),
+        Kind::Enums(f) => format!("{} {}", pick("list of", "列表，每项是"), values(&f())),
         Kind::EnumMap(key, f) => format!(
             "{} {} → {}",
             pick("map of", "映射："),

@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::redact::nest::Nest;
 use crate::redact::rules::{Hit, RuleSet};
@@ -121,6 +122,8 @@ pub struct Ledger {
     /// 发出去的占位符有哪几种长度，从短到长。还原时在每个开头处按它们各查一次表（见
     /// [`restore`]）；标签就那几个、号的位数也就几种，所以这里只有寥寥几个数
     lens: Vec<usize>,
+    /// 在一段文字里一次找出所有原值用的（[`hide_values`]），头一次用时建，记了新账就作废
+    finder: std::sync::OnceLock<Option<Arc<ValueFinder>>>,
 }
 
 impl Ledger {
@@ -131,6 +134,7 @@ impl Ledger {
             seen: HashMap::new(),
             issued: HashMap::new(),
             lens: Vec::new(),
+            finder: std::sync::OnceLock::new(),
         }
     }
     pub fn scheme(&self) -> Scheme {
@@ -199,7 +203,98 @@ impl Ledger {
         }
         self.back.insert(p.clone(), original.to_string());
         self.seen.insert(original.to_string(), p.clone());
+        self.finder = std::sync::OnceLock::new();
         p
+    }
+
+    fn finder(&self) -> Option<&ValueFinder> {
+        self.finder
+            .get_or_init(|| ValueFinder::build(&self.seen).map(Arc::new))
+            .as_deref()
+    }
+}
+
+/// 账本里的每个原值，一遍扫过去全找出来（Aho-Corasick）：不拿每个值去整段文字里找一遍
+/// —— 那是「值的个数 × 文字长度」，一个请求换了几万个值、回答有 1 MiB 时，打一次码要
+/// 小半秒。
+///
+/// **每个位置只取在那儿结束的最长的那一个**：互相重叠的几处要合成一处（见 [`ValueSpans`]），
+/// 而在同一个位置结束的几处，最长的那一处盖住了别的。不把每一处重叠的都列出来 —— 原值一个
+/// 套一个（`\d{6,}` 认出来的一串串 1，长度 6 到 600）时，那是「位置 × 值的个数」，几百 KB 的
+/// 正文就要上 G 的内存。
+#[derive(Debug)]
+struct ValueFinder {
+    nfa: aho_corasick::nfa::contiguous::NFA,
+    /// 第几个值换成哪个占位符
+    placeholders: Vec<String>,
+}
+
+impl ValueFinder {
+    fn build(seen: &HashMap<String, String>) -> Option<Self> {
+        let (values, placeholders): (Vec<&str>, Vec<String>) = seen
+            .iter()
+            .filter(|(v, _)| !v.is_empty())
+            .map(|(v, p)| (v.as_str(), p.clone()))
+            .unzip();
+        if values.is_empty() {
+            return None;
+        }
+        let nfa = aho_corasick::nfa::contiguous::NFA::builder()
+            .match_kind(aho_corasick::MatchKind::Standard)
+            .build(&values)
+            .ok()?;
+        Some(Self { nfa, placeholders })
+    }
+
+    /// `text` 里原值盖住的地方，位置照 `to` 换算：`(区间, 第几个值)`。重叠的连成一段（挨着的
+    /// 不连），一段记它头一处的值
+    fn find_all(
+        &self,
+        text: &str,
+        to: &dyn Fn(usize) -> usize,
+        out: &mut Vec<(Range<usize>, usize)>,
+    ) {
+        use aho_corasick::Anchored;
+        use aho_corasick::automaton::{Automaton, StateID};
+        let Ok(mut sid) = self.nfa.start_state(Anchored::No) else {
+            return;
+        };
+        // 每个状态上最长的那个值：用到才算，一段文字里走到的状态不比字多
+        let mut longest: HashMap<StateID, (usize, usize)> = HashMap::new();
+        let mut cur: Option<(usize, usize, usize)> = None;
+        let push = |c: (usize, usize, usize), out: &mut Vec<(Range<usize>, usize)>| {
+            out.push((to(c.0)..to(c.1), c.2));
+        };
+        for (i, &b) in text.as_bytes().iter().enumerate() {
+            sid = self.nfa.next_state(Anchored::No, sid, b);
+            if !self.nfa.is_match(sid) {
+                continue;
+            }
+            let (len, v) = *longest.entry(sid).or_insert_with(|| {
+                (0..self.nfa.match_len(sid))
+                    .map(|k| {
+                        let p = self.nfa.match_pattern(sid, k);
+                        (self.nfa.pattern_len(p), p.as_usize())
+                    })
+                    .max_by_key(|&(len, _)| len)
+                    .unwrap_or((0, 0))
+            });
+            if len == 0 {
+                continue;
+            }
+            let (s, e) = ((i + 1).saturating_sub(len), i + 1);
+            cur = match cur {
+                Some((cs, ce, cv)) if s < ce => Some((cs.min(s), e, cv)),
+                Some(c) => {
+                    push(c, out);
+                    Some((s, e, v))
+                }
+                None => Some((s, e, v)),
+            };
+        }
+        if let Some(c) = cur {
+            push(c, out);
+        }
     }
 }
 
@@ -288,6 +383,263 @@ pub fn redact(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
 pub fn redact_text(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     let hits = crate::redact::rules::scan_text(text, rules);
     apply_text(text, &hits, ledger)
+}
+
+/// 账本里记着的每个原值，在 `text` 里出现的每一处都换回它的占位符。
+///
+/// 回答里的占位符换回了原值之后，那份回答要存下来、写进日志时，按规则再找一遍不一定认得出
+/// 原值：连接串的口令要有 `postgres://app:` 在前面才认得出，模型单独复述一遍口令，规则就
+/// 认不出了；正则写成 `OPENAI_API_KEY=…` 的自定义规则，单独出现的那串值也一样。账本里记着
+/// 原值本身，按字面找一遍，哪种都漏不掉。**落盘、写日志之前用**，不用在发出去的请求上（那里
+/// 按规则找、按账本编号，见 [`crate::redact::flow`]）。
+///
+/// 怎么找见 [`value_spans`]。没有可换的时候原样借出去
+pub fn hide_values<'a>(text: &'a str, ledger: &Ledger, form: Form) -> Cow<'a, str> {
+    let found = value_spans(text, 0..text.len(), ledger, form);
+    if found.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (r, placeholder) in found {
+        out.push_str(text.get(at..r.start).unwrap_or_default());
+        out.push_str(placeholder);
+        at = r.end;
+    }
+    out.push_str(text.get(at..).unwrap_or_default());
+    Cow::Owned(out)
+}
+
+/// `text[range]` 里账本记着的原值在哪儿、各换成哪个占位符：按先后、互不重叠，落在 `range`
+/// 两头外面的那一截切掉。同一段文字要分几截问的，用 [`ValueSpans`]：只找一遍。
+pub fn value_spans<'l>(
+    text: &str,
+    range: Range<usize>,
+    ledger: &'l Ledger,
+    form: Form,
+) -> Vec<(Range<usize>, &'l str)> {
+    ValueSpans::new(text, ledger, form).within(range).collect()
+}
+
+/// 一段文字里账本记着的原值都在哪儿、各换成哪个占位符：按先后、互不重叠。**整段只找一遍**，
+/// 之后按区间取（[`Self::within`]）—— 安全日志一个请求要取上千段前后文，每一段都把整段
+/// 文字从头找一遍，几 MB 的请求就要好几秒。
+///
+/// - `form` 是 `text` 的写法。**一整段合规的 JSON 只在字符串的引号里面找**：数值、`true`、
+///   键之间的结构上的字换成占位符，存下来的正文、日志里的那一行就不是 JSON 了
+///   （`"completion_tokens":4096` 里的 `4096`）。引号里面解开转义再找，`\n`、`\"`、`\uXXXX`、
+///   `\/` 哪种写法都认得；字符串里又是一段 JSON 的（工具参数）、转义过几遍的，再往里解，
+///   最多六层；
+/// - 不是一整段合规 JSON 的（SSE 的几帧、纯文字的报错、解码过的正文）**哪儿都找**，数值也找
+///   —— 宁可多换；引号里面照样解开转义再找一遍；
+/// - **重叠的几处合成一处**，换成头一处的占位符：只换其中一处的话，另一处多出来的那一截就
+///   原样留着（同出站脱敏的做法）；
+/// - 已经写着的占位符里面不动，空的值不找。
+#[derive(Debug, Default)]
+pub struct ValueSpans<'l> {
+    spans: Vec<(Range<usize>, &'l str)>,
+}
+
+impl<'l> ValueSpans<'l> {
+    pub fn new(text: &str, ledger: &'l Ledger, form: Form) -> Self {
+        let Some(finder) = (!text.is_empty()).then(|| ledger.finder()).flatten() else {
+            return Self::default();
+        };
+        let mut found: Vec<(Range<usize>, usize)> = Vec::new();
+        let whole_json = form == Form::Json && crate::redact::rules::is_json(text);
+        if !whole_json {
+            finder.find_all(text, &|i| i, &mut found);
+        }
+        if form == Form::Json {
+            for span in crate::redact::rules::json_string_spans(text) {
+                if let Some(content) = text.get(span.clone()).filter(|c| !c.is_empty()) {
+                    // 不是一整段 JSON 的上面已经整段找过：没有转义的字符串不用再找
+                    if whole_json || content.contains('\\') {
+                        in_string(finder, content, &|i| span.start + i, &mut found);
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            return Self::default();
+        }
+        found.retain(|(r, _)| {
+            text.is_char_boundary(r.start) && text.is_char_boundary(r.end) && r.start < r.end
+        });
+        found.sort_by_key(|(r, _)| (r.start, std::cmp::Reverse(r.end)));
+        let mut merged: Vec<(Range<usize>, usize)> = Vec::with_capacity(found.len());
+        for (r, v) in found {
+            match merged.last_mut() {
+                Some((last, _)) if r.start < last.end => last.end = last.end.max(r.end),
+                _ => merged.push((r, v)),
+            }
+        }
+        // 已经写着的占位符里面不动：和它重叠的那一截让开，剩下的照样换 —— 整处不换的话，
+        // 挨着占位符的那一截原值就原样留着（`<<` 是原值时的 `<<<<TW_SECRET_6>>`）。占位符的
+        // 两头是 ASCII，切口落在字符边界上
+        let ours: Vec<Range<usize>> = ledger
+            .scheme
+            .find_in(text)
+            .into_iter()
+            .map(|(r, _, _)| r)
+            .collect();
+        let mut spans = Vec::with_capacity(merged.len());
+        for (r, v) in merged {
+            let Some(p) = finder.placeholders.get(v).map(String::as_str) else {
+                continue;
+            };
+            let mut from = r.start;
+            let k = ours.partition_point(|o| o.end <= r.start);
+            for o in ours[k..].iter().take_while(|o| o.start < r.end) {
+                if o.start > from {
+                    spans.push((from..o.start, p));
+                }
+                from = from.max(o.end);
+            }
+            if from < r.end {
+                spans.push((from..r.end, p));
+            }
+        }
+        Self { spans }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// 和 `range` 重叠的那几处，切到 `range` 里面：一个原值跨在切口上，切下来的那一截也是它
+    /// 的一部分，照样换
+    pub fn within(
+        &self,
+        range: Range<usize>,
+    ) -> impl Iterator<Item = (Range<usize>, &'l str)> + '_ {
+        let k = self.spans.partition_point(|(r, _)| r.end <= range.start);
+        self.spans[k..]
+            .iter()
+            .take_while(move |(r, _)| r.start < range.end)
+            .map(move |(r, p)| (r.start.max(range.start)..r.end.min(range.end), *p))
+            .filter(|(r, _)| r.start < r.end)
+    }
+
+    /// 跨在 `pos` 两边的那一处（`pos` 落在它中间）
+    pub fn across(&self, pos: usize) -> Option<Range<usize>> {
+        let k = self.spans.partition_point(|(r, _)| r.end <= pos);
+        self.spans
+            .get(k)
+            .map(|(r, _)| r.clone())
+            .filter(|r| r.start < pos && pos < r.end)
+    }
+}
+
+/// 解开几层转义找原值，最多这么多层：一层是正文的字符串，再往里是工具参数那段 JSON 的、
+/// 被再转义过的。每一层只在还有反斜杠时才解
+const UNESCAPE_DEPTH: usize = 6;
+
+/// 一个 JSON 字符串引号里面的一段（`content`，转义着的，`to` 把它里面的位置换回整段文字
+/// 里的）：解开一层找原值；解开之后还有反斜杠的（一段 JSON、转义过两遍的字），整段再解一层，
+/// 最多 [`UNESCAPE_DEPTH`] 层。
+///
+/// **一层一层往下解，只留着这一层**：位置的对照每解一层就并成「这一层 → `content`」的一张，
+/// 上一层的字和对照随即放掉；哪一层什么都没解开（`\q` 这类不成样子的转义）就停。几 MB 满是
+/// 反斜杠的字符串，每一层都留着的话要上百 MB
+fn in_string(
+    finder: &ValueFinder,
+    content: &str,
+    to: &dyn Fn(usize) -> usize,
+    out: &mut Vec<(Range<usize>, usize)>,
+) {
+    if !content.contains('\\') || u32::try_from(content.len()).is_err() {
+        // 没有转义：解开就是它自己
+        finder.find_all(content, to, out);
+        return;
+    }
+    let Some((mut plain, mut at)) = unescape_mapped(content) else {
+        finder.find_all(content, to, out);
+        return;
+    };
+    let back = |at: &[u32], i: usize| to(at.get(i).map_or(content.len(), |&p| p as usize));
+    finder.find_all(&plain, &|i| back(&at, i), out);
+    for _ in 1..UNESCAPE_DEPTH {
+        if !plain.contains('\\') {
+            break;
+        }
+        let Some((next, mut inner)) = unescape_mapped(&plain) else {
+            break;
+        };
+        // 并成一张：这一层的位置 → 上一层的 → `content` 的
+        for p in &mut inner {
+            *p = at.get(*p as usize).copied().unwrap_or(content.len() as u32);
+        }
+        (plain, at) = (next, inner);
+        finder.find_all(&plain, &|i| back(&at, i), out);
+    }
+}
+
+/// JSON 字符串引号里面的一段解开一层转义：解出来的字，和它每个字节（含末尾）在 `s` 里从哪儿
+/// 起。不成样子的转义（`\q`、半个 `\u`）照原样留着；落单的代理项解成 U+FFFD。一个转义都没
+/// 解开的是 `None`（解出来就是它自己）。`s` 不超过 4 GiB（调用方查过）
+fn unescape_mapped(s: &str) -> Option<(String, Vec<u32>)> {
+    let mut out = String::with_capacity(s.len());
+    let mut at: Vec<u32> = Vec::with_capacity(s.len() + 1);
+    let mut changed = false;
+    let push = |out: &mut String, at: &mut Vec<u32>, c: char, from: usize| {
+        out.push(c);
+        at.extend(std::iter::repeat_n(from as u32, c.len_utf8()));
+    };
+    let hex = |i: usize| {
+        s.get(i..i + 4)
+            .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+    };
+    let mut i = 0;
+    while let Some(c) = s.get(i..).and_then(|r| r.chars().next()) {
+        if c != '\\' {
+            push(&mut out, &mut at, c, i);
+            i += c.len_utf8();
+            continue;
+        }
+        let simple = match s.as_bytes().get(i + 1) {
+            Some(b'"') => Some('"'),
+            Some(b'\\') => Some('\\'),
+            Some(b'/') => Some('/'),
+            Some(b'b') => Some('\u{8}'),
+            Some(b'f') => Some('\u{c}'),
+            Some(b'n') => Some('\n'),
+            Some(b'r') => Some('\r'),
+            Some(b't') => Some('\t'),
+            _ => None,
+        };
+        if let Some(d) = simple {
+            push(&mut out, &mut at, d, i);
+            changed = true;
+            i += 2;
+            continue;
+        }
+        let Some(u) = (s.as_bytes().get(i + 1) == Some(&b'u'))
+            .then(|| hex(i + 2))
+            .flatten()
+        else {
+            push(&mut out, &mut at, '\\', i);
+            i += 1;
+            continue;
+        };
+        // 代理对写成两个 `\uXXXX`
+        let pair = (0xD800..0xDC00).contains(&u)
+            && s.get(i + 6..i + 8) == Some("\\u")
+            && hex(i + 8).is_some_and(|l| (0xDC00..0xE000).contains(&l));
+        let (c, len) = match (pair, hex(i + 8)) {
+            (true, Some(l)) => (
+                char::from_u32(0x10000 + ((u - 0xD800) << 10) + (l - 0xDC00)),
+                12,
+            ),
+            _ => (char::from_u32(u), 6),
+        };
+        push(&mut out, &mut at, c.unwrap_or('\u{FFFD}'), i);
+        changed = true;
+        i += len;
+    }
+    at.push(s.len() as u32);
+    changed.then_some((out, at))
 }
 
 /// 一次性还原一份 **JSON 原文**（非流式响应、WebSocket 的一帧、存下来的回答）：原值按它
@@ -394,6 +746,222 @@ pub(crate) fn swap_with<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// 账本里的原值照字面换回占位符：JSON 原文里转义过的写法也认，已经写着的占位符里面不动，
+    /// 没有可换的原样借出
+    #[test]
+    fn values_in_the_ledger_are_hidden_as_written() {
+        let pem = "line1\nline2";
+        let text = format!("k=hunter2 pw {pem}");
+        let hits = vec![
+            Hit {
+                bytes: 2..9,
+                rule: crate::redact::rules::Rule::Custom("a".into()),
+                label: None,
+            },
+            Hit {
+                bytes: 13..text.len(),
+                rule: crate::redact::rules::Rule::Custom("b".into()),
+                label: None,
+            },
+        ];
+        let ledger = apply_text(&text, &hits, Ledger::new(Scheme::SECRET)).ledger;
+        // 回答复述了口令，规则单独认不出它
+        let answer = r#"{"content":"The password hunter2 is wrong; key line1\nline2"}"#;
+        assert_eq!(
+            hide_values(answer, &ledger, Form::Json),
+            r#"{"content":"The password <<TW_SECRET_1>> is wrong; key <<TW_SECRET_2>>"}"#
+        );
+        // 解码过的正文按原样找
+        assert_eq!(
+            hide_values("say hunter2 and line1\nline2", &ledger, Form::Text),
+            "say <<TW_SECRET_1>> and <<TW_SECRET_2>>"
+        );
+        // 占位符里面不动，没有可换的原样借出
+        assert!(matches!(
+            hide_values("<<TW_SECRET_1>> clean", &ledger, Form::Json),
+            Cow::Borrowed(_)
+        ));
+        let empty = Ledger::new(Scheme::SECRET);
+        assert!(matches!(
+            hide_values("hunter2", &empty, Form::Text),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// 账本里记着这几个原值（解开转义之后的样子）
+    fn ledger_of(values: &[&str]) -> Ledger {
+        let text = values.join("\u{1}");
+        let mut hits = Vec::new();
+        let mut at = 0;
+        for v in values {
+            hits.push(Hit {
+                bytes: at..at + v.len(),
+                rule: crate::redact::rules::Rule::Custom("c".into()),
+                label: None,
+            });
+            at += v.len() + 1;
+        }
+        apply_text(&text, &hits, Ledger::new(Scheme::SECRET)).ledger
+    }
+
+    /// JSON 原文只在字符串里换：数值、`true`、结构上的字不动，换过的还是 JSON
+    #[test]
+    fn hidden_values_stay_inside_json_strings() {
+        let ledger = ledger_of(&["4096", "true"]);
+        let text = r#"{"max_tokens":4096,"stream":true,"messages":[{"role":"user","content":"pin 4096 is true"}],"created":17604096123}"#;
+        let out = hide_values(text, &ledger, Form::Json);
+        assert_eq!(
+            out,
+            r#"{"max_tokens":4096,"stream":true,"messages":[{"role":"user","content":"pin <<TW_SECRET_1>> is <<TW_SECRET_2>>"}],"created":17604096123}"#
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+        // 不是一整段合规 JSON 的（SSE 的几帧、纯文字、不合规的 JSON）哪儿都换，数值也换：宁可多换
+        let sse = "event: x\ndata: {\"n\":4096,\"t\":\"4096\"}\n\nplain 4096x and true";
+        assert_eq!(
+            hide_values(sse, &ledger, Form::Json),
+            "event: x\ndata: {\"n\":<<TW_SECRET_1>>,\"t\":\"<<TW_SECRET_1>>\"}\n\nplain <<TW_SECRET_1>>x and <<TW_SECRET_2>>"
+        );
+        let ledger = ledger_of(&["620102198811110554", "84721937", "a\"b"]);
+        assert_eq!(
+            hide_values(
+                "error: bad password 84721937 for 620102198811110554 a\"b",
+                &ledger,
+                Form::Json
+            ),
+            "error: bad password <<TW_SECRET_2>> for <<TW_SECRET_1>> <<TW_SECRET_3>>"
+        );
+        assert_eq!(
+            hide_values("{\"p\":84721937-1}", &ledger, Form::Json),
+            "{\"p\":<<TW_SECRET_2>>-1}",
+            "不合规的 JSON 当一段文字"
+        );
+    }
+
+    /// 一处原值和已经写着的占位符重叠：重叠的那一截让开，剩下的照样换
+    #[test]
+    fn a_value_touching_a_placeholder_is_masked_outside_it() {
+        let ledger = ledger_of(&["<<"]);
+        let p = ledger.placeholder_of("<<").unwrap().to_string();
+        assert_eq!(
+            hide_values("<<<<TW_SECRET_6>><<", &ledger, Form::Text),
+            format!("{p}<<TW_SECRET_6>>{p}")
+        );
+    }
+
+    /// 满是不成样子的转义（`\q`）的字符串解一层就停：解不开的不再往下解；里面的原值照样找得到
+    #[test]
+    fn strings_full_of_bogus_escapes_are_decoded_once() {
+        let ledger = ledger_of(&["hunter2"]);
+        let body = format!("{{\"x\":\"{} hunter2 \\\"pw\\\"\"}}", "\\q".repeat(100_000));
+        let started = std::time::Instant::now();
+        let out = hide_values(&body, &ledger, Form::Json);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(out.contains("<<TW_SECRET_1>>") && !out.contains("hunter2"));
+        // 一层都没解开的字符串原样找
+        let plain = format!("{{\"x\":\"{}hunter2\"}}", "\\q".repeat(10));
+        assert_eq!(
+            hide_values(&plain, &ledger, Form::Json),
+            format!("{{\"x\":\"{}<<TW_SECRET_1>>\"}}", "\\q".repeat(10))
+        );
+    }
+
+    /// 原值一个套一个（`\d{6,}` 认出来的一串串 1）：每个位置只取最长的，合成一段，不把每一处
+    /// 重叠的都列出来
+    #[test]
+    fn nested_values_merge_into_one_region() {
+        let values: Vec<String> = (6..40).map(|n| "1".repeat(n)).collect();
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let ledger = ledger_of(&refs);
+        let text = format!("a {} b {} c", "1".repeat(39), "1".repeat(7));
+        let out = hide_values(&text, &ledger, Form::Text);
+        let ours = Scheme::SECRET.find_in(&out);
+        assert_eq!(ours.len(), 2, "{out}");
+        assert_eq!(out.matches(' ').count(), 4, "{out}");
+        assert!(out.starts_with("a <<TW_") && out.ends_with(">> c"), "{out}");
+        // 和逐个值、逐个位置找出来再合并的一样
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        for _ in 0..2000 {
+            let letters = ["a", "b", "ab", "ba", "aab"];
+            let vals: Vec<String> = (0..1 + next(4))
+                .map(|_| {
+                    (0..1 + next(3))
+                        .map(|_| letters[next(letters.len())])
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+            let ledger = ledger_of(&refs);
+            let text: String = (0..next(30)).map(|_| ["a", "b", " "][next(3)]).collect();
+            let got: Vec<Range<usize>> = value_spans(&text, 0..text.len(), &ledger, Form::Text)
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect();
+            let mut all: Vec<Range<usize>> = Vec::new();
+            for v in &vals {
+                for i in 0..text.len() {
+                    if text[i..].starts_with(v.as_str()) {
+                        all.push(i..i + v.len());
+                    }
+                }
+            }
+            all.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
+            let mut want: Vec<Range<usize>> = Vec::new();
+            for r in all {
+                match want.last_mut() {
+                    Some(last) if r.start < last.end => last.end = last.end.max(r.end),
+                    _ => want.push(r),
+                }
+            }
+            assert_eq!(got, want, "{text:?} {vals:?}");
+        }
+    }
+
+    /// 字符串里各种写法、各层转义都认得：`\n`、`\"`、`\uXXXX`（含代理对）、`\/`，工具参数里
+    /// 转义两次、再往里套几层的（最多五层都试）
+    #[test]
+    fn hidden_values_are_found_however_the_string_spells_them() {
+        let v = "a\"b\nc\\d/中😀";
+        let ledger = ledger_of(&[v]);
+        let mut spelled = v.to_string();
+        for depth in 1..=5 {
+            spelled = serde_json::to_string(&spelled).unwrap();
+            let body = serde_json::json!({ "x": format!("say {spelled} end") }).to_string();
+            let out = hide_values(&body, &ledger, Form::Json);
+            assert!(out.contains("<<TW_SECRET_1>>"), "第 {depth} 层：{out}");
+            assert!(!out.contains('中'), "第 {depth} 层：{out}");
+            assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+        }
+        // `\uXXXX` 写的（ensure_ascii 的客户端）、`\/` 写的
+        let ledger = ledger_of(&["中文密码x", "a/b-secret"]);
+        let text = r#"{"c":"中文密码x and a\/b-secret 😀"}"#;
+        assert_eq!(
+            hide_values(text, &ledger, Form::Json),
+            r#"{"c":"<<TW_SECRET_1>> and <<TW_SECRET_2>> 😀"}"#
+        );
+    }
+
+    /// 两个原值重叠：合成一处换掉，不留一截原样
+    #[test]
+    fn overlapping_hidden_values_leave_nothing_behind() {
+        let ledger = ledger_of(&["abcX1", "X1defgh"]);
+        let out = hide_values("zz abcX1defgh zz", &ledger, Form::Text);
+        assert_eq!(out, "zz <<TW_SECRET_1>> zz");
+        let out = hide_values(r#"{"t":"zz abcX1defgh zz"}"#, &ledger, Form::Json);
+        assert_eq!(out, r#"{"t":"zz <<TW_SECRET_1>> zz"}"#);
+        // 占位符里面照样不动
+        let ledger = ledger_of(&["SECRET", "TW_", "1"]);
+        assert_eq!(
+            hide_values("a <<TW_SECRET_1>> b SECRET 1", &ledger, Form::Text),
+            "a <<TW_SECRET_1>> b <<TW_SECRET_1>> <<TW_SECRET_3>>"
+        );
+    }
+
     use super::*;
     use crate::redact::rules::{BUILTINS, RuleSet};
 

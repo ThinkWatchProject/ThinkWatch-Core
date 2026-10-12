@@ -1300,9 +1300,9 @@ pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, stand_in, try_parse};
 pub use retention::Retention;
 pub use security::{
-    ContentAction, ContentMatch, ContentPolicy, CustomContentRule, CustomRedactRule,
-    CustomToolRule, Mode as SecurityMode, PolicyError, RedactPolicy, Security, ToolAction,
-    ToolPolicy, policy_msg,
+    ContentAction, ContentMatch, ContentPolicy, ContentScope, CustomContentRule, CustomRedactRule,
+    CustomToolRule, Mode as SecurityMode, PolicyError, RedactAction, RedactPolicy, Security,
+    ToolAction, ToolPolicy, policy_msg,
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};

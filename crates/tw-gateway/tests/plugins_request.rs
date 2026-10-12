@@ -1256,6 +1256,9 @@ async fn screening_sees_the_body_after_plugins() {
             custom: vec![tw_config::CustomContentRule {
                 name: "no plan".into(),
                 pattern: "forbidden-plan".into(),
+                scope: vec![tw_config::ContentScope::Request],
+                case_sensitive: false,
+                replacement: "***".into(),
                 matching: Default::default(),
                 action: tw_config::ContentAction::Block,
                 disabled: false,
@@ -1304,6 +1307,9 @@ async fn after_a_plugin_only_what_it_added_is_reported_again() {
             custom: vec![tw_config::CustomContentRule {
                 name: "no plan".into(),
                 pattern: "forbidden-plan".into(),
+                scope: vec![tw_config::ContentScope::Request],
+                case_sensitive: false,
+                replacement: "***".into(),
                 matching: Default::default(),
                 action: tw_config::ContentAction::Block,
                 disabled: false,
@@ -2217,6 +2223,9 @@ async fn screening_sees_the_inputs_a_plugin_wrote() {
             custom: vec![tw_config::CustomContentRule {
                 name: "no plan".into(),
                 pattern: "forbidden-plan".into(),
+                scope: vec![tw_config::ContentScope::Request],
+                case_sensitive: false,
+                replacement: "***".into(),
                 matching: Default::default(),
                 action: tw_config::ContentAction::Block,
                 disabled: false,

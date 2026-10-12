@@ -102,3 +102,91 @@ fn tens_of_thousands_of_distinct_values_cost_linear_time() {
         "4 万个值花了 1 万个值的 {ratio:.1} 倍（{small:?} → {large:?}）：有一步不再是线性的"
     );
 }
+
+/// 账本里记着这几个原值
+fn ledger_of(values: &[String]) -> replace::Ledger {
+    let text = values.join("\u{1}");
+    let mut hits = Vec::new();
+    let mut at = 0;
+    for v in values {
+        hits.push(tw_guard::redact::rules::Hit {
+            bytes: at..at + v.len(),
+            rule: tw_guard::redact::rules::Rule::Custom("c".into()),
+            label: None,
+        });
+        at += v.len() + 1;
+    }
+    replace::apply_text(&text, &hits, replace::Ledger::new(replace::Scheme::SECRET)).ledger
+}
+
+/// 落盘前把账本里的原值换回占位符：`n` 个值、文字跟着长，里面每个值念一遍，还夹着一样多的
+/// 占位符
+fn hide(n: usize) -> Duration {
+    let values: Vec<String> = (0..n)
+        .map(|i| format!("user{i:06}@corp.example.com"))
+        .collect();
+    let ledger = ledger_of(&values);
+    let content: String = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("<<TW_SECRET_{}>> lorem ipsum {v} dolor ", i + 1))
+        .collect();
+    let body =
+        json!({"messages": [{"role": "user", "content": content}], "max_tokens": 4096}).to_string();
+    let started = Instant::now();
+    let out = replace::hide_values(&body, &ledger, replace::Form::Json);
+    let took = started.elapsed();
+    assert!(!out.contains("@corp.example.com"));
+    assert!(serde_json::from_str::<Value>(&out).is_ok());
+    took
+}
+
+#[test]
+fn hiding_tens_of_thousands_of_values_costs_linear_time() {
+    let (small, large) = medians(|| hide(5_000), || hide(40_000));
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // 线性的是 8 倍上下，平方级的是 64 倍
+    assert!(
+        ratio < 24.0,
+        "4 万个值花了 5 千个值的 {ratio:.1} 倍（{small:?} → {large:?}）：落盘前打码不再是线性的"
+    );
+}
+
+/// 两种大小**交替**各跑五遍、各取中位数：并行跑的测试抢 CPU 时，一阵忙落在哪一遍上都不至于
+/// 左右结论
+fn medians(small: impl Fn() -> Duration, large: impl Fn() -> Duration) -> (Duration, Duration) {
+    let (mut s, mut l) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        s.push(small());
+        l.push(large());
+    }
+    s.sort_unstable();
+    l.sort_unstable();
+    (s[2], l[2])
+}
+
+/// 原值一个套一个：`\d{6,}` 认出来的一串串 1，长度 6 到 `6 + k`。正文长度是 k² 级的；每个
+/// 位置只取最长的那一个，打码的花费跟着正文走（四倍的 k 是十六倍的正文），不是正文 × 值的
+/// 个数（六十四倍），也不占上 G 的内存
+fn nested_runs(k: usize) -> Duration {
+    let rules = RuleSet::none().with_custom("ids", r"\d{6,}").unwrap();
+    let content: String = (6..6 + k).map(|l| format!("{} ", "1".repeat(l))).collect();
+    let body = json!({"messages": [{"role": "user", "content": content}]}).to_string();
+    let (_, ledger) = flow::look(Mode::Enforce, &rules, body.as_bytes());
+    assert_eq!(ledger.len(), k);
+    let started = Instant::now();
+    let out = replace::hide_values(&body, &ledger, replace::Form::Json);
+    let took = started.elapsed();
+    assert!(!out.contains("111111"));
+    took
+}
+
+#[test]
+fn nested_values_are_hidden_in_time_linear_in_the_text() {
+    let (small, large) = medians(|| nested_runs(100), || nested_runs(400));
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    assert!(
+        ratio < 36.0,
+        "十六倍的正文花了 {ratio:.1} 倍（{small:?} → {large:?}）：一个套一个的原值在一处处地列"
+    );
+}

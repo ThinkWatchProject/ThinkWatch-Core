@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use tw_guard::redact::replace::{Form, Ledger, Scheme};
+use tw_guard::redact::replace::{Form, Ledger, Scheme, ValueSpans};
 use tw_guard::redact::rules::{Hit, Kind, Rule, RuleSet};
 
 /// 打码要多看的那一截。
@@ -110,8 +110,10 @@ impl Default for Redaction {
 impl Redaction {
     /// 换过、打过码的样子。
     ///
-    /// 两道：脱敏规则认出的每一处，账本里有的换成那个占位符（上游收到的就是它），没有的
-    /// 打码；然后整段再按形状打一遍（[`tw_secret::mask_body`]）兜住规则没认出来的。
+    /// 三道：脱敏规则认出的每一处，账本里有的换成那个占位符（上游收到的就是它），没有的
+    /// 打码；账本里的原值照字面再找一遍，换成占位符（规则要靠前后文才认得出的值单独出现时，
+    /// 比如回答里复述的口令）；然后整段再按形状打一遍（[`tw_secret::mask_body`]）兜住规则
+    /// 没认出来的。
     ///
     /// **读的时候还会再打一遍**，打第二遍不再改动什么（`mask_body` 认得自己打过的码）。
     pub fn apply(&self, text: &str) -> String {
@@ -132,11 +134,12 @@ impl Redaction {
             }
         };
         let sent = self.sent_as(form);
+        let values = self.values(text, form);
         // 摘要以外的各段照常（找过的命中照用）；摘要解开了重新找、换、打码，再包回去
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         for (span, summary) in carried_summaries(text) {
-            out.push_str(&self.piece(text, at..span.start, hits, &sent));
+            out.push_str(&self.piece(text, at..span.start, hits, &values, &sent));
             out.push_str(&tw_dialect::compaction::carry(&self.apply_found(
                 &summary,
                 None,
@@ -144,8 +147,13 @@ impl Redaction {
             )));
             at = span.end;
         }
-        out.push_str(&self.piece(text, at..text.len(), hits, &sent));
+        out.push_str(&self.piece(text, at..text.len(), hits, &values, &sent));
         out
+    }
+
+    /// 账本里的原值在 `text` 里都在哪儿（[`Self::piece`] 要）。**一段文字找一遍**，分几截取
+    pub(crate) fn values(&self, text: &str, form: Form) -> ValueSpans<'_> {
+        ValueSpans::new(text, &self.ledger, form)
     }
 
     /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表），在 JSON 原文里找。存下来的
@@ -155,7 +163,7 @@ impl Redaction {
     }
 
     /// [`Self::sent`]，在按 `form` 写的文字里找
-    fn sent_as(&self, form: Form) -> Sent<'_> {
+    pub(crate) fn sent_as(&self, form: Form) -> Sent<'_> {
         Sent {
             by_value: self.ledger.replacements().collect(),
             form,
@@ -166,30 +174,59 @@ impl Redaction {
     /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的。
     ///
     /// `hits` 是 [`crate::guard::hits`] 在 `text` 上找到的，按起点排好、互不重叠：整个落在这一段
-    /// 里的才算，按起点二分找到头一个。安全日志的前后文（[`crate::guard::detail`]）也走这里：
-    /// 和存下来的正文是同一个打码的办法
+    /// 里的才算，按起点二分找到头一个。`values` 是 [`Self::values`] 在 `text` 上找到的。安全
+    /// 日志的前后文（[`crate::guard::detail`]）也走这里：和存下来的正文是同一个打码的办法
     pub(crate) fn piece(
         &self,
         text: &str,
         range: Range<usize>,
         hits: &[Hit],
+        values: &ValueSpans<'_>,
         sent: &Sent<'_>,
     ) -> String {
-        let mut out = String::with_capacity(range.len());
-        let mut at = range.start;
         let first = hits.partition_point(|h| h.bytes.start < range.start);
-        for h in hits[first..]
+        let mine: Vec<&Hit> = hits[first..]
             .iter()
             .take_while(|h| h.bytes.start < range.end)
             .filter(|h| h.bytes.end <= range.end)
-        {
-            out.push_str(&text[at..h.bytes.start]);
+            .collect();
+        let mut changes: Vec<(Range<usize>, String)> = Vec::with_capacity(mine.len());
+        for h in &mine {
             let value = &text[h.bytes.clone()];
-            match sent.get(value) {
-                Some(placeholder) => out.push_str(placeholder),
-                None => out.push_str(&masked(&h.rule, value)),
+            changes.push((
+                h.bytes.clone(),
+                match sent.get(value) {
+                    Some(placeholder) => placeholder.to_string(),
+                    None => masked(&h.rule, value),
+                },
+            ));
+        }
+        // 规则认不出的原值也换掉：回答里换回来的口令单独出现时，没有前后文，规则认不出它
+        // （见 [`ValueSpans`]）。跨在这一段两头的切下来的那一截也换；和规则的命中重叠的那一截
+        // 让给命中，剩下的照样换 —— 一截都不原样留
+        for (r, placeholder) in values.within(range.clone()) {
+            let mut from = r.start;
+            let k = mine.partition_point(|h| h.bytes.end <= r.start);
+            for h in mine[k..].iter().take_while(|h| h.bytes.start < r.end) {
+                if h.bytes.start > from {
+                    changes.push((from..h.bytes.start, placeholder.to_string()));
+                }
+                from = from.max(h.bytes.end);
             }
-            at = h.bytes.end;
+            if from < r.end {
+                changes.push((from..r.end, placeholder.to_string()));
+            }
+        }
+        changes.sort_by_key(|(r, _)| r.start);
+        let mut out = String::with_capacity(range.len());
+        let mut at = range.start;
+        for (r, with) in changes {
+            if r.start < at {
+                continue;
+            }
+            out.push_str(&text[at..r.start]);
+            out.push_str(&with);
+            at = r.end;
         }
         out.push_str(&text[at..range.end]);
         tw_secret::mask_body(&out)
@@ -496,6 +533,51 @@ mod tests {
     use super::*;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// 一条只记录的规则认得比要换的那条宽：存下来的正文里口令是发给上游的那个占位符，只记录的
+    /// 那条认出来的其余部分（用户、主机、库名）照样打码，哪一截都不原样落盘
+    #[test]
+    fn a_record_only_hit_around_a_placeholder_is_masked_on_disk() {
+        let rules = RuleSet::defaults()
+            .with_custom("库", r"postgres://[^\s\x22]+")
+            .unwrap()
+            .recording(Rule::Custom("库".into()));
+        let body =
+            r#"{"content":"use postgres://appuser:hunter2@db-primary.internal:5432/orders now"}"#;
+        let (_, ledger) =
+            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, body.as_bytes());
+        let red = Redaction {
+            rules: Arc::new(rules),
+            ledger,
+        };
+        let stored = red.apply(body);
+        assert!(stored.contains("<<TW_SECRET_1>>"), "{stored}");
+        for clear in ["hunter2", "appuser", "db-primary.internal", "orders"] {
+            assert!(!stored.contains(clear), "{clear} 原样落盘：{stored}");
+        }
+    }
+
+    /// 存下来的客户端那一份回答里换回了原值：规则要靠前后文才认得出的（连接串的口令、写成
+    /// `OPENAI_API_KEY=…` 的自定义规则），单独复述的时候规则认不出 —— 照账本里的原值照字面
+    /// 换回占位符，不原样落盘
+    #[test]
+    fn a_restored_value_without_its_context_is_not_stored_in_clear() {
+        let rules = RuleSet::defaults()
+            .with_custom("env", r"OPENAI_API_KEY=\S+")
+            .unwrap();
+        let request = r#"{"messages":[{"role":"user","content":"postgres://app:hunter2@db.internal:5432/orders and OPENAI_API_KEY=abc123xyz"}]}"#;
+        let (_, ledger) =
+            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, request.as_bytes());
+        let red = Redaction {
+            rules: Arc::new(rules),
+            ledger,
+        };
+        let answer = r#"{"choices":[{"index":0,"message":{"content":"The password hunter2 is wrong; the value OPENAI_API_KEY=abc123xyz was set. Again: OPENAI_API_KEY=abc123xyz"}}]}"#;
+        let stored = red.apply(answer);
+        assert!(!stored.contains("hunter2"), "{stored}");
+        assert!(!stored.contains("abc123xyz"), "{stored}");
+        assert!(stored.contains("<<TW_SECRET_1>>"), "{stored}");
+    }
 
     #[test]
     fn a_short_response_is_kept_whole() {

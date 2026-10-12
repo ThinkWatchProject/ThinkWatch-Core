@@ -58,6 +58,12 @@ fn tool_actions() -> Vec<&'static str> {
 fn content_actions() -> Vec<&'static str> {
     super::fields::<ContentAction>()
 }
+fn redact_actions() -> Vec<&'static str> {
+    super::fields::<RedactAction>()
+}
+fn content_scopes() -> Vec<&'static str> {
+    super::fields::<ContentScope>()
+}
 fn content_matches() -> Vec<&'static str> {
     super::fields::<ContentMatch>()
 }
@@ -83,9 +89,10 @@ fn limit_pers() -> Vec<&'static str> {
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
 const MODE_DOC: T2 = t(
-    "`off` does nothing; `observe` detects and records only, and changes nothing; `enforce` \
-     detects and acts.",
-    "`off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。",
+    "`off` does nothing (Off in the app); `observe` detects and records only, and changes nothing \
+     (Monitor); `enforce` detects and handles each match by its rule's action (On).",
+    "`off` 不检测（应用里叫「关闭」）；`observe` 检测并记录，不改变任何行为（「监控」）；`enforce` \
+     检测并按每条规则的动作处理（「开启」）。",
 );
 const ENABLE_DOC: T2 = t(
     "Built-in rules to switch on that are off out of the box, by id.",
@@ -1092,8 +1099,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security.redact"),
                     Def::Section,
                     t(
-                        "Outbound redaction: credentials and personal information anywhere in a request are replaced before it leaves.",
-                        "出站脱敏：请求发出前，把其中任何位置的凭据和个人信息替换掉。",
+                        "Outbound redaction (Secrets & privacy in the app): credentials and personal information anywhere in a request are replaced with placeholders before it leaves, or only recorded, rule by rule.",
+                        "出站脱敏（应用里叫「密钥与隐私」）：请求发出前，按每条规则把其中任何位置的凭据和个人信息替换为占位符，或只记录。",
                     ),
                 ),
                 row(
@@ -1101,8 +1108,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security.inspect_tools"),
                     Def::Section,
                     t(
-                        "Tool-call inspection: dangerous commands in the tool calls a model returns cut the response off.",
-                        "工具调用审查：模型返回的工具调用中出现危险命令时切断响应。",
+                        "Tool-call inspection (Dangerous commands in the app): dangerous commands in the tool calls a model returns cut the response off.",
+                        "工具调用审查（应用里叫「危险命令」）：模型返回的工具调用中出现危险命令时切断响应。",
                     ),
                 ),
                 row(
@@ -1110,8 +1117,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security.content"),
                     Def::Section,
                     t(
-                        "Content filter: words, patterns or characters (hidden ones among them) in what the caller sends; each rule refuses the request, deletes what it matched, or only records it.",
-                        "内容过滤：调用方发送的内容中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除命中的内容或只记录。",
+                        "Content filter: words, patterns or characters (hidden ones among them) in what the caller sends, and words or patterns in the text of the answer; each rule refuses the request, deletes or replaces what it matched, or only records it.",
+                        "内容过滤：调用方发送的内容中、或模型回答的正文中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除或替换命中的内容，或只记录。",
                     ),
                 ),
             ],
@@ -1124,12 +1131,21 @@ pub fn sections() -> Vec<Section> {
                 row("enable", Kind::Strs, Def::Is("[]"), ENABLE_DOC),
                 row("disable", Kind::Strs, Def::Is("[]"), DISABLE_DOC),
                 row(
+                    "actions",
+                    Kind::EnumMap(RULE_ID, redact_actions),
+                    Def::Is("{}"),
+                    t(
+                        "What a built-in rule does under `enforce`, written only where it differs from the factory setting (`email: record`). `placeholder` sends a placeholder in place of the value and puts the value back where the answer repeats the placeholder; `record` sends the value as it is and records the match.",
+                        "内置规则在 `enforce` 下的动作，只写与出厂不同的（`email: record`）。`placeholder` 将值替换为占位符后发送，回答中出现该占位符时还原为原值；`record` 原样发送，记录命中。",
+                    ),
+                ),
+                row(
                     "custom",
                     Kind::Objs("security.redact.custom[]"),
                     Def::Is("[]"),
                     t(
-                        "Rules of your own: whatever a rule matches is replaced like a credential.",
-                        "自定义规则：匹配到的内容和凭据一样替换。",
+                        "Rules of your own: whatever a rule matches is replaced like a credential, or only recorded.",
+                        "自定义规则：匹配到的内容和凭据一样替换，或只记录。",
                     ),
                 ),
             ],
@@ -1173,6 +1189,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Placeholder name: what the rule matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters.",
                         "占位符名称：匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。",
+                    ),
+                ),
+                row(
+                    "action",
+                    Kind::Enum(redact_actions),
+                    Def::Is("placeholder"),
+                    t(
+                        "Under `enforce`: replace what the rule matches with a `placeholder`, or only `record` the match and send it as it is.",
+                        "`enforce` 下将匹配到的内容替换为占位符（`placeholder`），或只记录、原样发送（`record`）。",
                     ),
                 ),
                 row("disabled", Kind::Bool, Def::Is("false"), RULE_DISABLED),
@@ -1240,15 +1265,18 @@ pub fn sections() -> Vec<Section> {
                     Kind::EnumMap(RULE_ID, content_actions),
                     Def::Is("{}"),
                     t(
-                        "What a built-in rule does under `enforce`, written only where it differs from the factory setting.",
-                        "内置规则在 `enforce` 下的处置，只写与出厂不同的。",
+                        "What a built-in rule does under `enforce`, written only where it differs from the factory setting. Built-in rules check requests only; `replace` puts `***` in place of a match.",
+                        "内置规则在 `enforce` 下的动作，只写与出厂不同的。内置规则只检查请求；`replace` 将命中的内容替换为 `***`。",
                     ),
                 ),
                 row(
                     "custom",
                     Kind::Objs("security.content.custom[]"),
                     Def::Is("[]"),
-                    t("Rules of your own.", "自定义规则。"),
+                    t(
+                        "Rules of your own, each checking requests, answers or both.",
+                        "自定义规则，每条可检查请求、回答或两者。",
+                    ),
                 ),
             ],
         },
@@ -1262,8 +1290,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "A keyword; a regular expression with `match: regex`; code points with `match: codepoints` (`U+200B, U+E0000–U+E007F`). Keywords and regular expressions are case-insensitive.",
-                        "关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。关键词和正则不区分大小写。",
+                        "A keyword; a regular expression with `match: regex`; code points with `match: codepoints` (`U+200B, U+E0000–U+E007F`).",
+                        "关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。",
+                    ),
+                ),
+                row(
+                    "scope",
+                    Kind::Enums(content_scopes),
+                    Def::Is("[request]"),
+                    t(
+                        "What the rule checks: `request` is what the caller sends (its messages and the tool results in them); `response` is the text of the answer the client sees, the input of free-form tools such as Codex's `apply_patch` included, and neither tool calls nor reasoning. Both may be listed. A streamed answer is never held back whole: only the last few characters that could still grow into a match wait for the next piece, at most one fewer than the longest keyword, and at most 256 for a regular expression; a match longer than that may have its beginning sent already. Under `enforce`, rules that delete hold back as many characters again: text that comes together where something was deleted is checked again, until no match is left. A match nested deeper than that may have its beginning sent already, and the rest of it is deleted. Under `enforce`, when any rule that checks answers deletes or replaces, logprobs are removed from streamed answers, and from a whole answer whose text changed, since they repeat the text token by token. A rule that checks answers cannot `block`, and cannot match by `codepoints`.",
+                        "检查对象：`request` 为调用方发送的内容（用户消息及其中的工具结果）；`response` 为客户端看到的回答正文，包含 Codex `apply_patch` 等自由格式工具的输入，不含工具调用与思考过程。两项可同时列出。流式回答不整体缓冲，只暂缓发送可能构成命中的末尾片段：「包含」规则不超过最长匹配内容的字符数减一，正则规则最多 256 个字符；超过此长度的正则命中，其起始部分可能已送达客户端。`enforce` 下有删除内容的规则时，再多暂缓同样多的字符：删除处前后拼接成的文字重新检查，直到不再有命中。嵌套层数超出暂缓范围的命中，其起始部分可能已送达客户端，其余部分删除。`enforce` 下有检查回答的规则删除或替换内容时，流式回答中的 logprobs 一律去掉，非流式回答在正文有改动时去掉：logprobs 按 token 重复了正文。检查回答的规则不能用 `block`，也不能按 `codepoints` 匹配。",
                     ),
                 ),
                 row(
@@ -1271,8 +1308,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(content_matches),
                     Def::Is("contains"),
                     t(
-                        "`contains`: the text contains `pattern`. `regex`: `pattern` is a regular expression. `codepoints`: the text has a character among the code points or ranges listed in `pattern`, separated by commas.",
-                        "`contains`：正文包含 `pattern`。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔。",
+                        "`contains`: the text contains `pattern` as written; characters such as `.` and `*` have no special meaning. `regex`: `pattern` is a regular expression. `codepoints`: the text has a character among the code points or ranges listed in `pattern`, separated by commas; requests only.",
+                        "`contains`：正文按原样包含 `pattern`，`.`、`*` 等字符没有特殊含义。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔；仅用于请求。",
+                    ),
+                ),
+                row(
+                    "case_sensitive",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Tell capital letters from small ones. Off by default: `ABC` and `abc` both match. Code points are what they are either way.",
+                        "区分大小写。默认不区分：`ABC` 和 `abc` 都会匹配。码位不受此项影响。",
                     ),
                 ),
                 row(
@@ -1280,8 +1326,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(content_actions),
                     Def::Is("record"),
                     t(
-                        "Under `enforce`: `block` the request, `strip` what matched and send the rest, or only `record` the match.",
-                        "`enforce` 下拒绝请求（`block`）、删除命中的内容后发出（`strip`），或只记录（`record`）。",
+                        "Under `enforce`: `block` the request (requests only), `strip` what matched and send the rest, `replace` what matched with `replacement` and send the rest, or only `record` the match. Text that comes together where something was stripped is checked again, until no match is left; a replacement is never checked again, and in an answer a regular expression anchored to the start or end of the text or of a line (`^`, `$`, `\\A`, `\\z`) is checked once. Replacing cannot be undone: the answer does not get the original back.",
+                        "`enforce` 下拒绝请求（`block`，仅用于请求）、删除命中的内容后发出（`strip`）、将命中的内容替换为 `replacement` 后发出（`replace`），或只记录（`record`）。删除处前后拼接成的文字重新检查，直到不再有命中；替换上的文字不再检查；回答中锚定正文或行首尾的正则（`^`、`$`、`\\A`、`\\z`）只检查一次。替换不可还原，回答中不换回原文。",
+                    ),
+                ),
+                row(
+                    "replacement",
+                    Kind::Str,
+                    Def::Is("\"***\""),
+                    t(
+                        "What `replace` puts in place of a match.",
+                        "动作为 `replace` 时替换成的文字。",
                     ),
                 ),
                 row("disabled", Kind::Bool, Def::Is("false"), RULE_DISABLED),
@@ -1785,6 +1840,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
     let mut out = String::new();
     match kind {
         "redact" => {
+            // 内置规则出厂一律替换为占位符（`placeholder`），表里不另列
             out += if zh {
                 "| id | 名称 | 出厂 |\n|---|---|---|\n"
             } else {

@@ -15,7 +15,8 @@
 //!
 //! - 客户端 → 上游：内容过滤和出站脱敏，和普通请求同一套函数、同一份全局规则 ——
 //!   观察档记录，处置档拒绝、删除或替换；
-//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
+//! - 上游 → 客户端：先把占位符换回去，回答钩子之后按内容过滤里查回答的规则查正文（Responses
+//!   的连接，一次回答一个过滤，见 [`tw_guard::content::answer`]），再喂给工具调用审查。
 //!
 //! 每个 `response.create` 发出去的模型名**和 HTTP 那条路的一跳同一套**（见 [`Naming`]）：
 //! 规则给这一家指定的模型原样发，阶段二改的名字原样发，别的 —— 这一帧写的、阶段一改写成的、
@@ -221,6 +222,8 @@ pub struct Rules {
     pub tools: Arc<tw_guard::tools::rules::Rules>,
     /// 内容过滤
     pub screen: crate::guard::Screen,
+    /// 内容过滤里查回答正文的那几条。没有、或者内容过滤关着是 None
+    pub answer: Option<crate::guard::AnswerFilter>,
 }
 
 /// 这条连接上的插件：**升级那一刻取的那一份表**，一条连接活多久就用它多久。
@@ -654,6 +657,91 @@ struct Pipes {
     /// 发出去的模型名和客户端要的不一样时，回答里的模型名换回客户端用的（见
     /// [`crate::answer_model`]）
     rename: Option<crate::answer_model::Body>,
+    /// 这一次回答的回答过滤（Responses 的连接、有查回答的规则时）：`response.created` 起一个，
+    /// 回答收尾时报命中
+    answer: Option<tw_guard::content::answer::FrameFilter>,
+    /// 最近几次收了尾的回答的过滤，连同那次回答的 id、它的命中挂在哪一行：它收了尾之后又来的
+    /// 一帧（`error` 之后补的 `response.failed`）按它自己的过滤处理，**不碰这一次回答的**
+    answered: std::collections::VecDeque<Answered>,
+    /// 这一次回答（`answer`）的命中挂在哪一行：它开始时在前头的那一轮
+    answer_of: u64,
+    /// 哪一次回答的帧算谁的（见 [`Owner`]）
+    owner: Owner,
+}
+
+/// 上游带着回答 id 的一帧算哪一次回答的。
+///
+/// 有的中转站会改写回答 id（`response.created` 是一个，收尾的 `response.completed` 是另一个），
+/// 所以**不能只看 id 对不对得上**：一次回答正在答的时候来的收尾帧算它的，除非那个 id 认得出
+/// 是一次已经收了尾的回答的。认不出的 id 看这条连接上的上游的习惯：收尾帧换过 id 的，认不出的
+/// 也算正在答的这一次；id 一直对得上的，认不出的就是别的回答的。还没见过收尾时，认不出的
+/// `response.completed` 算这一次的（改写了 id），`response.failed`、`response.incomplete` 不算
+/// （多半是哪次早先报了 `error` 的回答补来的）。
+///
+/// 算别的回答的那一帧不碰此刻这一轮：不记进这一轮、不让它收尾、不过回答钩子、不碰这一次回答
+/// 的过滤（[`filter_late`]）。
+#[derive(Debug, Default)]
+struct Owner {
+    /// 有一次回答正在答（`response.created` 之后、收尾之前）
+    open: bool,
+    /// 这条连接上的上游会不会改写回答 id：见过的收尾帧说了算，没见过是 `None`
+    rewrites: Option<bool>,
+    /// 收了尾的回答的 id，最近 [`ENDED_IDS`] 个
+    ended: std::collections::VecDeque<String>,
+    ended_set: std::collections::HashSet<String>,
+}
+
+/// 记着多少个收了尾的回答的 id（[`Owner`]）
+const ENDED_IDS: usize = 1024;
+
+impl Owner {
+    /// `kind` 这一帧（带着回答 `id`）是不是别的回答的。`current` 是正在答（或者刚答完）的
+    /// 这一次回答在 `response.created` 里的 id
+    fn foreign(&self, kind: &str, id: Option<&str>, current: Option<&str>) -> bool {
+        let Some(id) = id.filter(|_| lifecycle(kind) && kind != "response.created") else {
+            return false;
+        };
+        if Some(id) == current {
+            return false;
+        }
+        if self.ended_set.contains(id) || !self.open {
+            return true;
+        }
+        match self.rewrites {
+            Some(rewrites) => !rewrites,
+            None => matches!(kind, "response.failed" | "response.incomplete"),
+        }
+    }
+
+    /// 算这一次回答的一帧过去了：开头、收尾记下来
+    fn saw(&mut self, kind: Option<&str>, id: Option<&str>, current: Option<&str>) {
+        match kind {
+            Some("response.created") => self.open = true,
+            Some("response.completed" | "response.failed" | "response.incomplete") => {
+                if id.is_some() {
+                    let rewritten = id != current;
+                    self.rewrites = Some(self.rewrites == Some(true) || rewritten);
+                }
+                self.end(current);
+                self.end(id);
+            }
+            Some("error") => self.end(current),
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, id: Option<&str>) {
+        self.open = false;
+        let Some(id) = id else { return };
+        if self.ended_set.insert(id.to_string()) {
+            self.ended.push_back(id.to_string());
+            if self.ended.len() > ENDED_IDS
+                && let Some(old) = self.ended.pop_front()
+            {
+                self.ended_set.remove(&old);
+            }
+        }
+    }
 }
 
 impl Pipes {
@@ -852,8 +940,14 @@ pub(crate) async fn proxy(
         bridge: None,
         reply: None,
         rename: None,
+        answer: None,
+        answered: std::collections::VecDeque::new(),
+        answer_of: 0,
+        owner: Owner::default(),
     };
-    pump(state, client, up, &mut p, ending).await;
+    pump(state.clone(), client, up, &mut p, ending).await;
+    // 连接断在一次回答中间：这次回答里已经认定的命中照样报
+    report_answer(&state, &mut p);
 }
 
 /// 为什么没连上。
@@ -1100,6 +1194,22 @@ async fn pump(
             let _ = forward(&state, p, tails, None, false, &mut c_tx).await;
         }
     }
+    // 回答过滤扣着的尾巴也一样：上游没收尾就走了，那几个字照样交给客户端（已经过了过滤）
+    if matches!(end, End::UpstreamClosed | End::Broke(_))
+        && let Some(f) = p.answer.as_mut()
+    {
+        for s in f.drain() {
+            if c_tx
+                .send(Message::Text(s.data.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    // 这一次回答里认定的命中挂在它那一轮上报，在那一轮收场之前
+    report_answer(&state, p);
     // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了。在等准入的那一轮
     // 开始了的话记成取消；在跑的几轮，上游断了、收了连接的是失败，客户端走了的是取消
     drop(waiting);
@@ -1395,11 +1505,12 @@ fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     if hits.is_empty() {
         return UpMsg::Text(text.into());
     }
-    let found = tw_guard::redact::rules::findings(&text, &hits);
+    let found = tw_guard::redact::flow::reported(&text, &p.rules.redact, &hits);
     let replaced = mode.acts().then(|| {
+        // 只记录的规则命中的不换
         let r = tw_guard::redact::replace::apply(
             &text,
-            &hits,
+            &p.rules.redact.to_replace(&hits),
             std::mem::replace(
                 &mut p.ledger,
                 tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
@@ -1479,19 +1590,32 @@ async fn upstream_text(
         .as_mut()
         .zip(response.as_deref().zip(kind.as_deref()))
         .and_then(|(turns, (id, kind))| turns.late(id, kind));
+    // 别的回答的一帧（见 [`Owner`]）：和收了尾的那一轮补来的一样，不碰此刻这一轮
+    let foreign = late.is_none()
+        && p.turns.is_some()
+        && kind.as_deref().is_some_and(|k| {
+            p.owner
+                .foreign(k, response.as_deref(), p.response.as_deref())
+        });
     match late {
         Some(true) => return Flow::Sent,
         Some(false) => {}
+        None if foreign => {}
         None => {
             if let Some(turn) = p.turns.as_mut().and_then(turn::Turns::front) {
                 turn.upstream(t, kind.as_deref(), response.as_deref());
             }
         }
     }
-    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx).await;
+    let theirs = late.is_some() || foreign;
+    let flow = relay(state, p, t, kind.as_deref(), theirs, c_tx).await;
+    if !theirs {
+        p.owner
+            .saw(kind.as_deref(), response.as_deref(), p.response.as_deref());
+    }
     if let Some(turns) = p.turns.as_mut() {
         match &flow {
-            Flow::Sent if late.is_none() && ends_turn(kind.as_deref()) => turns.finish_front(),
+            Flow::Sent if !theirs && ends_turn(kind.as_deref()) => turns.finish_front(),
             Flow::End(End::Cut(why)) => {
                 turns.fail_front(tw_api::FailureSource::Denied, why.clone())
             }
@@ -1586,12 +1710,28 @@ async fn forward(
         kind,
         Some("response.completed" | "response.failed" | "response.incomplete")
     );
-    // 收了尾的那一次回答又来的一帧不是此刻这一次的边界
+    // 收了尾的那一次回答又来的一帧、别的回答的一帧（见 [`Owner`]）不是此刻这一次的边界
     if late {
         // 原样往下走
     } else if kind == Some("response.created") {
-        p.response = response_id(&restored);
+        let previous = std::mem::replace(&mut p.response, response_id(&restored));
         p.dropping = false;
+        // 回答过滤：这一次回答起一个。上一次的命中先报掉，过滤留着给它收尾之后又来的帧
+        report_answer(state, p);
+        if let Some(old) = p.answer.take() {
+            p.answered.push_back((previous, old, p.answer_of));
+            if p.answered.len() > ANSWERED_KEPT {
+                p.answered.pop_front();
+            }
+        }
+        p.answer = p.turns.as_ref().and(p.rules.answer.as_ref()).map(|f| {
+            tw_guard::content::answer::FrameFilter::new(
+                f.answer.clone(),
+                f.acts,
+                tw_dialect::ir::Dialect::Responses,
+            )
+        });
+        p.answer_of = p.event_id();
         // 回答钩子：这一次回答起一组实例
         if let Err(why) = start_reply(state, p).await {
             return fail_response(p, c_tx, why).await;
@@ -1627,6 +1767,21 @@ async fn forward(
             }
             (msgs, err)
         }
+    };
+    // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的。收了尾的
+    // 那一次回答又来的一帧也过（上游先报 `error` 再补一个带着整段正文的 `response.failed`）
+    // 别的回答的一帧（见 [`Owner`]）也按它自己的过滤处理：**不碰此刻这一次回答的路**
+    let outgoing = if late {
+        filter_late(state, p, outgoing, response_id(&restored).as_deref())
+    } else {
+        let out = match p.answer.as_mut() {
+            Some(f) => filter_answer(f, outgoing),
+            None => outgoing,
+        };
+        if terminal || kind == Some("error") {
+            report_answer(state, p);
+        }
+        out
     };
     for msg in outgoing {
         let hits = match p.wall.as_mut() {
@@ -1685,6 +1840,111 @@ async fn forward(
         return fail_response(p, c_tx, e.detail).await;
     }
     Flow::Sent
+}
+
+/// 回答过滤这一次回答里的几帧：每一帧前面可能多出扣着的尾巴补成的帧。不是 JSON 的一帧，
+/// 先把扣着的补出来
+fn filter_answer(f: &mut tw_guard::content::answer::FrameFilter, msgs: Vec<String>) -> Vec<String> {
+    let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
+    let mut out = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        match serde_json::from_str::<serde_json::Value>(&m) {
+            Ok(mut v) => {
+                let rw = f.frame(&mut v);
+                out.extend(rw.before.iter().map(text));
+                out.push(if rw.changed { v.to_string() } else { m });
+            }
+            Err(_) => {
+                out.extend(f.drain().iter().map(text));
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// 一次收了尾的回答：它的 id、它的过滤、它的命中挂在哪一行
+type Answered = (Option<String>, tw_guard::content::answer::FrameFilter, u64);
+
+/// 收了尾的回答留着几次的过滤：它们收尾之后又来的帧按它们自己的过滤处理
+const ANSWERED_KEPT: usize = 8;
+
+/// 收了尾的那一次回答又来的几帧：按**那一次回答自己的**过滤处理 —— 还是此刻这一次的就用
+/// 此刻的（命中挂在这一次上报），是最近 [`ANSWERED_KEPT`] 次里的就用留着的那个（结束了的路
+/// 照记下的写、不多算；没见过的字里的命中挂在那一次的那一轮上报），更早的（或者认不出是哪
+/// 一次的）另起一个只管这几帧的，命中不报，见下面。
+/// **不碰此刻这一次回答的路**：它的 `response.failed` 会结束所有的路，套在此刻的过滤上就把
+/// 这一次扣着的字提前交了出去
+fn filter_late(
+    state: &AppState,
+    p: &mut Pipes,
+    msgs: Vec<String>,
+    response: Option<&str>,
+) -> Vec<String> {
+    if p.answer.is_some() && response.is_some() && response == p.response.as_deref() {
+        let out = match p.answer.as_mut() {
+            Some(f) => filter_answer(f, msgs),
+            None => msgs,
+        };
+        report_answer(state, p);
+        return out;
+    }
+    if let Some((_, f, then)) = p
+        .answered
+        .iter_mut()
+        .rev()
+        .find(|(id, ..)| response.is_some() && response == id.as_deref())
+    {
+        // 结束了的路照记下的写，不会多出命中；又来的新的字（一路新的增量）里的命中挂在那一次
+        // 回答的那一轮上报
+        let out = filter_answer(f, msgs);
+        let (hits, then) = (f.take_hits(), *then);
+        report_hits(state, p, then, hits);
+        return out;
+    }
+    let Some(rules) = p.rules.answer.as_ref().filter(|_| p.turns.is_some()) else {
+        return msgs;
+    };
+    let mut f = tw_guard::content::answer::FrameFilter::new(
+        rules.answer.clone(),
+        rules.acts,
+        tw_dialect::ir::Dialect::Responses,
+    );
+    let mut out = filter_answer(&mut f, msgs);
+    // 只管这几帧：扣着的不留到以后
+    let text = |s: &tw_guard::redact::sse::Synth| s.data.to_string();
+    out.extend(f.drain().iter().map(text));
+    // 命中不报：认不出是哪一次回答（或者早过了留着的那几次），不知道它那时报过哪些 —— 整段
+    // 正文的帧多半是它早先说过的话，再报一次就记重了；挂到此刻在答的这一轮上也是记错了地方
+    let _ = f.take_hits();
+    out
+}
+
+/// 收了尾的回答又来的帧里的命中报出去，挂在 `id` 上
+fn report_hits(
+    state: &AppState,
+    p: &Pipes,
+    id: u64,
+    hits: Vec<tw_guard::content::answer::AnswerHit>,
+) {
+    if hits.is_empty() {
+        return;
+    }
+    let redaction = p.redaction();
+    crate::guard::report_answer(&state.bus, id, &p.provider, hits, &redaction);
+}
+
+/// 这一次回答里认定的命中报出去，挂在此刻在回答的那一轮上
+fn report_answer(state: &AppState, p: &mut Pipes) {
+    let Some(f) = p.answer.as_mut() else {
+        return;
+    };
+    let hits = f.take_hits();
+    if hits.is_empty() {
+        return;
+    }
+    let redaction = p.redaction();
+    crate::guard::report_answer(&state.bus, p.event_id(), &p.provider, hits, &redaction);
 }
 
 /// 上游的一帧还原占位符：要发给客户端的几帧，这一帧在最后，前面是扣着的尾巴补成的帧。

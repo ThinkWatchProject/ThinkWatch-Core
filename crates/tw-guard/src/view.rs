@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::{self, Codepoints};
 use crate::policy::{
-    ContentAction, ContentMatch, ContentPolicy, DEFAULT_LABEL, LABEL_PREFIX, Mode, RedactPolicy,
-    Security, ToolAction, ToolPolicy,
+    ContentAction, ContentMatch, ContentPolicy, ContentScope, DEFAULT_LABEL, DEFAULT_REPLACEMENT,
+    LABEL_PREFIX, Mode, RedactAction, RedactPolicy, Security, ToolAction, ToolPolicy,
 };
 use crate::redact::rules as redact_rules;
 
@@ -25,40 +25,61 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// 一条规则在第三档下做什么。工具调用审查是 `cut` / `record`，内容过滤是 `block` /
-/// `strip` / `record`；出站脱敏的规则命中即替换，没有这一项。
+/// 一条规则在第三档下做什么。出站脱敏是 `placeholder` / `record`，工具调用审查是 `cut` /
+/// `record`，内容过滤是 `block` / `strip` / `replace` / `record`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum RuleAction {
+    /// 换成占位符再发出，回答里换回原值（出站脱敏）
+    #[serde(rename = "placeholder")]
+    Placeholder,
     /// 切断这个工具调用所在的流（工具调用审查）
     #[serde(rename = "cut")]
     Cut,
-    /// 拒绝这个请求，不发出去（内容过滤）
+    /// 拒绝这个请求，不发出去（内容过滤，只对请求）
     #[serde(rename = "block")]
     Block,
     /// 删掉命中的字再发出（内容过滤）
     #[serde(rename = "strip")]
     Strip,
+    /// 换成规则的替换文本再发出，不可还原（内容过滤）
+    #[serde(rename = "replace")]
+    Replace,
     /// 只记录
     #[serde(rename = "record")]
     Record,
 }
 
 words!(RuleAction {
+    Placeholder = "placeholder",
     Cut = "cut",
     Block = "block",
     Strip = "strip",
+    Replace = "replace",
     Record = "record",
 });
 
 impl RuleAction {
+    /// 出站脱敏认的那两个
+    pub fn redact(self) -> Option<RedactAction> {
+        RedactAction::from_slug(self.slug())
+    }
     /// 工具调用审查认的那两个
     pub fn tool(self) -> Option<ToolAction> {
         ToolAction::from_slug(self.slug())
     }
-    /// 内容过滤认的那三个
+    /// 内容过滤认的那四个
     pub fn content(self) -> Option<ContentAction> {
         ContentAction::from_slug(self.slug())
+    }
+}
+
+impl From<RedactAction> for RuleAction {
+    fn from(a: RedactAction) -> Self {
+        match a {
+            RedactAction::Placeholder => RuleAction::Placeholder,
+            RedactAction::Record => RuleAction::Record,
+        }
     }
 }
 
@@ -76,6 +97,7 @@ impl From<ContentAction> for RuleAction {
         match a {
             ContentAction::Block => RuleAction::Block,
             ContentAction::Strip => RuleAction::Strip,
+            ContentAction::Replace => RuleAction::Replace,
             ContentAction::Record => RuleAction::Record,
         }
     }
@@ -116,15 +138,15 @@ pub enum Matcher {
     /// 正则表达式：工具调用审查的全部规则，和各项防护的自定义规则
     Regex {
         pattern: String,
-        /// 分大小写：工具调用审查的规则（开头写了 `(?i)` 的除外）、写明了要分的出站脱敏
-        /// 自定义规则。内容过滤的不分
+        /// 分大小写：工具调用审查的规则（开头写了 `(?i)` 的除外）、写明了要分的出站脱敏和
+        /// 内容过滤的自定义规则。内容过滤的内置规则不分
         #[serde(default, skip_serializing_if = "is_false")]
         case_sensitive: bool,
     },
     /// 子串，按原样找：内容过滤的关键词规则、出站脱敏的自定义规则
     Contains {
         text: String,
-        /// 分大小写：写明了要分的出站脱敏自定义规则。内容过滤的不分
+        /// 分大小写：写明了要分的自定义规则。内容过滤的内置规则不分
         #[serde(default, skip_serializing_if = "is_false")]
         case_sensitive: bool,
     },
@@ -177,7 +199,8 @@ pub struct RuleView {
     pub enabled: bool,
     /// 出厂时开不开。自定义规则是 `true`
     pub on_by_default: bool,
-    /// 工具调用审查、内容过滤：第三档下做什么
+    /// 第三档下做什么：出站脱敏 `placeholder` / `record`，工具调用审查 `cut` / `record`，
+    /// 内容过滤 `block` / `strip` / `replace` / `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RuleAction>,
     /// 内置规则出厂时第三档下做什么。和 `action` 不一样就是改过
@@ -187,6 +210,14 @@ pub struct RuleView {
     /// 别的防护没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// 内容过滤：查哪一边，`request` / `response`，两边都查的两个都在。内置规则只查请求。
+    /// 别的防护没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<ContentScope>>,
+    /// 内容过滤：动作是替换时换成的文字（不写是 `***`，这里写明）。内置规则是 `***`。
+    /// 别的防护没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
 }
 
 /// 一项防护的档位和规则。
@@ -275,9 +306,11 @@ pub fn redact(p: &RedactPolicy) -> GuardDetail {
             matcher: matcher(&b.matcher),
             enabled: p.builtin_on(b),
             on_by_default: b.on_by_default,
-            action: None,
-            default_action: None,
+            action: Some(p.builtin_action(b).into()),
+            default_action: Some(RedactAction::default().into()),
             label: Some(builtin_label(b)),
+            scope: None,
+            replacement: None,
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| RuleView {
@@ -299,9 +332,11 @@ pub fn redact(p: &RedactPolicy) -> GuardDetail {
         },
         enabled: !c.disabled,
         on_by_default: true,
-        action: None,
+        action: Some(c.action.into()),
         default_action: None,
         label: Some(c.label.clone().unwrap_or_else(|| DEFAULT_LABEL.to_string())),
+        scope: None,
+        replacement: None,
     }));
     GuardDetail {
         mode: p.mode,
@@ -335,6 +370,8 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
             action: Some(p.builtin_action(r).into()),
             default_action: Some(ToolAction::factory(r).into()),
             label: None,
+            scope: None,
+            replacement: None,
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| RuleView {
@@ -352,6 +389,8 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
         action: Some(c.action.into()),
         default_action: None,
         label: None,
+        scope: None,
+        replacement: None,
     }));
     GuardDetail {
         mode: p.mode,
@@ -373,15 +412,20 @@ fn ignores_case(pattern: &str) -> bool {
 
 /// 内容规则按什么认。码位：内置规则写成规范写法，自定义规则照它写的样子一项一项给
 /// （界面拼回去存的就是这一份）；写坏了的（绕过校验写进去的）整段原样给
-fn content_matcher(matching: content::Match, pattern: &str, custom: bool) -> Matcher {
+fn content_matcher(
+    matching: content::Match,
+    pattern: &str,
+    custom: bool,
+    case_sensitive: bool,
+) -> Matcher {
     match matching {
         content::Match::Contains => Matcher::Contains {
             text: pattern.to_string(),
-            case_sensitive: false,
+            case_sensitive,
         },
         content::Match::Regex => Matcher::Regex {
             pattern: pattern.to_string(),
-            case_sensitive: false,
+            case_sensitive,
         },
         content::Match::Codepoints => Matcher::Codepoints {
             ranges: match Codepoints::parse(pattern) {
@@ -403,12 +447,15 @@ pub fn content(p: &ContentPolicy) -> GuardDetail {
             name: b.name.clone(),
             why: b.why.clone(),
             kind: b.group.clone(),
-            matcher: content_matcher(b.matching, &b.pattern, false),
+            matcher: content_matcher(b.matching, &b.pattern, false, false),
             enabled: p.builtin_on(b),
             on_by_default: b.on_by_default,
             action: Some(p.builtin_action(b).into()),
             default_action: Some(ContentAction::factory(b).into()),
             label: None,
+            // 内置规则只查请求，替换成出厂的那个
+            scope: Some(crate::policy::request_only()),
+            replacement: Some(DEFAULT_REPLACEMENT.to_string()),
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| RuleView {
@@ -417,12 +464,14 @@ pub fn content(p: &ContentPolicy) -> GuardDetail {
         name: c.name.clone(),
         why: String::new(),
         kind: "custom".into(),
-        matcher: content_matcher(c.matching.engine(), &c.pattern, true),
+        matcher: content_matcher(c.matching.engine(), &c.pattern, true, c.case_sensitive),
         enabled: !c.disabled,
         on_by_default: true,
         action: Some(c.action.into()),
         default_action: None,
         label: None,
+        scope: Some(c.scope.clone()),
+        replacement: Some(c.replacement.clone()),
     }));
     GuardDetail {
         mode: p.mode,
@@ -504,6 +553,7 @@ mod tests {
                     matching: ContentMatch::Regex,
                     case_sensitive: true,
                     label: Some("PROJECT".into()),
+                    action: RedactAction::Record,
                     disabled: false,
                 },
                 CustomRedactRule {
@@ -512,6 +562,7 @@ mod tests {
                     matching: ContentMatch::Contains,
                     case_sensitive: false,
                     label: None,
+                    action: RedactAction::Placeholder,
                     disabled: true,
                 },
             ],
@@ -519,6 +570,14 @@ mod tests {
         });
         let r = |id: &str| v.rules.iter().find(|r| r.id == id).unwrap().clone();
         assert!(r("email").enabled && !r("jwt").enabled);
+        // 每条都说得出动作：内置的出厂是换成占位符，自定义的按它写的
+        assert_eq!(
+            (r("email").action, r("email").default_action),
+            (Some(RuleAction::Placeholder), Some(RuleAction::Placeholder))
+        );
+        assert_eq!(r("项目号").action, Some(RuleAction::Record));
+        assert_eq!(r("不写标签").action, Some(RuleAction::Placeholder));
+        assert!(r("项目号").scope.is_none() && r("项目号").replacement.is_none());
         assert_eq!(r("项目号").label.as_deref(), Some("PROJECT"));
         assert_eq!(r("不写标签").label.as_deref(), Some("SECRET"));
         assert!(!r("不写标签").enabled && r("不写标签").custom);
@@ -626,8 +685,11 @@ mod tests {
             custom: vec![CustomContentRule {
                 name: "码位".into(),
                 pattern: "u+e000-u+f8ff, u+fffd".into(),
+                scope: crate::policy::request_only(),
                 matching: crate::policy::ContentMatch::Codepoints,
+                case_sensitive: false,
                 action: ContentAction::Strip,
+                replacement: DEFAULT_REPLACEMENT.into(),
                 disabled: false,
             }],
             ..Default::default()
@@ -678,6 +740,15 @@ mod tests {
             "自定义规则照它写的样子给"
         );
         assert_eq!(mine.action, Some(RuleAction::Strip));
+        assert_eq!(mine.scope, Some(vec![ContentScope::Request]));
+        assert_eq!(mine.replacement.as_deref(), Some("***"));
+        // 内置规则只查请求
+        assert!(
+            v.rules
+                .iter()
+                .filter(|r| !r.custom)
+                .all(|r| r.scope == Some(vec![ContentScope::Request]))
+        );
     }
 
     /// 企业版的界面按视图拼回整份策略、整键写回：拼回来的得和原来的一样
@@ -691,6 +762,12 @@ mod tests {
                 mode: Mode::Enforce,
                 enable: vec!["email".into()],
                 disable: vec!["jwt".into()],
+                // 停用着的那条也改过动作：视图里照样要带着
+                actions: [
+                    ("email".to_string(), RedactAction::Record),
+                    ("jwt".to_string(), RedactAction::Record),
+                ]
+                .into(),
                 custom: vec![
                     CustomRedactRule {
                         name: "项目号".into(),
@@ -698,6 +775,7 @@ mod tests {
                         matching: ContentMatch::Regex,
                         case_sensitive: true,
                         label: Some("PROJECT".into()),
+                        action: RedactAction::Record,
                         disabled: false,
                     },
                     CustomRedactRule {
@@ -706,6 +784,7 @@ mod tests {
                         matching: ContentMatch::Contains,
                         case_sensitive: false,
                         label: None,
+                        action: RedactAction::Placeholder,
                         disabled: true,
                     },
                 ],
@@ -740,22 +819,41 @@ mod tests {
                     CustomContentRule {
                         name: "关键词".into(),
                         pattern: " project-x ".into(),
+                        scope: crate::policy::request_only(),
                         matching: ContentMatch::Contains,
+                        case_sensitive: false,
                         action: ContentAction::Block,
+                        replacement: DEFAULT_REPLACEMENT.into(),
                         disabled: false,
                     },
                     CustomContentRule {
                         name: "正则".into(),
                         pattern: r"secret\s+plan".into(),
+                        scope: vec![ContentScope::Request, ContentScope::Response],
                         matching: ContentMatch::Regex,
-                        action: ContentAction::Record,
+                        case_sensitive: true,
+                        action: ContentAction::Replace,
+                        replacement: "[已隐去]".into(),
                         disabled: true,
+                    },
+                    CustomContentRule {
+                        name: "只查回答".into(),
+                        pattern: "北极星".into(),
+                        scope: vec![ContentScope::Response],
+                        matching: ContentMatch::Contains,
+                        case_sensitive: false,
+                        action: ContentAction::Record,
+                        replacement: DEFAULT_REPLACEMENT.into(),
+                        disabled: false,
                     },
                     CustomContentRule {
                         name: "码位".into(),
                         pattern: "u+e000-u+f8ff，U+FFFD".into(),
+                        scope: crate::policy::request_only(),
                         matching: ContentMatch::Codepoints,
+                        case_sensitive: false,
                         action: ContentAction::Strip,
+                        replacement: DEFAULT_REPLACEMENT.into(),
                         disabled: false,
                     },
                 ],
@@ -800,6 +898,7 @@ mod tests {
             mode: view.redact.mode,
             enable,
             disable,
+            actions: changed(&view.redact.rules, RuleAction::redact),
             custom: view
                 .redact
                 .rules
@@ -820,6 +919,7 @@ mod tests {
                         }
                     ),
                     label: r.label.clone(),
+                    action: r.action.and_then(RuleAction::redact).unwrap(),
                     disabled: !r.enabled,
                 })
                 .collect(),
@@ -859,8 +959,20 @@ mod tests {
                     CustomContentRule {
                         name: r.id.clone(),
                         pattern,
+                        scope: r.scope.clone().unwrap(),
                         matching,
+                        case_sensitive: matches!(
+                            r.matcher,
+                            Matcher::Regex {
+                                case_sensitive: true,
+                                ..
+                            } | Matcher::Contains {
+                                case_sensitive: true,
+                                ..
+                            }
+                        ),
                         action: r.action.and_then(RuleAction::content).unwrap(),
+                        replacement: r.replacement.clone().unwrap(),
                         disabled: !r.enabled,
                     }
                 })
@@ -908,7 +1020,11 @@ mod tests {
         assert!(tags.get("label").is_none(), "没有的不写");
         let key = &v["redact"]["rules"][0];
         assert_eq!(key["label"], "SECRET");
-        assert!(key.get("action").is_none() && key.get("why").is_none());
+        assert_eq!(key["action"], "placeholder");
+        assert_eq!(key["default_action"], "placeholder");
+        assert!(key.get("why").is_none() && key.get("scope").is_none());
+        assert_eq!(tags["scope"], serde_json::json!(["request"]));
+        assert_eq!(tags["replacement"], "***");
         assert_eq!(
             v["redact"]["rules"]
                 .as_array()
