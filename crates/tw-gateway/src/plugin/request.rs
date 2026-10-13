@@ -222,11 +222,11 @@ impl<'a> Hook<'a> {
 
     /// 按客户端原文编好号的那本账（第一次调时才编）
     fn base(&mut self) -> Bridge {
-        let (rules, body) = (&self.rules, self.body);
+        let (rules, body, path) = (&self.rules, self.body, self.path);
         self.base
             .get_or_insert_with(|| {
                 let mut b = Bridge::new(rules.clone());
-                b.learn(body);
+                b.learn(body, crate::client_api::ClientApi::written(path));
                 b
             })
             .clone()

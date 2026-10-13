@@ -16,6 +16,7 @@
 use tw_config::Protocol;
 use tw_dialect::convert::Decoded;
 use tw_dialect::ir::{Dialect, Rejection};
+use tw_dialect::written::Shape;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientApi {
@@ -163,6 +164,25 @@ impl ClientApi {
         }
     }
 
+    /// 这个路径的请求体是什么形状：出站脱敏只在它写出来的文字里找（见
+    /// [`tw_dialect::written`]）。**认不出的路径是 `None`，不找**：不知道哪些字符串是谁写的
+    /// 话，换掉的可能是一个 id、一个配置项，上游拒收整个请求。
+    ///
+    /// 生成回答，和请求体同一种形状的数 token、压缩上下文按格式认；嵌入、旧版补全各有各的
+    /// 形状。
+    pub fn written(path: &str) -> Option<Shape> {
+        let api = Self::of_path(path)?;
+        let p = path.trim_end_matches('/');
+        let tail = p.strip_prefix("/v1").unwrap_or(p);
+        Some(match api {
+            ClientApi::AnthropicMessages if tail == "/complete" => Shape::Completion,
+            ClientApi::OpenaiChat if Self::completes(path) => Shape::Completion,
+            ClientApi::OpenaiChat if Self::embeds(path) => Shape::Embeddings,
+            ClientApi::Gemini if Self::embeds(path) => Shape::GeminiEmbed,
+            api => Shape::Generate(api.dialect()),
+        })
+    }
+
     /// 和它同格式的上游协议。
     pub fn protocol(&self) -> Protocol {
         match self {
@@ -276,6 +296,39 @@ fn gemini_model(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_path_says_where_its_written_text_is() {
+        use Shape::*;
+        for (path, want) in [
+            ("/v1/messages", Some(Generate(Dialect::Anthropic))),
+            (
+                "/v1/messages/count_tokens",
+                Some(Generate(Dialect::Anthropic)),
+            ),
+            ("/v1/complete", Some(Completion)),
+            ("/v1/chat/completions", Some(Generate(Dialect::Chat))),
+            ("/v1/completions", Some(Completion)),
+            ("/v1/embeddings", Some(Embeddings)),
+            ("/v1/responses", Some(Generate(Dialect::Responses))),
+            (
+                "/backend-api/codex/responses/compact",
+                Some(Generate(Dialect::Responses)),
+            ),
+            (
+                "/v1beta/models/g:streamGenerateContent",
+                Some(Generate(Dialect::Gemini)),
+            ),
+            (
+                "/v1beta/models/g:countTokens",
+                Some(Generate(Dialect::Gemini)),
+            ),
+            ("/v1beta/models/g:batchEmbedContents", Some(GeminiEmbed)),
+            ("/v1/files", None),
+        ] {
+            assert_eq!(ClientApi::written(path), want, "{path}");
+        }
+    }
 
     #[test]
     fn each_api_is_recognised_by_its_path() {

@@ -30,6 +30,9 @@ fn key(i: usize) -> String {
     format!("AKIA{tail}")
 }
 
+/// 请求体都写成 Anthropic 的样子
+const SHAPE: flow::Shape = flow::Shape::Generate(Dialect::Anthropic);
+
 /// 一条用户消息，里面是 `n` 个不同的密钥
 fn request(n: usize) -> String {
     let keys: Vec<String> = (0..n).map(key).collect();
@@ -42,10 +45,10 @@ fn round_trip(n: usize) -> Duration {
     let body = request(n);
     let started = Instant::now();
 
-    let (found, ledger) = flow::look(Mode::Enforce, &rules, body.as_bytes());
+    let (found, ledger) = flow::look(Mode::Enforce, &rules, body.as_bytes(), SHAPE);
     assert_eq!(found.len(), n, "一个不同的值一条");
     assert_eq!(ledger.len(), n);
-    let (sent, ledger) = flow::replace(Mode::Enforce, &rules, body.clone().into(), &ledger);
+    let (sent, ledger) = flow::replace(Mode::Enforce, &rules, body.clone().into(), &ledger, SHAPE);
     let sent = String::from_utf8(sent.to_vec()).unwrap();
     assert!(!sent.contains("AKIA"), "每一个都换掉了");
     assert!(sent.contains(&format!("<<TW_SECRET_{n}>>")));
@@ -172,7 +175,7 @@ fn nested_runs(k: usize) -> Duration {
     let rules = RuleSet::none().with_custom("ids", r"\d{6,}").unwrap();
     let content: String = (6..6 + k).map(|l| format!("{} ", "1".repeat(l))).collect();
     let body = json!({"messages": [{"role": "user", "content": content}]}).to_string();
-    let (_, ledger) = flow::look(Mode::Enforce, &rules, body.as_bytes());
+    let (_, ledger) = flow::look(Mode::Enforce, &rules, body.as_bytes(), SHAPE);
     assert_eq!(ledger.len(), k);
     let started = Instant::now();
     let out = replace::hide_values(&body, &ledger, replace::Form::Json);

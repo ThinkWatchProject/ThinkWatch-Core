@@ -473,8 +473,13 @@ pub(super) async fn try_upstreams<'a>(
             // 换成占位符不算：落盘时两边换的是同一个
             let differs = out.reshaped || unsealed.as_ptr() != out.body.as_ptr();
             let mode = rt.config.security.redact.mode;
+            // 这一跳发出去的是什么形状：转换过的按转成的格式，直通的按路径
+            let shape = match out.target {
+                Some(d) => Some(crate::guard::Shape::Generate(d)),
+                None => crate::client_api::ClientApi::written(&out.path),
+            };
             let (body, ledger) =
-                crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known);
+                crate::guard::replace_found(mode, &rt.redact, unsealed, seed, shape, known);
             (body, ledger, differs)
         });
 

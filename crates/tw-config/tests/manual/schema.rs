@@ -1099,8 +1099,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security.redact"),
                     Def::Section,
                     t(
-                        "Outbound redaction (Secrets & privacy in the app): credentials and personal information anywhere in a request are replaced with placeholders before it leaves, or only recorded, rule by rule.",
-                        "出站脱敏（应用里叫「密钥与隐私」）：请求发出前，按每条规则把其中任何位置的凭据和个人信息替换为占位符，或只记录。",
+                        "Outbound redaction (Secrets & privacy in the app): credentials and personal information in the text a request carries (messages, system prompts, reasoning, tool arguments and results, tool descriptions) are replaced with placeholders before it leaves, or only recorded, rule by rule. Identifiers, model names and other protocol fields are sent as they are.",
+                        "出站脱敏（应用里叫「密钥与隐私」）：请求发出前，按每条规则把其中正文（消息、系统提示、推理、工具调用的参数和结果、工具说明）里的凭据和个人信息替换为占位符，或只记录；id、模型名等协议字段原样发出。",
                     ),
                 ),
                 row(

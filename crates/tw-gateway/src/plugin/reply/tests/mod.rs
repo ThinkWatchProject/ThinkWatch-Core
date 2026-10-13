@@ -42,7 +42,7 @@ async fn chain_with(
     request: &Value,
 ) -> Chain {
     let mut bridge = Bridge::new(Arc::new(tw_guard::redact::rules::RuleSet::defaults()));
-    bridge.learn(request.to_string().as_bytes());
+    bridge.learn(request.to_string().as_bytes(), crate::guard::TEST_SHAPE);
     Chain::start(
         state,
         set,

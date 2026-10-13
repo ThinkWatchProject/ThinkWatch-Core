@@ -137,7 +137,7 @@ async fn tried(
         .as_ref()
         .and_then(|r| serde_json::from_slice::<Value>(r.body).ok());
     if let Some(r) = &request {
-        bridge.learn(r.body);
+        bridge.learn(r.body, crate::client_api::ClientApi::written(r.path));
     }
     let requested = match (&request, dialect) {
         (Some(r), Some(d)) => super::request::asked_model(d, r.path, parsed.as_ref()),
