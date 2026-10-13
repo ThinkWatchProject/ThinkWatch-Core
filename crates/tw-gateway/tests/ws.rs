@@ -170,6 +170,14 @@ async fn start_gateway(up: SocketAddr, mode: SecurityMode, inspect: SecurityMode
     addr
 }
 
+/// 客户端在 Responses 的连接上说的一句话：写在 `input` 里。出站脱敏只看写出来的文字，
+/// 一帧光秃秃的字不是 Responses 的写法，不看
+fn said(text: &str) -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({ "input": text }).to_string().into(),
+    )
+}
+
 async fn connect(
     gw: SocketAddr,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -192,11 +200,9 @@ async fn a_secret_in_a_frame_is_redacted_before_it_reaches_the_upstream() {
     let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
     let mut c = connect(gw).await;
 
-    c.send(tokio_tungstenite::tungstenite::Message::Text(
-        format!("我的 key 是 {USER_KEY}，帮我看看").into(),
-    ))
-    .await
-    .unwrap();
+    c.send(said(&format!("我的 key 是 {USER_KEY}，帮我看看")))
+        .await
+        .unwrap();
     let back = tokio::time::timeout(Duration::from_secs(3), c.next())
         .await
         .expect("等回帧超时")
@@ -224,7 +230,7 @@ async fn a_private_key_echoed_in_a_frame_keeps_the_frame_json() {
     let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
     let mut c = connect(gw).await;
 
-    let frame = serde_json::json!({ "text": format!("钥匙：{pem}") }).to_string();
+    let frame = serde_json::json!({ "input": format!("钥匙：{pem}") }).to_string();
     c.send(tokio_tungstenite::tungstenite::Message::Text(
         frame.clone().into(),
     ))
@@ -243,7 +249,7 @@ async fn a_private_key_echoed_in_a_frame_keeps_the_frame_json() {
     let text = back.into_text().unwrap();
     assert_eq!(text.as_str(), frame);
     let v: serde_json::Value = serde_json::from_str(&text).expect("回来的一帧还是 JSON");
-    assert_eq!(v["text"], format!("钥匙：{pem}"));
+    assert_eq!(v["input"], format!("钥匙：{pem}"));
 }
 
 /// 一个占位符切在上游的两帧里，客户端拿到的照样是原值：正文是真的换行，参数解出来也是。
@@ -253,11 +259,7 @@ async fn a_placeholder_split_across_two_frames_comes_back_whole() {
     let (up, _) = start_upstream("split").await;
     let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
     let mut c = connect(gw).await;
-    c.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({ "text": pem }).to_string().into(),
-    ))
-    .await
-    .unwrap();
+    c.send(said(pem)).await.unwrap();
     let mut got: Vec<serde_json::Value> = Vec::new();
     while !got
         .iter()
@@ -308,19 +310,13 @@ async fn a_held_half_placeholder_survives_the_ledger_growing() {
     let (up, _) = start_upstream("grow").await;
     let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
     let mut c = connect(gw).await;
-    c.send(tokio_tungstenite::tungstenite::Message::Text(
-        format!("第一把 {USER_KEY}").into(),
-    ))
-    .await
-    .unwrap();
+    c.send(said(&format!("第一把 {USER_KEY}"))).await.unwrap();
     // 扣住的那一半之前的字先到：这时网关已经扣着 `<<TW_SEC`
     let first = next_json(&mut c).await;
     assert_eq!(first["delta"], "钥匙 ");
-    c.send(tokio_tungstenite::tungstenite::Message::Text(
-        "第二把 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB".into(),
-    ))
-    .await
-    .unwrap();
+    c.send(said("第二把 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB"))
+        .await
+        .unwrap();
     let mut got = vec![first];
     while !got.iter().any(|v| v["type"] == "response.output_text.done") {
         got.push(next_json(&mut c).await);
@@ -369,11 +365,7 @@ async fn a_second_frame_gets_its_own_placeholder_number() {
         "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA",
         "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB",
     ] {
-        c.send(tokio_tungstenite::tungstenite::Message::Text(
-            format!("这把是 {k}").into(),
-        ))
-        .await
-        .unwrap();
+        c.send(said(&format!("这把是 {k}"))).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(3), c.next())
             .await
             .expect("等回帧超时");
@@ -895,11 +887,9 @@ async fn a_secret_restored_into_a_flagged_call_is_masked_in_the_event() {
     ))
     .await;
     let mut c = connect(gw).await;
-    c.send(tokio_tungstenite::tungstenite::Message::Text(
-        format!("用这把 key 装一下：{USER_KEY}").into(),
-    ))
-    .await
-    .unwrap();
+    c.send(said(&format!("用这把 key 装一下：{USER_KEY}")))
+        .await
+        .unwrap();
     let back = tokio::time::timeout(Duration::from_secs(3), c.next())
         .await
         .expect("等回帧超时")

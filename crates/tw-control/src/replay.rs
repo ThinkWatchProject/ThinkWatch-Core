@@ -257,7 +257,8 @@ pub async fn quote(
         will_redact: {
             let rt = s.gateway.runtime();
             let mode = rt.config.security.redact.mode;
-            mode.acts() && !tw_gateway::guard::find(mode, &rt.redact, &raw).is_empty()
+            let shape = tw_gateway::client_api::ClientApi::written(&row.path);
+            mode.acts() && !tw_gateway::guard::find(mode, &rt.redact, &raw, shape).is_empty()
         },
         pricing_date: book.table().date.clone(),
     }))
@@ -312,8 +313,15 @@ pub async fn run(
     let rt = s.gateway.runtime();
     let ledger = tw_gateway::guard::ledger_for(&raw);
     let (body, path) = renamed(&row, raw, &model);
-    let (body, ledger) =
-        tw_gateway::guard::replace(rt.config.security.redact.mode, &rt.redact, body, &ledger);
+    // 只在写出来的文字里换，按存下来的那条请求的路径认形状（见 `tw_gateway::guard`）
+    let shape = tw_gateway::client_api::ClientApi::written(&path);
+    let (body, ledger) = tw_gateway::guard::replace(
+        rt.config.security.redact.mode,
+        &rt.redact,
+        body,
+        &ledger,
+        shape,
+    );
 
     let url = tw_gateway::forward::upstream_url(&provider.base_url, &path, None);
     let started = Instant::now();

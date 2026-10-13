@@ -128,7 +128,9 @@ pub(super) async fn attempt(
         .bridge
         .as_ref()
         .map_or_else(|| started.ledger.clone(), |b| b.ledger().clone());
-    let look = crate::guard::look_hits_from(mode, &rt.redact, &body, seed);
+    // 插件改过的这一份按它要发往的路径认形状
+    let shape = crate::client_api::ClientApi::written(&c.path);
+    let look = crate::guard::look_hits_from(mode, &rt.redact, &body, shape, seed);
     let (found, ledger) = (look.found, look.ledger);
     let more = crate::guard::more_found(&started.found, found);
     // 和开头那一条加起来，一个请求报的有上限（见 `crate::guard::REPORTED_MAX`）。位置是插件

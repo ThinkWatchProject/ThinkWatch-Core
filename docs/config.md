@@ -749,7 +749,7 @@ refuses, deletes, replaces or only records.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction (Secrets & privacy in the app): credentials and personal information anywhere in a request are replaced with placeholders before it leaves, or only recorded, rule by rule. |
+| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction (Secrets & privacy in the app): credentials and personal information in the text a request carries (messages, system prompts, reasoning, tool arguments and results, tool descriptions) are replaced with placeholders before it leaves, or only recorded, rule by rule. Identifiers, model names and other protocol fields are sent as they are. |
 | `inspect_tools` | object, [`security.inspect_tools`](#cfg-security-inspect_tools) | — | Tool-call inspection (Dangerous commands in the app): dangerous commands in the tool calls a model returns cut the response off. |
 | `content` | object, [`security.content`](#cfg-security-content) | — | Content filter: words, patterns or characters (hidden ones among them) in what the caller sends, and words or patterns in the text of the answer; each rule refuses the request, deletes or replaces what it matched, or only records it. |
 <!-- /generated -->

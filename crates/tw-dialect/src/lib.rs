@@ -28,3 +28,4 @@ pub mod responses;
 pub mod think;
 pub mod url;
 pub mod usage;
+pub mod written;

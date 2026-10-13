@@ -17,6 +17,13 @@
 //! 只有这一份；[`replace`] 在每一跳发出去之前替换 —— 那一跳的请求体可能是
 //! 转换过格式的，要换的是真正发出去的那一份。
 //!
+//! # 只看写出来的文字
+//!
+//! 两步都只在请求体里人、模型、工具写出来的文字里找（[`tw_dialect::written`]），按这一份
+//! 请求体的形状认：客户端的原文按路径（[`crate::client_api::ClientApi::written`]），转换过的
+//! 一跳按它转成的格式。认不出形状的（`None`）不找也不换：不知道哪个字符串是谁写的话，换掉的
+//! 可能是一个 id、一个配置项。
+//!
 //! # 一个值一个占位符，整个请求里都一样
 //!
 //! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换
@@ -32,19 +39,28 @@ use std::collections::HashSet;
 use tw_config::SecurityMode as Mode;
 use tw_guard::content::Screening;
 use tw_guard::redact::flow;
+pub use tw_guard::redact::flow::Shape;
 use tw_guard::redact::replace::Ledger;
 use tw_guard::redact::rules::{Finding, Hit, Rule, RuleSet};
 
 pub mod detail;
+
+/// 测试里的请求体大多写成 Anthropic 的样子
+#[cfg(test)]
+pub(crate) const TEST_SHAPE: Option<Shape> =
+    Some(Shape::Generate(tw_dialect::ir::Dialect::Anthropic));
 
 /// 按规则找一遍，**不算我们自己的占位符，也不进 base64 载荷**（见 [`flow::hits`]）。
 pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
     flow::hits(text, rules)
 }
 
-/// 找一遍。**观察档和拦截档都找**，关闭时不找（见 [`flow::find`]）。
-pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
-    flow::find(mode, rules, body)
+/// 找一遍。**观察档和拦截档都找**，关闭时不找（见 [`flow::find`]）。认不出形状的不找
+pub fn find(mode: Mode, rules: &RuleSet, body: &[u8], shape: Option<Shape>) -> Vec<Finding> {
+    match shape {
+        Some(shape) => flow::find(mode, rules, body, shape),
+        None => Vec::new(),
+    }
 }
 
 /// 一本新账，让开 `body` 里已经写着的占位符（见 [`flow::ledger_for`]）。
@@ -54,53 +70,87 @@ pub fn ledger_for(body: &[u8]) -> Ledger {
 
 /// 看一遍客户端发来的原文：报出去的记录，和这个请求的账本（见 [`flow::look`]）。存下来的
 /// 那份请求也照这本账换（[`crate::bodies::Redaction`]）。
-pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) {
-    flow::look(mode, rules, body)
+pub fn look(
+    mode: Mode,
+    rules: &RuleSet,
+    body: &[u8],
+    shape: Option<Shape>,
+) -> (Vec<Finding>, Ledger) {
+    let l = look_hits(mode, rules, body, shape);
+    (l.found, l.ledger)
 }
 
 /// [`look`]，连同找到的命中（见 [`flow::Look::hits`]）：同一份正文落盘前打码时不再找一遍
 /// （[`crate::bodies::BodyRecord::found`]）。
-pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8]) -> flow::Look {
-    flow::look_hits(
+pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], shape: Option<Shape>) -> flow::Look {
+    look_hits_from(
         mode,
         rules,
         body,
+        shape,
         Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
     )
 }
 
 /// [`look`]，接着 `seed` 的账编号（见 [`flow::look_from`]）。
-pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
-    flow::look_from(mode, rules, body, seed)
+pub fn look_from(
+    mode: Mode,
+    rules: &RuleSet,
+    body: &[u8],
+    shape: Option<Shape>,
+    seed: Ledger,
+) -> (Vec<Finding>, Ledger) {
+    let l = look_hits_from(mode, rules, body, shape, seed);
+    (l.found, l.ledger)
 }
 
 /// [`look_from`]，连同找到的命中（见 [`flow::Look::hits`]）：报出去的每一项要说得出在哪儿
 /// （[`detail::secrets`]）。
-pub fn look_hits_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> flow::Look {
-    flow::look_hits(mode, rules, body, seed)
+/// 认不出形状的不找：和关着一样，什么都没有
+pub fn look_hits_from(
+    mode: Mode,
+    rules: &RuleSet,
+    body: &[u8],
+    shape: Option<Shape>,
+    seed: Ledger,
+) -> flow::Look {
+    match shape {
+        Some(shape) => flow::look_hits(mode, rules, body, shape, seed),
+        None => flow::Look {
+            found: Vec::new(),
+            ledger: Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+            hits: None,
+        },
+    }
 }
 
 /// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`flow::replace`]）。
+/// 认不出形状的原样发
 pub fn replace(
     mode: Mode,
     rules: &RuleSet,
     body: bytes::Bytes,
     ledger: &Ledger,
+    shape: Option<Shape>,
 ) -> (bytes::Bytes, Ledger) {
-    flow::replace(mode, rules, body, ledger)
+    match shape {
+        Some(shape) => flow::replace(mode, rules, body, ledger, shape),
+        None => (body, ledger.clone()),
+    }
 }
 
 /// [`replace`]，`found` 是按这套规则在 `body` 上已经找过的命中（[`look_hits`] 在同一份字节上
-/// 找的）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样。
+/// 找的，同一个形状）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样。
 pub fn replace_found(
     mode: Mode,
     rules: &RuleSet,
     body: bytes::Bytes,
     ledger: &Ledger,
+    shape: Option<Shape>,
     found: Option<&[Hit]>,
 ) -> (bytes::Bytes, Ledger) {
     let Some(found) = found.filter(|_| mode.acts() && !rules.is_empty()) else {
-        return replace(mode, rules, body, ledger);
+        return replace(mode, rules, body, ledger, shape);
     };
     // 只记录的规则命中的不换
     let hits = rules.to_replace(found);
@@ -110,7 +160,7 @@ pub fn replace_found(
     }
     // 找得到命中的一定是 UTF-8（见 `flow::look_hits`）
     let Ok(text) = std::str::from_utf8(&body) else {
-        return replace(mode, rules, body, ledger);
+        return replace(mode, rules, body, ledger, shape);
     };
     let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
     (bytes::Bytes::from(r.text), r.ledger)
@@ -475,7 +525,13 @@ mod tests {
 
     #[test]
     fn enforce_replaces_with_a_placeholder_and_keeps_the_body_valid_json() {
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body(), &fresh());
+        let (out, ledger) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            body(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+        );
         let text = String::from_utf8(out.to_vec()).unwrap();
         assert!(!text.contains(KEY), "{text}");
         assert!(text.contains("<<TW_SECRET_1>>"), "{text}");
@@ -493,19 +549,52 @@ mod tests {
     #[test]
     fn observe_finds_what_enforce_would_replace_and_changes_nothing() {
         // 观察档**只记录，不改变任何行为**；它报的和拦截档会换的是同一批
-        let seen = find(Mode::Observe, &RuleSet::defaults(), &body());
+        let seen = find(
+            Mode::Observe,
+            &RuleSet::defaults(),
+            &body(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].masked.contains("AAAAAAAAAAAA"));
-        assert_eq!(seen, find(Mode::Enforce, &RuleSet::defaults(), &body()));
-        let (out, ledger) = replace(Mode::Observe, &RuleSet::defaults(), body(), &fresh());
+        assert_eq!(
+            seen,
+            find(
+                Mode::Enforce,
+                &RuleSet::defaults(),
+                &body(),
+                crate::guard::TEST_SHAPE
+            )
+        );
+        let (out, ledger) = replace(
+            Mode::Observe,
+            &RuleSet::defaults(),
+            body(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(out, body());
         assert!(ledger.is_empty());
     }
 
     #[test]
     fn off_does_not_even_look() {
-        assert!(find(Mode::Off, &RuleSet::defaults(), &body()).is_empty());
-        let (out, _) = replace(Mode::Off, &RuleSet::defaults(), body(), &fresh());
+        assert!(
+            find(
+                Mode::Off,
+                &RuleSet::defaults(),
+                &body(),
+                crate::guard::TEST_SHAPE
+            )
+            .is_empty()
+        );
+        let (out, _) = replace(
+            Mode::Off,
+            &RuleSet::defaults(),
+            body(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(out, body());
     }
 
@@ -513,16 +602,36 @@ mod tests {
     fn a_binary_body_is_left_alone_instead_of_being_mangled() {
         // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求。
         let raw = bytes::Bytes::from(vec![0xff, 0xfe, 0x00, 0x01]);
-        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), raw.clone(), &fresh());
+        let (out, l) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            raw.clone(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(out, raw);
         assert!(l.is_empty());
-        assert!(find(Mode::Enforce, &RuleSet::defaults(), &raw).is_empty());
+        assert!(
+            find(
+                Mode::Enforce,
+                &RuleSet::defaults(),
+                &raw,
+                crate::guard::TEST_SHAPE
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn a_body_with_nothing_to_redact_is_returned_untouched() {
         let plain = bytes::Bytes::from_static(b"{\"messages\":[]}");
-        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), plain.clone(), &fresh());
+        let (out, l) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            plain.clone(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(out, plain);
         assert!(l.is_empty());
     }
@@ -545,7 +654,12 @@ mod tests {
     #[test]
     fn the_event_items_name_the_rule_and_never_carry_the_value() {
         let it = items_of(
-            &find(Mode::Observe, &RuleSet::defaults(), &body()),
+            &find(
+                Mode::Observe,
+                &RuleSet::defaults(),
+                &body(),
+                crate::guard::TEST_SHAPE,
+            ),
             0,
             &body(),
         );
@@ -572,7 +686,12 @@ mod tests {
     fn a_request_reports_its_first_hundred_values_and_still_replaces_every_one() {
         let keys: Vec<String> = (0..150).map(aws_key).collect();
         let body = serde_json::json!({"messages": [{"content": keys.join(" ")}]}).to_string();
-        let (found, ledger) = look(Mode::Enforce, &RuleSet::defaults(), body.as_bytes());
+        let (found, ledger) = look(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            body.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         // 找到的一个不少：总共几个不同的值，`found.len()` 说得出来
         assert_eq!(found.len(), 150);
         let it = items_of(&found, 0, body.as_bytes());
@@ -593,7 +712,13 @@ mod tests {
         );
         assert!(items_of(&found, 150, body.as_bytes()).is_empty());
         // 没报的照样换掉
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body.into(), &ledger);
+        let (out, ledger) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            body.into(),
+            &ledger,
+            crate::guard::TEST_SHAPE,
+        );
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(!out.contains("AKIA"), "{out}");
         assert!(out.contains("<<TW_SECRET_150>>"), "{out}");
@@ -608,25 +733,46 @@ mod tests {
             r#"{{"system":"<<TW_SECRET_1>> {KEY}","messages":[{{"content":"{other} {KEY}"}}]}}"#
         ));
         let rules = RuleSet::defaults();
-        let seen = look_hits(Mode::Enforce, &rules, &body);
+        let seen = look_hits(Mode::Enforce, &rules, &body, crate::guard::TEST_SHAPE);
         let hits = seen.hits.unwrap();
-        let again = replace(Mode::Enforce, &rules, body.clone(), &seen.ledger);
+        let again = replace(
+            Mode::Enforce,
+            &rules,
+            body.clone(),
+            &seen.ledger,
+            crate::guard::TEST_SHAPE,
+        );
         let known = replace_found(
             Mode::Enforce,
             &rules,
             body.clone(),
             &seen.ledger,
+            crate::guard::TEST_SHAPE,
             Some(&hits),
         );
         assert_eq!(known.0, again.0);
         assert_eq!(known.1.table(), again.1.table());
         assert!(!String::from_utf8_lossy(&known.0).contains(KEY));
         // 观察档不换，找过也不换
-        let (out, _) = replace_found(Mode::Observe, &rules, body.clone(), &fresh(), Some(&hits));
+        let (out, _) = replace_found(
+            Mode::Observe,
+            &rules,
+            body.clone(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+            Some(&hits),
+        );
         assert_eq!(out, body);
         // 什么都没找到：原样，不拷贝
         let plain = bytes::Bytes::from_static(b"{\"messages\":[]}");
-        let (out, l) = replace_found(Mode::Enforce, &rules, plain.clone(), &fresh(), Some(&[]));
+        let (out, l) = replace_found(
+            Mode::Enforce,
+            &rules,
+            plain.clone(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+            Some(&[]),
+        );
         assert_eq!(out.as_ptr(), plain.as_ptr());
         assert!(l.is_empty());
     }
@@ -634,17 +780,31 @@ mod tests {
     /// 查表比和两两比，留下的一模一样：同一条规则下打码一样的算见过，换一条规则就不算
     #[test]
     fn more_found_keeps_exactly_what_comparing_every_pair_kept() {
-        let text = |range: std::ops::Range<usize>| {
+        let content = |range: std::ops::Range<usize>| {
             let keys: Vec<String> = range.map(aws_key).collect();
-            serde_json::json!({ "content": keys.join(" ") }).to_string()
+            serde_json::json!({ "content": keys.join(" ") })
         };
-        let mut before = find(Mode::Observe, &RuleSet::defaults(), text(0..60).as_bytes());
+        let text = |range: std::ops::Range<usize>| {
+            serde_json::json!({ "messages": [content(range)] }).to_string()
+        };
+        let mut before = find(
+            Mode::Observe,
+            &RuleSet::defaults(),
+            text(0..60).as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         // 前 10 个当成是另一条规则认出来的：打码一样、规则不同，不算见过
         for f in &mut before[..10] {
             f.rule = Rule::Custom(std::sync::Arc::from("aws-again"));
         }
-        let after_text = format!("{} {}", text(30..90), text(0..5));
-        let after = find(Mode::Observe, &RuleSet::defaults(), after_text.as_bytes());
+        let after_text =
+            serde_json::json!({ "messages": [content(30..90), content(0..5)] }).to_string();
+        let after = find(
+            Mode::Observe,
+            &RuleSet::defaults(),
+            after_text.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         let pairwise: Vec<Finding> = after
             .iter()
             .filter(|f| {
@@ -667,18 +827,35 @@ mod tests {
         let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let client =
             format!(r#"{{"system":"{KEY}","messages":[{{"role":"user","content":"{other}"}}]}}"#);
-        let (found, l0) = look(Mode::Enforce, &RuleSet::defaults(), client.as_bytes());
+        let (found, l0) = look(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            client.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!((found.len(), l0.len()), (2, 2));
         let hop =
             format!(r#"{{"messages":[{{"role":"user","content":"{other}"}}],"system":"{KEY}"}}"#);
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), hop.clone().into(), &l0);
+        let (out, ledger) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            hop.clone().into(),
+            &l0,
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(
             String::from_utf8(out.to_vec()).unwrap(),
             r#"{"messages":[{"role":"user","content":"<<TW_SECRET_2>>"}],"system":"<<TW_SECRET_1>>"}"#
         );
         assert_eq!(ledger.len(), 2);
         // 各起一本账的话号就对调了 —— 这条测试防的就是它
-        let (alone, _) = replace(Mode::Enforce, &RuleSet::defaults(), hop.into(), &fresh());
+        let (alone, _) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            hop.into(),
+            &fresh(),
+            crate::guard::TEST_SHAPE,
+        );
         assert!(
             String::from_utf8(alone.to_vec())
                 .unwrap()
@@ -688,13 +865,36 @@ mod tests {
 
     #[test]
     fn look_numbers_only_under_enforce_and_reports_the_same_either_way() {
-        let (seen, l) = look(Mode::Observe, &RuleSet::defaults(), &body());
-        assert_eq!(seen, find(Mode::Observe, &RuleSet::defaults(), &body()));
+        let (seen, l) = look(
+            Mode::Observe,
+            &RuleSet::defaults(),
+            &body(),
+            crate::guard::TEST_SHAPE,
+        );
+        assert_eq!(
+            seen,
+            find(
+                Mode::Observe,
+                &RuleSet::defaults(),
+                &body(),
+                crate::guard::TEST_SHAPE
+            )
+        );
         assert!(l.is_empty(), "观察档不该编号");
-        let (acted, l) = look(Mode::Enforce, &RuleSet::defaults(), &body());
+        let (acted, l) = look(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            &body(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(acted, seen);
         assert_eq!(l.len(), 1);
-        let (none, l) = look(Mode::Off, &RuleSet::defaults(), &body());
+        let (none, l) = look(
+            Mode::Off,
+            &RuleSet::defaults(),
+            &body(),
+            crate::guard::TEST_SHAPE,
+        );
         assert!(none.is_empty() && l.is_empty());
     }
 
@@ -708,9 +908,15 @@ mod tests {
             .map(|h| t[h.bytes.clone()].to_string())
             .collect();
         assert_eq!(found, vec!["hunter2".to_string(), KEY.to_string()]);
-        let body = format!(r#"{{"content":"{t}"}}"#);
+        let body = format!(r#"{{"messages":[{{"content":"{t}"}}]}}"#);
         assert_eq!(
-            find(Mode::Observe, &RuleSet::defaults(), body.as_bytes()).len(),
+            find(
+                Mode::Observe,
+                &RuleSet::defaults(),
+                body.as_bytes(),
+                crate::guard::TEST_SHAPE
+            )
+            .len(),
             2
         );
         let (out, _) = replace(
@@ -718,6 +924,7 @@ mod tests {
             &RuleSet::defaults(),
             body.clone().into(),
             &ledger_for(body.as_bytes()),
+            crate::guard::TEST_SHAPE,
         );
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(out.contains("postgres://app:<<TW_SECRET_2>>@db/x"), "{out}");
@@ -730,8 +937,19 @@ mod tests {
         let pasted = format!(
             r#"{{"messages":[{{"role":"user","content":"上次发的是 <<TW_SECRET_1>>，这次是 {KEY}"}}]}}"#
         );
-        let (_, l0) = look(Mode::Enforce, &RuleSet::defaults(), pasted.as_bytes());
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), pasted.into(), &l0);
+        let (_, l0) = look(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            pasted.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
+        let (out, ledger) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            pasted.into(),
+            &l0,
+            crate::guard::TEST_SHAPE,
+        );
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(out.contains("这次是 <<TW_SECRET_2>>"), "{out}");
         assert_eq!(
@@ -739,14 +957,18 @@ mod tests {
             format!("<<TW_SECRET_1>> / {KEY}")
         );
         // 重放用的那本新账也让开它
-        let stored = format!("<<TW_SECRET_1>> {KEY}");
+        let stored = format!(r#"{{"messages":[{{"content":"<<TW_SECRET_1>> {KEY}"}}]}}"#);
         let (out, _) = replace(
             Mode::Enforce,
             &RuleSet::defaults(),
             bytes::Bytes::from(stored.clone()),
             &ledger_for(stored.as_bytes()),
+            crate::guard::TEST_SHAPE,
         );
-        assert_eq!(&out[..], b"<<TW_SECRET_1>> <<TW_SECRET_2>>");
+        assert_eq!(
+            &out[..],
+            br#"{"messages":[{"content":"<<TW_SECRET_1>> <<TW_SECRET_2>>"}]}"#
+        );
     }
 
     /// 内容过滤的几条规则：拒绝一个词、只记录一个词、删掉零宽字符

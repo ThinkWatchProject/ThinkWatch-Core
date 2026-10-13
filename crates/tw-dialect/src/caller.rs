@@ -115,26 +115,26 @@ pub fn rewrite(dialect: Dialect, body: &mut Value, mut f: impl FnMut(&mut String
 }
 
 #[derive(Default)]
-struct Collect {
+pub(crate) struct Collect {
     at: Vec<Step>,
-    out: Vec<Spot>,
+    pub(crate) out: Vec<Spot>,
 }
 
 impl Collect {
-    fn key(&mut self, k: &str, f: impl FnOnce(&mut Self)) {
+    pub(crate) fn key(&mut self, k: &str, f: impl FnOnce(&mut Self)) {
         self.at.push(Step::Key(k.to_string()));
         f(self);
         self.at.pop();
     }
 
-    fn index(&mut self, i: usize, f: impl FnOnce(&mut Self)) {
+    pub(crate) fn index(&mut self, i: usize, f: impl FnOnce(&mut Self)) {
         self.at.push(Step::Index(i));
         f(self);
         self.at.pop();
     }
 
     /// 眼下这个位置上的值是一个非空字符串就记下
-    fn here(&mut self, v: &Value, in_tool_result: bool) {
+    pub(crate) fn here(&mut self, v: &Value, in_tool_result: bool) {
         if v.as_str().is_some_and(|s| !s.is_empty()) {
             self.out.push(Spot {
                 path: self.at.clone(),
@@ -144,7 +144,7 @@ impl Collect {
     }
 
     /// `v.k` 是一个非空字符串就记下
-    fn field(&mut self, v: &Value, k: &str, in_tool_result: bool) {
+    pub(crate) fn field(&mut self, v: &Value, k: &str, in_tool_result: bool) {
         if let Some(x) = v.get(k) {
             self.key(k, |c| c.here(x, in_tool_result));
         }
@@ -152,7 +152,7 @@ impl Collect {
 
     /// `string | [{text}]` 形状的内容：中间表示用 `text_of` 读它，数组里**每一块**的
     /// `text` 都算，不看块的类型
-    fn text_of(&mut self, v: &Value, in_tool_result: bool) {
+    pub(crate) fn text_of(&mut self, v: &Value, in_tool_result: bool) {
         match v {
             Value::String(_) => self.here(v, in_tool_result),
             Value::Array(items) => {
@@ -167,7 +167,7 @@ impl Collect {
     /// 一个值里的全部字符串。中间表示把它整个写成 JSON 文字的地方用（Gemini 的函数
     /// 结果、Bedrock 的 `json` 结果）：调用方的字在这些字符串里，键名和 JSON 的标点
     /// 不是谁打的字
-    fn leaves(&mut self, v: &Value, in_tool_result: bool) {
+    pub(crate) fn leaves(&mut self, v: &Value, in_tool_result: bool) {
         match v {
             Value::String(_) => self.here(v, in_tool_result),
             Value::Array(items) => {
@@ -185,11 +185,11 @@ impl Collect {
     }
 }
 
-fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+pub(crate) fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
 }
 
-fn each<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = (usize, &'a Value)> {
+pub(crate) fn each<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = (usize, &'a Value)> {
     v.get(k)
         .and_then(Value::as_array)
         .map(Vec::as_slice)
@@ -257,7 +257,7 @@ fn anthropic_block(c: &mut Collect, b: &Value) {
 
 /// `document` 块：`text` 来源的 `data`，`content` 来源的各块文字。base64 和 URL
 /// 来源是文件，不是文字
-fn anthropic_document(c: &mut Collect, b: &Value, in_tool_result: bool) {
+pub(crate) fn anthropic_document(c: &mut Collect, b: &Value, in_tool_result: bool) {
     let Some(src) = b.get("source") else {
         return;
     };
@@ -273,7 +273,7 @@ fn anthropic_document(c: &mut Collect, b: &Value, in_tool_result: bool) {
 }
 
 /// `search_result` 块：中间表示里是「标题、来源、正文」三段拼成的一段文字
-fn anthropic_search_result(c: &mut Collect, b: &Value, in_tool_result: bool) {
+pub(crate) fn anthropic_search_result(c: &mut Collect, b: &Value, in_tool_result: bool) {
     c.field(b, "title", in_tool_result);
     c.field(b, "source", in_tool_result);
     if let Some(content) = b.get("content") {
@@ -394,7 +394,7 @@ fn responses_content(c: &mut Collect, content: &Value, in_tool_result: bool) {
 
 /// Gemini 的字段名驼峰和下划线写法都认（`gemini::request::field`）。这个值写在哪个
 /// 键下：先驼峰，再下划线
-fn gemini_key(v: &Value, camel: &str) -> Option<String> {
+pub(crate) fn gemini_key(v: &Value, camel: &str) -> Option<String> {
     if v.get(camel).is_some() {
         return Some(camel.to_string());
     }

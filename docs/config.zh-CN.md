@@ -554,7 +554,7 @@ pricing:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏（应用里叫「密钥与隐私」）：请求发出前，按每条规则把其中任何位置的凭据和个人信息替换为占位符，或只记录。 |
+| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏（应用里叫「密钥与隐私」）：请求发出前，按每条规则把其中正文（消息、系统提示、推理、工具调用的参数和结果、工具说明）里的凭据和个人信息替换为占位符，或只记录；id、模型名等协议字段原样发出。 |
 | `inspect_tools` | 对象，见 [`security.inspect_tools`](#cfg-security-inspect_tools) | — | 工具调用审查（应用里叫「危险命令」）：模型返回的工具调用中出现危险命令时切断响应。 |
 | `content` | 对象，见 [`security.content`](#cfg-security-content) | — | 内容过滤：调用方发送的内容中、或模型回答的正文中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除或替换命中的内容，或只记录。 |
 <!-- /generated -->

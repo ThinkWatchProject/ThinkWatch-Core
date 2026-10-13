@@ -1308,19 +1308,21 @@ content:
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
         let body = format!(r#"{{"messages":[{{"content":"{key} PRJ-123456 E-1234"}}]}}"#);
         // 找到三处、报三处
-        let found = crate::redact::flow::find(Mode::Enforce, &rs, body.as_bytes());
+        let shape = crate::redact::flow::Shape::Generate(tw_dialect::ir::Dialect::Anthropic);
+        let found = crate::redact::flow::find(Mode::Enforce, &rs, body.as_bytes(), shape);
         assert_eq!(found.len(), 3);
         // 只换了工号：只记录的原样发，也不进账本
         let l = crate::redact::flow::look_hits(
             Mode::Enforce,
             &rs,
             body.as_bytes(),
+            shape,
             crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
         );
         assert_eq!(l.ledger.len(), 1);
         assert_eq!(l.hits.as_ref().map(Vec::len), Some(3));
         let (out, ledger) =
-            crate::redact::flow::replace(Mode::Enforce, &rs, body.clone().into(), &l.ledger);
+            crate::redact::flow::replace(Mode::Enforce, &rs, body.clone().into(), &l.ledger, shape);
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(out.contains(key) && out.contains("PRJ-123456"), "{out}");
         assert!(

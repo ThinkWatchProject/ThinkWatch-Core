@@ -8,6 +8,9 @@
 //! 中间表示里调用方的话一个记号都不剩，系统提示和模型的话原样都在 —— 删也删在同一批
 //! 字符串上。
 //!
+//! 出站脱敏的名单（[`tw_dialect::written`]）比调用方的正文宽：中间表示里的系统提示、模型的
+//! 话和推理，在那份名单里也都要找得到（转换时封起来的压缩摘要除外：原文里它是编码过的）。
+//!
 //! 一处说明：中间表示把 Gemini 的函数结果、Bedrock 的 `json` 结果整个写成 JSON 文字，
 //! 键名也在里面；这里认的是其中的字符串。记号不放在键名里。
 
@@ -17,6 +20,7 @@ use serde_json::{Value, json};
 use tw_dialect::caller;
 use tw_dialect::convert::decode;
 use tw_dialect::ir::{Dialect, Part, Role};
+use tw_dialect::written::{self, Shape};
 
 type Marks = BTreeSet<(String, bool)>;
 
@@ -102,6 +106,19 @@ fn check(d: Dialect, v: Value, users: &[&str], tools: &[&str]) {
 
     let kept = not_callers(d, &v);
     assert!(!kept.is_empty(), "{d:?}: 例子里该有系统提示或模型的话");
+    let mut all = Marks::new();
+    for s in written::spots(Shape::Generate(d), &v) {
+        marks_in(s.get(&v).unwrap_or_default(), false, &mut all);
+    }
+    let all: BTreeSet<String> = all.into_iter().map(|(m, _)| m).collect();
+    for (m, _) in &want {
+        assert!(all.contains(m), "{d:?}: 脱敏的名单里没有 {m}");
+    }
+    // 转换时封进 `encrypted_content` 的压缩摘要在原文里是编码过的，不是一段字
+    let raw = v.to_string();
+    for m in kept.iter().filter(|m| raw.contains(m.as_str())) {
+        assert!(all.contains(m), "{d:?}: 脱敏的名单里没有 {m}");
+    }
     let mut stripped = v.clone();
     caller::rewrite(d, &mut stripped, |s, _| {
         while let (Some(i), Some(j)) = (s.find('«'), s.find('»')) {
