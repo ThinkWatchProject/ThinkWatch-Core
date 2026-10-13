@@ -756,14 +756,16 @@ refuses, deletes, replaces or only records.
 
 #### `security.redact`
 
-Before a request leaves, the whole request (system prompt, earlier answers
-and tool calls included) is searched for credentials and personal
-information. Under `enforce` what a rule finds is replaced with placeholders,
-and put back where the answer repeats them; what a rule with `action: record`
-finds is sent as it is and only recorded. Images, files and other base64
-payloads are not searched, nor are field names; custom rules also leave alone
-the identifiers a protocol needs as they are, such as item and call ids,
-types, roles, tool names and model names.
+Before a request leaves, the text written in it is searched for credentials
+and personal information: system prompts, the messages of every role
+(earlier answers included), reasoning, tool-call arguments, tool results and
+tool descriptions. Under `enforce` what a rule finds is replaced with
+placeholders, and put back where the answer repeats them; what a rule with
+`action: record` finds is sent as it is and only recorded. Values the
+protocol needs as they are, such as ids, types, roles, tool names, model
+names and signatures, are never searched, nor are field names, images,
+files, settings, or parts of a request the gateway does not recognize as
+written text.
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
