@@ -542,10 +542,13 @@ mod tests {
             .with_custom("库", r"postgres://[^\s\x22]+")
             .unwrap()
             .recording(Rule::Custom("库".into()));
-        let body =
-            r#"{"content":"use postgres://appuser:hunter2@db-primary.internal:5432/orders now"}"#;
-        let (_, ledger) =
-            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, body.as_bytes());
+        let body = r#"{"messages":[{"content":"use postgres://appuser:hunter2@db-primary.internal:5432/orders now"}]}"#;
+        let (_, ledger) = crate::guard::look(
+            tw_config::SecurityMode::Enforce,
+            &rules,
+            body.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         let red = Redaction {
             rules: Arc::new(rules),
             ledger,
@@ -566,8 +569,12 @@ mod tests {
             .with_custom("env", r"OPENAI_API_KEY=\S+")
             .unwrap();
         let request = r#"{"messages":[{"role":"user","content":"postgres://app:hunter2@db.internal:5432/orders and OPENAI_API_KEY=abc123xyz"}]}"#;
-        let (_, ledger) =
-            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, request.as_bytes());
+        let (_, ledger) = crate::guard::look(
+            tw_config::SecurityMode::Enforce,
+            &rules,
+            request.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         let red = Redaction {
             rules: Arc::new(rules),
             ledger,
@@ -639,8 +646,12 @@ mod tests {
     /// 拦截档下这个请求的账本：和 `start` 里一样，按客户端原文编号
     fn enforced(body: &str) -> Redaction {
         let rules = RuleSet::defaults();
-        let (_, ledger) =
-            crate::guard::look(tw_config::SecurityMode::Enforce, &rules, body.as_bytes());
+        let (_, ledger) = crate::guard::look(
+            tw_config::SecurityMode::Enforce,
+            &rules,
+            body.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         Redaction {
             rules: Arc::new(rules),
             ledger,
@@ -664,6 +675,7 @@ mod tests {
             &r.rules,
             Bytes::from(body.clone()),
             &r.ledger,
+            crate::guard::TEST_SHAPE,
         );
         let stored = written(record(BodyKind::Request, &body, r));
         assert_eq!(stored.as_bytes(), &sent[..]);
@@ -688,6 +700,7 @@ mod tests {
             &r.rules,
             Bytes::from(body),
             &r.ledger,
+            crate::guard::TEST_SHAPE,
         );
         let stored = written(record(BodyKind::Request, body, r));
         assert_eq!(stored.as_bytes(), &sent[..]);
@@ -708,6 +721,7 @@ mod tests {
             &r.rules,
             Bytes::from(body.clone()),
             &r.ledger,
+            crate::guard::TEST_SHAPE,
         );
         let stored = written(record(BodyKind::Request, &body, r));
         assert!(!stored.contains(KEY), "{stored}");
@@ -777,7 +791,8 @@ mod tests {
             tw_config::SecurityMode::Enforce,
         ] {
             let rules = RuleSet::defaults();
-            let seen = crate::guard::look_hits(mode, &rules, body.as_bytes());
+            let seen =
+                crate::guard::look_hits(mode, &rules, body.as_bytes(), crate::guard::TEST_SHAPE);
             assert_eq!(seen.hits.as_ref().map(Vec::len), Some(2));
             let r = Redaction {
                 rules: Arc::new(rules),
@@ -869,7 +884,10 @@ mod tests {
             tw_config::SecurityMode::Enforce,
         ] {
             let rules = RuleSet::defaults();
-            let seen = crate::guard::look_hits(mode, &rules, body.as_bytes());
+            let responses = Some(crate::guard::Shape::Generate(
+                tw_dialect::ir::Dialect::Responses,
+            ));
+            let seen = crate::guard::look_hits(mode, &rules, body.as_bytes(), responses);
             let r = Redaction {
                 rules: Arc::new(rules),
                 ledger: seen.ledger,

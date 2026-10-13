@@ -643,6 +643,9 @@ struct Pipes {
     turns: Option<turn::Turns>,
     /// 整条连接一行的 Realtime 连接：每一次回答的用量（`response.done`）加到这一行上
     realtime: bool,
+    /// 客户端的帧是什么形状：出站脱敏只在写出来的文字里找（见 [`outbound`]）。Responses 的连接
+    /// 每一帧是一个 Responses 请求的样子，Realtime 的是它的事件；别的路径认不出，不找
+    written: Option<crate::guard::Shape>,
     /// 范围里可能有插件时才有
     plugins: Option<Plugins>,
     /// 每个 `response.create` 发出去的模型名怎么定。Responses 的连接才有
@@ -804,6 +807,13 @@ pub(crate) async fn proxy(
     let name = &upstream.provider.name;
     // 每一轮一行的连接连上了：连接本身不留行，每一轮各有各的号（见 `turn`）。连不上的补上
     // 这一行，和整条连接一行的一样报
+    let written = match &rows {
+        Rows::Turns { .. } => Some(crate::guard::Shape::Generate(
+            tw_dialect::ir::Dialect::Responses,
+        )),
+        Rows::Connection { realtime: true, .. } => Some(crate::guard::Shape::RealtimeEvent),
+        Rows::Connection { .. } => None,
+    };
     let (id, mut ending, turns, realtime) = match (rows, &connected) {
         (
             Rows::Connection {
@@ -933,6 +943,7 @@ pub(crate) async fn proxy(
         id,
         turns,
         realtime,
+        written,
         plugins,
         naming,
         requested_model: String::new(),
@@ -1497,15 +1508,20 @@ async fn reply_failed(c_tx: &mut ClientSink, err: GatewayError) -> Step {
 /// `crate::guard::REPORTED_MAX`）
 fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     let mode = p.rules.redact_mode;
-    if !mode.detects() || p.rules.redact.is_empty() {
+    let Some(shape) = p
+        .written
+        .filter(|_| mode.detects() && !p.rules.redact.is_empty())
+    else {
         return UpMsg::Text(text.into());
-    }
-    // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不算（见 `crate::guard::find`）
-    let hits = crate::guard::hits(&text, &p.rules.redact);
+    };
+    // 换的和报出去的是同一批：只在写出来的文字里找，我们自己的占位符、base64 载荷不算（见
+    // `crate::guard::find`）
+    let scope = tw_guard::redact::flow::Scope::Written(shape);
+    let hits = tw_guard::redact::flow::hits_in(&text, &p.rules.redact, scope);
     if hits.is_empty() {
         return UpMsg::Text(text.into());
     }
-    let found = tw_guard::redact::flow::reported(&text, &p.rules.redact, &hits);
+    let found = tw_guard::redact::flow::reported(&text, &p.rules.redact, &hits, scope);
     let replaced = mode.acts().then(|| {
         // 只记录的规则命中的不换
         let r = tw_guard::redact::replace::apply(

@@ -12,6 +12,7 @@ use tw_guard::redact::rules::RuleSet;
 
 use super::*;
 use crate::bodies::Redaction;
+use crate::guard::Shape;
 
 const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 const GHP: &str = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
@@ -39,7 +40,9 @@ fn redacted(
     rules: RuleSet,
 ) -> Vec<SecurityHitDetail> {
     let text = body.to_string();
-    let look = crate::guard::look_hits(mode, &rules, text.as_bytes());
+    // 认不出格式的例子写成嵌入请求的样子
+    let shape = dialect.map_or(Shape::Embeddings, Shape::Generate);
+    let look = crate::guard::look_hits(mode, &rules, text.as_bytes(), Some(shape));
     let hits = look.hits.unwrap_or_default();
     let redaction = Redaction {
         rules: Arc::new(rules),
@@ -270,10 +273,11 @@ fn an_unknown_format_still_has_paths_and_plain_text_has_none() {
     assert_eq!(place_of(l), (HitPart::Message, None, None, None));
     assert_eq!(l.before, "a ");
 
+    // 不是 JSON 的一段文字（WebSocket 上别的路径的一帧在日志里的样子）：整段找
     let text = format!("plain {KEY} text");
     let rules = RuleSet::defaults();
-    let look = crate::guard::look_hits(Mode::Observe, &rules, text.as_bytes());
-    let hits = look.hits.unwrap();
+    let hits = crate::guard::hits(&text, &rules);
+    let found = tw_guard::redact::rules::findings(&text, &hits);
     let redaction = Redaction::default();
     let seen = Seen {
         body: text.as_bytes(),
@@ -282,7 +286,7 @@ fn an_unknown_format_still_has_paths_and_plain_text_has_none() {
         redaction: &redaction,
         replaced: false,
     };
-    let d = secrets(&seen, &look.found);
+    let d = secrets(&seen, &found);
     let l = &d[0].locations[0];
     assert_eq!((l.path.as_str(), l.before.as_str()), ("", "plain "));
     assert_eq!(l.after, " text");
@@ -359,7 +363,12 @@ fn a_value_written_with_other_escapes_shows_its_placeholder() {
         r#"{{"messages":[{{"role":"user","content":"first {KEY} and postgres://app:hunter\u00e9hunter@db/x end"}}]}}"#
     );
     let rules = RuleSet::defaults();
-    let look = crate::guard::look_hits(Mode::Enforce, &rules, text.as_bytes());
+    let look = crate::guard::look_hits(
+        Mode::Enforce,
+        &rules,
+        text.as_bytes(),
+        crate::guard::TEST_SHAPE,
+    );
     let hits = look.hits.unwrap_or_default();
     let redaction = Redaction {
         rules: Arc::new(rules),
@@ -1072,7 +1081,12 @@ fn reported_items_on_a_large_body_cost_linear_time() {
         }
         let text = json!({"model": "m", "messages": msgs}).to_string();
         let rules = RuleSet::defaults();
-        let look = crate::guard::look_hits(Mode::Enforce, &rules, text.as_bytes());
+        let look = crate::guard::look_hits(
+            Mode::Enforce,
+            &rules,
+            text.as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         let hits = look.hits.unwrap_or_default();
         let redaction = Redaction {
             rules: Arc::new(rules),

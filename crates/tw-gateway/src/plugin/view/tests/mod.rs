@@ -1200,7 +1200,7 @@ fn placeholders_in_edits_are_revealed_before_write_back() {
     let mut bridge = Bridge::new(std::sync::Arc::new(
         tw_guard::redact::rules::RuleSet::defaults(),
     ));
-    bridge.learn(raw.to_string().as_bytes());
+    bridge.learn(raw.to_string().as_bytes(), crate::guard::TEST_SHAPE);
     let built = build(Dialect::Anthropic, &raw, MESSAGES).unwrap();
     let mut input = trim(&built.view, &all());
     bridge.hide_value(&mut input);

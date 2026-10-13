@@ -61,15 +61,20 @@ impl Bridge {
     ///
     /// 账里记的是值解开转义之后的样子（见 [`Ledger`]）：插件看到的是解码过的正文，请求体
     /// 里写着 `\n` 的私钥块在那儿是真的换行，照样认得出、换成同一个号。
-    pub fn learn(&mut self, body: &[u8]) {
+    ///
+    /// 和出站脱敏一样只在写出来的文字里找（`shape`，见 [`crate::guard`]）：认不出形状的不找。
+    pub fn learn(&mut self, body: &[u8], shape: Option<crate::guard::Shape>) {
         let Ok(text) = std::str::from_utf8(body) else {
             return;
         };
         let seed = std::mem::replace(&mut self.ledger, Ledger::new(Scheme::SECRET)).avoiding(text);
-        let hits = if self.rules.is_empty() {
-            Vec::new()
-        } else {
-            crate::guard::hits(text, &self.rules)
+        let hits = match shape.filter(|_| !self.rules.is_empty()) {
+            Some(shape) => tw_guard::redact::flow::hits_in(
+                text,
+                &self.rules,
+                tw_guard::redact::flow::Scope::Written(shape),
+            ),
+            None => Vec::new(),
         };
         self.ledger = if hits.is_empty() {
             seed
@@ -381,6 +386,7 @@ mod tests {
             serde_json::json!({"messages": [{"content": format!("k={KEY}")}]})
                 .to_string()
                 .as_bytes(),
+            crate::guard::TEST_SHAPE,
         );
         let shown = b.hide(&format!("用这把 {KEY} 试试"));
         assert!(!shown.contains(KEY), "{shown}");
@@ -391,7 +397,10 @@ mod tests {
     #[test]
     fn a_key_the_body_did_not_have_is_found_and_numbered_after_the_known_ones() {
         let mut b = Bridge::new(rules());
-        b.learn(format!("{{\"a\":\"{KEY}\"}}").as_bytes());
+        b.learn(
+            format!("{{\"messages\":[{{\"content\":\"{KEY}\"}}]}}").as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         let shown = b.hide(&format!("新的 {OTHER}"));
         assert_eq!(shown, "新的 <<TW_SECRET_2>>");
         assert_eq!(b.reveal(&shown), format!("新的 {OTHER}"));
@@ -404,7 +413,12 @@ mod tests {
         // 请求体里私钥块的换行是 `\n` 两个字符，插件看到的正文里是真的换行：还是 1 号，
         // 换回来的是真的换行，不是一个反斜杠和一个 n
         let mut b = Bridge::new(rules());
-        b.learn(serde_json::json!({ "content": PEM }).to_string().as_bytes());
+        b.learn(
+            serde_json::json!({"messages": [{ "content": PEM }]})
+                .to_string()
+                .as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         assert_eq!(b.ledger().len(), 1);
         let shown = b.hide(&format!("钥匙：{PEM}"));
         assert_eq!(shown, "钥匙：<<TW_SECRET_1>>");
@@ -449,7 +463,7 @@ mod tests {
     #[test]
     fn nothing_recognised_means_nothing_changes() {
         let mut b = Bridge::new(rules());
-        b.learn(b"{\"x\":\"hello\"}");
+        b.learn(b"{\"x\":\"hello\"}", crate::guard::TEST_SHAPE);
         assert!(b.is_empty());
         assert_eq!(b.hide("普通的一段话"), "普通的一段话");
     }
@@ -457,7 +471,10 @@ mod tests {
     #[test]
     fn the_tail_that_could_still_become_a_known_value_is_held() {
         let mut b = Bridge::new(rules());
-        b.learn(format!("{{\"a\":\"{KEY}\"}}").as_bytes());
+        b.learn(
+            format!("{{\"messages\":[{{\"content\":\"{KEY}\"}}]}}").as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
         let buf = format!("前面的话 {}", &KEY[..10]);
         assert_eq!(b.hold_from(&buf), buf.len() - 10);
         assert_eq!(b.hold_from("别的 sk"), "别的 sk".len() - 2);
@@ -579,7 +596,7 @@ mod tests {
             let body = serde_json::json!({ "messages": messages });
             let started = std::time::Instant::now();
             let mut b = Bridge::new(rules());
-            b.learn(body.to_string().as_bytes());
+            b.learn(body.to_string().as_bytes(), crate::guard::TEST_SHAPE);
             let mut shown = body.clone();
             b.hide_value(&mut shown);
             let text = shown.to_string();

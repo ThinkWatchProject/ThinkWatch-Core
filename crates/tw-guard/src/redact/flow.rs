@@ -1,17 +1,23 @@
 //! 一个请求体在出站脱敏里怎么走：先看一遍、编好号（[`look`]），每一跳发出去之前换
 //! （[`replace`]）。两个网关都用这一份。
 //!
-//! # 查的是整个请求体
+//! # 查的是请求里写出来的文字
 //!
-//! 不只是用户消息：系统提示、模型以前的回答、工具调用的参数里都可能躺着一把密钥。
-//! 规则直接跑在请求体的 JSON 原文上（见 [`crate::redact::rules::scan`]：它认得 JSON
-//! 的转义，换下来的值放回去还是合法的 JSON）。三样东西不算：
+//! 不只是用户消息：系统提示、模型以前的回答、推理、工具调用的参数、工具结果里都可能躺着
+//! 一把密钥。**哪些字符串是写出来的文字按协议的结构认**（[`tw_dialect::written`] 的名单）：
+//! id、类型、角色、工具名、模型名、签名、配置项这些协议自己的值不找、不换 —— 改一个字上游
+//! 就拒收整个请求，而它们也不是谁写的话。名单之外的（不认识的块、不认识的字段）一律不看。
 //!
-//! - **base64 载荷**（图片、文件、推理签名、`data:` URI）：一段编码过的图片里碰巧
+//! 规则跑在请求体的 JSON 原文上（见 [`crate::redact::rules::scan`]：它认得 JSON 的转义，
+//! 换下来的值放回去还是合法的 JSON），找到的命中只留落在正文字符串里的（[`Scope::Written`]）。
+//! 正文里也有两样不算：
+//!
+//! - **base64 载荷**（工具参数里的文件内容、文字里的 `data:` URI）：一段编码过的图片里碰巧
 //!   有一截像密钥的字母，换掉它换坏的是那张图，报出来的是一条没人看得懂的误报；
-//! - **我们自己的占位符**（见 [`hits`]）；
-//! - **请求体的结构**：键；自定义规则也不找协议里的 id、类型、角色、工具名、模型名
-//!   （见 [`untouched`]）。
+//! - **我们自己的占位符**（见 [`hits_in`]）。
+//!
+//! 落盘前打码、日志里的前后文不发给谁，在整段文字上找（[`Scope::Whole`]）：只是不让值留在
+//! 盘上和界面上。
 //!
 //! # 仅记录的规则
 //!
@@ -33,11 +39,28 @@
 
 use std::ops::Range;
 
+pub use tw_dialect::written::Shape;
+
 use crate::policy::Mode;
 use crate::redact::replace::{Ledger, Scheme};
 use crate::redact::rules::{Finding, Hit, RuleSet};
 
-/// 按规则找一遍，**不算我们自己的占位符，也不进 base64 载荷**。
+/// 在一份文字的哪些地方找。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// 一个这种形状的请求体里写出来的文字（[`tw_dialect::written`]）。发出去的请求只在这里
+    /// 找、只换这里；不是 JSON 的没有正文可言，一处都不算
+    Written(Shape),
+    /// 整段文字：落盘前打码、日志里的前后文、解码过的一段话。键和 base64 载荷照样不算
+    Whole,
+}
+
+/// [`hits_in`] 整段文字（[`Scope::Whole`]）。
+pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
+    hits_in(text, rules, Scope::Whole)
+}
+
+/// 按规则找一遍，**只在 `scope` 里找，不算我们自己的占位符，也不进 base64 载荷**。
 ///
 /// 连接串里写着 `postgres://app:<<TW_SECRET_2>>@db` 的那一段，在口令那条规则看来就是
 /// 一个口令 —— 可它是我们换上去的：存下来的请求拿去重放、用户把详情里看到的东西贴回
@@ -46,24 +69,26 @@ use crate::redact::rules::{Finding, Hit, RuleSet};
 ///
 /// **先去掉、再合并**：每条规则各自的命中先去掉不算的那些，剩下的才合并重叠的（见
 /// [`crate::redact::rules::resolve`]）。反过来的话，一处要换的值和一处压在占位符上（或者
-/// 落在协议的 id 里）的命中合成一处之后，会跟着它一起被去掉，原样发出去。
-pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
+/// 落在正文外面）的命中合成一处之后，会跟着它一起被去掉，原样发出去。
+///
+/// **先在整段上找、再看落在哪儿**：大多数请求一处都不命中，正文和载荷在哪儿等有了命中
+/// 再找 —— 认正文要把请求体解析一遍。
+pub fn hits_in(text: &str, rules: &RuleSet, scope: Scope) -> Vec<Hit> {
     let mut hits = crate::redact::rules::scan_unresolved(text, rules);
     if hits.is_empty() {
         return hits;
     }
     off_placeholders(text, &mut hits);
-    // 大多数请求一处都不命中：载荷在哪儿等有了命中再找
-    if !hits.is_empty() {
-        let (everyone, custom) = untouched(text);
-        outside(&mut hits, everyone);
-        if hits.iter().any(|h| h.rule.custom()) && !custom.is_empty() {
-            let (mut mine, builtin): (Vec<Hit>, Vec<Hit>) =
-                hits.into_iter().partition(|h| h.rule.custom());
-            outside(&mut mine, custom);
-            hits = builtin;
-            hits.extend(mine);
+    if !hits.is_empty()
+        && let Scope::Written(shape) = scope
+    {
+        match tw_dialect::written::ranges(shape, text) {
+            Some(written) => within(&mut hits, &written),
+            None => hits.clear(),
         }
+    }
+    if !hits.is_empty() {
+        outside(&mut hits, untouched(text));
     }
     crate::redact::rules::resolve(hits, rules)
 }
@@ -81,6 +106,15 @@ pub fn off_placeholders(text: &str, hits: &mut Vec<Hit>) {
 /// 上的「测试」用它：用户贴进来的是一段正文，网关找的是装着它的 JSON —— 结论得一致。
 pub fn hits_plain(text: &str, rules: &RuleSet) -> Vec<Hit> {
     crate::redact::rules::plain_with(text, |encoded| hits(encoded, rules))
+}
+
+/// 只留整个落在 `spans` 里某一段之内的命中。`spans` 按起点排好、互不重叠（原文里一个个
+/// 字符串引号之间的那一段）。
+fn within(hits: &mut Vec<Hit>, spans: &[Range<usize>]) {
+    hits.retain(|h| {
+        let after = spans.partition_point(|s| s.start <= h.bytes.start);
+        after > 0 && spans[after - 1].end >= h.bytes.end
+    });
 }
 
 /// 只留和 `spans` 里哪一段都不重叠的命中。
@@ -110,24 +144,25 @@ fn outside(hits: &mut Vec<Hit>, mut spans: Vec<Range<usize>>) {
 /// 找一遍。**观察档和替换档都找**，关闭时不找。
 ///
 /// **不是 UTF-8 就不看。**图片之类的二进制体里不会有粘贴进来的 key。
-pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
+pub fn find(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape) -> Vec<Finding> {
     if !mode.detects() || rules.is_empty() {
         return Vec::new();
     }
     let Ok(text) = std::str::from_utf8(body) else {
         return Vec::new();
     };
-    reported(text, rules, &hits(text, rules))
+    let scope = Scope::Written(shape);
+    reported(text, rules, &hits_in(text, rules, scope), scope)
 }
 
-/// 报出去的记录：`found`（[`hits`] 在 `text` 上找到的），**加上被换成占位符的命中盖住的、
-/// 只记录的规则的命中**。
+/// 报出去的记录：`found`（[`hits_in`] 在 `text` 的 `scope` 里找到的），**加上被换成占位符的
+/// 命中盖住的、只记录的规则的命中**（同一个 `scope` 里找）。
 ///
 /// 一处值两条规则都认得、一条换成占位符一条只记录时，换的那条说了算（见
 /// [`crate::redact::rules::scan`]）：发出去的是占位符，`found` 里只记录的那条只剩让开之后的
 /// 几截（存下来时照样打码）。报的时候它整个算一处、照样报 —— 用户要看得见它在认哪些值。
 /// 没有只记录的规则时就是 `found` 的那些
-pub fn reported(text: &str, rules: &RuleSet, found: &[Hit]) -> Vec<Finding> {
+pub fn reported(text: &str, rules: &RuleSet, found: &[Hit], scope: Scope) -> Vec<Finding> {
     let Some(rec) = rules.recording_only() else {
         return crate::redact::rules::findings(text, found);
     };
@@ -138,7 +173,7 @@ pub fn reported(text: &str, rules: &RuleSet, found: &[Hit]) -> Vec<Finding> {
         .filter(|h| !rules.records(&h.rule))
         .cloned()
         .collect();
-    all.extend(hits(text, &rec));
+    all.extend(hits_in(text, &rec, scope));
     all.sort_by_key(|h| h.bytes.start);
     crate::redact::rules::findings(text, &all)
 }
@@ -163,15 +198,21 @@ pub fn ledger_for(body: &[u8]) -> Ledger {
 /// **替换档下账本在这里就编好号**：原文里找到的每个值按出现的先后发号，让开原文里本来
 /// 就写着的占位符。之后每一跳都接着这本账换（[`replace`]），存下来的那份请求也照它换。
 /// 不在替换档时账本是空的。
-pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) {
-    look_from(mode, rules, body, Ledger::new(Scheme::SECRET))
+pub fn look(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape) -> (Vec<Finding>, Ledger) {
+    look_from(mode, rules, body, shape, Ledger::new(Scheme::SECRET))
 }
 
 /// [`look`]，**接着 `seed` 的账编号**：一个请求改过之后再看一遍时（桌面版的插件改写过的
 /// 请求），改过的这一份接着原文那本账编，同一个值还是同一个号，新出现的值接着往后编。
 /// 不在替换档时账本是空的，`seed` 用不上。
-pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
-    let l = look_hits(mode, rules, body, seed);
+pub fn look_from(
+    mode: Mode,
+    rules: &RuleSet,
+    body: &[u8],
+    shape: Shape,
+    seed: Ledger,
+) -> (Vec<Finding>, Ledger) {
+    let l = look_hits(mode, rules, body, shape, seed);
     (l.found, l.ledger)
 }
 
@@ -191,7 +232,7 @@ pub struct Look {
 }
 
 /// [`look_from`]，把找到的命中一起交回去（见 [`Look::hits`]）。
-pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> Look {
+pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape, seed: Ledger) -> Look {
     let empty = || Look {
         found: Vec::new(),
         ledger: Ledger::new(Scheme::SECRET),
@@ -203,8 +244,9 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> Look
     let Ok(text) = std::str::from_utf8(body) else {
         return empty();
     };
-    let hits = hits(text, rules);
-    let found = reported(text, rules, &hits);
+    let scope = Scope::Written(shape);
+    let hits = hits_in(text, rules, scope);
+    let found = reported(text, rules, &hits, scope);
     let ledger = if !mode.acts() {
         Ledger::new(Scheme::SECRET)
     } else {
@@ -226,6 +268,7 @@ pub fn replace(
     rules: &RuleSet,
     body: bytes::Bytes,
     ledger: &Ledger,
+    shape: Shape,
 ) -> (bytes::Bytes, Ledger) {
     if !mode.acts() || rules.is_empty() {
         return (body, ledger.clone());
@@ -234,7 +277,7 @@ pub fn replace(
     let Ok(text) = std::str::from_utf8(&body) else {
         return (body, ledger.clone());
     };
-    let found = hits(text, rules);
+    let found = hits_in(text, rules, Scope::Written(shape));
     // 只记录的规则命中的不换
     let hits = rules.to_replace(&found);
     if hits.is_empty() {
@@ -262,55 +305,21 @@ const CARRIERS: &[&str] = &[
 /// 图片、签名动辄上千
 const PAYLOAD_MIN: usize = 256;
 
-/// 不换的地方，两份：**哪条规则都不换的** —— base64 载荷（见 [`payload`]）和每一个键；
-/// **自定义规则不换的** —— 协议里标识一样东西的值（[`structural`]）。
-///
-/// 一个自定义规则 `abc123` 按子串找，会找进 Codex 的条目 id（`fco_019f…`，十六进制的
-/// UUID）里去：换成占位符之后上游以「id 里有别的字符」拒绝整个请求，而历史每一轮都整段
-/// 重发，这段对话从此每一轮都被拒。类型、工具名换掉同理。
-///
-/// **内置规则照找这些值**：它们认的是有前缀、有格式的东西（`AKIA…`、号码），不会长在一个
-/// 十六进制的 id 里；而工具参数这种对象里，凭据和号码常常就写在 `aws_access_key_id`、
-/// `user_id` 这样的键下面。
-fn untouched(text: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
-    let (mut everyone, mut custom) = (Vec::new(), Vec::new());
-    json_strings(text, |s, key, is_key| match key {
-        _ if is_key => everyone.push(s),
-        _ if payload(&text[s.clone()], key) => everyone.push(s),
-        Some(k) if structural(k) => custom.push(s),
-        _ => {}
+/// 哪条规则都不换的地方：每一个键，和 base64 载荷（见 [`payload`]）。
+fn untouched(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    json_strings(text, |s, key, is_key| {
+        if is_key || payload(&text[s.clone()], key) {
+            out.push(s);
+        }
     });
-    (everyone, custom)
+    out
 }
 
 /// 一个值是不是 base64 载荷：[`CARRIERS`] 下面、长得像 base64 的，和任何地方的
 /// `data:…;base64,` URI
 fn payload(value: &str, key: Option<&str>) -> bool {
     data_uri(value) || (key.is_some_and(|k| CARRIERS.contains(&k)) && looks_base64(value))
-}
-
-/// 各家协议里值是一个标识、不是一段话的那些键：条目和调用的 id、类型、角色、工具名、
-/// 模型名。**只认协议自己的键**，不按 `_id` 结尾去猜：工具参数里的 `user_id`、`order_id`
-/// 是用户的数据。
-fn structural(key: &str) -> bool {
-    matches!(
-        key,
-        "id" | "call_id"
-            | "item_id"
-            | "tool_use_id"
-            | "tool_call_id"
-            | "toolUseId"
-            | "previous_response_id"
-            | "response_id"
-            | "type"
-            | "role"
-            | "name"
-            | "namespace"
-            | "model"
-            | "status"
-            | "object"
-            | "phase"
-    )
 }
 
 /// `end` 是一个字符串的结尾（引号之前）：它后面（跳过空白）是冒号的话，这个字符串是一个键
@@ -397,6 +406,11 @@ fn looks_base64(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    use tw_dialect::ir::Dialect;
+
+    /// 测试里的请求体大多写成 Anthropic 的样子
+    const S: Shape = Shape::Generate(Dialect::Anthropic);
+
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn body() -> bytes::Bytes {
@@ -411,7 +425,7 @@ mod tests {
 
     #[test]
     fn enforce_replaces_with_a_placeholder_and_keeps_the_body_valid_json() {
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body(), &fresh());
+        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body(), &fresh(), S);
         let text = String::from_utf8(out.to_vec()).unwrap();
         assert!(!text.contains(KEY), "{text}");
         assert!(text.contains("<<TW_SECRET_1>>"), "{text}");
@@ -429,19 +443,19 @@ mod tests {
     #[test]
     fn observe_finds_what_enforce_would_replace_and_changes_nothing() {
         // 观察档**只记录，不改变任何行为**；它报的和替换档会换的是同一批
-        let seen = find(Mode::Observe, &RuleSet::defaults(), &body());
+        let seen = find(Mode::Observe, &RuleSet::defaults(), &body(), S);
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].masked.contains("AAAAAAAAAAAA"));
-        assert_eq!(seen, find(Mode::Enforce, &RuleSet::defaults(), &body()));
-        let (out, ledger) = replace(Mode::Observe, &RuleSet::defaults(), body(), &fresh());
+        assert_eq!(seen, find(Mode::Enforce, &RuleSet::defaults(), &body(), S));
+        let (out, ledger) = replace(Mode::Observe, &RuleSet::defaults(), body(), &fresh(), S);
         assert_eq!(out, body());
         assert!(ledger.is_empty());
     }
 
     #[test]
     fn off_does_not_even_look() {
-        assert!(find(Mode::Off, &RuleSet::defaults(), &body()).is_empty());
-        let (out, _) = replace(Mode::Off, &RuleSet::defaults(), body(), &fresh());
+        assert!(find(Mode::Off, &RuleSet::defaults(), &body(), S).is_empty());
+        let (out, _) = replace(Mode::Off, &RuleSet::defaults(), body(), &fresh(), S);
         assert_eq!(out, body());
     }
 
@@ -449,16 +463,28 @@ mod tests {
     fn a_binary_body_is_left_alone_instead_of_being_mangled() {
         // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求。
         let raw = bytes::Bytes::from(vec![0xff, 0xfe, 0x00, 0x01]);
-        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), raw.clone(), &fresh());
+        let (out, l) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            raw.clone(),
+            &fresh(),
+            S,
+        );
         assert_eq!(out, raw);
         assert!(l.is_empty());
-        assert!(find(Mode::Enforce, &RuleSet::defaults(), &raw).is_empty());
+        assert!(find(Mode::Enforce, &RuleSet::defaults(), &raw, S).is_empty());
     }
 
     #[test]
     fn a_body_with_nothing_to_redact_is_returned_untouched() {
         let plain = bytes::Bytes::from_static(b"{\"messages\":[]}");
-        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), plain.clone(), &fresh());
+        let (out, l) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            plain.clone(),
+            &fresh(),
+            S,
+        );
         assert_eq!(out, plain);
         assert!(l.is_empty());
     }
@@ -470,18 +496,24 @@ mod tests {
         let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let client =
             format!(r#"{{"system":"{KEY}","messages":[{{"role":"user","content":"{other}"}}]}}"#);
-        let (found, l0) = look(Mode::Enforce, &RuleSet::defaults(), client.as_bytes());
+        let (found, l0) = look(Mode::Enforce, &RuleSet::defaults(), client.as_bytes(), S);
         assert_eq!((found.len(), l0.len()), (2, 2));
         let hop =
             format!(r#"{{"messages":[{{"role":"user","content":"{other}"}}],"system":"{KEY}"}}"#);
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), hop.clone().into(), &l0);
+        let (out, ledger) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            hop.clone().into(),
+            &l0,
+            S,
+        );
         assert_eq!(
             String::from_utf8(out.to_vec()).unwrap(),
             r#"{"messages":[{"role":"user","content":"<<TW_SECRET_2>>"}],"system":"<<TW_SECRET_1>>"}"#
         );
         assert_eq!(ledger.len(), 2);
         // 各起一本账的话号就对调了 —— 这条测试防的就是它
-        let (alone, _) = replace(Mode::Enforce, &RuleSet::defaults(), hop.into(), &fresh());
+        let (alone, _) = replace(Mode::Enforce, &RuleSet::defaults(), hop.into(), &fresh(), S);
         assert!(
             String::from_utf8(alone.to_vec())
                 .unwrap()
@@ -491,13 +523,13 @@ mod tests {
 
     #[test]
     fn look_numbers_only_under_enforce_and_reports_the_same_either_way() {
-        let (seen, l) = look(Mode::Observe, &RuleSet::defaults(), &body());
-        assert_eq!(seen, find(Mode::Observe, &RuleSet::defaults(), &body()));
+        let (seen, l) = look(Mode::Observe, &RuleSet::defaults(), &body(), S);
+        assert_eq!(seen, find(Mode::Observe, &RuleSet::defaults(), &body(), S));
         assert!(l.is_empty(), "观察档不该编号");
-        let (acted, l) = look(Mode::Enforce, &RuleSet::defaults(), &body());
+        let (acted, l) = look(Mode::Enforce, &RuleSet::defaults(), &body(), S);
         assert_eq!(acted, seen);
         assert_eq!(l.len(), 1);
-        let (none, l) = look(Mode::Off, &RuleSet::defaults(), &body());
+        let (none, l) = look(Mode::Off, &RuleSet::defaults(), &body(), S);
         assert!(none.is_empty() && l.is_empty());
     }
 
@@ -505,20 +537,27 @@ mod tests {
     #[test]
     fn look_from_goes_on_numbering_from_the_seed() {
         let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-        let (_, seed) = look(Mode::Enforce, &RuleSet::defaults(), &body());
+        let (_, seed) = look(Mode::Enforce, &RuleSet::defaults(), &body(), S);
         let changed = format!(r#"{{"messages":[{{"content":"{other} 和 {KEY}"}}]}}"#);
         let (found, ledger) = look_from(
             Mode::Enforce,
             &RuleSet::defaults(),
             changed.as_bytes(),
+            S,
             seed.clone(),
         );
         assert_eq!(found.len(), 2);
-        let (out, _) = replace(Mode::Enforce, &RuleSet::defaults(), changed.into(), &ledger);
+        let (out, _) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            changed.into(),
+            &ledger,
+            S,
+        );
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(out.contains("<<TW_SECRET_2>> 和 <<TW_SECRET_1>>"), "{out}");
         // 观察档不编号，种子也用不上
-        let (_, l) = look_from(Mode::Observe, &RuleSet::defaults(), &body(), seed);
+        let (_, l) = look_from(Mode::Observe, &RuleSet::defaults(), &body(), S, seed);
         assert!(l.is_empty());
     }
 
@@ -531,7 +570,7 @@ mod tests {
             r#"{{"system":"<<TW_SECRET_1>> {KEY}","messages":[{{"content":"{other} {KEY}"}}]}}"#
         );
         let rules = RuleSet::defaults();
-        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
         let found = hits(&body, &rules);
         assert_eq!(found.len(), 3);
         assert_eq!(l.hits.as_deref(), Some(&found[..]));
@@ -539,21 +578,21 @@ mod tests {
         assert_eq!(l.ledger.table(), replaced.ledger.table());
         assert_eq!(l.ledger.len(), 2);
         assert_eq!((l.found.clone(), l.ledger.table().clone()), {
-            let (f, ledger) = look(Mode::Enforce, &rules, body.as_bytes());
+            let (f, ledger) = look(Mode::Enforce, &rules, body.as_bytes(), S);
             (f, ledger.table().clone())
         });
         // 观察档照样找、照样交回命中，只是不编号
-        let o = look_hits(Mode::Observe, &rules, body.as_bytes(), fresh());
+        let o = look_hits(Mode::Observe, &rules, body.as_bytes(), S, fresh());
         assert_eq!((o.found, o.hits), (l.found, l.hits));
         assert!(o.ledger.is_empty());
         // 关着的、不是 UTF-8 的不找
         assert!(
-            look_hits(Mode::Off, &rules, body.as_bytes(), fresh())
+            look_hits(Mode::Off, &rules, body.as_bytes(), S, fresh())
                 .hits
                 .is_none()
         );
         assert!(
-            look_hits(Mode::Enforce, &rules, &[0xff, 0xfe], fresh())
+            look_hits(Mode::Enforce, &rules, &[0xff, 0xfe], S, fresh())
                 .hits
                 .is_none()
         );
@@ -569,9 +608,9 @@ mod tests {
             .map(|h| t[h.bytes.clone()].to_string())
             .collect();
         assert_eq!(found, vec!["hunter2".to_string(), KEY.to_string()]);
-        let body = format!(r#"{{"content":"{t}"}}"#);
+        let body = format!(r#"{{"messages":[{{"content":"{t}"}}]}}"#);
         assert_eq!(
-            find(Mode::Observe, &RuleSet::defaults(), body.as_bytes()).len(),
+            find(Mode::Observe, &RuleSet::defaults(), body.as_bytes(), S).len(),
             2
         );
         let (out, _) = replace(
@@ -579,6 +618,7 @@ mod tests {
             &RuleSet::defaults(),
             body.clone().into(),
             &ledger_for(body.as_bytes()),
+            S,
         );
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(out.contains("postgres://app:<<TW_SECRET_2>>@db/x"), "{out}");
@@ -591,8 +631,8 @@ mod tests {
         let pasted = format!(
             r#"{{"messages":[{{"role":"user","content":"上次发的是 <<TW_SECRET_1>>，这次是 {KEY}"}}]}}"#
         );
-        let (_, l0) = look(Mode::Enforce, &RuleSet::defaults(), pasted.as_bytes());
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), pasted.into(), &l0);
+        let (_, l0) = look(Mode::Enforce, &RuleSet::defaults(), pasted.as_bytes(), S);
+        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), pasted.into(), &l0, S);
         let out = String::from_utf8(out.to_vec()).unwrap();
         assert!(out.contains("这次是 <<TW_SECRET_2>>"), "{out}");
         assert_eq!(
@@ -600,14 +640,18 @@ mod tests {
             format!("<<TW_SECRET_1>> / {KEY}")
         );
         // 重放用的那本新账也让开它
-        let stored = format!("<<TW_SECRET_1>> {KEY}");
+        let stored = format!(r#"{{"messages":[{{"content":"<<TW_SECRET_1>> {KEY}"}}]}}"#);
         let (out, _) = replace(
             Mode::Enforce,
             &RuleSet::defaults(),
             bytes::Bytes::from(stored.clone()),
             &ledger_for(stored.as_bytes()),
+            S,
         );
-        assert_eq!(&out[..], b"<<TW_SECRET_1>> <<TW_SECRET_2>>");
+        assert_eq!(
+            &out[..],
+            br#"{"messages":[{"content":"<<TW_SECRET_1>> <<TW_SECRET_2>>"}]}"#
+        );
     }
 
     /// 一段 base64 图片里碰巧有一截像密钥：报出来是没人看得懂的误报，换掉它换坏的是那张图
@@ -639,6 +683,7 @@ mod tests {
             &RuleSet::defaults(),
             body.clone().into(),
             &fresh(),
+            S,
         );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let parts = &v["messages"][0]["content"];
@@ -647,71 +692,88 @@ mod tests {
         assert_eq!(parts[3]["signature"], blob.as_str());
     }
 
-    /// 自定义规则按子串找：`abc123` 会找进 Codex 的条目 id（十六进制的 UUID）里去，换成
-    /// 占位符之后上游以「id 里有别的字符」拒绝整个请求，这段对话从此每一轮都被拒
+    /// 只找写出来的文字。协议自己的值一个字都不动：Codex 推理条目的 id（`rs_` 加十六进制）
+    /// 里碰巧有 11 位连着的数字，手机号那条认得出；自定义规则 `abc123` 按子串找，会找进条目
+    /// id、工具名、模型名里 —— 换掉哪一个，上游都拒收整个请求，这段对话从此每一轮都被拒
     #[test]
-    fn keys_and_identifiers_are_left_alone() {
-        let rules = RuleSet::defaults().with_custom("mine", "abc123").unwrap();
+    fn only_the_written_text_is_looked_at() {
+        let rules = RuleSet::only(&["cn-mobile-phone"])
+            .with_custom("mine", "abc123")
+            .unwrap();
         let body = serde_json::json!({
             "model": "abc123-model",
             "previous_response_id": "resp_abc123",
             "abc123": "a key that happens to match",
+            "instructions": "say abc123",
             "input": [
                 {"type": "message", "id": "msg_019fabc123de", "role": "user",
-                 "content": [{"type": "input_text", "text": "my code is abc123"}]},
-                {"type": "function_call", "id": "fc_abc123", "call_id": "call_abc123",
-                 "name": "abc123", "arguments": "{\"q\":\"abc123\"}"},
-                {"type": "function_call_output", "id": "fco_019f93de-abc123", "call_id": "call_abc123",
+                 "content": [{"type": "input_text", "text": "my code is abc123, call 13800138000"}]},
+                {"type": "reasoning", "id": "rs_0a1b2c13800138000c9d8e", "encrypted_content": "gAAAAabc123",
+                 "summary": [{"type": "summary_text", "text": "the user said abc123"}]},
+                {"type": "function_call", "id": "fc_abc123", "call_id": "call_13800138000", "name": "abc123",
+                 "namespace": "abc123", "arguments": "{\"q\":\"abc123\"}"},
+                {"type": "function_call_output", "id": "fco_019f93de-abc123", "call_id": "call_13800138000",
                  "output": "found abc123"},
+                {"type": "web_search_call", "id": "ws_abc123", "action": {"query": "abc123"}},
             ],
-            "messages": [{"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_abc123", "name": "x", "input": {}},
-                {"type": "tool_result", "tool_use_id": "toolu_abc123", "content": "abc123"},
-            ]}],
-            "toolUse": {"toolUseId": "abc123"},
+            "tools": [{"type": "function", "name": "abc123", "description": "finds abc123",
+                       "parameters": {"type": "object", "properties": {"abc123": {"type": "string"}}}}],
         })
         .to_string();
-        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh());
+        let shape = Shape::Generate(Dialect::Responses);
+        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh(), shape);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "abc123-model");
         assert_eq!(v["previous_response_id"], "resp_abc123");
         assert_eq!(v["abc123"], "a key that happens to match");
+        assert_eq!(v["instructions"], "say <<TW_SECRET_1>>");
         let input = &v["input"];
         assert_eq!(input[0]["id"], "msg_019fabc123de");
-        assert_eq!(input[0]["content"][0]["text"], "my code is <<TW_SECRET_1>>");
-        assert_eq!(input[1]["id"], "fc_abc123");
-        assert_eq!(input[1]["call_id"], "call_abc123");
-        assert_eq!(input[1]["name"], "abc123");
-        assert_eq!(input[1]["arguments"], "{\"q\":\"<<TW_SECRET_1>>\"}");
-        assert_eq!(input[2]["id"], "fco_019f93de-abc123");
-        assert_eq!(input[2]["output"], "found <<TW_SECRET_1>>");
-        let parts = &v["messages"][0]["content"];
-        assert_eq!(parts[0]["id"], "toolu_abc123");
-        assert_eq!(parts[1]["tool_use_id"], "toolu_abc123");
-        assert_eq!(parts[1]["content"], "<<TW_SECRET_1>>");
-        assert_eq!(v["toolUse"]["toolUseId"], "abc123");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            "my code is <<TW_SECRET_1>>, call <<TW_PHONE_1>>"
+        );
+        assert_eq!(input[1]["id"], "rs_0a1b2c13800138000c9d8e");
+        assert_eq!(input[1]["encrypted_content"], "gAAAAabc123");
+        assert_eq!(
+            input[1]["summary"][0]["text"],
+            "the user said <<TW_SECRET_1>>"
+        );
+        assert_eq!(input[2]["id"], "fc_abc123");
+        assert_eq!(input[2]["call_id"], "call_13800138000");
+        assert_eq!(input[2]["name"], "abc123");
+        assert_eq!(input[2]["namespace"], "abc123");
+        assert_eq!(input[2]["arguments"], "{\"q\":\"<<TW_SECRET_1>>\"}");
+        assert_eq!(input[3]["id"], "fco_019f93de-abc123");
+        assert_eq!(input[3]["call_id"], "call_13800138000");
+        assert_eq!(input[3]["output"], "found <<TW_SECRET_1>>");
+        // 不认识的条目不看
+        assert_eq!(input[4]["action"]["query"], "abc123");
+        assert_eq!(v["tools"][0]["name"], "abc123");
+        assert_eq!(v["tools"][0]["description"], "finds <<TW_SECRET_1>>");
+        assert!(v["tools"][0]["parameters"]["properties"]["abc123"].is_object());
     }
 
-    /// 工具参数这种对象里，凭据和号码就写在 `aws_access_key_id`、`user_id` 下面：内置规则
-    /// 照找；自定义规则也照找不属于协议的 `*_id`
+    /// 工具调用的参数是模型写的：凭据和号码写在什么键下面都找，叫 `id` 的也一样。请求的
+    /// `metadata` 是配置，不是谁写的话，不找
     #[test]
-    fn credentials_under_id_like_keys_of_user_data_are_still_found() {
+    fn tool_call_arguments_are_looked_at_whatever_their_keys() {
         let rules = RuleSet::defaults().with_custom("工号", "E-\\d{6}").unwrap();
         let key = "AKIAABCDEFGHIJKLMNOP";
         let body = serde_json::json!({
             "messages": [{"role": "assistant", "content": [
                 {"type": "tool_use", "id": "toolu_1", "name": "deploy",
-                 "input": {"aws_access_key_id": key, "employee_id": "E-123456"}},
+                 "input": {"aws_access_key_id": key, "id": "E-123456"}},
             ]}],
             "metadata": {"user_id": key},
         })
         .to_string();
-        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh());
+        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh(), S);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let input = &v["messages"][0]["content"][0]["input"];
         assert_eq!(input["aws_access_key_id"], "<<TW_SECRET_1>>");
-        assert_eq!(input["employee_id"], "<<TW_SECRET_2>>");
-        assert_eq!(v["metadata"]["user_id"], "<<TW_SECRET_1>>");
+        assert_eq!(input["id"], "<<TW_SECRET_2>>");
+        assert_eq!(v["metadata"]["user_id"], key);
         assert_eq!(v["messages"][0]["content"][0]["id"], "toolu_1");
     }
 
@@ -785,8 +847,8 @@ mod tests {
         };
         let send = |p: &RedactPolicy, body: &str| {
             let rules = p.rules().unwrap();
-            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
-            let (out, _) = replace(Mode::Enforce, &rules, body.to_string().into(), &l.ledger);
+            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
+            let (out, _) = replace(Mode::Enforce, &rules, body.to_string().into(), &l.ledger, S);
             let reported: Vec<(String, bool)> = l
                 .found
                 .iter()
@@ -923,8 +985,8 @@ mod tests {
             bare.actions.clear();
             let out = |p: &RedactPolicy| {
                 let rules = p.rules().unwrap();
-                let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
-                let (out, _) = replace(Mode::Enforce, &rules, body.clone().into(), &l.ledger);
+                let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
+                let (out, _) = replace(Mode::Enforce, &rules, body.clone().into(), &l.ledger, S);
                 String::from_utf8(out.to_vec()).unwrap()
             };
             assert_eq!(out(&p), out(&bare), "{text:?} {p:?}");
@@ -962,8 +1024,8 @@ mod tests {
                 "命中要排好、互不重叠：{all:?}"
             );
             // 发出去的照样是 JSON，回答里原样复述的话能一字不差地换回来
-            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
-            let (sent, ledger) = replace(Mode::Enforce, &rules, body.clone().into(), &l.ledger);
+            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
+            let (sent, ledger) = replace(Mode::Enforce, &rules, body.clone().into(), &l.ledger, S);
             serde_json::from_slice::<serde_json::Value>(&sent).expect("still JSON");
             assert_eq!(
                 crate::redact::replace::restore(std::str::from_utf8(&sent).unwrap(), &ledger),
@@ -980,10 +1042,13 @@ mod tests {
             .unwrap()
             .with_custom("右", "bbbccc")
             .unwrap();
-        let body = r#"{"content":"x aaabbbccc y"}"#;
-        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
-        let (out, ledger) = replace(Mode::Enforce, &rules, body.into(), &l.ledger);
-        assert_eq!(&out[..], br#"{"content":"x <<TW_SECRET_1>> y"}"#);
+        let body = r#"{"messages":[{"content":"x aaabbbccc y"}]}"#;
+        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
+        let (out, ledger) = replace(Mode::Enforce, &rules, body.into(), &l.ledger, S);
+        assert_eq!(
+            &out[..],
+            br#"{"messages":[{"content":"x <<TW_SECRET_1>> y"}]}"#
+        );
         assert_eq!(
             crate::redact::replace::restore(std::str::from_utf8(&out).unwrap(), &ledger),
             body
@@ -997,7 +1062,7 @@ mod tests {
             .with_custom("库", r"postgres://[^\s\x22]+")
             .unwrap();
         rules = rules.recording(crate::redact::rules::Rule::Custom("库".into()));
-        let body = r#"{"content":"use postgres://app:hunter2@db.internal:5432/orders now"}"#;
+        let body = r#"{"messages":[{"content":"use postgres://app:hunter2@db.internal:5432/orders now"}]}"#;
         let found = hits(body, &rules);
         // 口令那一截换成占位符，前后两截还是只记录的那条规则的，存下来时打码
         let pieces: Vec<(&str, bool)> = found
@@ -1012,21 +1077,20 @@ mod tests {
                 ("@db.internal:5432/orders", true)
             ]
         );
-        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh());
+        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh(), S);
         assert_eq!(
             &out[..],
-            br#"{"content":"use postgres://app:<<TW_SECRET_1>>@db.internal:5432/orders now"}"#
+            br#"{"messages":[{"content":"use postgres://app:<<TW_SECRET_1>>@db.internal:5432/orders now"}]}"#
         );
         // 报的时候只记录的那条整个算一处
-        let reported: Vec<String> = reported(body, &rules, &found)
+        let reported: Vec<String> = reported(body, &rules, &found, Scope::Written(S))
             .iter()
             .map(|f| f.rule.id().to_string())
             .collect();
         assert_eq!(reported, ["库", "conn-string-password"]);
     }
 
-    /// 先去掉压在占位符上的、落在协议 id 里的命中，再合并：一处要换的值不会跟着一处该去掉的
-    /// 命中一起被去掉
+    /// 先去掉压在占位符上的命中，再合并：一处要换的值不会跟着一处该去掉的命中一起被去掉
     #[test]
     fn hits_that_do_not_count_are_dropped_before_overlaps_merge() {
         use crate::policy::{ContentMatch, CustomRedactRule, RedactAction, RedactPolicy};
@@ -1041,8 +1105,8 @@ mod tests {
         };
         let send = |p: &RedactPolicy, body: &str| {
             let rules = p.rules().unwrap();
-            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
-            let (out, _) = replace(Mode::Enforce, &rules, body.to_string().into(), &l.ledger);
+            let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
+            let (out, _) = replace(Mode::Enforce, &rules, body.to_string().into(), &l.ledger, S);
             String::from_utf8(out.to_vec()).unwrap()
         };
         // 邮箱和一处一直连到已经写着的占位符上的自定义命中
@@ -1062,18 +1126,6 @@ mod tests {
         };
         let body = r#"{"messages":[{"role":"user","content":"use postgres://app:hunter2@db.internal/x<<TW_SECRET_1>> now"}]}"#;
         assert!(!send(&p, body).contains("hunter2"));
-        // 工具调用的 id 里的一把内置认得的密钥，和一处更早开始的自定义命中交叠：自定义规则不碰
-        // 协议的 id，内置规则照换
-        let key = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdEFGH";
-        let p = RedactPolicy {
-            custom: vec![custom(r"x sk-proj")],
-            ..Default::default()
-        };
-        let body = serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
-            {"id": format!("x {key}"), "type":"function","function":{"name":"f","arguments":"{}"}}]}]})
-        .to_string();
-        let out = send(&p, &body);
-        assert!(!out.contains(key), "{out}");
     }
 
     /// 自定义规则的正则（`\S+`）从结构上的字开始匹配、或者一路吃过引号：只换字符串里面的那一段，
@@ -1083,8 +1135,8 @@ mod tests {
         let rules = RuleSet::none().with_custom("all", r"\S+").unwrap();
         let body =
             r#"{"messages":[{"role":"user","content":"a-b c"},{"role":"user","content":"d"}]}"#;
-        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
-        let (out, ledger) = replace(Mode::Enforce, &rules, body.into(), &l.ledger);
+        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), S, fresh());
+        let (out, ledger) = replace(Mode::Enforce, &rules, body.into(), &l.ledger, S);
         let v: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
         assert_eq!(
             v["messages"][0]["content"],
