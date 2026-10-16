@@ -1,12 +1,19 @@
 //! OpenAI Chat Completions 的回答。
 //!
-//! Chat 的流没有块边界：正文是 `delta.content` 一路；换成推理、开始工具调用、
-//! `finish_reason`、`[DONE]` 都算这一块结束。工具调用按 `index` 分片，OpenAI 一个
-//! 发完再发下一个，所以换了 `index` 或者到了 `finish_reason` 就是上一个收齐了。
+//! Chat 的流没有块边界：每个选项（`n` > 1 时有好几个，帧里按选项的 `index` 分）的正文
+//! 是 `delta.content` 一路；换成推理、开始工具调用、`finish_reason`、`[DONE]` 都算这一块
+//! 结束。工具调用按 `index` 分片，OpenAI 一个发完再发下一个，所以换了 `index` 或者到了
+//! `finish_reason` 就是上一个收齐了。
+//!
+//! **每个选项各算各的**：正文一个选项一块（块号就是选项的 `index`），工具调用各攒各的、
+//! 序号各数各的，`finish_reason` 只结束它那一个选项；`[DONE]`、错误帧、用量块把所有选项
+//! 一起收尾。
 //!
 //! 工具调用的分片从原来的帧里摘掉，收齐之后**写成一帧完整的调用**（不变的也是：一帧
-//! 和几帧拼起来是同一个调用），序号按写出去的顺序重新数。全被去掉了的话
-//! `finish_reason` 从 `tool_calls` 改成 `stop`。
+//! 和几帧拼起来是同一个调用），序号按写出去的顺序重新数。一个选项的调用全被去掉了的话，
+//! 它的 `finish_reason` 从 `tool_calls` 改成 `stop`。
+
+use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
@@ -14,21 +21,25 @@ use super::{Call, Chain, Frame, Ids, Out, whole_text};
 use crate::error::GatewayError;
 use crate::plugin::view::{args_text, args_value};
 
-/// 正文只有一路
-const LANE: u64 = 0;
-
 pub(crate) struct Codec {
     wants_text: bool,
     wants_tools: bool,
+    /// 每个选项一份，按选项的 `index`
+    choices: BTreeMap<u64, Choice>,
+    /// 最近一帧的外壳（id、created、model……），补帧时抄它
+    envelope: Map<String, Value>,
+    ids: Ids,
+}
+
+/// 一个选项的正文和工具调用。正文的块号就是选项的 `index`
+#[derive(Default)]
+struct Choice {
     lane_open: bool,
     calls: Vec<CallBuf>,
     /// 写出去的下一个调用的序号
     next_index: u64,
-    /// 最近一帧的外壳（id、created、model……），补帧时抄它
-    envelope: Map<String, Value>,
     tools_seen: u64,
     tools_emitted: u64,
-    ids: Ids,
 }
 
 struct CallBuf {
@@ -41,26 +52,34 @@ struct CallBuf {
     first: Value,
 }
 
+/// 帧里一个选项的 `index`。没写的按它在数组里的位置
+fn index_of(choice: &Value, pos: usize) -> u64 {
+    choice
+        .get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or(pos as u64)
+}
+
 impl Codec {
     pub(super) fn new(chain: &Chain) -> Self {
         Self {
             wants_text: chain.wants_text(),
             wants_tools: chain.wants_tools(),
-            lane_open: false,
-            calls: Vec::new(),
-            next_index: 0,
+            choices: BTreeMap::new(),
             envelope: Map::new(),
-            tools_seen: 0,
-            tools_emitted: 0,
             ids: Ids::new(),
         }
     }
 
-    fn chunk(&self, delta: Value) -> Out {
+    fn at(&mut self, k: u64) -> &mut Choice {
+        self.choices.entry(k).or_default()
+    }
+
+    fn chunk(&self, k: u64, delta: Value) -> Out {
         let mut m = self.envelope.clone();
         m.insert(
             "choices".into(),
-            json!([{ "index": 0, "delta": delta, "finish_reason": null }]),
+            json!([{ "index": k, "delta": delta, "finish_reason": null }]),
         );
         Out::new(None, Value::Object(m))
     }
@@ -68,23 +87,30 @@ impl Codec {
     async fn close_lane(
         &mut self,
         chain: &mut Chain,
+        k: u64,
         out: &mut Vec<Out>,
     ) -> Result<(), GatewayError> {
-        if !self.lane_open {
+        let c = self.at(k);
+        if !c.lane_open {
             return Ok(());
         }
-        self.lane_open = false;
-        let end = chain.text_end(LANE).await?;
+        c.lane_open = false;
+        let end = chain.text_end(k).await?;
         if !end.is_empty() {
-            out.push(self.chunk(json!({ "content": end })));
+            out.push(self.chunk(k, json!({ "content": end })));
         }
         Ok(())
     }
 
-    /// 攒着的调用都收齐了：交给插件，写出去
-    async fn settle(&mut self, chain: &mut Chain, out: &mut Vec<Out>) -> Result<(), GatewayError> {
-        for c in std::mem::take(&mut self.calls) {
-            self.tools_seen += 1;
+    /// 选项 `k` 攒着的调用都收齐了：交给插件，写出去
+    async fn settle(
+        &mut self,
+        chain: &mut Chain,
+        k: u64,
+        out: &mut Vec<Out>,
+    ) -> Result<(), GatewayError> {
+        for c in std::mem::take(&mut self.at(k).calls) {
+            self.at(k).tools_seen += 1;
             let input = if c.custom {
                 Value::String(c.args.clone())
             } else {
@@ -115,7 +141,10 @@ impl Codec {
             };
             for (id, name, args) in written {
                 let mut entry = c.first.clone();
-                entry["index"] = json!(self.next_index);
+                let ch = self.at(k);
+                entry["index"] = json!(ch.next_index);
+                ch.next_index += 1;
+                ch.tools_emitted += 1;
                 entry["id"] = json!(id);
                 if c.custom {
                     entry["type"] = json!("custom");
@@ -131,10 +160,22 @@ impl Codec {
                     f.insert("arguments".into(), json!(args));
                     entry["function"] = Value::Object(f);
                 }
-                self.next_index += 1;
-                self.tools_emitted += 1;
-                out.push(self.chunk(json!({ "tool_calls": [entry] })));
+                out.push(self.chunk(k, json!({ "tool_calls": [entry] })));
             }
+        }
+        Ok(())
+    }
+
+    /// 所有选项一起收尾：扣着的正文、攒着的调用都补出来
+    async fn close_all(
+        &mut self,
+        chain: &mut Chain,
+        out: &mut Vec<Out>,
+    ) -> Result<(), GatewayError> {
+        let ks: Vec<u64> = self.choices.keys().copied().collect();
+        for k in ks {
+            self.close_lane(chain, k, out).await?;
+            self.settle(chain, k, out).await?;
         }
         Ok(())
     }
@@ -147,14 +188,12 @@ impl Codec {
     ) -> Result<(), GatewayError> {
         let Some(data) = f.data.as_mut() else {
             // `[DONE]`：攒着的赶在它前面补出来
-            self.close_lane(chain, out).await?;
-            self.settle(chain, out).await?;
+            self.close_all(chain, out).await?;
             out.push(Out::Keep(f));
             return Ok(());
         };
         if data.get("error").is_some_and(|e| !e.is_null()) {
-            self.close_lane(chain, out).await?;
-            self.settle(chain, out).await?;
+            self.close_all(chain, out).await?;
             out.push(Out::Keep(f));
             return Ok(());
         }
@@ -166,18 +205,52 @@ impl Codec {
             }
         }
         let has_usage = data.get("usage").is_some_and(|u| !u.is_null());
-        let Some(choice) = data
+        let Some(choices) = data
             .get_mut("choices")
             .and_then(Value::as_array_mut)
-            .and_then(|c| c.get_mut(0))
+            .filter(|c| !c.is_empty())
         else {
             // 没有 choices 的（流末尾的用量块）：之前攒着的先补出来
-            self.close_lane(chain, out).await?;
-            self.settle(chain, out).await?;
+            self.close_all(chain, out).await?;
             out.push(Out::Keep(f));
             return Ok(());
         };
         let mut before: Vec<Out> = Vec::new();
+        let mut dirty = false;
+        let mut kept = Vec::with_capacity(choices.len());
+        for (pos, mut choice) in std::mem::take(choices).into_iter().enumerate() {
+            let k = index_of(&choice, pos);
+            let changed = self.choice(chain, k, &mut choice, &mut before).await?;
+            dirty |= changed;
+            // 摘空了的选项不发：没有正文、没有工具调用、没有结束原因，帧上也没有用量
+            let empty = choice
+                .get("delta")
+                .and_then(Value::as_object)
+                .is_none_or(|d| d.values().all(|v| v.is_null() || v == ""))
+                && choice.get("finish_reason").is_none_or(Value::is_null)
+                && !has_usage;
+            if !(changed && empty) {
+                kept.push(choice);
+            }
+        }
+        out.extend(before);
+        if kept.is_empty() {
+            return Ok(());
+        }
+        *choices = kept;
+        f.dirty |= dirty;
+        out.push(Out::Keep(f));
+        Ok(())
+    }
+
+    /// 帧里选项 `k` 的那一份。补出来的帧放进 `before`，返回这一份改没改
+    async fn choice(
+        &mut self,
+        chain: &mut Chain,
+        k: u64,
+        choice: &mut Value,
+        before: &mut Vec<Out>,
+    ) -> Result<bool, GatewayError> {
         let mut dirty = false;
         let finish = choice
             .get("finish_reason")
@@ -192,7 +265,7 @@ impl Codec {
                     .is_some_and(|t| !t.is_empty())
             });
             if thinking {
-                self.close_lane(chain, &mut before).await?;
+                self.close_lane(chain, k, before).await?;
             }
             if self.wants_text
                 && let Some(text) = delta
@@ -201,15 +274,15 @@ impl Codec {
                     .filter(|t| !t.is_empty())
                     .map(str::to_string)
             {
-                if !self.calls.is_empty() {
-                    self.settle(chain, &mut before).await?;
+                if !self.at(k).calls.is_empty() {
+                    self.settle(chain, k, before).await?;
                 }
-                self.lane_open = true;
-                let mut got = chain.text(LANE, &text).await?;
+                self.at(k).lane_open = true;
+                let mut got = chain.text(k, &text).await?;
                 if finish.is_some() {
                     // 这一帧就是结尾：扣着的接在它自己的正文后面
-                    self.lane_open = false;
-                    got.push_str(&chain.text_end(LANE).await?);
+                    self.at(k).lane_open = false;
+                    got.push_str(&chain.text_end(k).await?);
                 }
                 if got != text {
                     dirty = true;
@@ -224,14 +297,14 @@ impl Codec {
                 && let Some(entries) = delta.get("tool_calls").and_then(Value::as_array).cloned()
                 && !entries.is_empty()
             {
-                self.close_lane(chain, &mut before).await?;
+                self.close_lane(chain, k, before).await?;
                 for (pos, e) in entries.iter().enumerate() {
-                    let k = e.get("index").and_then(Value::as_u64).unwrap_or(pos as u64);
-                    let known = self.calls.iter().any(|c| c.index == k);
+                    let i = e.get("index").and_then(Value::as_u64).unwrap_or(pos as u64);
+                    let known = self.at(k).calls.iter().any(|c| c.index == i);
                     if !known {
-                        // 新的一个调用开始了：前面的都收齐了
-                        if !self.calls.is_empty() {
-                            self.settle(chain, &mut before).await?;
+                        // 新的一个调用开始了：这个选项前面的都收齐了
+                        if !self.at(k).calls.is_empty() {
+                            self.settle(chain, k, before).await?;
                         }
                         let custom = e.get("type").and_then(Value::as_str) == Some("custom");
                         let inner = if custom {
@@ -248,8 +321,8 @@ impl Codec {
                         if let Some(o) = first.as_object_mut() {
                             o.remove("index");
                         }
-                        self.calls.push(CallBuf {
-                            index: k,
+                        self.at(k).calls.push(CallBuf {
+                            index: i,
                             id: e
                                 .get("id")
                                 .and_then(Value::as_str)
@@ -262,9 +335,10 @@ impl Codec {
                         });
                     }
                     let c = self
+                        .at(k)
                         .calls
                         .iter_mut()
-                        .find(|c| c.index == k)
+                        .find(|c| c.index == i)
                         .expect("just pushed");
                     let piece = if c.custom {
                         e.pointer("/custom/input")
@@ -280,29 +354,15 @@ impl Codec {
             }
         }
         if let Some(reason) = finish {
-            if self.lane_open {
-                self.close_lane(chain, &mut before).await?;
-            }
-            self.settle(chain, &mut before).await?;
-            if reason == "tool_calls" && self.tools_seen > 0 && self.tools_emitted == 0 {
+            self.close_lane(chain, k, before).await?;
+            self.settle(chain, k, before).await?;
+            let c = self.at(k);
+            if reason == "tool_calls" && c.tools_seen > 0 && c.tools_emitted == 0 {
                 choice["finish_reason"] = json!("stop");
                 dirty = true;
             }
         }
-        out.extend(before);
-        // 摘空了的帧不发：没有正文、没有工具调用、没有结束原因、没有用量
-        let empty = choice
-            .get("delta")
-            .and_then(Value::as_object)
-            .is_none_or(|d| d.values().all(|v| v.is_null() || v == ""))
-            && choice.get("finish_reason").is_none_or(Value::is_null)
-            && !has_usage;
-        if dirty && empty {
-            return Ok(());
-        }
-        f.dirty |= dirty;
-        out.push(Out::Keep(f));
-        Ok(())
+        Ok(dirty)
     }
 
     pub(super) async fn finish(
@@ -310,17 +370,26 @@ impl Codec {
         chain: &mut Chain,
         out: &mut Vec<Out>,
     ) -> Result<(), GatewayError> {
-        self.close_lane(chain, out).await?;
-        self.settle(chain, out).await
+        self.close_all(chain, out).await
     }
 }
 
-/// 整包：`choices[0].message` 的正文和工具调用
+/// 整包：每个选项（`n` > 1 时有好几个）的 `message` 里的正文和工具调用
 pub(super) async fn whole(chain: &mut Chain, v: &mut Value) -> Result<bool, GatewayError> {
-    let Some(m) = v
-        .pointer_mut("/choices/0/message")
-        .and_then(Value::as_object_mut)
-    else {
+    let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for (pos, choice) in choices.iter_mut().enumerate() {
+        let k = index_of(choice, pos);
+        changed |= whole_choice(chain, k, choice).await?;
+    }
+    Ok(changed)
+}
+
+/// 整包里的一个选项。正文的块号是选项的 `index`
+async fn whole_choice(chain: &mut Chain, k: u64, choice: &mut Value) -> Result<bool, GatewayError> {
+    let Some(m) = choice.get_mut("message").and_then(Value::as_object_mut) else {
         return Ok(false);
     };
     let mut changed = false;
@@ -328,7 +397,7 @@ pub(super) async fn whole(chain: &mut Chain, v: &mut Value) -> Result<bool, Gate
         && let Some(t) = m.get("content").and_then(Value::as_str).map(str::to_string)
         && !t.is_empty()
     {
-        let got = whole_text(chain, LANE, &t).await?;
+        let got = whole_text(chain, k, &t).await?;
         if got != t {
             m.insert("content".into(), json!(got));
             changed = true;
@@ -395,7 +464,7 @@ pub(super) async fn whole(chain: &mut Chain, v: &mut Value) -> Result<bool, Gate
         }
     }
     if all_dropped
-        && let Some(f) = v.pointer_mut("/choices/0/finish_reason")
+        && let Some(f) = choice.get_mut("finish_reason")
         && f == "tool_calls"
     {
         *f = json!("stop");

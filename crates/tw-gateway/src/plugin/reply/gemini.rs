@@ -1,25 +1,28 @@
 //! Gemini 的回答。
 //!
-//! 每一帧都是一个完整的响应对象：文字部分是增量，函数调用整个在一个部分里。正文是
-//! 一路：碰到推理部分、函数调用或者 `finishReason` 就是这一块结束了，插件扣着的补成
-//! 一个文字部分。函数调用不用攒，那一个部分就是完整的调用；换出来的几个各写成一个
-//! `functionCall` 部分，**推理签名（`thoughtSignature`）留在第一个上**，去掉的那个的
-//! 签名挪给同一帧里下一个调用 —— Gemini 下一轮要看到它。
+//! 每一帧都是一个完整的响应对象：文字部分是增量，函数调用整个在一个部分里。每个候选
+//! （`candidateCount` > 1 时有好几个，按候选的 `index` 分）的正文各是一路，块号就是
+//! 候选的 `index`：碰到推理部分、函数调用或者 `finishReason` 就是这个候选的这一块结束
+//! 了，插件扣着的补成一个文字部分。函数调用不用攒，那一个部分就是完整的调用；换出来的
+//! 几个各写成一个 `functionCall` 部分，**推理签名（`thoughtSignature`）留在第一个上**，
+//! 去掉的那个的签名挪给同一帧里下一个调用 —— Gemini 下一轮要看到它。
 //!
-//! 一帧里的部分全被扣下了：没有结束原因就整帧不发，有的话留一个空的文字部分。
+//! 一帧里一个候选的部分全被扣下了：没有结束原因就不发这个候选（一个候选都不剩就整帧
+//! 不发），有的话留一个空的文字部分。
 //! 不带 `alt=sse` 的客户端收到的是 JSON 数组，拆帧、拼数组在上一层。
+
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value, json};
 
 use super::{Call, Chain, Frame, Ids, Out, whole_text};
 use crate::error::GatewayError;
 
-const LANE: u64 = 0;
-
 pub(crate) struct Codec {
     wants_text: bool,
     wants_tools: bool,
-    lane_open: bool,
+    /// 正文那一块开着的候选（按候选的 `index`）
+    open: BTreeSet<u64>,
     /// 最近一帧的外壳（`modelVersion`、`responseId`），流结束时补帧抄它
     envelope: Map<String, Value>,
     ids: Ids,
@@ -35,25 +38,35 @@ impl Codec {
         Self {
             wants_text: chain.wants_text(),
             wants_tools: chain.wants_tools(),
-            lane_open: false,
+            open: BTreeSet::new(),
             envelope: Map::new(),
             ids: Ids::new(),
         }
     }
 
-    async fn end(&mut self, chain: &mut Chain) -> Result<String, GatewayError> {
-        if !self.lane_open {
+    async fn end(&mut self, chain: &mut Chain, k: u64) -> Result<String, GatewayError> {
+        if !self.open.remove(&k) {
             return Ok(String::new());
         }
-        self.lane_open = false;
-        chain.text_end(LANE).await
+        chain.text_end(k).await
     }
 
-    fn chunk(&self, text: String) -> Out {
+    /// 所有候选一起收尾：扣着的各补成一帧
+    async fn end_all(&mut self, chain: &mut Chain, out: &mut Vec<Out>) -> Result<(), GatewayError> {
+        for k in std::mem::take(&mut self.open) {
+            let end = chain.text_end(k).await?;
+            if !end.is_empty() {
+                out.push(self.chunk(k, end));
+            }
+        }
+        Ok(())
+    }
+
+    fn chunk(&self, k: u64, text: String) -> Out {
         let mut m = self.envelope.clone();
         m.insert(
             "candidates".into(),
-            json!([{ "content": { "role": "model", "parts": [{ "text": text }] }, "index": 0 }]),
+            json!([{ "content": { "role": "model", "parts": [{ "text": text }] }, "index": k }]),
         );
         Out::new(None, Value::Object(m))
     }
@@ -67,10 +80,7 @@ impl Codec {
         let Some(data) = f.data.as_mut() else {
             // JSON 数组的 `]`、心跳：之前扣着的先补出来
             if f.raw == b"]" {
-                let end = self.end(chain).await?;
-                if !end.is_empty() {
-                    out.push(self.chunk(end));
-                }
+                self.end_all(chain, out).await?;
             }
             out.push(Out::Keep(f));
             return Ok(());
@@ -81,21 +91,55 @@ impl Codec {
             }
         }
         if data.get("error").is_some_and(|e| !e.is_null()) {
-            let end = self.end(chain).await?;
-            if !end.is_empty() {
-                out.push(self.chunk(end));
-            }
+            self.end_all(chain, out).await?;
             out.push(Out::Keep(f));
             return Ok(());
         }
-        let Some(cand) = data
+        let Some(cands) = data
             .get_mut("candidates")
             .and_then(Value::as_array_mut)
-            .and_then(|c| c.get_mut(0))
+            .filter(|c| !c.is_empty())
         else {
             out.push(Out::Keep(f));
             return Ok(());
         };
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(cands.len());
+        for (pos, mut cand) in std::mem::take(cands).into_iter().enumerate() {
+            let k = cand
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(pos as u64);
+            match self.candidate(chain, k, &mut cand).await? {
+                // 这个候选的字都扣着：不发
+                None => changed = true,
+                Some(c) => {
+                    changed |= c;
+                    kept.push(cand);
+                }
+            }
+        }
+        *cands = kept;
+        if !changed {
+            out.push(Out::Keep(f));
+            return Ok(());
+        }
+        if cands.is_empty() {
+            return Ok(());
+        }
+        f.dirty = true;
+        out.push(Out::Keep(f));
+        Ok(())
+    }
+
+    /// 帧里候选 `k` 的那一份。返回改没改；`None` 是它的部分全被扣下了、又没有结束原因，
+    /// 这一帧里不发它
+    async fn candidate(
+        &mut self,
+        chain: &mut Chain,
+        k: u64,
+        cand: &mut Value,
+    ) -> Result<Option<bool>, GatewayError> {
         let finished = field(cand, "finishReason", "finish_reason").is_some_and(|r| !r.is_null());
         let parts = cand
             .pointer("/content/parts")
@@ -111,8 +155,8 @@ impl Codec {
             let thought = p.get("thought").and_then(Value::as_bool) == Some(true);
             if let Some(t) = text {
                 if thought || !self.wants_text {
-                    if thought && self.lane_open {
-                        let end = self.end(chain).await?;
+                    if thought && self.open.contains(&k) {
+                        let end = self.end(chain, k).await?;
                         if !end.is_empty() {
                             next.push(json!({ "text": end }));
                             changed = true;
@@ -121,8 +165,8 @@ impl Codec {
                     next.push(p);
                     continue;
                 }
-                self.lane_open = true;
-                let got = chain.text(LANE, &t).await?;
+                self.open.insert(k);
+                let got = chain.text(k, &t).await?;
                 if got == t {
                     next.push(p);
                     continue;
@@ -141,7 +185,7 @@ impl Codec {
                 next.push(p);
                 continue;
             };
-            let end = self.end(chain).await?;
+            let end = self.end(chain, k).await?;
             if !end.is_empty() {
                 next.push(json!({ "text": end }));
                 changed = true;
@@ -214,8 +258,8 @@ impl Codec {
                 }
             }
         }
-        if finished && self.lane_open {
-            let end = self.end(chain).await?;
+        if finished && self.open.contains(&k) {
+            let end = self.end(chain, k).await?;
             if !end.is_empty() {
                 changed = true;
                 match next.last_mut() {
@@ -231,22 +275,18 @@ impl Codec {
             }
         }
         if !changed {
-            out.push(Out::Keep(f));
-            return Ok(());
+            return Ok(Some(false));
         }
         if next.is_empty() {
             if !finished {
-                // 这一帧里的字都扣着：不发
-                return Ok(());
+                return Ok(None);
             }
             next.push(json!({ "text": "" }));
         }
         if let Some(c) = cand.get_mut("content") {
             c["parts"] = Value::Array(next);
         }
-        f.dirty = true;
-        out.push(Out::Keep(f));
-        Ok(())
+        Ok(Some(true))
     }
 
     pub(super) async fn finish(
@@ -254,18 +294,26 @@ impl Codec {
         chain: &mut Chain,
         out: &mut Vec<Out>,
     ) -> Result<(), GatewayError> {
-        let end = self.end(chain).await?;
-        if !end.is_empty() {
-            out.push(self.chunk(end));
-        }
-        Ok(())
+        self.end_all(chain, out).await
     }
 }
 
-/// 整包：`candidates[0].content.parts` 里的文字和函数调用。每个文字部分算一块
+/// 整包：每个候选（`candidateCount` > 1 时有好几个）
 pub(super) async fn whole(chain: &mut Chain, v: &mut Value) -> Result<bool, GatewayError> {
-    let Some(parts) = v
-        .pointer("/candidates/0/content/parts")
+    let Some(cands) = v.get_mut("candidates").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for cand in cands.iter_mut() {
+        changed |= whole_candidate(chain, cand).await?;
+    }
+    Ok(changed)
+}
+
+/// 整包里一个候选 `content.parts` 里的文字和函数调用。每个文字部分算一块
+async fn whole_candidate(chain: &mut Chain, cand: &mut Value) -> Result<bool, GatewayError> {
+    let Some(parts) = cand
+        .pointer("/content/parts")
         .and_then(Value::as_array)
         .cloned()
     else {
@@ -330,7 +378,7 @@ pub(super) async fn whole(chain: &mut Chain, v: &mut Value) -> Result<bool, Gate
             }
         }
     }
-    if changed && let Some(c) = v.pointer_mut("/candidates/0/content") {
+    if changed && let Some(c) = cand.get_mut("content") {
         c["parts"] = Value::Array(out);
     }
     Ok(changed)
