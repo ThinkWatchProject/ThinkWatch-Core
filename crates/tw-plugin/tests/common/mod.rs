@@ -116,14 +116,14 @@ pub fn reply(p: &Plugin, settings: Value) -> Reply {
 
 pub fn text(r: &mut Reply, s: &str) -> Invocation<Option<String>> {
     let t = Instant::now();
-    let inv = r.on_text(s);
+    let inv = r.on_text(0, s);
     assert!(t.elapsed() < BOUND, "onReplyText took {:?}", t.elapsed());
     inv
 }
 
 pub fn text_end(r: &mut Reply) -> Invocation<Option<String>> {
     let t = Instant::now();
-    let inv = r.on_text_end();
+    let inv = r.on_text_end(0);
     assert!(t.elapsed() < BOUND, "onReplyTextEnd took {:?}", t.elapsed());
     inv
 }

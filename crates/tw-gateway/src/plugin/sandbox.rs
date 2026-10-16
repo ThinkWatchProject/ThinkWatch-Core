@@ -17,6 +17,7 @@ use crate::plugin::engine::{Engine, Hooks, LoadError, Manifest, SettingSpec};
 use crate::plugin::host::{
     Invocation, PluginHost, ReplyHost, RequestOutcome, RunError, ToolCallOutcome,
 };
+use crate::plugin::reply::Lane;
 use crate::plugin::set::{LogLine, Scope};
 
 /// 进程里那一份运行时。起不来时是起不来的原因
@@ -92,12 +93,12 @@ impl PluginHost for Host {
 struct Reply(tw_plugin::Reply);
 
 impl ReplyHost for Reply {
-    fn on_text(&mut self, text: &str) -> Invocation<Option<String>> {
-        invocation(self.0.on_text(text), |t| t)
+    fn on_text(&mut self, lane: Lane, text: &str) -> Invocation<Option<String>> {
+        invocation(self.0.on_text(lane, text), |t| t)
     }
 
-    fn on_text_end(&mut self) -> Invocation<Option<String>> {
-        invocation(self.0.on_text_end(), |t| t)
+    fn on_text_end(&mut self, lane: Lane) -> Invocation<Option<String>> {
+        invocation(self.0.on_text_end(lane), |t| t)
     }
 
     fn on_tool_call(&mut self, call: Value) -> Invocation<ToolCallOutcome> {

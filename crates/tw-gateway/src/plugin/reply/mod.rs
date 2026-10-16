@@ -445,7 +445,7 @@ impl Chain {
             .lanes
             .get(&lane)
             .is_some_and(|l| !l.unrevealed.is_empty());
-        match self.invoke(i, move |r| r.on_text(&given)).await {
+        match self.invoke(i, move |r| r.on_text(lane, &given)).await {
             Ok(None) if !carrying => {
                 self.stages[i]
                     .lanes
@@ -551,7 +551,7 @@ impl Chain {
                         let hidden = self.bridge.hide(&whole);
                         let given = hidden.clone();
                         self.stages[i].counts.text_calls += 1;
-                        match self.invoke(i, move |r| r.on_text(&given)).await {
+                        match self.invoke(i, move |r| r.on_text(lane, &given)).await {
                             Ok(None) => out.push(whole),
                             Ok(Some(s)) => {
                                 if s != hidden {
@@ -581,7 +581,7 @@ impl Chain {
                     }
                     let mut last = String::new();
                     if self.live(i) && self.stages[i].text_end {
-                        match self.invoke(i, |r| r.on_text_end()).await {
+                        match self.invoke(i, move |r| r.on_text_end(lane)).await {
                             Ok(None) => {}
                             Ok(Some(s)) => {
                                 if !s.is_empty() {

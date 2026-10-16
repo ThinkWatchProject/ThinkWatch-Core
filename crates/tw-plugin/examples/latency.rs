@@ -49,7 +49,7 @@ fn main() {
     });
     let mut r = p.reply(ctx.clone()).expect("reply");
     report("on_text on a live reply instance", 20000, || {
-        let inv = r.on_text("a small widget delta");
+        let inv = r.on_text(0, "a small widget delta");
         assert!(inv.result.is_ok());
         inv.cpu
     });
@@ -63,9 +63,29 @@ fn main() {
                 }"#,
         )
         .expect("load");
+    // 钩子什么都不改、也不返回：插件只读请求（比如只记日志）时付的代价
+    let look = rt
+        .load(
+            br#"export const manifest = { name: "look", api: 1, permissions: ["messages"] };
+                export function onRequest(req) {
+                  let n = 0;
+                  for (const m of req.messages) n += m.parts.length;
+                  if (n < 0) return req;
+                }"#,
+        )
+        .expect("load");
     for (label, size, n) in [("100 KB", 100usize << 10, 200), ("1 MB", 1 << 20, 30)] {
         let v = big_view(size);
         let bytes = serde_json::to_vec(&v).unwrap().len();
+        report(
+            &format!("read a {label} view, no return, sandbox CPU"),
+            n,
+            || {
+                let inv = look.on_request(v.clone(), ctx.clone());
+                assert!(matches!(inv.result, Ok(RequestOutcome::Unchanged)));
+                inv.cpu
+            },
+        );
         report(
             &format!("edit a {label} view ({bytes} B), sandbox CPU"),
             n,
