@@ -403,7 +403,11 @@ impl Chain {
         p: String,
     ) -> Result<Option<String>, GatewayError> {
         if !self.live(i) {
-            return Ok(Some(p));
+            // 在别的块里出错被拿掉的：这一块里它攒着的原样接在这一段前面放出来
+            return Ok(Some(match self.stages[i].lanes.remove(&lane) {
+                Some(l) => format!("{}{}{}{p}", l.unrevealed, l.pending, l.buf),
+                None => p,
+            }));
         }
         if self.stages[i].mode == ReplyMode::Block {
             self.stages[i]

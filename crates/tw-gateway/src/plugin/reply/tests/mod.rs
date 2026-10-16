@@ -620,6 +620,66 @@ async fn a_stream_plugin_failing_at_the_end_of_a_block_gives_back_what_it_held()
 }
 
 #[tokio::test]
+async fn a_plugin_skipped_in_one_block_gives_back_another_open_blocks_text_in_order() {
+    // 两块文字同时开着、增量交替来。插件一直扣着，在 0 号块出错跳过：1 号块里它扣着的
+    // （连同为了不交出半截密钥先扣着的尾巴）排在 1 号块后来的段前面，一个字不丢
+    let fails_on_a2 = Double::new("fails-on-a2")
+        .permit(&[Permission::ReplyText])
+        .mode(ReplyMode::Stream)
+        .on_reply(true, false, false, |_| {
+            Ok(Box::new(Closures {
+                text: Box::new(|t| {
+                    if t.contains("A2") {
+                        Invocation::err(RunError::CpuLimit)
+                    } else {
+                        Invocation::ok(Some(String::new()))
+                    }
+                }),
+                end: Box::new(|| Invocation::ok(None)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        });
+    let start = |i: u64| {
+        ev(
+            "content_block_start",
+            json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}}),
+        )
+    };
+    let delta = |i: u64, t: &str| {
+        ev(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":i,"delta":{"type":"text_delta","text":t}}),
+        )
+    };
+    let stop = |i: u64| {
+        ev(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":i}),
+        )
+    };
+    let input = [
+        start(0),
+        start(1),
+        delta(1, "B1 "),
+        delta(0, "A1 "),
+        delta(1, &format!("B2 {}", &KEY[..12])),
+        delta(0, "A2 "),
+        delta(1, &format!("{} B3", &KEY[12..])),
+        stop(0),
+        stop(1),
+    ]
+    .concat();
+    let mut chain = chain_of(Dialect::Anthropic, vec![fails_on_a2], &key_request()).await;
+    chain.stages[0].on_error = OnError::Skip;
+    let mut s = Stream::new(chain, Framing::Sse);
+    let (out, err) = run(&mut s, &input, 4096).await;
+    assert!(err.is_none());
+    let blocks = anthropic_blocks(&out);
+    assert_eq!(blocks[0].2, "A1 A2 ");
+    assert_eq!(blocks[1].2, format!("B1 B2 {KEY} B3"));
+}
+
+#[tokio::test]
 async fn whole_bodies_restore_a_placeholder_a_stream_plugin_splits() {
     let t = format!("use {KEY} now");
     let cases = [
