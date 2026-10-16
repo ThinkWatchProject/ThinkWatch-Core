@@ -6,11 +6,13 @@
 //!
 //! 宿主只通过下面这些导出驱动它：
 //!
-//! 1. 构建时：`tw_init(bridge.js)` 建运行时和上下文、求值桥脚本；之后整块内存
-//!    做成快照，每个实例都从那里开始（`tw-plugin` 的 `build.rs`）。
+//! 1. 构建时：`tw_init(helpers.js + bridge.js)` 建运行时和上下文、求值桥脚本（前面拼着
+//!    插件辅助函数 `tw`）；之后整块内存做成快照，每个实例都从那里开始（`tw-plugin` 的
+//!    `build.rs`）。
 //! 2. 加载插件：`tw_compile(源码)` 出字节码；再在新实例里走一遍 3 读出清单。
 //! 3. 每个实例：`tw_seed` → `tw_load(字节码)`（求值模块顶层）→ `tw_set_ctx`。
-//! 4. 每次钩子：`tw_call` —— 调钩子、跑完 Promise 任务、取结果。
+//! 4. 每次钩子：`tw_call` —— 调钩子（连同这是回答里的第几块文字）、跑完 Promise 任务、
+//!    取结果。
 //!
 //! 结果放在一块输出缓冲里，宿主用 `tw_out_ptr` / `tw_out_len` 读。输入由宿主用
 //! `tw_alloc` 要一块内存写进来，交给导出函数之后归这边释放。
@@ -77,9 +79,9 @@ const JS_STACK_LIMIT: usize = 256 * 1024;
 // ── 导出 ─────────────────────────────────────────────────────────
 
 /// 宿主和胶水之间的约定版本写在这个导出的名字里（宿主按名字找它，不用实例化）。
-/// 改了导出的签名或含义就改名，两边一起改
+/// 改了导出的签名或含义就改名，两边一起改。2：`tw_call` 多了 `lane`
 #[unsafe(no_mangle)]
-pub extern "C" fn tw_abi_1() {}
+pub extern "C" fn tw_abi_2() {}
 
 /// 要一块 `len` 字节的内存给宿主写输入。多给一个字节：要求以 NUL 结尾的
 /// 输入（`JS_Eval`）由宿主在末尾补 0
@@ -306,11 +308,12 @@ pub unsafe extern "C" fn tw_set_ctx(json: *mut u8, len: usize) -> u32 {
 }
 
 /// 调一次钩子。`kind`：0 onRequest，1 onReplyText，2 onReplyTextEnd，3 onToolCall。
-/// `input` 可以是空指针（onReplyTextEnd 没有输入）。
+/// `lane`：回答里的第几块文字（别的钩子是 0），桥只交给 `tw.streamReplace`，插件代码
+/// 看不到。`input` 可以是空指针（onReplyTextEnd 没有输入）。
 ///
 /// 输出总是「一位状态码 + 内容」，返回值也是那位状态码（见 `bridge.js`）。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tw_call(kind: u32, input: *mut u8, len: usize) -> u32 {
+pub unsafe extern "C" fn tw_call(kind: u32, lane: u64, input: *mut u8, len: usize) -> u32 {
     unsafe {
         q::JS_UpdateStackTop(RT);
         let arg = if input.is_null() {
@@ -323,7 +326,8 @@ pub unsafe extern "C" fn tw_call(kind: u32, input: *mut u8, len: usize) -> u32 {
         if q::JS_IsException(arg) {
             return threw();
         }
-        let mut args = [int(kind), arg];
+        // 数字不占堆，不会失败，也不用释放；超过 2^53 的编号会丢精度，那只是插件自己分不清
+        let mut args = [int(kind), q::JS_NewNumber(CTX, lane as f64), arg];
         let r = call_bridge(c"call", &mut args);
         q::JS_FreeValue(CTX, arg);
         if q::JS_IsException(r) {

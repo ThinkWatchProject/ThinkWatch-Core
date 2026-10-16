@@ -9,6 +9,9 @@
 // 权限：system，只读写系统提示词。
 // 设置：回答语言，装上时是简体中文。出错时（比如语言名写得不对）拒绝这个请求。
 //
+// 附加用的是辅助函数 tw.appendSystem：和原文之间空一行，原文已经有这句就不再附加；改的是
+// 传入的 req，不用返回。
+//
 // manifest 是纯数据，写成 core 改写它时的样子：界面改设置时只换这一段，改出来的和原来
 // 只差改了的那一行。
 //
@@ -36,8 +39,5 @@ export function onRequest(req, ctx) {
       "The answer language setting accepts only the name of a language, such as English or Deutsch.",
     );
   }
-  const line = `Always respond in ${language}, unless the user explicitly asks for another language.`;
-  if (req.system.includes(line)) return undefined;
-  req.system = req.system ? `${req.system}\n\n${line}` : line;
-  return req;
+  tw.appendSystem(req, `Always respond in ${language}, unless the user explicitly asks for another language.`);
 }

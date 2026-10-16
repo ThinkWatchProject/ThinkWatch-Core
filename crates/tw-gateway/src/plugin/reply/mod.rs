@@ -51,6 +51,9 @@ mod anthropic;
 mod chat;
 mod gemini;
 mod responses;
+mod tally;
+
+use tally::Tally;
 
 /// 一块文字在这次回答里的编号。由各格式自己发
 pub type Lane = u64;
@@ -116,11 +119,15 @@ struct StageLane {
     /// 流式模式：插件交回来的结尾是半个占位符（它从占位符中间切开了交出的文字），先扣着，
     /// 和它交出的下一段拼起来再换回原值（见 [`Bridge::unfinished_from`]）
     unrevealed: String,
+    /// 流式模式：这一块里交给插件的和它交出的对到哪儿了。块结束时拼起来不一样才算改了
+    /// 文字（只扣着不改的不算）
+    tally: Tally,
 }
 
 #[derive(Default, Clone, Copy)]
 struct Counts {
     text_calls: u64,
+    /// 改了文字的块（整块模式一块一次调用；流式模式按块比，见 [`Tally`]）
     text_changed: u64,
     tool_calls: u64,
     replaced: u64,
@@ -395,6 +402,14 @@ impl Chain {
         self.stages[i].instance.is_some()
     }
 
+    /// 第 `i` 个流式插件出错被拿掉了，这一块到此为止：它交出的已经和交给它的对不上（改了、
+    /// 多交了）才算改了文字；它扣着没交的原样往下走，不算
+    fn count_dropped(&mut self, i: usize, l: &StageLane) {
+        if l.tally.changed_so_far() {
+            self.stages[i].counts.text_changed += 1;
+        }
+    }
+
     /// 一段文字流过第 `i` 个插件，返回它此刻交出的（可能没有）
     async fn piece(
         &mut self,
@@ -405,7 +420,10 @@ impl Chain {
         if !self.live(i) {
             // 在别的块里出错被拿掉的：这一块里它攒着的原样接在这一段前面放出来
             return Ok(Some(match self.stages[i].lanes.remove(&lane) {
-                Some(l) => format!("{}{}{}{p}", l.unrevealed, l.pending, l.buf),
+                Some(l) => {
+                    self.count_dropped(i, &l);
+                    format!("{}{}{}{p}", l.unrevealed, l.pending, l.buf)
+                }
                 None => p,
             }));
         }
@@ -445,22 +463,22 @@ impl Chain {
             .lanes
             .get(&lane)
             .is_some_and(|l| !l.unrevealed.is_empty());
-        match self.invoke(i, move |r| r.on_text(&given)).await {
+        match self.invoke(i, move |r| r.on_text(lane, &given)).await {
             Ok(None) if !carrying => {
-                self.stages[i]
-                    .lanes
-                    .entry(lane)
-                    .or_default()
-                    .pending
-                    .clear();
+                let l = self.stages[i].lanes.entry(lane).or_default();
+                l.pending.clear();
+                l.tally.pass(&hidden, &hidden);
                 Ok(Some(send))
             }
             // 没改就是交回了交给它的那样：前一段结尾扣着半个占位符时，接在它后面一起换
             Ok(s) => {
                 let s = s.unwrap_or_else(|| hidden.clone());
-                if s != hidden {
-                    self.stages[i].counts.text_changed += 1;
-                }
+                self.stages[i]
+                    .lanes
+                    .entry(lane)
+                    .or_default()
+                    .tally
+                    .pass(&hidden, &s);
                 let out = self.reveal(i, lane, &s, false);
                 let l = self.stages[i].lanes.entry(lane).or_default();
                 // 交出了东西（哪怕整段都还扣在半个占位符里）：收到的原文有了着落
@@ -475,6 +493,7 @@ impl Chain {
                 self.fail(i, e)?;
                 // 跳过：它交出的半个占位符、它扣着的、这一段、还没交给它的尾巴，原样往下走
                 let l = self.stages[i].lanes.remove(&lane).unwrap_or_default();
+                self.count_dropped(i, &l);
                 Ok(Some(format!(
                     "{}{}{send}{}",
                     l.unrevealed, l.pending, l.buf
@@ -538,6 +557,7 @@ impl Chain {
             if !self.live(i) {
                 // 半路被拿掉的：它攒着的原样放出来
                 if let Some(l) = self.stages[i].lanes.remove(&lane) {
+                    self.count_dropped(i, &l);
                     out.push(format!("{}{}{}", l.unrevealed, l.pending, l.buf));
                 }
                 carry = out;
@@ -551,7 +571,7 @@ impl Chain {
                         let hidden = self.bridge.hide(&whole);
                         let given = hidden.clone();
                         self.stages[i].counts.text_calls += 1;
-                        match self.invoke(i, move |r| r.on_text(&given)).await {
+                        match self.invoke(i, move |r| r.on_text(lane, &given)).await {
                             Ok(None) => out.push(whole),
                             Ok(Some(s)) => {
                                 if s != hidden {
@@ -581,24 +601,33 @@ impl Chain {
                     }
                     let mut last = String::new();
                     if self.live(i) && self.stages[i].text_end {
-                        match self.invoke(i, |r| r.on_text_end()).await {
+                        match self.invoke(i, move |r| r.on_text_end(lane)).await {
                             Ok(None) => {}
                             Ok(Some(s)) => {
-                                if !s.is_empty() {
-                                    self.stages[i].counts.text_changed += 1;
-                                }
+                                self.stages[i]
+                                    .lanes
+                                    .entry(lane)
+                                    .or_default()
+                                    .tally
+                                    .returned(&s);
                                 last = s;
                             }
                             Err(e) => {
                                 let l = self.stages[i].lanes.remove(&lane).unwrap_or_default();
                                 self.fail(i, e)?;
+                                self.count_dropped(i, &l);
                                 out.push(format!("{}{}", l.unrevealed, l.pending));
                             }
                         }
                     }
                     // 扣着的半个占位符接上最后这一段换回去，凑不完整的原样放出去
                     out.push(self.reveal(i, lane, &last, true));
-                    self.stages[i].lanes.remove(&lane);
+                    // 这一块到头了：交出的和交给它的拼起来不一样，才算改了一次文字
+                    if let Some(l) = self.stages[i].lanes.remove(&lane)
+                        && l.tally.changed()
+                    {
+                        self.stages[i].counts.text_changed += 1;
+                    }
                 }
             }
             carry = out;
