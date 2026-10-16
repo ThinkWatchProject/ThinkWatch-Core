@@ -18,12 +18,13 @@
 //! **一条流里不止一路正文。**Anthropic 一个内容块一路，工具参数又是一路；
 //! Chat 的正文和每个工具调用的参数各是一路。扣住的尾巴只能接回它自己那一路：
 //! 正文块末尾扣住的 `<<TW_`，要是被接到下一个工具参数分片的开头，工具参数就
-//! 坏了。
+//! 坏了。Chat 的 `choices`、Gemini 的 `candidates` 有好几个时（`n`、`candidateCount`
+//! 大于 1），每个选项各是各的几路，按选项的 `index` 分。
 //!
-//! 一路结束的时候（内容块的 `content_block_stop`、Chat 的 `finish_reason`、
+//! 一路结束的时候（内容块的 `content_block_stop`、Chat 和 Gemini 一个选项的结束原因、
 //! Responses 的 `*.done`），扣住的尾巴要**在那一帧之前**补成一帧发出去，形状
 //! 照着那一路自己的格式 —— 补一帧 Anthropic 的 delta 给 Chat 客户端，客户端
-//! 不认识它，那几个字就丢了。
+//! 不认识它，那几个字就丢了。一个选项结束只收尾它自己那几路。
 //!
 //! **工具参数也要还原。**用户说「把我的 key 写进 .env」时，占位符会从工具参数
 //! 流过去 —— 不还原的话，客户端真的会把占位符写进文件。Codex 的 `apply_patch` 这种
@@ -68,10 +69,10 @@ const UNTOUCHED: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lane {
     /// 正文。Anthropic 是内容块的 index，Responses 是 `output_index` 和
-    /// `content_index` 拼起来的，Chat 和 Gemini 只有一路
+    /// `content_index` 拼起来的，Chat 和 Gemini 是选项的 `index`（见 [`choice_lane`]）
     Text(u64),
-    /// 工具参数。Anthropic 是内容块的 index，Chat 是工具调用的 index，
-    /// Responses 是 `output_index`
+    /// 工具参数。Anthropic 是内容块的 index，Chat 是选项的 `index` 和工具调用的
+    /// index 拼起来的，Responses 是 `output_index`
     Args(u64),
     /// Responses 自由格式工具（Codex 的 `apply_patch`）的输入，`output_index`。是一段话，
     /// 不是 JSON
@@ -86,6 +87,20 @@ impl Lane {
         }
     }
 
+    /// Chat、Gemini：这一路是哪个选项的
+    fn choice(self) -> u64 {
+        match self {
+            Lane::Text(k) | Lane::Args(k) | Lane::Input(k) => k >> 32,
+        }
+    }
+
+    /// Chat 工具参数那一路里工具调用的 index
+    fn call(self) -> u64 {
+        match self {
+            Lane::Text(k) | Lane::Args(k) | Lane::Input(k) => k & 0xffff_ffff,
+        }
+    }
+
     /// 这一路的字段解码之后是哪种写法：工具参数还是一段 JSON
     fn form(self) -> Form {
         match self {
@@ -93,6 +108,16 @@ impl Lane {
             Lane::Text(_) | Lane::Input(_) => Form::Text,
         }
     }
+}
+
+/// Chat、Gemini 一路的编号：选项的 `index` 在高 32 位，Chat 工具调用的 index 在低 32 位
+fn choice_lane(choice: u64, call: u64) -> u64 {
+    choice << 32 | (call & 0xffff_ffff)
+}
+
+/// Chat 选项、Gemini 候选的 `index`。没写的算 0：Gemini 的 0 就是省略不写的
+fn choice_of(c: &Value) -> u64 {
+    c.get("index").and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// 一帧里的一处正文：哪一路、在哪个字段。
@@ -128,6 +153,8 @@ enum Close {
     Lanes(Vec<Lane>),
     /// Responses 的 `output_item.done`：这一项的所有路
     Output(u64),
+    /// Chat、Gemini：结束了的这几个选项的所有路
+    Choices(Vec<u64>),
     All,
 }
 
@@ -238,6 +265,12 @@ impl FrameRestorer {
                 .keys()
                 .copied()
                 .filter(|l| l.output_index() == oi)
+                .collect(),
+            Close::Choices(ks) => self
+                .lanes
+                .keys()
+                .copied()
+                .filter(|l| ks.contains(&l.choice()))
                 .collect(),
             Close::All => self.lanes.keys().copied().collect(),
         };
@@ -354,34 +387,38 @@ fn fields(d: Dialect, v: &Value) -> Vec<Field> {
                 }
             }
         }
+        // 每个选项都看，各是各的几路
         Dialect::Chat => {
-            let Some(delta) = v.pointer("/choices/0/delta") else {
-                return out;
-            };
-            if delta.get("content").is_some_and(Value::is_string) {
-                out.push(Field {
-                    lane: Lane::Text(0),
-                    path: vec![Key("choices"), Idx(0), Key("delta"), Key("content")],
-                });
-            }
-            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for (k, c) in calls.iter().enumerate() {
-                    if c.pointer("/function/arguments")
-                        .is_some_and(Value::is_string)
-                    {
-                        let i = c.get("index").and_then(Value::as_u64).unwrap_or(k as u64);
-                        out.push(Field {
-                            lane: Lane::Args(i),
-                            path: vec![
-                                Key("choices"),
-                                Idx(0),
-                                Key("delta"),
-                                Key("tool_calls"),
-                                Idx(k),
-                                Key("function"),
-                                Key("arguments"),
-                            ],
-                        });
+            for (pos, choice) in arr(v, "choices").iter().enumerate() {
+                let Some(delta) = choice.get("delta") else {
+                    continue;
+                };
+                let n = choice_of(choice);
+                if delta.get("content").is_some_and(Value::is_string) {
+                    out.push(Field {
+                        lane: Lane::Text(choice_lane(n, 0)),
+                        path: vec![Key("choices"), Idx(pos), Key("delta"), Key("content")],
+                    });
+                }
+                if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for (k, c) in calls.iter().enumerate() {
+                        if c.pointer("/function/arguments")
+                            .is_some_and(Value::is_string)
+                        {
+                            let i = c.get("index").and_then(Value::as_u64).unwrap_or(k as u64);
+                            out.push(Field {
+                                lane: Lane::Args(choice_lane(n, i)),
+                                path: vec![
+                                    Key("choices"),
+                                    Idx(pos),
+                                    Key("delta"),
+                                    Key("tool_calls"),
+                                    Idx(k),
+                                    Key("function"),
+                                    Key("arguments"),
+                                ],
+                            });
+                        }
                     }
                 }
             }
@@ -402,26 +439,26 @@ fn fields(d: Dialect, v: &Value) -> Vec<Field> {
             _ => {}
         },
         Dialect::Gemini => {
-            let Some(parts) = v
-                .pointer("/candidates/0/content/parts")
-                .and_then(Value::as_array)
-            else {
-                return out;
-            };
-            for (j, p) in parts.iter().enumerate() {
-                let thought = p.get("thought").and_then(Value::as_bool) == Some(true);
-                if !thought && p.get("text").is_some_and(Value::is_string) {
-                    out.push(Field {
-                        lane: Lane::Text(0),
-                        path: vec![
-                            Key("candidates"),
-                            Idx(0),
-                            Key("content"),
-                            Key("parts"),
-                            Idx(j),
-                            Key("text"),
-                        ],
-                    });
+            for (pos, cand) in arr(v, "candidates").iter().enumerate() {
+                let Some(parts) = cand.pointer("/content/parts").and_then(Value::as_array) else {
+                    continue;
+                };
+                let n = choice_of(cand);
+                for (j, p) in parts.iter().enumerate() {
+                    let thought = p.get("thought").and_then(Value::as_bool) == Some(true);
+                    if !thought && p.get("text").is_some_and(Value::is_string) {
+                        out.push(Field {
+                            lane: Lane::Text(choice_lane(n, 0)),
+                            path: vec![
+                                Key("candidates"),
+                                Idx(pos),
+                                Key("content"),
+                                Key("parts"),
+                                Idx(j),
+                                Key("text"),
+                            ],
+                        });
+                    }
                 }
             }
         }
@@ -461,12 +498,7 @@ fn close(d: Dialect, v: &Value) -> Close {
             Some("message_stop") | Some("error") => Close::All,
             _ => Close::None,
         },
-        Dialect::Chat => {
-            let done = v
-                .pointer("/choices/0/finish_reason")
-                .is_some_and(|f| !f.is_null());
-            if done { Close::All } else { Close::None }
-        }
+        Dialect::Chat => choices_done(v, "choices", "finish_reason"),
         Dialect::Responses => match kind(v) {
             Some("response.output_text.done") => Close::Lanes(vec![Lane::Text(
                 u(v, "output_index") << 32 | u(v, "content_index"),
@@ -484,12 +516,7 @@ fn close(d: Dialect, v: &Value) -> Close {
             | Some("error") => Close::All,
             _ => Close::None,
         },
-        Dialect::Gemini => {
-            let done = v
-                .pointer("/candidates/0/finishReason")
-                .is_some_and(|f| !f.is_null());
-            if done { Close::All } else { Close::None }
-        }
+        Dialect::Gemini => choices_done(v, "candidates", "finishReason"),
         // `messageStop` 带 `stopReason`；`contentBlockStop` 只有下标，没有 `delta`
         // 也没有 `start`
         Dialect::Bedrock => {
@@ -505,6 +532,28 @@ fn close(d: Dialect, v: &Value) -> Close {
                 Close::None
             }
         }
+    }
+}
+
+/// `v[key]` 这个数组，不是数组就是空的
+fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// Chat、Gemini：这一帧里带着结束原因的选项结束了。**只收尾它们自己**：别的选项扣着的
+/// 半个占位符还在等它的下一帧
+fn choices_done(v: &Value, list: &str, finish: &str) -> Close {
+    let done: Vec<u64> = arr(v, list)
+        .iter()
+        .filter(|c| c.get(finish).is_some_and(|f| !f.is_null()))
+        .map(choice_of)
+        .collect();
+    if done.is_empty() {
+        Close::None
+    } else {
+        Close::Choices(done)
     }
 }
 
@@ -548,15 +597,15 @@ fn synth(d: Dialect, lane: Lane, last: &Value, tail: String) -> Synth {
         },
         (Dialect::Chat, lane) => {
             let delta = match lane {
-                Lane::Args(i) => json!({
-                    "tool_calls": [{ "index": i, "function": { "arguments": tail } }],
+                Lane::Args(_) => json!({
+                    "tool_calls": [{ "index": lane.call(), "function": { "arguments": tail } }],
                 }),
                 Lane::Text(_) | Lane::Input(_) => json!({ "content": tail }),
             };
             let mut m = copy(&["id", "object", "created", "model", "system_fingerprint"]);
             m.insert(
                 "choices".into(),
-                json!([{ "index": 0, "delta": delta, "finish_reason": null }]),
+                json!([{ "index": lane.choice(), "delta": delta, "finish_reason": null }]),
             );
             Synth {
                 event: None,
@@ -582,11 +631,11 @@ fn synth(d: Dialect, lane: Lane, last: &Value, tail: String) -> Synth {
                 "delta": tail,
             }),
         },
-        (Dialect::Gemini, _) => {
+        (Dialect::Gemini, lane) => {
             let mut m = copy(&["modelVersion", "responseId"]);
             m.insert(
                 "candidates".into(),
-                json!([{ "content": { "role": "model", "parts": [{ "text": tail }] }, "index": 0 }]),
+                json!([{ "content": { "role": "model", "parts": [{ "text": tail }] }, "index": lane.choice() }]),
             );
             Synth {
                 event: None,
@@ -1091,6 +1140,129 @@ mod tests {
         ]},"index":0}]}));
         let out = run(Dialect::Gemini, &[raw]);
         assert!(out.contains(KEY), "{out}");
+    }
+
+    /// Chat 选项 `k` 的一帧
+    fn chat_of(k: u64, delta: Value, finish: Value) -> String {
+        data(json!({
+            "id":"c1","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":k,"delta":delta,"finish_reason":finish}],
+        }))
+    }
+
+    /// Chat：按选项的 `index` 拼出 (正文, 第一个工具调用的参数)
+    fn chat_choices(out: &str) -> BTreeMap<u64, (String, String)> {
+        let mut m: BTreeMap<u64, (String, String)> = BTreeMap::new();
+        for v in values(out) {
+            for c in v["choices"].as_array().into_iter().flatten() {
+                let e = m.entry(c["index"].as_u64().unwrap()).or_default();
+                if let Some(s) = c["delta"]["content"].as_str() {
+                    e.0.push_str(s);
+                }
+                if let Some(s) = c["delta"]["tool_calls"][0]["function"]["arguments"].as_str() {
+                    e.1.push_str(s);
+                }
+            }
+        }
+        m
+    }
+
+    /// `n` > 1：两个选项交替出帧，正文和工具参数各扣各的，扣着的半个占位符只接回它自己
+    /// 那个选项
+    #[test]
+    fn chat_choices_hold_back_and_restore_apart() {
+        let call = |id: Option<&str>, args: &str| {
+            let mut c = json!({"index":0,"function":{"arguments":args}});
+            if let Some(id) = id {
+                c["id"] = json!(id);
+                c["function"]["name"] = json!("write");
+            }
+            json!({ "tool_calls": [c] })
+        };
+        let frames = vec![
+            chat_of(0, json!({"content":"key 是 <<TW"}), Value::Null),
+            chat_of(1, json!({"content":"hi"}), Value::Null),
+            chat_of(1, call(Some("t1"), r#"{"w":"<<TW_SE"#), Value::Null),
+            chat_of(0, json!({"content":"_SECRET_1>>"}), Value::Null),
+            chat_of(0, call(Some("t0"), r#"{"v":"<<TW_SE"#), Value::Null),
+            chat_of(1, call(None, r#"CRET_1>>"}"#), Value::Null),
+            chat_of(1, json!({}), json!("tool_calls")),
+            chat_of(0, call(None, r#"CRET_1>>"}"#), Value::Null),
+            chat_of(0, json!({}), json!("tool_calls")),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let out = run(Dialect::Chat, &frames);
+        let c = chat_choices(&out);
+        assert_eq!(
+            c[&0],
+            (format!("key 是 {KEY}"), format!(r#"{{"v":"{KEY}"}}"#)),
+            "{out}"
+        );
+        assert_eq!(c[&1], ("hi".into(), format!(r#"{{"w":"{KEY}"}}"#)), "{out}");
+    }
+
+    /// 一个选项结束只收尾它自己：另一个选项扣着的半个占位符接着等，补出来的帧写的是
+    /// 它自己的 `index`
+    #[test]
+    fn a_chat_choice_that_finishes_closes_only_itself() {
+        let frames = vec![
+            chat_of(0, json!({"content":"a <<TW_SEC"}), Value::Null),
+            chat_of(1, json!({"content":"b <<TW"}), Value::Null),
+            chat_of(1, json!({}), json!("stop")),
+            chat_of(0, json!({"content":"RET_1>>"}), Value::Null),
+            chat_of(0, json!({}), json!("stop")),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let out = run(Dialect::Chat, &frames);
+        let c = chat_choices(&out);
+        assert_eq!(c[&0].0, format!("a {KEY}"), "{out}");
+        assert_eq!(c[&1].0, "b <<TW", "{out}");
+        // 选项 1 扣着的尾巴补在它自己结束的那一帧之前
+        let vs = values(&out);
+        let tail = vs
+            .iter()
+            .position(|v| v["choices"][0]["delta"]["content"] == "<<TW")
+            .unwrap();
+        assert_eq!(vs[tail]["choices"][0]["index"], 1, "{out}");
+        let finish = vs
+            .iter()
+            .position(|v| {
+                v["choices"][0]["index"] == 1 && v["choices"][0]["finish_reason"] == "stop"
+            })
+            .unwrap();
+        assert!(tail < finish, "{out}");
+    }
+
+    /// Gemini 一帧里几个候选：每个候选各扣各的
+    #[test]
+    fn gemini_candidates_hold_back_and_restore_apart() {
+        let cand = |k: u64, text: &str, finish: bool| {
+            let mut c = json!({"content":{"role":"model","parts":[{"text":text}]},"index":k});
+            if finish {
+                c["finishReason"] = json!("STOP");
+            }
+            c
+        };
+        let frames = vec![
+            data(json!({"candidates":[cand(0, "key: <<TW_SEC", false), cand(1, "x <<TW", false)]})),
+            data(json!({"candidates":[cand(1, "_SECRET_1>>", true)]})),
+            data(json!({"candidates":[cand(0, "RET_1>>", true)]})),
+        ];
+        let out = run(Dialect::Gemini, &frames);
+        let mut text: BTreeMap<u64, String> = BTreeMap::new();
+        for v in values(&out) {
+            for c in v["candidates"].as_array().into_iter().flatten() {
+                for p in c["content"]["parts"].as_array().into_iter().flatten() {
+                    if let Some(t) = p["text"].as_str() {
+                        text.entry(c["index"].as_u64().unwrap())
+                            .or_default()
+                            .push_str(t);
+                    }
+                }
+            }
+        }
+        assert_eq!(text[&0], format!("key: {KEY}"), "{out}");
+        assert_eq!(text[&1], format!("x {KEY}"), "{out}");
     }
 
     #[test]
