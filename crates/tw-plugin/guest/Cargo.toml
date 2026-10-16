@@ -1,9 +1,7 @@
 # 插件沙箱里跑的那个 QuickJS：编成 wasm32-unknown-unknown，没有 WASI。
 #
-# **它不是工作区成员**，平时的 `cargo build` / `cargo test` 不编它 —— 编它要一个
-# 能出 wasm 的 clang，而从源码编 core 只该需要 Rust。编好的 `qjs.wasm` 提交在
-# 旁边，`build.sh` 用钉死的工具链重编，CI 核对重编出来的和提交的逐字节相同。
-# 见 `build.sh` 和 `qjs.wasm.manifest`。
+# **它不是工作区成员**：tw-plugin 的 `build.rs` 另起一个 cargo 编它（C 那一半要一个
+# 能出 wasm 的 clang），再做成快照、预编译进二进制。见 `build.rs`。
 [package]
 name = "tw-plugin-guest"
 version = "0.0.0"

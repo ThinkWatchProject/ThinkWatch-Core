@@ -1,7 +1,7 @@
 //! 沙箱里有什么、实例之间留下什么（I2、I3）。
 //!
-//! - 全局只有 ECMAScript 标准内置、`console` 和 `reject`；连网、读文件、拿环境
-//!   变量、加载模块的东西一样都没有。
+//! - 全局只有 ECMAScript 标准内置、`console`、`reject` 和辅助函数 `tw`；连网、读文件、
+//!   拿环境变量、加载模块的东西一样都没有。
 //! - 每次请求钩子都是新实例；一个回答一个实例，回答之间、插件之间什么都不共享。
 //! - `ctx` 冻结，改不动。
 //! - 时钟是真的，随机数每个实例不同（快照冻住的种子会让每个实例一模一样）。
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tw_plugin::{RequestOutcome, RunError};
 
 /// ECMAScript 2026 规范里全局对象上的属性（第 19 章，含附录 B 的 escape、unescape），
-/// 外加插件的两个：`console`、`reject`。引擎没实现的可以缺，**多出来的一个都不行**
+/// 外加插件的三个：`console`、`reject`、`tw`。引擎没实现的可以缺，**多出来的一个都不行**
 const ALLOWED_GLOBALS: &[&str] = &[
     // 值属性
     "globalThis",
@@ -89,10 +89,11 @@ const ALLOWED_GLOBALS: &[&str] = &[
     // 插件的
     "console",
     "reject",
+    "tw",
 ];
 
 #[test]
-fn the_global_object_holds_only_standard_built_ins_console_and_reject() {
+fn the_global_object_holds_only_standard_built_ins_console_reject_and_tw() {
     let p = load("globals");
     let names: Vec<String> =
         serde_json::from_str(&system_of(&request(&p, json!({})).result)).unwrap();
@@ -107,7 +108,7 @@ fn the_global_object_holds_only_standard_built_ins_console_and_reject() {
         extra.is_empty(),
         "globals outside the allowed set: {extra:?}"
     );
-    for must in ["console", "reject", "JSON", "Date", "Math", "RegExp"] {
+    for must in ["console", "reject", "tw", "JSON", "Date", "Math", "RegExp"] {
         assert!(
             names.iter().any(|n| n == must),
             "{must} is missing: {names:?}"

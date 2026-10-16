@@ -715,6 +715,69 @@ async fn whole_bodies_restore_a_placeholder_a_stream_plugin_splits() {
     }
 }
 
+/// 记下每次调用拿到的块编号，文字原样交回
+struct Lanes(Arc<Mutex<Vec<String>>>);
+
+impl ReplyHost for Lanes {
+    fn on_text(&mut self, lane: Lane, text: &str) -> Invocation<Option<String>> {
+        self.0.lock().unwrap().push(format!("{lane}:{text}"));
+        Invocation::ok(None)
+    }
+
+    fn on_text_end(&mut self, lane: Lane) -> Invocation<Option<String>> {
+        self.0.lock().unwrap().push(format!("{lane}:end"));
+        Invocation::ok(None)
+    }
+
+    fn on_tool_call(&mut self, _: Value) -> Invocation<ToolCallOutcome> {
+        Invocation::ok(ToolCallOutcome::Unchanged)
+    }
+}
+
+/// 两块文字同时开着、增量交替到达：每次调用都带着它那一块的编号（`tw.streamReplace`
+/// 靠它分开缓冲）
+#[tokio::test]
+async fn every_text_call_carries_the_number_of_its_block() {
+    let input = [
+        ev("message_start", json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"usage":{"input_tokens":3,"output_tokens":1}}})),
+        ev("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
+        ev("content_block_start", json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a1"}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"b1"}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a2"}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"b2"}})),
+        ev("content_block_stop", json!({"type":"content_block_stop","index":0})),
+        ev("content_block_stop", json!({"type":"content_block_stop","index":1})),
+        ev("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":9}})),
+        ev("message_stop", json!({"type":"message_stop"})),
+    ]
+    .concat();
+    for (mode, want) in [
+        (
+            ReplyMode::Stream,
+            vec!["0:a1", "1:b1", "0:a2", "1:b2", "0:end", "1:end"],
+        ),
+        // 整块模式：块结束时一次交一整块，也带着编号
+        (ReplyMode::Block, vec!["0:a1a2", "1:b1b2"]),
+    ] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let rec = Double::new("lanes")
+            .permit(&[Permission::ReplyText])
+            .mode(mode)
+            .on_reply(true, mode == ReplyMode::Stream, false, move |_| {
+                Ok(Box::new(Lanes(log.clone())))
+            });
+        let mut s = Stream::new(
+            chain_of(Dialect::Anthropic, vec![rec], &json!({})).await,
+            Framing::Sse,
+        );
+        let (_, err) = run(&mut s, &input, 4096).await;
+        assert!(err.is_none());
+        assert_eq!(*seen.lock().unwrap(), want, "{mode:?}");
+    }
+}
+
 // ───────────────────────────────────────────────────────── Chat
 
 fn chat_stream() -> String {

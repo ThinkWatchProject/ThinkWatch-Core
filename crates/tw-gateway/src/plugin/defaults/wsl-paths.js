@@ -13,6 +13,10 @@
 //
 // 设置只有一个开关：客户端在哪一侧。设置改不出任何别的改写。
 //
+// 遍历和复制交给辅助函数：tw.toolCalls 逐个交出对话历史里的工具调用，tw.mapStrings 复制
+// 参数、把其中每个字符串换一遍（参数里有 __proto__ 这样的键也照常复制）。改的是传入的
+// 对象，不用返回；什么都没换时请求原样发出，一个字节都不动。
+//
 // 权限：messages（对话历史），reply.tool_calls（回答里的工具调用）。reply.tool_calls 是
 // 高风险权限：插件能改动模型要执行的操作；改过的工具调用照样经过 Lite 的工具调用审查。
 // 设置：客户端运行在 Windows 上（关闭时按客户端在 WSL 里处理）。出错时拒绝这个请求。
@@ -52,39 +56,14 @@ function convert(value, windows) {
   return m ? `/mnt/${m[1].toLowerCase()}${(m[2] ?? "/").replaceAll("\\", "/")}` : value;
 }
 
-function rewrite(value, windows) {
-  if (typeof value === "string") return convert(value, windows);
-  if (Array.isArray(value)) return value.map((item) => rewrite(item, windows));
-  if (value !== null && typeof value === "object") {
-    // fromEntries 按原样建出每个键，参数里有 __proto__ 这样的键也不会出错
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, rewrite(item, windows)]),
-    );
-  }
-  return value;
-}
-
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-
 export function onRequest(req, ctx) {
   const windows = ctx.settings.windows_client === true;
-  let changed = false;
-  for (const m of req.messages) {
-    for (const p of m.parts) {
-      if (p.type !== "tool_call") continue;
-      const input = rewrite(p.input, windows);
-      if (!same(input, p.input)) {
-        p.input = input;
-        changed = true;
-      }
-    }
-  }
-  // 没改就不返回：请求原样发出，一个字节都不动
-  return changed ? req : undefined;
+  tw.toolCalls(req, (call) => {
+    call.input = tw.mapStrings(call.input, (s) => convert(s, windows));
+  });
 }
 
 export function onToolCall(call, ctx) {
-  const input = rewrite(call.input, ctx.settings.windows_client === true);
-  if (same(input, call.input)) return undefined;
-  return { id: call.id, name: call.name, input };
+  const windows = ctx.settings.windows_client === true;
+  call.input = tw.mapStrings(call.input, (s) => convert(s, windows));
 }

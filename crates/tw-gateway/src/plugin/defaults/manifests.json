@@ -32,7 +32,7 @@
         }
       ]
     },
-    "sha256": "f34e95b9db72c98eadac320f7c3f7af9acb8beae9fa3acd8eda1d0459e18bb6e"
+    "sha256": "30ca8624472ebdbeb6793b19226402ff3934ff832fb690e2ed1b513496e49322"
   },
   "wsl-paths": {
     "manifest": {
@@ -68,6 +68,6 @@
         }
       ]
     },
-    "sha256": "6aaf3646438f024a6482413eca7fe9f17230d3f5177458476d070485cb333a99"
+    "sha256": "06adbac883676e7587394437c4f483e2020449515a62fb2db69f682495b303df"
   }
 }

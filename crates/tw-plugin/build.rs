@@ -4,8 +4,8 @@
 //!    rquickjs-sys）编成 `wasm32-unknown-unknown` 模块。C 由 clang 编，链接用 rustc
 //!    自带的 rust-lld —— 所以外部只要 clang 和 llvm-ar 两样。这里**不下载任何
 //!    东西**：找不到就报错，告诉人怎么装。
-//! 2. **快照**：在构建机上跑一遍 `tw_init(bridge.js)`，把初始化好的整块内存写回
-//!    模块的数据段（Wizer 的做法）。之后每个实例都从初始化完的状态起步。
+//! 2. **快照**：在构建机上跑一遍 `tw_init(helpers.js + bridge.js)`，把初始化好的整块
+//!    内存写回模块的数据段（Wizer 的做法）。之后每个实例都从初始化完的状态起步。
 //! 3. **预编译**：用 Cranelift 把快照编成目标平台的 `.cwasm`。交叉编译时就编给
 //!    目标平台（`Config::target`），也就不会带上构建机 CPU 的特性。运行时只有
 //!    Wasmtime 的运行时部分，没有编译器。
@@ -39,6 +39,7 @@ fn main() {
     for p in [
         "build.rs",
         "src/engine.rs",
+        "src/helpers.js",
         "src/bridge.js",
         "guest/Cargo.toml",
         "guest/Cargo.lock",
@@ -71,7 +72,7 @@ fn main() {
     println!("cargo:rustc-env=TW_PLUGIN_GUEST_SHA256={sha}");
     println!("cargo:rustc-env=TW_PLUGIN_GUEST_CLANG={}", tools.version);
 
-    let bridge = fs::read(manifest_dir.join("src/bridge.js")).expect("read src/bridge.js");
+    let bridge = bridge_source(&manifest_dir);
     let snapshot = snapshot(&wasm, &bridge);
     let cwasm = precompile(&snapshot, &target);
     fs::write(out_dir.join("guest.cwasm"), cwasm).expect("write guest.cwasm");
@@ -549,7 +550,17 @@ fn check_imports(wasm: &[u8]) {
 
 // ── 快照 ─────────────────────────────────────────────────────────
 
-/// 在构建机上实例化一次、跑 `tw_init(bridge.js)`，把那一刻的整块内存写回数据段
+/// 求值进快照的那一段脚本：`helpers.js`（全局的 `tw`）在前，`bridge.js` 在后。拼成一段
+/// 求值：脚本的值是最后一句的值，也就是桥对象；两边交接用的全局由桥删掉。文件名一律
+/// 是 `bridge.js`，报给插件的栈里这两个文件的帧都会被去掉
+fn bridge_source(manifest_dir: &Path) -> Vec<u8> {
+    let mut src = fs::read(manifest_dir.join("src/helpers.js")).expect("read src/helpers.js");
+    src.push(b'\n');
+    src.extend(fs::read(manifest_dir.join("src/bridge.js")).expect("read src/bridge.js"));
+    src
+}
+
+/// 在构建机上实例化一次、跑 `tw_init(helpers.js + bridge.js)`，把那一刻的整块内存写回数据段
 fn snapshot(wasm: &[u8], bridge: &[u8]) -> Vec<u8> {
     use wasmtime::{Engine, Linker, Module, Store};
 
@@ -593,7 +604,7 @@ fn snapshot(wasm: &[u8], bridge: &[u8]) -> Vec<u8> {
     src.push(0);
     memory
         .write(&mut store, ptr as usize, &src)
-        .unwrap_or_else(|e| fail(&format!("write bridge.js: {e}")));
+        .unwrap_or_else(|e| fail(&format!("write the bridge script: {e}")));
     let rc = init
         .call(&mut store, (ptr, len))
         .unwrap_or_else(|e| fail(&format!("tw_init trapped: {e:?}")));
@@ -605,7 +616,9 @@ fn snapshot(wasm: &[u8], bridge: &[u8]) -> Vec<u8> {
             .get(p..p + n)
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
-        fail(&format!("bridge.js failed to initialize: {msg}"));
+        fail(&format!(
+            "helpers.js + bridge.js failed to initialize: {msg}"
+        ));
     }
     let image = memory.data(&store).to_vec();
     rewrite(wasm, &image)

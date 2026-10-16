@@ -278,10 +278,10 @@ fn only_standard_globals_exist() {
     let inv = run(
         r#"for (const n of ["fetch", "require", "std", "os", "process", "queueMicrotask", "setTimeout",
               "setInterval", "performance", "navigator", "XMLHttpRequest", "WebAssembly", "Deno", "Bun",
-              "print", "gc", "scriptArgs", "atob", "btoa", "__tw_log", "module", "exports"]) {
+              "print", "gc", "scriptArgs", "atob", "btoa", "__tw_log", "__tw_helpers", "module", "exports"]) {
              if (typeof globalThis[n] !== "undefined") throw new Error(n + " is defined");
            }
-           if (typeof console.log !== "function" || typeof reject !== "function") throw new Error("missing");
+           if (typeof console.log !== "function" || typeof reject !== "function" || typeof tw.replace !== "function") throw new Error("missing");
            return undefined;"#,
     );
     assert_eq!(
@@ -360,11 +360,11 @@ fn state_persists_within_one_reply() {
            export function onReplyText(text) { n++; return text + "#" + n; }"##,
     );
     let mut r = p.reply(ctx()).unwrap();
-    assert_eq!(r.on_text("a").result, Ok(Some("a#1".into())));
-    assert_eq!(r.on_text("b").result, Ok(Some("b#2".into())));
+    assert_eq!(r.on_text(0, "a").result, Ok(Some("a#1".into())));
+    assert_eq!(r.on_text(0, "b").result, Ok(Some("b#2".into())));
     let mut r2 = p.reply(ctx()).unwrap();
-    assert_eq!(r2.on_text("c").result, Ok(Some("c#1".into())));
-    assert_eq!(r.on_text("d").result, Ok(Some("d#3".into())));
+    assert_eq!(r2.on_text(0, "c").result, Ok(Some("c#1".into())));
+    assert_eq!(r.on_text(0, "d").result, Ok(Some("d#3".into())));
 }
 
 // ── 回答钩子 ─────────────────────────────────────────────────────
@@ -380,10 +380,10 @@ fn stream_mode_holds_text_and_flushes_it_at_the_end() {
     assert_eq!(p.manifest().reply_mode, ReplyMode::Stream);
     assert!(p.manifest().hooks.reply_text_end);
     let mut r = p.reply(ctx()).unwrap();
-    assert_eq!(r.on_text("abc").result, Ok(Some(String::new())));
-    assert_eq!(r.on_text("def").result, Ok(Some("ABCDEF".into())));
-    assert_eq!(r.on_text("gh").result, Ok(Some(String::new())));
-    assert_eq!(r.on_text_end().result, Ok(Some("gh".into())));
+    assert_eq!(r.on_text(0, "abc").result, Ok(Some(String::new())));
+    assert_eq!(r.on_text(0, "def").result, Ok(Some("ABCDEF".into())));
+    assert_eq!(r.on_text(0, "gh").result, Ok(Some(String::new())));
+    assert_eq!(r.on_text_end(0).result, Ok(Some("gh".into())));
 }
 
 #[test]
@@ -400,13 +400,13 @@ fn reply_text_output_is_validated_and_made_well_formed() {
     );
     let mut r = p.reply(ctx()).unwrap();
     assert!(
-        matches!(r.on_text("num").result, Err(RunError::BadOutput(m)) if m.contains("must return a string"))
+        matches!(r.on_text(0, "num").result, Err(RunError::BadOutput(m)) if m.contains("must return a string"))
     );
     // 切半的代理对换成 U+FFFD，不让整段回答出错
-    assert_eq!(r.on_text("split").result, Ok(Some("a\u{fffd}".into())));
-    assert_eq!(r.on_text("same").result, Ok(None));
-    assert_eq!(r.on_text("other").result, Ok(None));
-    let m = match r.on_text("reject").result {
+    assert_eq!(r.on_text(0, "split").result, Ok(Some("a\u{fffd}".into())));
+    assert_eq!(r.on_text(0, "same").result, Ok(None));
+    assert_eq!(r.on_text(0, "other").result, Ok(None));
+    let m = match r.on_text(0, "reject").result {
         Err(RunError::Threw { message, .. }) => message,
         other => panic!("{other:?}"),
     };
@@ -478,8 +478,8 @@ fn tool_call_hooks_replace_drop_and_keep_calls() {
 fn hooks_a_plugin_does_not_export_are_no_ops() {
     let p = request("return req;");
     let mut r = p.reply(ctx()).unwrap();
-    assert_eq!(r.on_text("x").result, Ok(None));
-    assert_eq!(r.on_text_end().result, Ok(None));
+    assert_eq!(r.on_text(0, "x").result, Ok(None));
+    assert_eq!(r.on_text_end(0).result, Ok(None));
     assert_eq!(
         r.on_tool_call(json!({"name": "x", "input": {}})).result,
         Ok(ToolCallOutcome::Unchanged)
@@ -560,8 +560,8 @@ fn a_giant_output_is_stopped_by_the_output_cap() {
            export function onReplyTextEnd() { return "y".repeat(2 << 20); }"#,
     );
     let mut r = p.reply(ctx()).unwrap();
-    assert_eq!(r.on_text("a").result, Ok(Some(String::new())));
-    assert_eq!(r.on_text_end().result, Err(RunError::OutputLimit));
+    assert_eq!(r.on_text(0, "a").result, Ok(Some(String::new())));
+    assert_eq!(r.on_text_end(0).result, Err(RunError::OutputLimit));
 }
 
 #[test]
@@ -600,7 +600,7 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
            }"#,
     );
     let mut r = p.reply(ctx()).unwrap();
-    let inv = r.on_text("spin");
+    let inv = r.on_text(0, "spin");
     assert_eq!(inv.result, Err(RunError::CpuLimit));
     assert!(
         inv.cpu >= limits.reply_call_cpu && inv.cpu < limits.reply_call_cpu + slack(),
@@ -608,7 +608,7 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
         inv.cpu
     );
     // 被打断过的实例不再用
-    assert_eq!(r.on_text("0").result, Err(RunError::CpuLimit));
+    assert_eq!(r.on_text(0, "0").result, Err(RunError::CpuLimit));
 
     // 每次都没超单次的预算，但加起来超过一个回答的总预算。单次预算放宽到
     // 远大于每次的用量：Windows 上量的是墙上时间，被抢占一下就可能先撞单次上限
@@ -632,7 +632,7 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
     let mut used = Duration::ZERO;
     let mut stopped = false;
     for _ in 0..1000 {
-        let inv = r.on_text("10");
+        let inv = r.on_text(0, "10");
         used += inv.cpu;
         if inv.result == Err(RunError::CpuLimit) {
             stopped = true;

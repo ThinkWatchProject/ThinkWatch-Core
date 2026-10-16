@@ -1,12 +1,13 @@
 // 插件桥：在沙箱里、插件之前求值一次，然后连同整个 QuickJS 一起做进快照
-// （见 build.rs）。整个脚本的值是给 Rust 胶水（guest/src/lib.rs）的桥对象 ——
-// 它不挂在任何全局上，插件拿不到。
+// （见 build.rs，它把 helpers.js 拼在这个文件前面一起求值）。整个脚本的值是给 Rust
+// 胶水（guest/src/lib.rs）的桥对象 —— 它不挂在任何全局上，插件拿不到。
 //
-// 它做四件事：
-//   1. 只留标准 ECMAScript 的全局，外加 console 和 reject；
+// 它做五件事：
+//   1. 只留标准 ECMAScript 的全局，外加 console、reject 和 tw（helpers.js）；
 //   2. Math.random 换成每个实例重新播种的版本（快照把原来的状态冻住了）；
 //   3. 调钩子，把返回值按钩子的类型核对、转成 JSON；
-//   4. 把异常整理成 {"message","stack"}。
+//   4. 钩子不返回时，以它收到的对象此刻的样子为准（修改传入的对象即生效）；
+//   5. 把异常整理成 {"message","stack"}。
 //
 // **宿主不信这里的任何结论。**插件和桥在同一个领域里，插件能改原型、改内建
 // 函数，所以这里的核对只是为了给出好懂的错误；输出交回宿主后，宿主照样按
@@ -36,6 +37,9 @@
   const ErrorCtor = Error;
   const TypeErrorCtor = TypeError;
   const hostLog = G.__tw_log;
+  // helpers.js 留下的那条私下的路（见它的开头）：告诉 tw 这是第几块文字、是不是逐段模式
+  const setLane = G.__tw_helpers.lane;
+  const setMode = G.__tw_helpers.mode;
 
   // 状态码：输出的第一个字符（Rust 那边按它分派）
   const VALUE = "0";
@@ -54,6 +58,9 @@
   let current = null; // 正在跑的钩子名（reject 只认 onRequest）
   let rejected = null; // reject() 给的理由
   let outcome = null; // { done, ok, value }
+  // onRequest、onToolCall 收到的对象和宿主给的原文：钩子不返回时拿它比（见 untouched）
+  let arg;
+  let argText = null;
 
   function clip(s, n) {
     return s.length > n ? ReflectApply(StringSlice, s, [0, n]) : s;
@@ -164,11 +171,30 @@
     return VALUE + s;
   }
 
+  // 钩子没返回（undefined）：以它收到的那个对象此刻的样子为准。序列化出来和宿主给的
+  // 原文一字不差就是没改，不必交给宿主；不一样就当它返回了这个对象，交给宿主照常解析、
+  // 核对（改了又改回的那几项宿主不算改动）。
+  //
+  // 这里判成「没改」只会丢掉改动，放不过越权的改动：越权只可能出在交给宿主的结果里，而
+  // 宿主的核对一点没变。async 钩子到这里时 Promise 已经落定，比的是落定时的样子
+  function untouched(kind) {
+    const hook = HOOKS[kind];
+    let s;
+    try {
+      s = JSONstringify(arg);
+    } catch (e) {
+      return BAD + hook + " changed its argument into something that cannot be turned into JSON: " + clip(show(e), 500);
+    }
+    if (typeof s !== "string") return BAD + hook + " changed its argument into something that cannot be turned into JSON";
+    if (s === argText) return UNCHANGED;
+    return VALUE + (kind === 0 ? s : "[" + s + "]");
+  }
+
   function finish(kind, v) {
     const hook = HOOKS[kind];
     switch (kind) {
       case 0:
-        if (v === undefined) return UNCHANGED;
+        if (v === undefined) return untouched(0);
         if (v === null || typeof v !== "object" || ArrayIsArray(v)) {
           return BAD + "onRequest must return the request object or undefined, not " + typeName(v);
         }
@@ -183,7 +209,7 @@
         // 和 TextEncoder 的做法一样，不让一个截断的表情把整个回答弄挂
         return VALUE + wellFormed(v);
       case 3:
-        if (v === undefined) return UNCHANGED;
+        if (v === undefined) return untouched(3);
         if (v === null) return DROP;
         if (typeof v !== "object") {
           return BAD + "onToolCall must return a tool call, an array of them, null or undefined, not " + typeName(v);
@@ -273,8 +299,9 @@
   ObjectDefineProperty(G, "console", { value: consoleObject, writable: true, configurable: true, enumerable: false });
   ObjectDefineProperty(G, "reject", { value: reject, writable: true, configurable: true, enumerable: false });
 
-  // 全局只留 ECMAScript 标准里的（含附录 B 的 escape/unescape）和上面两个。
-  // 引擎哪天多给了什么（queueMicrotask、performance、navigator……），在这里统一去掉
+  // 全局只留 ECMAScript 标准里的（含附录 B 的 escape/unescape）、上面两个和 tw。
+  // 引擎哪天多给了什么（queueMicrotask、performance、navigator……），在这里统一去掉；
+  // 交接用的 __tw_log、__tw_helpers 也在这里去掉
   const KEEP = [
     "globalThis", "Infinity", "NaN", "undefined",
     "eval", "isFinite", "isNaN", "parseFloat", "parseInt",
@@ -287,7 +314,7 @@
     "SuppressedError", "Symbol", "SyntaxError", "TypeError", "Uint8Array", "Uint8ClampedArray",
     "Uint16Array", "Uint32Array", "URIError", "WeakMap", "WeakRef", "WeakSet",
     "Atomics", "JSON", "Math", "Reflect",
-    "console", "reject",
+    "console", "reject", "tw",
   ];
   const keep = { __proto__: null };
   for (let i = 0; i < KEEP.length; i++) keep[KEEP[i]] = true;
@@ -336,6 +363,14 @@
           }
         } catch (_) {}
       }
+      // tw.streamReplace 要知道：逐段模式下才扣住文字，扣着的要有 onReplyTextEnd 放出来
+      let stream = false;
+      if (kind === "object") {
+        try {
+          stream = m.reply === "stream";
+        } catch (_) {}
+      }
+      setMode(stream, typeof h.onReplyTextEnd === "function");
       const def = ns.default;
       return (
         '{"hooks":' + found +
@@ -360,10 +395,14 @@
       ctxValue = deepFreeze(JSONparse(text));
     },
 
-    call(kind, input) {
+    // `lane`：回答里的第几块文字（请求钩子、工具调用是 0），只交给 tw.streamReplace
+    call(kind, lane, input) {
       rejected = null;
       outcome = null;
+      arg = undefined;
+      argText = null;
       current = HOOKS[kind];
+      setLane(lane);
       const f = hooks[current];
       if (typeof f !== "function") {
         outcome = { __proto__: null, done: true, ok: false, value: new TypeErrorCtor(current + " is not exported") };
@@ -371,10 +410,12 @@
       }
       let r;
       try {
-        if (kind === 0) r = ReflectApply(f, undefined, [JSONparse(input), ctxValue]);
-        else if (kind === 1) r = ReflectApply(f, undefined, [input, ctxValue]);
-        else if (kind === 2) r = ReflectApply(f, undefined, [ctxValue]);
-        else r = ReflectApply(f, undefined, [JSONparse(input), ctxValue]);
+        if (kind === 0 || kind === 3) {
+          argText = input;
+          arg = JSONparse(input);
+          r = ReflectApply(f, undefined, [arg, ctxValue]);
+        } else if (kind === 1) r = ReflectApply(f, undefined, [input, ctxValue]);
+        else r = ReflectApply(f, undefined, [ctxValue]);
       } catch (e) {
         outcome = { __proto__: null, done: true, ok: false, value: e };
         return;
@@ -414,6 +455,8 @@
         return finish(kind, o.value);
       } finally {
         current = null;
+        arg = undefined;
+        argText = null;
       }
     },
 

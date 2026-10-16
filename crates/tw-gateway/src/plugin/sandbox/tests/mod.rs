@@ -185,9 +185,9 @@ fn a_rejection_and_a_throw_keep_their_meaning() {
 fn a_reply_instance_keeps_its_state_for_one_answer() {
     let h = load(BOTH);
     let mut r = h.reply(ctx()).unwrap();
-    assert_eq!(r.on_text("hel").result, Ok(Some(String::new())));
-    assert_eq!(r.on_text("lo").result, Ok(Some(String::new())));
-    assert_eq!(r.on_text_end().result, Ok(Some("HELLO".into())));
+    assert_eq!(r.on_text(0, "hel").result, Ok(Some(String::new())));
+    assert_eq!(r.on_text(0, "lo").result, Ok(Some(String::new())));
+    assert_eq!(r.on_text_end(0).result, Ok(Some("HELLO".into())));
     // 工具调用：丢掉一个、改一个
     assert_eq!(
         r.on_tool_call(json!({"id": "t1", "name": "Bash", "input": {"command": "ls"}}))
@@ -205,7 +205,45 @@ fn a_reply_instance_keeps_its_state_for_one_answer() {
 
     // 另一个回答是另一个实例：上一个攒着的不会漏过来
     let mut fresh = h.reply(ctx()).unwrap();
-    assert_eq!(fresh.on_text_end().result, Ok(Some(String::new())));
+    assert_eq!(fresh.on_text_end(0).result, Ok(Some(String::new())));
+}
+
+/// 块编号一路交到沙箱里：两块文字交替送段，`tw.streamReplace` 各扣各的
+#[test]
+fn the_lane_reaches_the_sandbox() {
+    let h = load(
+        r#"export const manifest = { name: "spelling", api: 1, permissions: ["reply.text"], reply: "stream" };
+           export const { onReplyText, onReplyTextEnd } = tw.streamReplace([["colour", "color"]]);"#,
+    );
+    let mut r = h.reply(ctx()).unwrap();
+    let mut text = |lane: u64, t: &str| match r.on_text(lane, t).result {
+        Ok(Some(s)) => s,
+        Ok(None) => t.to_string(),
+        Err(e) => panic!("{e:?}"),
+    };
+    let mut a = text(0, "the col");
+    let mut b = text(1, "a col");
+    a += &text(0, "our");
+    b += &text(1, "d day");
+    a += &r.on_text_end(0).result.unwrap().unwrap_or_default();
+    b += &r.on_text_end(1).result.unwrap().unwrap_or_default();
+    assert_eq!(a, "the color");
+    assert_eq!(b, "a cold day");
+}
+
+/// 修改传入的 req 即生效，不用返回
+#[test]
+fn an_edited_request_counts_without_a_return() {
+    let h = load(
+        r#"export const manifest = { name: "t", api: 1, permissions: ["system"] };
+           export function onRequest(req) { tw.appendSystem(req, "Answer in English."); }"#,
+    );
+    match h.on_request(view(), ctx()).result {
+        Ok(RequestOutcome::Changed(v)) => {
+            assert_eq!(v["system"], "Be brief.\n\nAnswer in English.")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

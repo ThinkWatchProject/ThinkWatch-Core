@@ -14,9 +14,9 @@ use wasmtime::{
 
 use crate::{Limits, LogLevel, LogLine, RunError, cpu};
 
-/// guest 和这边的约定版本：guest 导出一个带版本号的函数名，见它的 `tw_abi_1`。
+/// guest 和这边的约定版本：guest 导出一个带版本号的函数名，见它的 `tw_abi_2`。
 /// 改了导出的签名或含义，两边一起改名
-const ABI_EXPORT: &str = "tw_abi_1";
+const ABI_EXPORT: &str = "tw_abi_2";
 
 /// 沙箱模块唯一允许的导入（build.rs 编的时候查过一次，加载时再查一次）
 pub(crate) const ALLOWED_IMPORTS: &[(&str, &str)] =
@@ -184,7 +184,7 @@ struct Exports {
     load: TypedFunc<(u32, u32), u32>,
     seed: TypedFunc<(u32, u32, u32, u32), u32>,
     set_ctx: TypedFunc<(u32, u32), u32>,
-    call: TypedFunc<(u32, u32, u32), u32>,
+    call: TypedFunc<(u32, u64, u32, u32), u32>,
 }
 
 /// 一段 JS 抛出的错误，桥整理成的样子
@@ -447,10 +447,12 @@ impl Sandbox {
         Ok(())
     }
 
-    /// 调一次钩子。返回状态码和内容；内容超过 `cap` 字节按超出输出上限算
+    /// 调一次钩子。`lane` 是回答里的第几块文字（只交给沙箱里的 `tw.streamReplace`），
+    /// 别的钩子给 0。返回状态码和内容；内容超过 `cap` 字节按超出输出上限算
     pub(crate) fn call(
         &mut self,
         hook: Hook,
+        lane: u64,
         input: Option<&[u8]>,
         cap: usize,
     ) -> Result<(u8, Vec<u8>), RunError> {
@@ -460,7 +462,7 @@ impl Sandbox {
         };
         self.f
             .call
-            .call(&mut self.store, (hook as u32, ptr, len))
+            .call(&mut self.store, (hook as u32, lane, ptr, len))
             .map_err(|e| self.classify(e))?;
         if self.memory_denied() {
             return Err(RunError::MemoryLimit);

@@ -3,7 +3,12 @@
 //! 插件是一个 JavaScript 模块。它在 QuickJS 里执行，而 QuickJS 本身编成了 wasm、
 //! 跑在 Wasmtime 里（`build.rs` 把它编好、做成快照、预编译成本机机器码嵌进来）。
 //! 沙箱从宿主那里只拿得到两样东西：写一行日志、看一眼时钟。没有文件、网络、
-//! 环境变量、进程，也没有别的插件。
+//! 环境变量、进程，也没有别的插件。插件看得到的全局除了 ECMAScript 标准内置，只有
+//! `console`、`reject` 和辅助函数 `tw`（`src/helpers.js`：纯 JavaScript，和桥脚本一起
+//! 做进快照；它交出的东西宿主照样不信）。
+//!
+//! 请求钩子、工具调用钩子不返回时，以它收到的对象在调用结束时的样子为准（修改传入的
+//! 对象即生效，见 `src/bridge.js`）。
 //!
 //! 每次请求钩子都是一个**新实例**；一个回答用**一个实例**，那个回答的每次钩子
 //! 调用共用它，回答结束就丢掉。实例从快照起步（QuickJS 已经初始化好），然后求值
@@ -133,7 +138,7 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestOutcome {
-    /// 返回了 `undefined`，或者返回的视图和传进去的一样
+    /// 返回的视图（返回 `undefined` 时是钩子结束时的 `req`）和传进去的一样
     Unchanged,
     /// 改过的视图（没核对过结构和权限，那是 tw-gateway 的事）
     Changed(Value),
@@ -617,7 +622,7 @@ impl Plugin {
         let cap = limits.max_output.limit(view_json.len());
         let raw = sb
             .set_ctx(&ctx_json)
-            .and_then(|()| sb.call(Hook::Request, Some(&view_json), cap));
+            .and_then(|()| sb.call(Hook::Request, 0, Some(&view_json), cap));
         // 量到钩子返回为止：解析输出、和原视图比较是这边的事
         let spent = sb.elapsed();
         logs.extend(sb.take_logs());
@@ -675,13 +680,16 @@ impl fmt::Debug for Reply {
 }
 
 impl Reply {
-    /// 一段助手文字。分块模式下是整块，流式时是一段增量。`None` 表示照原样
-    pub fn on_text(&mut self, text: &str) -> Invocation<Option<String>> {
+    /// 一段助手文字。分块模式下是整块，流式时是一段增量。`None` 表示照原样。
+    ///
+    /// `lane` 是这块文字在这次回答里的编号：同时进行的几块文字（Chat Completions 的
+    /// `n > 1`）各一个。它只交给沙箱里的 `tw.streamReplace` 分开缓冲，插件代码看不到
+    pub fn on_text(&mut self, lane: u64, text: &str) -> Invocation<Option<String>> {
         if !self.plugin.manifest.hooks.reply_text {
             return self.skip(None);
         }
         let cap = self.plugin.rt.limits.max_output.limit(text.len());
-        self.run(Hook::ReplyText, Some(text.as_bytes()), cap)
+        self.run(Hook::ReplyText, lane, Some(text.as_bytes()), cap)
             .then(|(status, payload)| match status {
                 sandbox::VALUE => {
                     let s = String::from_utf8_lossy(&payload).into_owned();
@@ -692,13 +700,13 @@ impl Reply {
             })
     }
 
-    /// 流式模式下一个文字块结束：放出还攒着的文字
-    pub fn on_text_end(&mut self) -> Invocation<Option<String>> {
+    /// 流式模式下第 `lane` 块文字结束：放出还攒着的文字
+    pub fn on_text_end(&mut self, lane: u64) -> Invocation<Option<String>> {
         if !self.plugin.manifest.hooks.reply_text_end {
             return self.skip(None);
         }
         let cap = self.plugin.rt.limits.max_output.limit(0);
-        self.run(Hook::ReplyTextEnd, None, cap)
+        self.run(Hook::ReplyTextEnd, lane, None, cap)
             .then(|(status, payload)| match status {
                 sandbox::VALUE => Ok(Some(String::from_utf8_lossy(&payload).into_owned())),
                 sandbox::UNCHANGED => Ok(None),
@@ -713,7 +721,7 @@ impl Reply {
         }
         let input = to_json(&call);
         let cap = self.plugin.rt.limits.max_output.limit(input.len());
-        self.run(Hook::ToolCall, Some(&input), cap)
+        self.run(Hook::ToolCall, 0, Some(&input), cap)
             .then(|(status, payload)| decode_tool_call(status, payload, &call))
     }
 
@@ -725,7 +733,13 @@ impl Reply {
         }
     }
 
-    fn run(&mut self, hook: Hook, input: Option<&[u8]>, cap: usize) -> Invocation<(u8, Vec<u8>)> {
+    fn run(
+        &mut self,
+        hook: Hook,
+        lane: u64,
+        input: Option<&[u8]>,
+        cap: usize,
+    ) -> Invocation<(u8, Vec<u8>)> {
         let mut logs = std::mem::take(&mut self.carry_logs);
         let mut cpu = std::mem::take(&mut self.carry_cpu);
         if let Some(e) = &self.failed {
@@ -747,7 +761,7 @@ impl Reply {
         }
         let _running = self.plugin.rt.ticker.enter();
         self.sb.arm(limits.reply_call_cpu.min(left));
-        let result = self.sb.call(hook, input, cap);
+        let result = self.sb.call(hook, lane, input, cap);
         let spent = self.sb.elapsed();
         self.used += spent;
         cpu += spent;

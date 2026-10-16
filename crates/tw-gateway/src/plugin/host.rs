@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::plugin::engine::Manifest;
+use crate::plugin::reply::Lane;
 use crate::plugin::set::LogLine;
 
 pub trait PluginHost: Send + Sync {
@@ -43,11 +44,14 @@ pub trait PluginHost: Send + Sync {
 }
 
 /// 一次回答的插件实例。**只给这一次回答用**。
+///
+/// `lane` 是这块文字在这次回答里的编号（[`Lane`]）：同时进行的几块文字分开缓冲。它只交给
+/// 沙箱里的 `tw.streamReplace`，插件代码看不到
 pub trait ReplyHost: Send {
     /// `None` 是没改
-    fn on_text(&mut self, text: &str) -> Invocation<Option<String>>;
+    fn on_text(&mut self, lane: Lane, text: &str) -> Invocation<Option<String>>;
     /// 流式一块文字结束。`None` 是什么都不补
-    fn on_text_end(&mut self) -> Invocation<Option<String>>;
+    fn on_text_end(&mut self, lane: Lane) -> Invocation<Option<String>>;
     fn on_tool_call(&mut self, call: Value) -> Invocation<ToolCallOutcome>;
 }
 
@@ -302,7 +306,8 @@ pub mod double {
     type EndFn = dyn FnMut() -> Invocation<Option<String>> + Send;
     type ToolFn = dyn FnMut(Value) -> Invocation<ToolCallOutcome> + Send;
 
-    /// 一个回答实例的替身：三个闭包，可以带状态（流式扣住文字的插件就要）。
+    /// 一个回答实例的替身：三个闭包，可以带状态（流式扣住文字的插件就要）。块编号不交给
+    /// 闭包：插件代码本来就看不到它
     pub struct Closures {
         pub text: Box<TextFn>,
         pub end: Box<EndFn>,
@@ -310,11 +315,11 @@ pub mod double {
     }
 
     impl ReplyHost for Closures {
-        fn on_text(&mut self, text: &str) -> Invocation<Option<String>> {
+        fn on_text(&mut self, _lane: Lane, text: &str) -> Invocation<Option<String>> {
             (self.text)(text)
         }
 
-        fn on_text_end(&mut self) -> Invocation<Option<String>> {
+        fn on_text_end(&mut self, _lane: Lane) -> Invocation<Option<String>> {
             (self.end)()
         }
 
