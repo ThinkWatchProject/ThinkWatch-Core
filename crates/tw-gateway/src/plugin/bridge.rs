@@ -38,6 +38,11 @@ pub struct Bridge {
     /// `values` 的下标，按值的字节序排：一段尾巴是不是哪个值的开头，二分查一次（见
     /// [`Bridge::hold_from`]）
     by_bytes: Vec<usize>,
+    /// `values` 的下标，按占位符的字节序排：插件交回来的一段结尾是不是哪个占位符的开头，
+    /// 二分查一次（见 [`Bridge::unfinished_from`]）
+    by_placeholder: Vec<usize>,
+    /// 最长的占位符有多长：结尾扣住的不会比它长
+    longest_placeholder: usize,
 }
 
 impl Bridge {
@@ -48,6 +53,8 @@ impl Bridge {
             values: Vec::new(),
             lengths: Lengths::default(),
             by_bytes: Vec::new(),
+            by_placeholder: Vec::new(),
+            longest_placeholder: 0,
         }
     }
 
@@ -106,8 +113,12 @@ impl Bridge {
         values.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         let mut by_bytes: Vec<usize> = (0..values.len()).collect();
         by_bytes.sort_unstable_by(|&a, &b| values[a].0.cmp(&values[b].0));
+        let mut by_placeholder: Vec<usize> = (0..values.len()).collect();
+        by_placeholder.sort_unstable_by(|&a, &b| values[a].1.cmp(&values[b].1));
+        self.longest_placeholder = values.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
         self.lengths = Lengths::of(&values);
         self.by_bytes = by_bytes;
+        self.by_placeholder = by_placeholder;
         self.values = values;
     }
 
@@ -263,6 +274,31 @@ impl Bridge {
         self.by_bytes[first..].iter().take(2).any(|&v| {
             let o = self.values[v].0.as_bytes();
             o.len() > tail.len() && o.starts_with(tail)
+        })
+    }
+
+    /// 流式插件交回来的一段，从哪个字节起是账里某个占位符**没写完**的开头：插件从占位符
+    /// 中间切开它交出的文字时，前后两截各自都换不回原值，结尾这半个要扣住，和它交出的下一段
+    /// 拼起来再换。
+    ///
+    /// 返回 `s.len()` 是没有要扣的。只认账里的占位符（同 [`tw_guard::redact::stream`]）：
+    /// `<<` 在 C++ 代码、heredoc 里到处都是，不能见一个扣一个。扣住的因此不会比最长的占位符
+    /// 长；切点在占位符开头那个 ASCII 字节上，总在字符边界上。
+    pub fn unfinished_from(&self, s: &str) -> usize {
+        let b = s.as_bytes();
+        (b.len().saturating_sub(self.longest_placeholder)..b.len())
+            .find(|&at| s.is_char_boundary(at) && self.starts_a_placeholder(&b[at..]))
+            .unwrap_or(b.len())
+    }
+
+    /// `tail` 是不是账里某个占位符的**真**前缀（同 [`Bridge::starts_a_value`]）
+    fn starts_a_placeholder(&self, tail: &[u8]) -> bool {
+        let first = self
+            .by_placeholder
+            .partition_point(|&v| self.values[v].1.as_bytes() < tail);
+        self.by_placeholder[first..].iter().take(2).any(|&v| {
+            let p = self.values[v].1.as_bytes();
+            p.len() > tail.len() && p.starts_with(tail)
         })
     }
 }
@@ -479,6 +515,32 @@ mod tests {
         assert_eq!(b.hold_from(&buf), buf.len() - 10);
         assert_eq!(b.hold_from("别的 sk"), "别的 sk".len() - 2);
         assert_eq!(b.hold_from("什么都不像"), "什么都不像".len());
+    }
+
+    #[test]
+    fn only_the_unfinished_start_of_a_placeholder_in_the_ledger_is_held() {
+        let mut b = Bridge::new(rules());
+        b.learn(
+            format!("{{\"messages\":[{{\"content\":\"{KEY}\"}}]}}").as_bytes(),
+            crate::guard::TEST_SHAPE,
+        );
+        for (s, held) in [
+            ("用 <<TW_SECRET_1", "<<TW_SECRET_1"),
+            ("用 <<TW_SECRET_1>", "<<TW_SECRET_1>"),
+            ("用 <", "<"),
+            ("<<<TW_SEC", "<<TW_SEC"),
+            ("用 <<TW_SECRET_1>>", ""),
+            // 账里没有的占位符、C++ 的 `<<` 不扣
+            ("用 <<TW_SECRET_9", ""),
+            ("std::cout << x", ""),
+        ] {
+            assert_eq!(&s[b.unfinished_from(s)..], held, "{s:?}");
+        }
+        assert_eq!(
+            Bridge::new(rules()).unfinished_from("<<TW_"),
+            5,
+            "空账什么都不扣"
+        );
     }
 
     /// 一本账里装着这些值（按出现的先后发号）
