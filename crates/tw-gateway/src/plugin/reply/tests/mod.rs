@@ -849,6 +849,127 @@ async fn chat_calls_that_pass_untouched_keep_their_ids_and_order() {
     assert_eq!(finish, "tool_calls");
 }
 
+/// `n` = 2 的流：两个选项交替出帧，各有正文、各有工具调用（工具调用的序号各从 0 数）
+fn chat_two_choices(text0: [&str; 2], text1: [&str; 2]) -> String {
+    let chunk = |k: u64, delta: Value, finish: Value| {
+        data(
+            json!({"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":k,"delta":delta,"finish_reason":finish}]}),
+        )
+    };
+    [
+        chunk(0, json!({"role":"assistant","content":""}), Value::Null),
+        chunk(1, json!({"role":"assistant","content":""}), Value::Null),
+        chunk(0, json!({"content":text0[0]}), Value::Null),
+        chunk(1, json!({"content":text1[0]}), Value::Null),
+        chunk(0, json!({"content":text0[1]}), Value::Null),
+        chunk(1, json!({"content":text1[1]}), Value::Null),
+        chunk(0, json!({"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"shell","arguments":""}}]}), Value::Null),
+        chunk(1, json!({"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"shell","arguments":""}}]}), Value::Null),
+        chunk(0, json!({"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}), Value::Null),
+        chunk(1, json!({"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}), Value::Null),
+        chunk(0, json!({"tool_calls":[{"index":1,"id":"call_c","type":"function","function":{"name":"read","arguments":"{\"p\":1}"}}]}), Value::Null),
+        chunk(1, json!({}), json!("tool_calls")),
+        chunk(0, json!({}), json!("tool_calls")),
+        data(json!({"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}})),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+}
+
+/// 只读一个选项（帧里 `index` 是 `k` 的那些）的输出
+fn chat_reading_of(out: &str, k: u64) -> (String, Vec<ChatCall>, String) {
+    let only: String = frames(out)
+        .into_iter()
+        .flat_map(|(_, v)| {
+            v["choices"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["index"] == k)
+                .map(|c| data(json!({ "choices": [c] })))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    chat_reading(&only)
+}
+
+/// 工具调用：`shell` 的命令后面加 ` -a`，`read` 去掉
+fn shell_dash_a() -> Double {
+    tools(|call| {
+        if call["name"] == "shell" {
+            let cmd = call["input"]["cmd"].as_str().unwrap_or("?");
+            ToolCallOutcome::Replace(vec![
+                json!({ "name": "shell", "input": { "cmd": format!("{cmd} -a") } }),
+            ])
+        } else {
+            ToolCallOutcome::Drop
+        }
+    })
+}
+
+/// `n` > 1：每个选项的正文各攒各的、工具调用各收各的，改过的写回它自己的选项
+#[tokio::test]
+async fn chat_choices_are_kept_apart_in_a_stream() {
+    let input = chat_two_choices(["hel", "lo"], ["wor", "ld"]);
+    let mut s = Stream::new(
+        chain_of(Dialect::Chat, vec![upper(), shell_dash_a()], &json!({})).await,
+        Framing::Sse,
+    );
+    let (out, err) = run(&mut s, &input, 4096).await;
+    assert!(err.is_none());
+    // 换出来的调用没给 id，另发一个：只看序号、名字、参数
+    let shape = |calls: Vec<ChatCall>| -> Vec<(u64, String, String)> {
+        calls.into_iter().map(|c| (c.0, c.2, c.3)).collect()
+    };
+    let (text, calls, finish) = chat_reading_of(&out, 0);
+    assert_eq!(text, "HELLO", "{out}");
+    assert_eq!(
+        shape(calls),
+        [(0, "shell".into(), "{\"cmd\":\"ls -a\"}".into())],
+        "{out}"
+    );
+    assert_eq!(finish, "tool_calls");
+    let (text, calls, finish) = chat_reading_of(&out, 1);
+    assert_eq!(text, "WORLD", "{out}");
+    assert_eq!(
+        shape(calls),
+        [(0, "shell".into(), "{\"cmd\":\"pwd -a\"}".into())],
+        "{out}"
+    );
+    assert_eq!(finish, "tool_calls");
+    assert!(out.ends_with("data: [DONE]\n\n"));
+}
+
+/// 流式插件逐段收、半个密钥先扣着：扣着的那半个只接这个选项后面的字，不会落进另一个选项
+#[tokio::test]
+async fn chat_choices_hold_back_apart_in_stream_mode() {
+    let request = json!({ "messages": [{ "role": "user", "content": format!("key {KEY}") }] });
+    let input = chat_two_choices(
+        [
+            &format!("use {}", &KEY[..12]),
+            &format!("{} now", &KEY[12..]),
+        ],
+        ["ab", "c"],
+    );
+    let mut s = Stream::new(
+        chain_of(
+            Dialect::Chat,
+            vec![upper().mode(ReplyMode::Stream), shell_dash_a()],
+            &request,
+        )
+        .await,
+        Framing::Sse,
+    );
+    let (out, err) = run(&mut s, &input, 7).await;
+    assert!(err.is_none());
+    assert_eq!(
+        chat_reading_of(&out, 0).0,
+        format!("USE {KEY} NOW"),
+        "{out}"
+    );
+    assert_eq!(chat_reading_of(&out, 1).0, "ABC", "{out}");
+}
+
 // ───────────────────────────────────────────────────────── Responses
 
 fn responses_stream() -> String {
@@ -1114,6 +1235,77 @@ async fn a_cut_json_array_is_closed_into_a_valid_array() {
     assert_eq!(got.last().unwrap()["error"]["message"], "cut");
 }
 
+/// 只读一个候选（`index` 是 `k` 的那些）的输出：(正文, 调用)
+fn gemini_reading_of(chunks: &[Value], k: u64) -> (String, Vec<Value>) {
+    let only: Vec<Value> = chunks
+        .iter()
+        .flat_map(|c| {
+            c["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|x| x["index"] == k)
+                .map(|x| json!({ "candidates": [x] }))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let (text, calls, _) = gemini_reading(&only);
+    (text, calls)
+}
+
+/// 函数调用：`ls` 的目录前面加 `x`
+fn ls_x() -> Double {
+    tools(|call| {
+        let dir = call["input"]["dir"].as_str().unwrap_or("?");
+        ToolCallOutcome::Replace(vec![
+            json!({ "name": "ls", "input": { "dir": format!("x{dir}") } }),
+        ])
+    })
+}
+
+/// `candidateCount` > 1：每个候选的正文各攒各的，最后一帧里两个候选都交给插件
+#[tokio::test]
+async fn gemini_candidates_are_kept_apart_in_a_stream() {
+    let cand = |k: u64, parts: Value| json!({"content":{"role":"model","parts":parts},"index":k});
+    let mut last0 = cand(0, json!([{"text":"!"}]));
+    last0["finishReason"] = json!("STOP");
+    let mut last1 = cand(
+        1,
+        json!([{"text":"ld"},{"functionCall":{"name":"ls","args":{"dir":"tmp"}}}]),
+    );
+    last1["finishReason"] = json!("STOP");
+    let chunks = [
+        json!({"candidates":[cand(0, json!([{"text":"hel"}]))],"modelVersion":"g"}),
+        json!({"candidates":[cand(1, json!([{"text":"wor"}]))],"modelVersion":"g"}),
+        json!({"candidates":[cand(0, json!([{"text":"lo"},{"functionCall":{"name":"ls","args":{"dir":"."}}}]))],"modelVersion":"g"}),
+        json!({"candidates":[last0, last1],"usageMetadata":{"promptTokenCount":1},"modelVersion":"g"}),
+    ];
+    let sse: String = chunks.iter().map(|c| data(c.clone())).collect();
+    let mut s = Stream::new(
+        chain_of(Dialect::Gemini, vec![upper(), ls_x()], &json!({})).await,
+        Framing::Sse,
+    );
+    let (out, err) = run(&mut s, &sse, 4096).await;
+    assert!(err.is_none());
+    let got: Vec<Value> = frames(&out).into_iter().map(|(_, v)| v).collect();
+    assert_eq!(
+        gemini_reading_of(&got, 0),
+        (
+            "HELLO!".into(),
+            vec![json!({"name":"ls","args":{"dir":"x."}})]
+        ),
+        "{out}"
+    );
+    assert_eq!(
+        gemini_reading_of(&got, 1),
+        (
+            "WORLD".into(),
+            vec![json!({"name":"ls","args":{"dir":"xtmp"}})]
+        ),
+        "{out}"
+    );
+}
+
 // ───────────────────────────────────────────────────────── 整包
 
 #[tokio::test]
@@ -1176,6 +1368,50 @@ async fn whole_bodies_get_block_semantics_in_every_format() {
             whole(&mut chain, raw.as_bytes()).await.unwrap(),
             raw.as_bytes()
         );
+    }
+}
+
+/// 整包里有几个选项（Chat 的 `n`、Gemini 的 `candidateCount`）：每一个都交给插件
+#[tokio::test]
+async fn whole_bodies_run_every_choice_through_the_plugins() {
+    let chat_choice = |k: u64, text: &str| {
+        json!({"index":k,"message":{"role":"assistant","content":text,
+            "tool_calls":[{"id":format!("call_{k}"),"type":"function","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]},
+            "finish_reason":"tool_calls"})
+    };
+    let gemini_cand = |k: u64, text: &str| {
+        json!({"content":{"role":"model","parts":[
+            {"text":text},
+            {"functionCall":{"name":"Bash","args":{"command":"ls"}}}
+        ]},"finishReason":"STOP","index":k})
+    };
+    let cases = [
+        (
+            Dialect::Chat,
+            json!({"id":"c","object":"chat.completion","choices":[chat_choice(0, "hello"), chat_choice(1, "world")]}),
+        ),
+        (
+            Dialect::Gemini,
+            json!({"candidates":[gemini_cand(0, "hello"), gemini_cand(1, "world")]}),
+        ),
+    ];
+    for (d, body) in cases {
+        let drop_bash = tools(|_| ToolCallOutcome::Drop);
+        let mut chain = chain_of(d, vec![hold_until_end(), drop_bash], &json!({})).await;
+        let out = whole(&mut chain, body.to_string().as_bytes())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let text = v.to_string();
+        assert!(
+            text.contains("HELLO") && text.contains("WORLD"),
+            "{d:?}: {text}"
+        );
+        assert!(!text.contains("Bash"), "{d:?}: {text}");
+        if d == Dialect::Chat {
+            assert_eq!(v["choices"][0]["finish_reason"], "stop");
+            assert_eq!(v["choices"][1]["finish_reason"], "stop");
+        }
     }
 }
 
