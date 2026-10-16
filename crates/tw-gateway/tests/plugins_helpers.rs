@@ -178,3 +178,64 @@ async fn stream_replace_leaves_secrets_whole_and_the_client_gets_its_key_back() 
         }
     }
 }
+
+// ── 记录里的「改了文字」 ─────────────────────────────────────────
+//
+// 逐段插件扣字是常事：按块比，这一块里插件交出的全部文字拼起来和交给它的全部文字拼起来
+// 不一样，才算改了文字
+
+const NEVER: &str = r#"
+export const manifest = { name: "never", api: 1, permissions: ["reply.text"], reply: "stream" };
+
+// 有正则：每段都扣着末尾 maxMatch 个字，块结束才放出
+export const { onReplyText, onReplyTextEnd } = tw.streamReplace([[/\d{3}/, '#'], ["zebra", "horse"]]);
+"#;
+
+const HOARD: &str = r#"
+export const manifest = { name: "hoard", api: 1, permissions: ["reply.text"], reply: "stream" };
+
+let held = "";
+export function onReplyText(t) { held += t; return ""; }
+export function onReplyTextEnd() { const out = held; held = ""; return out; }
+"#;
+
+const SHOUT_AT_THE_END: &str = r#"
+export const manifest = { name: "shout", api: 1, permissions: ["reply.text"], reply: "stream" };
+
+let held = "";
+export function onReplyText(t) { held += t; return ""; }
+export function onReplyTextEnd() { const out = held; held = ""; return out.toUpperCase(); }
+"#;
+
+const SAME_BLOCK: &str = r#"
+export const manifest = { name: "same", api: 1, permissions: ["reply.text"] };
+
+export function onReplyText(t) { return t.replace("zebra", "horse"); }
+"#;
+
+#[tokio::test]
+async fn holding_text_back_without_changing_it_is_not_a_change() {
+    for stream in [true, false] {
+        for (id, source, text, want) in [
+            // 规则一处都没命中
+            ("never", NEVER, "plain words, 12 of them", "unchanged"),
+            ("never", NEVER, "a zebra and 123", "changed"),
+            // 整块扣到最后原样放出
+            ("hoard", HOARD, "plain words", "unchanged"),
+            ("shout", SHOUT_AT_THE_END, "plain words", "changed"),
+            // 整块模式
+            ("same", SAME_BLOCK, "plain words", "unchanged"),
+            ("same", SAME_BLOCK, "a zebra", "changed"),
+        ] {
+            let up = Upstream::start(vec![Answer::Text(text.into())]).await;
+            let gw = Gateway::start(
+                config(&up, Security::default()),
+                vec![Plug::new(id, source)],
+            )
+            .await;
+            let r = gw.ask(body("hi", stream)).await;
+            assert_eq!(r.status, 200, "{id}/{stream}: {}", r.body);
+            assert_eq!(gw.outcomes(id), [want], "{id}/{stream}: {text}");
+        }
+    }
+}
