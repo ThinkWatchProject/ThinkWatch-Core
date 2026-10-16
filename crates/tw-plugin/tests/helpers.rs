@@ -602,15 +602,64 @@ fn replace_rejects_bad_rules() {
     );
 }
 
+/// 命中很密的大文字在请求钩子的 CPU 上限（200 ms）之内换完。不量时间（CI 的机器慢好几倍），
+/// 只要求不撞上限：
+///
+/// - 全是字符串的规则走 split 的快路径：1 MB、约 10.8 万处命中，本机约 20 ms；
+/// - 有正则的规则一处一处地挑：规模小一些，100 KB、约 1 万处命中，本机约 15 ms
 #[test]
-fn replace_handles_a_large_text_quickly() {
-    // 1 MB 的文字、几条规则：远在请求钩子的 CPU 上限之内
+fn dense_replacements_stay_well_inside_the_cpu_limit() {
     let inv = run(r#"
         const text = "the widget costs 12 dollars; ".repeat(36000);
-        const out = tw.replace(text, [["widget", "gadget"], [/\d+/, '#'], ["dollars", "USD"]]);
-        req.system = out.length + "|" + out.slice(0, 22);
+        const out = tw.replace(text, [["widget", "gadget"], ["12", '#'], ["dollars", "USD"]]);
+        req.system = out.length + "|" + out.slice(0, 24);
     "#);
-    assert_eq!(changed(&inv)["system"], "864000|the gadget costs # USD");
+    assert_eq!(changed(&inv)["system"], "864000|the gadget costs # USD; ");
+    let inv = run(r#"
+        const text = "the widget costs 12 dollars; ".repeat(3600);
+        const out = tw.replace(text, [["widget", "gadget"], [/\d+/, '#'], ["dollars", "USD"]]);
+        req.system = out.length + "|" + out.slice(0, 24);
+    "#);
+    assert_eq!(changed(&inv)["system"], "86400|the gadget costs # USD; ");
+}
+
+/// 全是字符串的快路径（文字够长时）和一处一处地挑的结果一样：重复的查找字符串取第一条；
+/// 换进去的字不再参与匹配；换成空串也不会让两边的字拼出新的命中；自己和自己交叠的查找
+/// 字符串从左到右、不重叠；会交叠的规则回到一处一处地挑；文字里本来就有私用区字符
+#[test]
+fn the_fast_path_for_string_rules_keeps_the_same_meaning() {
+    for (rules, text, want) in [
+        (
+            r#"[["cat", "1"], ["cat", "2"], ["dog", "cat"]]"#,
+            "cat dog",
+            "1 cat",
+        ),
+        (r#"[["X", ""], ["ab", "Y"]]"#, "aXb ab", "ab Y"),
+        (r#"[["aa", "b"]]"#, "aaaaa", "bba"),
+        (
+            r#"[["cat", "x"], ["category", "y"]]"#,
+            "category cat",
+            "xegory x",
+        ),
+        (r#"[["ab", "1"], ["bc", "2"]]"#, "abc bc", "1c 2"),
+        (
+            r#"[["a", "\ue000"], ["b", "\ue001"]]"#,
+            "a\u{e000}b\u{e001}",
+            "\u{e000}\u{e000}\u{e001}\u{e001}",
+        ),
+        (r#"[["😀", "a"], ["é", "b"]]"#, "😀é😀", "aba"),
+    ] {
+        let pad = "-".repeat(300);
+        let got = eval(&format!(
+            r#"(() => {{
+                 const t = "{pad}" + {text:?} + "{pad}";
+                 const fast = tw.replace(t, {rules});
+                 const slow = tw.replace({text:?}, {rules});
+                 return [fast.slice(300, fast.length - 300), slow];
+               }})()"#
+        ));
+        assert_eq!(got, json!([want, want]), "{rules} on {text:?}");
+    }
 }
 
 // ── lines / pairs ────────────────────────────────────────────────

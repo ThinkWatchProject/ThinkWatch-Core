@@ -6,6 +6,9 @@
 //   3. 任意切分之后逐段交给 tw.streamReplace，拼起来的结果。
 // 另外查两样：逐段交出的每一段都不会把输入里的占位符切开，也不会把一个代理对切开。
 //
+// 三成的组是「全是字符串的规则 + 几百上千字的长文字 + 切得粗」：规则全是字符串、两两不交叠
+// 时 tw.replace 和逐段替换都走 split 的快路径，这几组就是盯着它的。
+//
 // 在 onRequest 里跑（lane 一直是 0），每种切分是同一个 lane 上的一块文字，块和块之间
 // 调 onReplyTextEnd。ctx.settings：seed（随机种子）、cases（几组规则和文字）、splits
 // （每组切几种）。结果写进系统提示词：{ checked, failures }。
@@ -32,6 +35,9 @@ const PIECES = ["a", "b", "c", "ab", "A", "1", "2", " ", "\n", "<", ">", "<<", "
 const PLACEHOLDERS = ["<<TW_SECRET_1>>", "<<TW_SECRET_12>>", "<<TW_EMAIL_3>>", "<<TW_ID_NUMBER_2>>"];
 const LOOKALIKES = ["<<TW_", "<<TW_x>>", "<<TW_A_1>", "<TW_A_1>>", "<<<TW_SECRET_1>>", "<<TW_SECRET_1>>>", "<<TW_SEC"];
 const FINDS = ["a", "b", "c", "ab", "A", "1", " ", "\n", "<", ">", "<<", ">>", "T", "W", "_", "TW_", "SECRET", "_1", "é", "😀"];
+// 多半两两不交叠的查找字符串（快路径能用）；<< 和两个换行自己和自己交叠
+const WORDS = ["cat", "dog", "TW_", "SECRET", "é", "😀", "xyz", "\n\n", "<<", "12", "\ue000"];
+const LONG_PIECES = [...PIECES, ...WORDS, "the ", "cat ", "dog ", "xy", "z", "\ue001"];
 const TOS = ["", "x", "$&", "$1", "<", "TW_", "<<TW_SECRET_9>>", "😀", "[]"];
 // 每一条一次命中连同前后断言看到的范围都不超过 7 个字（maxMatch 至少 8）
 const REGEXES = [
@@ -70,14 +76,26 @@ const FUNCTIONS = [
   (...a) => "@" + a[a.length - (typeof a[a.length - 1] === "object" ? 3 : 2)],
 ];
 
-function text() {
+function text(long) {
   let s = "";
-  const n = int(0, 30);
+  const n = long ? int(100, 700) : int(0, 30);
   for (let i = 0; i < n; i++) {
     const r = rand();
-    s += r < 0.08 ? pick(PLACEHOLDERS) : r < 0.13 ? pick(LOOKALIKES) : pick(PIECES);
+    if (long) s += r < 0.01 ? pick(PLACEHOLDERS) : r < 0.02 ? pick(LOOKALIKES) : pick(LONG_PIECES);
+    else s += r < 0.08 ? pick(PLACEHOLDERS) : r < 0.13 ? pick(LOOKALIKES) : pick(PIECES);
   }
   return s;
+}
+
+// 全是「字符串 → 字符串」的规则：多半取自 WORDS（不交叠），偶尔混一条会交叠的
+function literalRules() {
+  const out = [];
+  const n = int(1, 5);
+  for (let i = 0; i < n; i++) {
+    const f = rand() < 0.85 ? pick(WORDS) : pick(FINDS) + pick(FINDS);
+    out.push([f, pick(TOS)]);
+  }
+  return out;
 }
 
 function rules() {
@@ -147,15 +165,17 @@ function section(t, rs) {
   return out;
 }
 
-// 随机切开，不切在代理对中间（宿主交来的每一段都是完整的 UTF-8）
-function split(s) {
+// 随机切开，不切在代理对中间（宿主交来的每一段都是完整的 UTF-8）。coarse：切得粗（块中间
+// 那几段也够长，走得到快路径）
+function split(s, coarse) {
   const mode = rand();
+  const p = coarse ? 0.004 : 0.35;
   const chunks = [];
   let start = 0;
   for (let i = 1; i < s.length; i++) {
     const c = s.charCodeAt(i);
     if (c >= 0xdc00 && c <= 0xdfff) continue;
-    if (mode < 0.2 || rand() < 0.35) {
+    if ((!coarse && mode < 0.2) || rand() < p) {
       chunks.push(s.slice(start, i));
       start = i;
     }
@@ -175,9 +195,10 @@ export function onRequest(req, ctx) {
   const failures = [];
   let checked = 0;
   for (let k = 0; k < ctx.settings.cases && failures.length < 5; k++) {
-    const rs = rules();
+    const long = rand() < 0.3;
+    const rs = long ? literalRules() : rules();
     const max = int(8, 16);
-    const input = text();
+    const input = text(long);
     const ref = reference(input, rs);
     const finds = rs.map(([f]) => f);
     const asMap = rand() < 0.2 && new Set(finds).size === finds.length;
@@ -188,7 +209,7 @@ export function onRequest(req, ctx) {
     }
     const h = tw.streamReplace(rand() < 0.3 ? () => rs : rs, { maxMatch: max });
     for (let n = 0; n < ctx.settings.splits; n++) {
-      const chunks = split(input);
+      const chunks = split(input, long && rand() < 0.7);
       const outs = chunks.map((c) => h.onReplyText(c, ctx));
       outs.push(h.onReplyTextEnd(ctx));
       const got = outs.join("");

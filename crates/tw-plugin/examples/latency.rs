@@ -106,9 +106,62 @@ fn main() {
             },
         );
     }
+
+    // tw.replace / tw.streamReplace 在 1 MB、命中很密的文字上（每 29 个字三处命中，约 10.8
+    // 万处）。CPU 上限放宽，量的是要多久；减去只造文字的那一份就是替换本身
+    let roomy = Runtime::new(Limits {
+        request_cpu: Duration::from_secs(30),
+        ..Limits::default()
+    })
+    .expect("runtime");
+    let dense = roomy
+        .load(
+            br##"export const manifest = { name: "dense", api: 1, permissions: ["system", "reply.text"], reply: "stream" };
+                export const { onReplyText, onReplyTextEnd } = tw.streamReplace([]);
+                const RULES = {
+                  strings: [["widget", "gadget"], ["12", "#"], ["dollars", "USD"]],
+                  mixed: [["widget", "gadget"], [/\d+/, "#"], ["dollars", "USD"]],
+                };
+                export function onRequest(req, ctx) {
+                  const text = "the widget costs 12 dollars; ".repeat(36000);
+                  const [op, kind] = ctx.settings.op.split(":");
+                  let out = "";
+                  if (op === "replace") out = tw.replace(text, RULES[kind]);
+                  if (op === "stream") {
+                    const h = tw.streamReplace(RULES[kind]);
+                    for (let i = 0; i < text.length; i += 64) out += h.onReplyText(text.slice(i, i + 64), ctx);
+                    out += h.onReplyTextEnd(ctx);
+                  }
+                  req.system = String(out.length);
+                }"##,
+        )
+        .expect("load");
+    let base = json!({ "format": "anthropic", "model": "m", "system": "" });
+    let cost = |op: &str| {
+        let c = json!({ "client": null, "model": "m", "format": "anthropic", "upstream": "u", "settings": { "op": op } });
+        report(&format!("1 MB dense text, {op}, sandbox CPU"), 10, || {
+            let inv = dense.on_request(base.clone(), c.clone());
+            assert!(inv.result.is_ok(), "{op}: {:?}", inv.result);
+            inv.cpu
+        })
+    };
+    let none = cost("none:");
+    for op in [
+        "replace:strings",
+        "replace:mixed",
+        "stream:strings",
+        "stream:mixed",
+    ] {
+        let t = cost(op);
+        println!(
+            "  {op}: {:.1?} more than building the text",
+            t.saturating_sub(none)
+        );
+    }
 }
 
-fn report(label: &str, n: usize, mut f: impl FnMut() -> Duration) {
+/// 打印中位数和 p90/p99，返回中位数
+fn report(label: &str, n: usize, mut f: impl FnMut() -> Duration) -> Duration {
     for _ in 0..(n / 10).max(3) {
         f();
     }
@@ -121,6 +174,7 @@ fn report(label: &str, n: usize, mut f: impl FnMut() -> Duration) {
         q(0.9),
         q(0.99)
     );
+    q(0.5)
 }
 
 fn big_view(target: usize) -> Value {

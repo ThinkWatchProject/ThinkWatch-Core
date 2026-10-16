@@ -29,14 +29,18 @@
   const ArrayPrototype = Array.prototype;
   const ArrayJoin = Array.prototype.join;
   const ReflectApply = Reflect.apply;
+  const FunctionCall = Function.prototype.call;
+  const FunctionBind = Function.prototype.bind;
   const NumberIsInteger = Number.isInteger;
   const MathMin = Math.min;
   const MathMax = Math.max;
   const StringCtor = String;
+  const StringFromCharCode = String.fromCharCode;
   const StringIndexOf = String.prototype.indexOf;
   const StringSlice = String.prototype.slice;
   const StringTrim = String.prototype.trim;
   const StringCharCodeAt = String.prototype.charCodeAt;
+  const StringSplit = String.prototype.split;
   const RegExpCtor = RegExp;
   const RegExpPrototype = RegExp.prototype;
   const RegExpExec = RegExp.prototype.exec;
@@ -77,25 +81,26 @@
 
   // ── 小工具 ───────────────────────────────────────────────────
 
-  function slice(s, a, b) {
-    return ReflectApply(StringSlice, s, b === undefined ? [a] : [a, b]);
-  }
-
-  function indexOf(s, x, from) {
-    return ReflectApply(StringIndexOf, s, [x, from]);
-  }
-
-  function code(s, i) {
-    return ReflectApply(StringCharCodeAt, s, [i]);
-  }
-
-  function trim(s) {
-    return ReflectApply(StringTrim, s, []);
-  }
+  // 内建方法绑成普通函数：slice(s, a, b) 就是 s.slice(a, b)，绑的是上面拿住的那个，不经原型。
+  // 比每次 Reflect.apply 再包一层快得多 —— 替换时每处命中都要调好几次
+  const unbind = (f) => ReflectApply(FunctionBind, FunctionCall, [f]);
+  const slice = unbind(StringSlice);
+  const indexOf = unbind(StringIndexOf);
+  const code = unbind(StringCharCodeAt);
+  const trim = unbind(StringTrim);
+  // 分隔符是字符串时 QuickJS 不去找 Symbol.split，插件改不了它
+  const split = unbind(StringSplit);
+  const joinWith = unbind(ArrayJoin);
+  const execAt = unbind(RegExpExec);
+  const mapGet = unbind(MapGet);
+  const mapSet = unbind(MapSet);
+  const mapDelete = unbind(MapDelete);
+  const setAdd = unbind(SetAdd);
+  const setHas = unbind(SetHas);
 
   function exec(re, s, from) {
     re.lastIndex = from;
-    return ReflectApply(RegExpExec, re, [s]);
+    return execAt(re, s);
   }
 
   // 拼字、攒结果用的数组：没有原型
@@ -112,7 +117,7 @@
   }
 
   function join(a) {
-    return ReflectApply(ArrayJoin, a, [""]);
+    return joinWith(a, "");
   }
 
   // 建一个普通的自有属性。`__proto__` 这样的键也是一个普通的键，不会去改原型
@@ -202,11 +207,12 @@
   const PARTIAL = /^<(?:<(?:T(?:W(?:_[A-Z0-9_]{0,64}>?)?)?)?)?$/;
   const PARTIAL_MAX = 70;
 
-  // `s` 末尾那个可能还没收全的占位符从哪儿起；没有就是 `s.length`
+  // `s` 末尾那个可能还没收全的占位符从哪儿起；没有就是 `s.length`。只看末尾那几十个字里
+  // 的 `<`（逐段时每段都要查一次，多半一个 `<` 都没有）
   function partial(s) {
     const n = s.length;
-    for (let p = MathMax(0, n - PARTIAL_MAX); p < n; p++) {
-      if (code(s, p) === 60 && exec(PARTIAL, slice(s, p), 0) !== null) return p;
+    for (let p = indexOf(s, "<", MathMax(0, n - PARTIAL_MAX)); p !== -1; p = indexOf(s, "<", p + 1)) {
+      if (exec(PARTIAL, slice(s, p), 0) !== null) return p;
     }
     return n;
   }
@@ -261,12 +267,14 @@
     const pairs = pairsOf(rules, who);
     const out = list();
     let regex = false;
+    let literal = true;
     let longest = 0;
     for (let i = 0; i < pairs.length; i++) {
       const n = i + 1;
       const find = pairs[i][0];
       const to = pairs[i][1];
-      const r = { __proto__: null, n, find: null, re: null, to: null, fn: null, plain: true };
+      // at / end / hit：扫描时这条规则从游标起的下一处命中（见 scan）
+      const r = { __proto__: null, n, find: null, re: null, to: null, fn: null, plain: true, at: -2, end: 0, hit: null };
       if (typeof find === "string") {
         if (find === "") throw new TypeErrorCtor(who + ": rule " + n + " looks for an empty string");
         r.find = find;
@@ -293,12 +301,13 @@
         r.plain = r.re === null || indexOf(to, "$", 0) === -1;
       } else if (typeof to === "function") {
         r.fn = to;
+        literal = false;
       } else {
         throw new TypeErrorCtor(who + ": rule " + n + " replaces with " + typeName(to) + "; use a string or a function");
       }
       out[out.length] = r;
     }
-    return { __proto__: null, who, rules: out, regex, longest, prefixes: null };
+    return { __proto__: null, who, rules: out, regex, longest, prefixes: null, literal: literal && !regex, split: undefined };
   }
 
   // 逐段要的：每个查找字符串的真前缀（文字末尾是不是某个查找字符串的开头，查一次）
@@ -307,7 +316,7 @@
     for (let k = 0; k < c.rules.length; k++) {
       const f = c.rules[k].find;
       if (f === null) continue;
-      for (let n = 1; n < f.length; n++) ReflectApply(SetAdd, set, [slice(f, 0, n)]);
+      for (let n = 1; n < f.length; n++) setAdd(set, slice(f, 0, n));
     }
     c.prefixes = set;
     return c;
@@ -386,20 +395,13 @@
     return `${ReflectApply(r.fn, undefined, args)}`;
   }
 
-  // 第 k 条规则从 `cur` 起的下一处命中，记进 at / end / hit。没有是 -1
-  function locate(c, k, s, cur, at, end, hit) {
-    const r = c.rules[k];
-    if (r.re === null) {
-      const i = indexOf(s, r.find, cur);
-      at[k] = i;
-      end[k] = i + r.find.length;
-      return i;
-    }
+  // 正则规则从 `cur` 起的下一处命中，记进它的 at / end / hit。没有是 -1
+  function locate(c, r, s, cur) {
     let m = exec(r.re, s, cur);
     // 带 u 的正则从一个代理对中间起找时，命中可能落在 cur 前面一格：从下一格重找
     if (m !== null && m.index < cur) m = exec(r.re, s, cur + 1);
     if (m === null || m.index < cur) {
-      at[k] = -1;
+      r.at = -1;
       return -1;
     }
     const a = m.index;
@@ -407,41 +409,48 @@
     if (e === a) {
       throw new TypeErrorCtor(c.who + ": rule " + r.n + " matched an empty string; a rule has to match at least one character");
     }
-    at[k] = a;
-    end[k] = e;
-    hit[k] = m;
+    r.at = a;
+    r.end = e;
+    r.hit = m;
     return a;
   }
 
   // 扫 `s` 里 [from, limit) 这一段，换好的追加到 `out`。起点在 limit 之前的命中都算（它可以
-  // 越过 limit）；limit 之前没有命中的原样追加。返回扫到了哪儿（不小于 limit）
+  // 越过 limit）；limit 之前没有命中的原样追加。返回扫到了哪儿（不小于 limit）。
+  //
+  // 每条规则记着它从游标起的下一处命中（at：-2 还没找过，-1 往后再也没有），只有被别的命中
+  // 盖过去的才重找：每处命中只多花一次 indexOf 或 exec
   function scan(c, s, from, limit, out, base) {
-    const n = c.rules.length;
-    const at = list();
-    const end = list();
-    const hit = list();
-    // -2：还没找过；-1：往后再也没有
-    for (let k = 0; k < n; k++) at[k] = -2;
+    const rules = c.rules;
+    const n = rules.length;
+    for (let k = 0; k < n; k++) rules[k].at = -2;
     let cur = from;
     while (cur < limit) {
-      let best = -1;
+      let best = null;
       let bestAt = limit;
       for (let k = 0; k < n; k++) {
-        let a = at[k];
+        const r = rules[k];
+        let a = r.at;
         if (a === -1) continue;
         if (a < cur) {
-          a = locate(c, k, s, cur, at, end, hit);
+          if (r.re === null) {
+            a = indexOf(s, r.find, cur);
+            r.at = a;
+            r.end = a + r.find.length;
+          } else {
+            a = locate(c, r, s, cur);
+          }
           if (a === -1) continue;
         }
         if (a < bestAt) {
           bestAt = a;
-          best = k;
+          best = r;
         }
       }
-      if (best === -1) break;
+      if (best === null) break;
       if (bestAt > cur) out[out.length] = slice(s, cur, bestAt);
-      out[out.length] = replacement(c.rules[best], hit[best], s, bestAt, base);
-      cur = end[best];
+      out[out.length] = best.fn === null && best.plain ? best.to : replacement(best, best.hit, s, bestAt, base);
+      cur = best.end;
     }
     if (cur < limit) {
       out[out.length] = slice(s, cur, limit);
@@ -450,23 +459,163 @@
     return cur;
   }
 
-  // 整段替换：按占位符分节，一节一节地扫
+  // ── 全是字符串的快路径 ───────────────────────────────────────
+  //
+  // 规则全是「字符串 → 字符串」、两两之间不会在文字里交叠（谁也不是谁的一部分，谁的结尾也
+  // 不是谁的开头）时：每处命中都只可能是一条规则的，一次扫描挑出来的就是每条规则各自从左
+  // 到右、不重叠地找到的那些。于是每条规则用一次原生的 split 就找全了，不必一处一处在
+  // JavaScript 里挑。
+  //
+  // 规则两两不交叠时先后无所谓，排一个遍数最少的顺序：一条规则的替换文字不空、和还没换的
+  // 那些查找字符串没有一个共同的字（按 UTF-16 码元比），就直接换 —— 后面的规则在它里面找
+  // 不到东西，也不能拿它和旁边的字拼出新的命中。不行的先放一个文字里没有的私用区字符占位，
+  // 全部规则找完再换成替换文字。最后剩下的一条后面没有规则了，直接换。
+
+  // 走快路径的最短文字和最多规则：短文字逐个挑也很快，规则多了 split 的遍数跟着多
+  const LITERAL_MIN = 256;
+  const LITERAL_MAX_RULES = 16;
+  // 同一套规则判断一次（tw.texts 里每段文字都会调一次 tw.replace）。攒多了整个换掉
+  let splitPlans = new MapCtor();
+  let splitPlanCount = 0;
+
+  // 这套规则能不能走快路径：去掉重复的查找字符串（同一个查找字符串取第一条），再看两两之间
+  // 会不会交叠。不能就是 null
+  function splitPlan(c) {
+    if (c.split !== undefined) return c.split;
+    const rules = c.rules;
+    let key = "";
+    for (let k = 0; k < rules.length; k++) key += rules[k].find.length + ":" + rules[k].find + rules[k].to.length + ":" + rules[k].to;
+    let plan = mapGet(splitPlans, key);
+    if (plan === undefined) {
+      plan = makePlan(rules);
+      if (splitPlanCount >= 32) {
+        splitPlans = new MapCtor();
+        splitPlanCount = 0;
+      }
+      mapSet(splitPlans, key, plan);
+      splitPlanCount++;
+    }
+    c.split = plan;
+    return plan;
+  }
+
+  function makePlan(rules) {
+    const finds = list();
+    const tos = list();
+    let chars = "";
+    for (let k = 0; k < rules.length; k++) {
+      const f = rules[k].find;
+      let seen = false;
+      for (let j = 0; j < finds.length; j++) if (finds[j] === f) seen = true;
+      if (seen) continue;
+      if (finds.length >= LITERAL_MAX_RULES) return null;
+      finds[finds.length] = f;
+      tos[tos.length] = rules[k].to;
+      chars += f + rules[k].to;
+    }
+    let selfOverlap = false;
+    for (let a = 0; a < finds.length; a++) {
+      for (let b = 0; b < finds.length; b++) {
+        if (a !== b && (indexOf(finds[b], finds[a], 0) !== -1 || endStarts(finds[a], finds[b]))) return null;
+      }
+      if (endStarts(finds[a], finds[a])) selfOverlap = true;
+    }
+    // 排顺序：steps 里每一步是 [查找, 替换, 要不要占位]
+    const steps = list();
+    const left = list();
+    for (let k = 0; k < finds.length; k++) left[k] = k;
+    while (left.length > 0) {
+      let pick = -1;
+      for (let i = 0; i < left.length && pick === -1; i++) {
+        const to = tos[left[i]];
+        let others = "";
+        for (let j = 0; j < left.length; j++) if (j !== i) others += finds[left[j]];
+        if (left.length === 1 || (to !== "" && !sharesUnit(to, others))) pick = i;
+      }
+      const marked = pick === -1;
+      if (marked) pick = 0;
+      const k = left[pick];
+      steps[steps.length] = [finds[k], tos[k], marked];
+      for (let i = pick; i < left.length - 1; i++) left[i] = left[i + 1];
+      left.length = left.length - 1;
+    }
+    // selfOverlap：有查找字符串自己和自己交叠（aa、abab）。逐段时它的一处命中可能跨过
+    // frontier，块中间那几段不走快路径（见 drain）
+    return { __proto__: null, steps, chars, selfOverlap };
+  }
+
+  // a 里有没有 b 里也有的 UTF-16 码元
+  function sharesUnit(a, b) {
+    for (let i = 0; i < a.length; i++) if (indexOf(b, slice(a, i, i + 1), 0) !== -1) return true;
+    return false;
+  }
+
+  // a 的一段真后缀是 b 的开头
+  function endStarts(a, b) {
+    const first = slice(b, 0, 1);
+    for (let i = indexOf(a, first, 1); i !== -1; i = indexOf(a, first, i + 1)) {
+      const tail = slice(a, i);
+      if (tail.length < b.length && slice(b, 0, tail.length) === tail) return true;
+    }
+    return false;
+  }
+
+  // 用快路径换一节文字。找不到够用的占位字符时是 null（回到逐个挑）
+  function splitReplace(plan, seg) {
+    const steps = plan.steps;
+    const marks = list();
+    const later = list();
+    let ch = 0xe000;
+    let t = seg;
+    for (let k = 0; k < steps.length; k++) {
+      const step = steps[k];
+      if (!step[2]) {
+        t = joinWith(split(t, step[0]), step[1]);
+        continue;
+      }
+      // 占位字符：文字里没有，查找、替换文字里也没有
+      let m = "";
+      for (; ch < 0xf900 && m === ""; ch++) {
+        const c = StringFromCharCode(ch);
+        if (indexOf(seg, c, 0) === -1 && indexOf(plan.chars, c, 0) === -1) m = c;
+      }
+      if (m === "") return null;
+      t = joinWith(split(t, step[0]), m);
+      marks[marks.length] = m;
+      later[later.length] = step[1];
+    }
+    for (let k = 0; k < marks.length; k++) t = joinWith(split(t, marks[k]), later[k]);
+    return t;
+  }
+
+  // 一节文字（两个占位符之间那一段）整个换掉
+  function replaceSection(c, seg, out) {
+    if (c.literal && seg.length >= LITERAL_MIN) {
+      const plan = splitPlan(c);
+      const t = plan === null ? null : splitReplace(plan, seg);
+      if (t !== null) {
+        out[out.length] = t;
+        return;
+      }
+    }
+    scan(c, seg, 0, seg.length, out, 0);
+  }
+
+  // 整段替换：按占位符分节，一节一节地换
   function replaceWhole(c, text) {
+    if (c.rules.length === 0) return text;
     const out = list();
     let from = 0;
-    if (c.rules.length === 0) return text;
     if (indexOf(text, "<<TW_", 0) !== -1) {
       for (;;) {
         const m = exec(PLACEHOLDER, text, from);
         if (m === null) break;
-        const seg = slice(text, from, m.index);
-        scan(c, seg, 0, seg.length, out, 0);
+        replaceSection(c, slice(text, from, m.index), out);
         out[out.length] = m[0];
         from = m.index + m[0].length;
       }
     }
-    const seg = from === 0 ? text : slice(text, from);
-    scan(c, seg, 0, seg.length, out, 0);
+    replaceSection(c, from === 0 ? text : slice(text, from), out);
     return join(out);
   }
 
@@ -491,7 +640,7 @@
     let f = c.regex ? n - max : n;
     if (c.longest > 1) {
       for (let p = MathMax(cur, n - c.longest + 1); p < f; p++) {
-        if (ReflectApply(SetHas, c.prefixes, [slice(a, p)])) {
+        if (setHas(c.prefixes, slice(a, p))) {
           f = p;
           break;
         }
@@ -502,6 +651,13 @@
     return f;
   }
 
+  // 一节到头了（遇到占位符或者块结束），从 from 起整个换掉。全是字符串的规则没有前文
+  // （ctx 总是空的），能走快路径
+  function finishSection(c, a, from, out, base) {
+    if (c.literal && from === 0) replaceSection(c, a, out);
+    else scan(c, a, from, a.length, out, base);
+  }
+
   function drain(st, max, end) {
     const c = st.c;
     const out = list();
@@ -509,16 +665,14 @@
     while (indexOf(st.pending, "<<TW_", 0) !== -1) {
       const m = exec(PLACEHOLDER, st.pending, 0);
       if (m === null) break;
-      const a = st.ctx + slice(st.pending, 0, m.index);
-      scan(c, a, st.ctx.length, a.length, out, st.base);
+      finishSection(c, st.ctx + slice(st.pending, 0, m.index), st.ctx.length, out, st.base);
       out[out.length] = m[0];
       st.ctx = "";
       st.base = 0;
       st.pending = slice(st.pending, m.index + m[0].length);
     }
     if (end) {
-      const a = st.ctx + st.pending;
-      scan(c, a, st.ctx.length, a.length, out, st.base);
+      finishSection(c, st.ctx + st.pending, st.ctx.length, out, st.base);
       st.ctx = "";
       st.pending = "";
       return join(out);
@@ -528,6 +682,18 @@
     let cur = st.ctx.length;
     for (;;) {
       const lim = frontier(c, a, cur, max);
+      // 全是字符串、两两不交叠、也没有自己和自己交叠的：起点在 frontier 之前的命中不会越过
+      // 它（越过的话，它的一段真后缀就是 frontier 处那个查找字符串的开头），前面这一截可以
+      // 单独整个换
+      if (c.literal && lim - cur >= LITERAL_MIN) {
+        const plan = splitPlan(c);
+        const t = plan === null || plan.selfOverlap ? null : splitReplace(plan, slice(a, cur, lim));
+        if (t !== null) {
+          out[out.length] = t;
+          cur = lim;
+          break;
+        }
+      }
       const next = scan(c, a, cur, lim, out, st.base);
       // 一处命中越过了 frontier：从它后面再算一次
       if (next <= lim) {
@@ -688,19 +854,19 @@
           if (!ends) {
             throw new ErrorCtor(who + ": export its onReplyTextEnd as well; without it the text held back at the end of a block is lost");
           }
-          let st = ReflectApply(MapGet, lanes, [lane]);
+          let st = mapGet(lanes, lane);
           if (st === undefined) {
             const c = rulesFor(ctx);
             st = { __proto__: null, c: c.prefixes === null ? withPrefixes(c) : c, pending: "", ctx: "", base: 0 };
-            ReflectApply(MapSet, lanes, [lane, st]);
+            mapSet(lanes, lane, st);
           }
           st.pending += text;
           return drain(st, max, false);
         },
         onReplyTextEnd() {
-          const st = ReflectApply(MapGet, lanes, [lane]);
+          const st = mapGet(lanes, lane);
           if (st === undefined) return "";
-          ReflectApply(MapDelete, lanes, [lane]);
+          mapDelete(lanes, lane);
           return drain(st, max, true);
         },
       };
