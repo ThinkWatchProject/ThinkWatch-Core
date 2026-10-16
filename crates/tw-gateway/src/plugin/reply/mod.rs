@@ -20,7 +20,8 @@
 //!
 //! - **文字**按块交：整块模式攒齐一块再交一次，交回来的才发给客户端；流式模式每段
 //!   增量交一次，交回什么现在就发什么（空串是先扣着），块结束时调 `onReplyTextEnd`
-//!   把扣着的补上。几个插件串起来，前一个交出的是后一个收到的。
+//!   把扣着的补上。交回来的结尾是半个占位符的，那半个等它交出下一段拼齐了再换回原值。
+//!   几个插件串起来，前一个交出的是后一个收到的。
 //! - **工具调用**攒到完整再交：不变、换成别的（一个或几个）、去掉。换出来的按客户端
 //!   的格式写成完整的调用，后面块的序号跟着挪。
 //! - 推理内容不交给插件，原样发。
@@ -112,6 +113,9 @@ struct StageLane {
     /// 流式模式：上一次交出非空的东西之后收到的原文。插件半路出错又是跳过时，它
     /// 扣着的那些字从这里补回去，模型说过的话不丢
     pending: String,
+    /// 流式模式：插件交回来的结尾是半个占位符（它从占位符中间切开了交出的文字），先扣着，
+    /// 和它交出的下一段拼起来再换回原值（见 [`Bridge::unfinished_from`]）
+    unrevealed: String,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -433,8 +437,12 @@ impl Chain {
         let hidden = self.bridge.hide(&send);
         let given = hidden.clone();
         self.stages[i].counts.text_calls += 1;
+        let carrying = self.stages[i]
+            .lanes
+            .get(&lane)
+            .is_some_and(|l| !l.unrevealed.is_empty());
         match self.invoke(i, move |r| r.on_text(&given)).await {
-            Ok(None) => {
+            Ok(None) if !carrying => {
                 self.stages[i]
                     .lanes
                     .entry(lane)
@@ -443,27 +451,47 @@ impl Chain {
                     .clear();
                 Ok(Some(send))
             }
-            Ok(Some(s)) => {
+            // 没改就是交回了交给它的那样：前一段结尾扣着半个占位符时，接在它后面一起换
+            Ok(s) => {
+                let s = s.unwrap_or_else(|| hidden.clone());
                 if s != hidden {
                     self.stages[i].counts.text_changed += 1;
                 }
-                let out = self.bridge.reveal(&s);
+                let out = self.reveal(i, lane, &s, false);
                 let l = self.stages[i].lanes.entry(lane).or_default();
-                if out.is_empty() {
+                // 交出了东西（哪怕整段都还扣在半个占位符里）：收到的原文有了着落
+                if s.is_empty() {
                     l.pending.push_str(&send);
-                    Ok(None)
                 } else {
                     l.pending.clear();
-                    Ok(Some(out))
                 }
+                Ok((!out.is_empty()).then_some(out))
             }
             Err(e) => {
                 self.fail(i, e)?;
-                // 跳过：它扣着的、这一段、还没交给它的尾巴，原样往下走
+                // 跳过：它交出的半个占位符、它扣着的、这一段、还没交给它的尾巴，原样往下走
                 let l = self.stages[i].lanes.remove(&lane).unwrap_or_default();
-                Ok(Some(format!("{}{send}{}", l.pending, l.buf)))
+                Ok(Some(format!(
+                    "{}{}{send}{}",
+                    l.unrevealed, l.pending, l.buf
+                )))
             }
         }
+    }
+
+    /// 流式插件在这一块里交回来的一段，换回原值。结尾是半个占位符的先扣着，和它交出的
+    /// 下一段拼起来再换。`end`：块结束了，扣着的一起放出去，凑不完整的原样放
+    fn reveal(&mut self, i: usize, lane: Lane, s: &str, end: bool) -> String {
+        let l = self.stages[i].lanes.entry(lane).or_default();
+        let mut joined = std::mem::take(&mut l.unrevealed);
+        joined.push_str(s);
+        let cut = if end {
+            joined.len()
+        } else {
+            self.bridge.unfinished_from(&joined)
+        };
+        l.unrevealed = joined.split_off(cut);
+        self.bridge.reveal(&joined)
     }
 
     /// 一块文字的一段增量。返回此刻该发给客户端的（可能是空的：插件扣着）
@@ -506,14 +534,14 @@ impl Chain {
             if !self.live(i) {
                 // 半路被拿掉的：它攒着的原样放出来
                 if let Some(l) = self.stages[i].lanes.remove(&lane) {
-                    out.push(format!("{}{}", l.pending, l.buf));
+                    out.push(format!("{}{}{}", l.unrevealed, l.pending, l.buf));
                 }
                 carry = out;
                 continue;
             }
-            let l = self.stages[i].lanes.remove(&lane).unwrap_or_default();
             match self.stages[i].mode {
                 ReplyMode::Block => {
+                    let l = self.stages[i].lanes.remove(&lane).unwrap_or_default();
                     if !l.buf.is_empty() {
                         let whole = l.buf;
                         let hidden = self.bridge.hide(&whole);
@@ -535,12 +563,19 @@ impl Chain {
                     }
                 }
                 ReplyMode::Stream => {
-                    if !l.buf.is_empty() {
+                    // 这一块的账留到最后：扣着的半个占位符、出错时要补回去的原文都在上面
+                    let buf = self.stages[i]
+                        .lanes
+                        .get_mut(&lane)
+                        .map(|l| std::mem::take(&mut l.buf))
+                        .unwrap_or_default();
+                    if !buf.is_empty() {
                         // 扣着的尾巴到头了：不会再长成别的，交出去
-                        if let Some(o) = self.stream_call(i, lane, l.buf).await? {
+                        if let Some(o) = self.stream_call(i, lane, buf).await? {
                             out.push(o);
                         }
                     }
+                    let mut last = String::new();
                     if self.live(i) && self.stages[i].text_end {
                         match self.invoke(i, |r| r.on_text_end()).await {
                             Ok(None) => {}
@@ -548,19 +583,17 @@ impl Chain {
                                 if !s.is_empty() {
                                     self.stages[i].counts.text_changed += 1;
                                 }
-                                out.push(self.bridge.reveal(&s));
+                                last = s;
                             }
                             Err(e) => {
-                                let pending = self.stages[i]
-                                    .lanes
-                                    .remove(&lane)
-                                    .map(|l| l.pending)
-                                    .unwrap_or_default();
+                                let l = self.stages[i].lanes.remove(&lane).unwrap_or_default();
                                 self.fail(i, e)?;
-                                out.push(pending);
+                                out.push(format!("{}{}", l.unrevealed, l.pending));
                             }
                         }
                     }
+                    // 扣着的半个占位符接上最后这一段换回去，凑不完整的原样放出去
+                    out.push(self.reveal(i, lane, &last, true));
                     self.stages[i].lanes.remove(&lane);
                 }
             }

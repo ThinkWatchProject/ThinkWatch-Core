@@ -452,6 +452,209 @@ async fn a_failing_plugin_cuts_under_reject_and_steps_aside_under_skip() {
     assert_eq!(anthropic_blocks(&out)[1].2, "HELLO 世界");
 }
 
+// ───────────────────────────────────────────────────────── 切开的占位符
+
+/// 流式：每段只交出除最后 `n` 个字以外的，扣着的块结束时放出来。交出去的切口会落在
+/// 占位符中间
+fn hold_last(n: usize) -> Double {
+    Double::new("hold-last")
+        .permit(&[Permission::ReplyText])
+        .mode(ReplyMode::Stream)
+        .on_reply(true, true, false, move |_| {
+            let buf = Arc::new(Mutex::new(String::new()));
+            let (a, b) = (buf.clone(), buf);
+            Ok(Box::new(Closures {
+                text: Box::new(move |t| {
+                    let mut buf = a.lock().unwrap();
+                    buf.push_str(t);
+                    let cut = buf.char_indices().rev().nth(n - 1).map_or(0, |(i, _)| i);
+                    Invocation::ok(Some(buf.drain(..cut).collect()))
+                }),
+                end: Box::new(move || {
+                    Invocation::ok(Some(std::mem::take(&mut *b.lock().unwrap())))
+                }),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        })
+}
+
+/// 流式：记下每次收到的，原样放过
+fn spy(seen: Arc<Mutex<Vec<String>>>) -> Double {
+    Double::new("spy")
+        .permit(&[Permission::ReplyText])
+        .mode(ReplyMode::Stream)
+        .on_reply(true, false, false, move |_| {
+            let seen = seen.clone();
+            Ok(Box::new(Closures {
+                text: Box::new(move |t| {
+                    seen.lock().unwrap().push(t.to_string());
+                    Invocation::ok(None)
+                }),
+                end: Box::new(|| Invocation::ok(None)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        })
+}
+
+/// 只有一块文字的 Anthropic 流，按这几段增量发
+fn anthropic_text(deltas: &[&str]) -> String {
+    let mut frames = vec![ev(
+        "content_block_start",
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+    )];
+    for d in deltas {
+        frames.push(ev(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text": d}}),
+        ));
+    }
+    frames.push(ev(
+        "content_block_stop",
+        json!({"type":"content_block_stop","index":0}),
+    ));
+    frames.concat()
+}
+
+/// 请求里有 `KEY`：回答里出现时插件看到的是 `<<TW_SECRET_1>>`
+fn key_request() -> Value {
+    json!({ "messages": [{ "role": "user", "content": format!("key {KEY}") }] })
+}
+
+#[tokio::test]
+async fn a_placeholder_a_stream_plugin_splits_is_restored_from_both_halves() {
+    let want = format!("use {KEY} now");
+    let (head, tail) = (format!("use {}", &KEY[..12]), format!("{} now", &KEY[12..]));
+    let splits: [Vec<&str>; 3] = [vec![&want], vec!["use ", KEY, " now"], vec![&head, &tail]];
+    for deltas in &splits {
+        let input = anthropic_text(deltas);
+        for plugins in [vec![hold_last(5)], vec![hold_last(5), hold_last(7)]] {
+            let n = plugins.len();
+            for step in [3, 4096] {
+                let mut s = Stream::new(
+                    chain_of(Dialect::Anthropic, plugins.clone(), &key_request()).await,
+                    Framing::Sse,
+                );
+                let (out, err) = run(&mut s, &input, step).await;
+                assert!(err.is_none());
+                assert_eq!(
+                    anthropic_blocks(&out)[0].2,
+                    want,
+                    "{deltas:?}, {n} plugins, step {step}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_next_plugin_in_the_chain_sees_whole_placeholders() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let input = anthropic_text(&["use ", KEY, " now"]);
+    let mut s = Stream::new(
+        chain_of(
+            Dialect::Anthropic,
+            vec![hold_last(5), spy(seen.clone())],
+            &key_request(),
+        )
+        .await,
+        Framing::Sse,
+    );
+    let (out, _) = run(&mut s, &input, 4096).await;
+    assert_eq!(anthropic_blocks(&out)[0].2, format!("use {KEY} now"));
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.concat(), "use <<TW_SECRET_1>> now");
+    // 每一段里的占位符都是整的
+    for t in &seen {
+        assert_eq!(
+            t.matches("<<").count(),
+            t.matches("<<TW_SECRET_1>>").count(),
+            "{seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn text_given_back_when_a_plugin_is_skipped_comes_out_restored() {
+    let want = format!("use {KEY} now");
+    let input = anthropic_text(&["use ", KEY, " now"]);
+    // 后一个插件头一段就出错：前一个切开交出的照样拼回原值
+    let boom = Double::new("boom")
+        .permit(&[Permission::ReplyText])
+        .mode(ReplyMode::Stream)
+        .on_reply(true, false, false, |_| {
+            Ok(Box::new(Closures {
+                text: Box::new(|_| Invocation::err(RunError::CpuLimit)),
+                end: Box::new(|| Invocation::ok(None)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        });
+    let mut chain = chain_of(Dialect::Anthropic, vec![hold_last(5), boom], &key_request()).await;
+    chain.stages[1].on_error = OnError::Skip;
+    let mut s = Stream::new(chain, Framing::Sse);
+    let (out, err) = run(&mut s, &input, 4096).await;
+    assert!(err.is_none());
+    assert_eq!(anthropic_blocks(&out)[0].2, want);
+}
+
+#[tokio::test]
+async fn a_stream_plugin_failing_at_the_end_of_a_block_gives_back_what_it_held() {
+    let want = format!("use {KEY} now");
+    let input = anthropic_text(&["use ", KEY, " now"]);
+    // 一直扣着、到块结束时才出错：扣着的那些原文补回来
+    let late = Double::new("late")
+        .permit(&[Permission::ReplyText])
+        .mode(ReplyMode::Stream)
+        .on_reply(true, true, false, |_| {
+            Ok(Box::new(Closures {
+                text: Box::new(|_| Invocation::ok(Some(String::new()))),
+                end: Box::new(|| Invocation::err(RunError::CpuLimit)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        });
+    let mut chain = chain_of(Dialect::Anthropic, vec![late], &key_request()).await;
+    chain.stages[0].on_error = OnError::Skip;
+    let mut s = Stream::new(chain, Framing::Sse);
+    let (out, err) = run(&mut s, &input, 4096).await;
+    assert!(err.is_none());
+    assert_eq!(anthropic_blocks(&out)[0].2, want);
+}
+
+#[tokio::test]
+async fn whole_bodies_restore_a_placeholder_a_stream_plugin_splits() {
+    let t = format!("use {KEY} now");
+    let cases = [
+        (
+            Dialect::Anthropic,
+            json!({"id":"m","type":"message","role":"assistant",
+                   "content":[{"type":"text","text":t}],"stop_reason":"end_turn"}),
+        ),
+        (
+            Dialect::Chat,
+            json!({"id":"c","object":"chat.completion","choices":[{"index":0,
+                   "message":{"role":"assistant","content":t},"finish_reason":"stop"}]}),
+        ),
+        (
+            Dialect::Responses,
+            json!({"id":"r","object":"response","status":"completed","output":[
+                {"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":t}]}
+            ]}),
+        ),
+        (
+            Dialect::Gemini,
+            json!({"candidates":[{"content":{"role":"model","parts":[{"text":t}]},"finishReason":"STOP"}]}),
+        ),
+    ];
+    for (d, body) in cases {
+        let mut chain = chain_of(d, vec![hold_last(5), hold_last(7)], &key_request()).await;
+        let out = whole(&mut chain, body.to_string().as_bytes())
+            .await
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(&t), "{d:?}: {text}");
+        assert!(!text.contains("TW_SECRET"), "{d:?}: {text}");
+    }
+}
+
 // ───────────────────────────────────────────────────────── Chat
 
 fn chat_stream() -> String {
