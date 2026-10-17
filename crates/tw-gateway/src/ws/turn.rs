@@ -527,7 +527,11 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
         at_ms: a.at_ms,
     });
     hold.bind(id);
-    ending.streaming(tw_dialect::ir::Dialect::Responses, &line.provider);
+    ending.streaming(
+        tw_dialect::ir::Dialect::Responses,
+        &line.provider,
+        &state.pace,
+    );
     // 拒绝的也在开始之后：被拒是一次来源为 `denied` 的失败，一个字节都不发
     let details = a.screened.clone();
     if let Some(why) =

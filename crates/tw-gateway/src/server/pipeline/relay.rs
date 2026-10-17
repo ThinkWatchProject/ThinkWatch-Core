@@ -140,7 +140,7 @@ pub(super) fn respond(
     let upstream_dialect = upstream_dialect(req, session.as_ref());
     // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
     if generates && plan.is_sse && status.is_success() {
-        ending.streaming(upstream_dialect, &provider.name);
+        ending.streaming(upstream_dialect, &provider.name, &state.pace);
         // `url-test` 和按快慢分的 `load-balance` 的判据：从这一跳发出去到第一个 token（见
         // `crate::latency`）。**只有成功的流有**：一个 500 在十毫秒内返回，会让最坏的上游
         // 看起来最快；整包的回答分不出排队和说话

@@ -165,13 +165,13 @@ async fn live(router: axum::Router) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-/// `/live`：菜单栏要的在跑的请求和生成速率，由 core 数好。
+/// `/live`：菜单栏要的在跑的请求和此刻的生成速度，由 core 数好。
 #[tokio::test]
 async fn live_gives_the_running_requests_and_the_generation_rate() {
     let (_d, bus, router) = app();
     let idle = live(router.clone()).await;
     assert_eq!(idle["running"], serde_json::json!([]));
-    // 这一分钟里没有跑完的：是空，不是 0
+    // 没有在跑的：是空，不是 0
     assert!(idle["tokens_per_sec"].is_null(), "{idle}");
 
     bus.emit(started(1, "claude-sonnet-5"));
@@ -199,12 +199,22 @@ async fn live_gives_the_running_requests_and_the_generation_rate() {
         answered_model: None,
     });
     bus.emit(started(2, "gpt-5.5"));
+    bus.emit(started(3, "gpt-5.5"));
+    // 3 开口了、记了 40 个；2 还在等第一个 token
+    bus.meter(3).unwrap().add(40);
 
     let v = live(router).await;
-    assert_eq!(v["tokens_per_sec"], 50, "{v}");
-    assert_eq!(v["running"].as_array().unwrap().len(), 1);
+    // **跑完的不算**，只看在跑的：2 没开口不算速度，合计就是 3 的。3 刚开口，40 个除以
+    // 开口以来的时间（至少一格 250 毫秒，所以最多 160）；跑得慢的机器上读得晚一点，数小一点
+    let rate = v["running"][1]["tokens_per_sec"].as_u64().unwrap();
+    assert!((1..=160).contains(&rate), "{v}");
+    assert_eq!(v["tokens_per_sec"], rate, "{v}");
+    assert_eq!(v["running"].as_array().unwrap().len(), 2);
+    assert_eq!(v["running"][1]["output_tokens"], 40, "{v}");
     let r = &v["running"][0];
     assert_eq!(r["id"], 2);
+    assert!(r["tokens_per_sec"].is_null(), "{v}");
+    assert!(r["output_tokens"].is_null(), "{v}");
     assert_eq!(r["client"], "我");
     assert_eq!(r["client_hint"], "claude-code");
     assert_eq!(r["model"], "gpt-5.5");

@@ -42,6 +42,7 @@ pub mod live;
 pub mod models;
 pub mod oauth;
 pub mod outbound;
+pub mod pace;
 pub mod panic_note;
 pub mod plugin;
 pub mod probe;

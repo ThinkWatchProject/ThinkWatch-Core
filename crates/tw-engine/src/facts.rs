@@ -235,15 +235,19 @@ fn part(text: &mut Text, p: &Part) -> u64 {
     0
 }
 
-/// 攒着的文字：ASCII 字节数和其余字符数分开数。
-#[derive(Default)]
-struct Text {
+/// 攒着的文字：ASCII 字节数和其余字符数分开数。估 token 和输入同一个算法（见
+/// [`estimate_tokens`]）。
+///
+/// **一段一段喂、最后一起算**：流里的一段常常只有两三个字符，每段各自取整的话，英文会
+/// 被估高好几倍。网关读着回答的流估已经生成了多少，用的也是它
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Text {
     ascii: u64,
     other: u64,
 }
 
 impl Text {
-    fn add(&mut self, s: &str) {
+    pub fn add(&mut self, s: &str) {
         self.add_bytes(s.as_bytes());
     }
 
@@ -275,7 +279,7 @@ impl Text {
         let _ = serde_json::to_writer(Count(self), v);
     }
 
-    fn tokens(&self) -> u64 {
+    pub fn tokens(&self) -> u64 {
         self.ascii.div_ceil(4) + self.other
     }
 }

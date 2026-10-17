@@ -11,21 +11,20 @@
 //! **存储层不订阅广播**，它有自己的一条有界通道（[`EventBus::record_feed`]）：广播上
 //! 掉队丢掉的是界面上的几个点，记录丢掉的是那几个请求，永远不在库里了。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc};
+
+use crate::meter::Meter;
 
 const CAPACITY: usize = 1024;
 
 /// 存储层那条通道有多少格（见 [`EventBus::record_feed`]）。一个请求五六条事件，这么多格
 /// 够存储层落后两千多个请求
 pub const RECORD_CAPACITY: usize = 16 * 1024;
-
-/// 生成速率看最近这么久里跑完的请求
-pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct EventBus {
@@ -73,10 +72,6 @@ impl RecordFeed {
 struct Tally {
     /// 开始了、还没有结局的请求，按 id
     open: BTreeMap<u64, Open>,
-    /// 在跑的请求第一个 token 用了多久，毫秒。生成用时要从总耗时里减掉它
-    ttft: HashMap<u64, u64>,
-    /// 最近跑完的：（什么时候结束的，第一个 token 之后吐了多少 token，生成用了多少毫秒）
-    done: VecDeque<(Instant, u64, u64)>,
 }
 
 /// 一个还没有结局的请求。
@@ -85,6 +80,8 @@ struct Open {
     since: Instant,
     /// 到目前为止关于它的事件，按发生的先后，第一条是开始事件（见 [`about_the_request`]）
     events: Vec<tw_api::Event>,
+    /// 它此刻生成得多快。数据面读着流往里记（见 [`EventBus::meter`]）
+    meter: Arc<Meter>,
 }
 
 /// 这条事件说的是它挂着的那个请求本身吗 —— 是的话，半路才来的一方要重建那个请求，
@@ -138,18 +135,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-impl Tally {
-    fn forget(&mut self, now: Instant) {
-        while self
-            .done
-            .front()
-            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) > RATE_WINDOW)
-        {
-            self.done.pop_front();
-        }
-    }
 }
 
 impl Default for EventBus {
@@ -242,38 +227,14 @@ impl EventBus {
                     Open {
                         since: now,
                         events: vec![ev.clone()],
+                        meter: Arc::new(Meter::new(now)),
                     },
                 );
             }
-            E::RequestFirstToken { id, ttft_ms } => {
-                if let Some(o) = t.open.get_mut(id) {
-                    o.events.push(ev.clone());
-                    t.ttft.insert(*id, *ttft_ms);
-                }
-            }
-            E::RequestFinished {
-                id,
-                duration_ms,
-                tokens_per_sec,
-                ..
-            } => {
+            E::RequestFinished { id, .. }
+            | E::RequestFailed { id, .. }
+            | E::RequestCancelled { id, .. } => {
                 t.open.remove(id);
-                let ttft = t.ttft.remove(id);
-                // **只数有速度的。**速度怎么算、什么时候没有，由网关在结局里定（见
-                // `RequestFinished::tokens_per_sec`）：非流式的没有第一个 token，取消的、
-                // 断掉的输出不全。这里只按生成用的时间把它们合起来
-                if let (Some(rate), Some(ttft)) = (tokens_per_sec, ttft) {
-                    let gen_ms = duration_ms.saturating_sub(ttft);
-                    if *rate > 0 && gen_ms > 0 {
-                        t.done
-                            .push_back((now, u64::from(*rate) * gen_ms / 1000, gen_ms));
-                    }
-                }
-                t.forget(now);
-            }
-            E::RequestFailed { id, .. } | E::RequestCancelled { id, .. } => {
-                t.open.remove(id);
-                t.ttft.remove(id);
             }
             // 别的事件挂着的 id 要么是一个请求的，要么是它自己取的号 —— 号从同一个
             // 计数器里取，不会和一个在跑的请求撞上
@@ -326,33 +287,41 @@ impl EventBus {
         t.open.contains_key(&id)
     }
 
-    /// 此刻的实时读数：在跑的请求（和 [`EventBus::in_flight`] 同一批），和最近
-    /// 一分钟跑完的请求平均每秒生成多少 token。
+    /// 这个在跑的请求的速度表：数据面读着流，每读到一段输出就往里记估出来的 token（见
+    /// [`Meter::add`]），`/live` 从这里读。**开始事件之后才有**，结局之后就没了 —— 记在一份
+    /// 已经划掉的表上不碍事，只是没人再读
+    pub fn meter(&self, id: u64) -> Option<Arc<Meter>> {
+        let t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
+        t.open.get(&id).map(|o| o.meter.clone())
+    }
+
+    /// 此刻的实时读数：在跑的请求（和 [`EventBus::in_flight`] 同一批），各自此刻生成得
+    /// 多快，和加起来的速度。
     ///
-    /// **量的是生成的快慢**：每个请求的速度按它生成用的时间（总耗时减去第一个 token 的
-    /// 时刻）加权，也就是吐出的 token 合计除以生成用的时间合计。拿「一分钟里输出了多少」去除以六十的话，一个跑了一分钟才
-    /// 结束的长请求，要等它结束之后才把速率一次性摊进来，数字跟着请求的长短忽高
-    /// 忽低。
+    /// **量的是此刻**：每个请求看最近 [`crate::meter::WINDOW`] 里生成了多少（见 [`Meter`]）。
+    /// 以前看的是最近一分钟跑完的请求，一个跑几分钟的长请求要等它结束才有数，跑着的时候
+    /// 菜单栏上是空的。
+    ///
+    /// 没有在跑的请求，速度是空；有请求在跑、却都还没开口（等第一个 token，或者非流式的），
+    /// 是 0 —— 有活在干，只是此刻没有字出来
     pub fn live(&self) -> tw_api::LiveView {
         self.live_at(Instant::now())
     }
 
     fn live_at(&self, now: Instant) -> tw_api::LiveView {
-        let mut t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
-        t.forget(now);
-        let (tokens, ms) = t
-            .done
-            .iter()
-            .fold((0u64, 0u64), |(tok, ms), (_, out, gen_ms)| {
-                (tok + out, ms + gen_ms)
-            });
+        let t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
         let mut running: Vec<tw_api::RunningView> =
             t.open.values().filter_map(|o| running(o, now)).collect();
         running.sort_by_key(|r| (r.at_ms, r.id));
+        let tokens_per_sec = (!running.is_empty()).then(|| {
+            running
+                .iter()
+                .filter_map(|r| r.tokens_per_sec)
+                .fold(0u32, u32::saturating_add)
+        });
         tw_api::LiveView {
             running,
-            tokens_per_sec: (ms > 0)
-                .then(|| (tokens.saturating_mul(1000) / ms).min(u32::MAX as u64) as u32),
+            tokens_per_sec,
         }
     }
 
@@ -400,6 +369,7 @@ fn running(o: &Open, now: Instant) -> Option<tw_api::RunningView> {
             .map(|a| a.provider.clone()),
         _ => None,
     });
+    let reading = o.meter.read_at(now);
     Some(tw_api::RunningView {
         id: *id,
         client: client.clone(),
@@ -413,11 +383,15 @@ fn running(o: &Open, now: Instant) -> Option<tw_api::RunningView> {
         rule: rule.clone(),
         group: group.clone(),
         upstream,
+        tokens_per_sec: reading.map(|r| r.tokens_per_sec),
+        output_tokens: reading.map(|r| r.total),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn started(id: u64) -> tw_api::Event {
@@ -650,74 +624,43 @@ mod tests {
         }
     }
 
-    /// **几个请求按生成用的时间加权**：吐出的 token 合计除以生成用的时间合计。
+    /// **没有在跑的就没有速度**，不是 0；有请求在跑却都还没开口，是 0
     #[test]
-    fn the_rate_weighs_each_request_by_its_generation_time() {
+    fn the_speed_is_empty_when_idle_and_zero_when_nothing_is_generating() {
         let b = EventBus::new();
         let now = Instant::now();
-        // 第一个 token 在 1 秒，之后 2 秒、每秒 50 个
+        assert_eq!(b.live_at(now).tokens_per_sec, None);
         b.track_at(&started(1), now);
-        b.track_at(&first_token(1, 1_000), now);
-        b.track_at(&finished(1, 3_000, Some(50)), now);
-        assert_eq!(b.live_at(now).tokens_per_sec, Some(50));
-        // 又一个：1 秒、每秒 200 个。合起来 300 个 / 3 秒，不是两个速度的平均 125
-        b.track_at(&started(2), now);
-        b.track_at(&first_token(2, 500), now);
-        b.track_at(&finished(2, 1_500, Some(200)), now);
-        assert_eq!(b.live_at(now).tokens_per_sec, Some(100));
+        let live = b.live_at(now + Duration::from_secs(5));
+        assert_eq!(live.tokens_per_sec, Some(0));
+        assert_eq!(live.running[0].tokens_per_sec, None);
+        assert_eq!(live.running[0].output_tokens, None);
     }
 
-    /// 一分钟之前跑完的不算；**没有就是没有**，不是 0
+    /// 在跑的请求各自的速度加起来；结局之后它就不在里面了
     #[test]
-    fn an_idle_minute_has_no_rate() {
+    fn the_speed_is_the_sum_of_the_running_requests() {
         let b = EventBus::new();
-        let then = Instant::now();
-        assert_eq!(b.live_at(then).tokens_per_sec, None);
-        b.track_at(&started(1), then);
-        b.track_at(&first_token(1, 100), then);
-        b.track_at(&finished(1, 1_100, Some(40)), then);
-        assert_eq!(b.live_at(then).tokens_per_sec, Some(40));
-        let later = then + RATE_WINDOW + Duration::from_secs(1);
-        assert_eq!(b.live_at(later).tokens_per_sec, None);
-    }
-
-    /// 没有速度的（非流式：响应头要等整段生成完才到，没有第一个 token）、取消的，都不
-    /// 拿来算。**非流式的混进来会把数顶上天**：总耗时减去响应头只剩读 body 的几毫秒
-    #[test]
-    fn only_requests_with_a_rate_make_the_rate() {
-        let b = EventBus::new();
-        let now = Instant::now();
-        b.track_at(&started(1), now);
+        let t = Instant::now();
+        b.track_at(&started(1), t);
+        b.track_at(&started(2), t);
+        let (m1, m2) = (b.meter(1).unwrap(), b.meter(2).unwrap());
+        m1.add_at(50, t + Duration::from_millis(1_000));
+        m1.add_at(50, t + Duration::from_millis(2_000));
+        m2.add_at(30, t + Duration::from_millis(1_000));
+        m2.add_at(30, t + Duration::from_millis(2_000));
+        let live = b.live_at(t + Duration::from_millis(2_000));
+        assert_eq!(live.running[0].tokens_per_sec, Some(100));
+        assert_eq!(live.running[0].output_tokens, Some(100));
+        assert_eq!(live.running[1].tokens_per_sec, Some(60));
+        assert_eq!(live.tokens_per_sec, Some(160));
         b.track_at(
-            &tw_api::Event::RequestHeaders {
-                id: 1,
-                status: 200,
-                ttfb_ms: 1_995,
-            },
-            now,
+            &finished(1, 2_000, Some(50)),
+            t + Duration::from_millis(2_000),
         );
-        b.track_at(&finished(1, 2_000, None), now);
-        b.track_at(&started(2), now);
-        b.track_at(&first_token(2, 100), now);
-        b.track_at(
-            &tw_api::Event::RequestCancelled {
-                id: 2,
-                model: "m".into(),
-                status: Some(200),
-                sent_bytes: Some(0),
-                received_bytes: Some(1),
-                duration_ms: 2_000,
-                usage: Some(tw_api::UsageView {
-                    output: 100,
-                    ..Default::default()
-                }),
-                answered_model: None,
-            },
-            now,
-        );
-        let live = b.live_at(now);
-        assert_eq!(live.tokens_per_sec, None);
-        assert!(live.running.is_empty());
+        assert!(b.meter(1).is_none());
+        let live = b.live_at(t + Duration::from_millis(2_000));
+        assert_eq!(live.tokens_per_sec, Some(60));
     }
 
     /// 菜单的「进行中」要知道是谁、用什么模型、跑了多久；开始得早的在前
@@ -761,6 +704,9 @@ mod tests {
                 group: Some("__all__".into()),
                 // 路由还没报出结论：不知道最后是哪家接下的
                 upstream: None,
+                // 还没开口
+                tokens_per_sec: None,
+                output_tokens: None,
             }
         );
     }

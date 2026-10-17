@@ -5,5 +5,7 @@
 //! 一个没人观测的网关必须能照常转发。
 
 pub mod bus;
+pub mod meter;
 
 pub use bus::{EventBus, RecordFeed};
+pub use meter::Meter;
