@@ -1825,6 +1825,14 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Ok(tw_api::Event::RequestFailed { message, .. })) => {
                 assert!(message.text.contains("stream broke"), "{message}");
+                // 不是 reqwest 那句「error decoding response body」：说清是连接断了、怎么断的
+                assert_eq!(message.code, "gw.upstream.body_broken", "{message}");
+                assert!(
+                    message
+                        .text
+                        .contains("end of file before message length reached"),
+                    "{message}"
+                );
                 saw_failed = true;
                 break;
             }

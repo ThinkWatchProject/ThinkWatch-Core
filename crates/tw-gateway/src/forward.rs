@@ -152,11 +152,56 @@ pub fn map_reqwest_error(e: reqwest::Error) -> GatewayError {
             "The upstream could not be reached at {url}. Check the endpoint address, the network \
              and the proxy settings."
         ))
+    } else if broke_reading(&e) {
+        // reqwest 把读正文时的一切失败都叫「error decoding response body」，哪怕根本没有
+        // 在解码：上游关了连接、连接被重置、HTTP/2 的流被重置，都是这一句。用户照字面去
+        // 查「解码」只会走错路，所以单给一个码，说清是连接在回答途中断了，再接上断法
+        GatewayError::upstream(msg!(
+            "gw.upstream.body_broken", detail = match causes(&e) {
+                c if c.is_empty() => e.to_string(),
+                c => c,
+            } =>
+            "The connection to the upstream broke while the answer was being received: {detail}"
+        ))
     } else {
         GatewayError::upstream(msg!(
-            "gw.upstream.forward_failed", detail = e => "Forwarding failed: {detail}"
+            "gw.upstream.forward_failed", detail = with_causes(&e) => "Forwarding failed: {detail}"
         ))
     }
+}
+
+/// 读正文的半路断了。reqwest 0.13 里读正文的失败一律是 decode；`json()` 解析失败也是
+/// decode，那一种的原因是 serde 的错误，不是连接断了
+fn broke_reading(e: &reqwest::Error) -> bool {
+    e.is_decode() && !sources(e).any(|c| c.is::<serde_json::Error>())
+}
+
+fn sources(e: &reqwest::Error) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    std::iter::successors(std::error::Error::source(e), |c| c.source())
+}
+
+/// 错误本身连同每一层原因。**reqwest 自己只说最外面一层**，真正的原因（「end of file
+/// before message length reached」「connection reset by peer」「stream error received: …」）
+/// 在 `source()` 里，只报外层的话这一句什么都没说。带着的地址照 `unreachable` 那样打码
+fn with_causes(e: &reqwest::Error) -> String {
+    let mut top = e.to_string();
+    if let Some(u) = e.url() {
+        top = top.replace(u.as_str(), &tw_secret::redact_url(u.as_str()));
+    }
+    match causes(e) {
+        c if c.is_empty() => top,
+        c => format!("{top}: {c}"),
+    }
+}
+
+/// 只要原因那几层，用 `: ` 连起来。**中间套着的 reqwest 错误跳过**：接回开头字节的那条流
+/// （`opening`）把上游的错误又包了一层，它只会把「error decoding response body」再说一遍
+fn causes(e: &reqwest::Error) -> String {
+    sources(e)
+        .filter(|c| !c.is::<reqwest::Error>())
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 #[cfg(test)]
@@ -487,5 +532,85 @@ mod tests {
             }
         }
         assert!(changed > 1_000 && unusual > 50, "{changed} {unusual}");
+    }
+
+    /// 回了响应头和一段正文，说好的长度没发完就关连接：上游在回答途中走了的样子
+    async fn cut_short() -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 900\r\n\r\ndata: {}\n\n")
+                .await;
+        });
+        reqwest::Client::new()
+            .post(format!("http://{at}/v1/responses?key=secret"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn first_error(r: reqwest::Response) -> reqwest::Error {
+        use futures::StreamExt;
+        let mut s = r.bytes_stream();
+        loop {
+            match s.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return e,
+                None => panic!("the body ended without an error"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_names_the_break_not_a_decoding_error() {
+        let err = map_reqwest_error(first_error(cut_short().await).await);
+        assert_eq!(err.detail.code, "gw.upstream.body_broken");
+        let text = &err.detail.text;
+        assert!(
+            text.ends_with(
+                "error reading a body from connection: end of file before message length reached"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("decoding"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_break_behind_the_replayed_opening_is_told_once() {
+        // `opening` 把读过的字节接回流的前面，上游的错误因此又被 reqwest 包了一层
+        let r = cut_short().await;
+        let replayed = http::Response::new(reqwest::Body::wrap_stream(r.bytes_stream()));
+        let err = map_reqwest_error(first_error(reqwest::Response::from(replayed)).await);
+        assert_eq!(err.detail.code, "gw.upstream.body_broken");
+        assert!(!err.detail.text.contains("decoding"), "{}", err.detail.text);
+        assert!(
+            err.detail.text.contains("end of file"),
+            "{}",
+            err.detail.text
+        );
+    }
+
+    #[tokio::test]
+    async fn every_cause_is_spelled_out_and_the_address_redacted() {
+        // 整包读（`bytes()`）的错误带着地址：query 里可能就是密钥
+        let e = cut_short().await.bytes().await.unwrap_err();
+        let detail = with_causes(&e);
+        assert!(
+            detail.starts_with("error decoding response body for url (http://127.0.0.1:"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("secret") && !detail.contains("/v1/"),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with("end of file before message length reached"),
+            "{detail}"
+        );
     }
 }

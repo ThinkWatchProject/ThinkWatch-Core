@@ -1749,7 +1749,7 @@ pub struct AttemptView {
 }
 
 /// 发出去之后才失败的一跳报的码（见 [`AttemptView::sent`]）：上游没在时限内回话、请求在路上
-/// 断了、流在第一段内容之前报了错。**上游可能已经收下了它、在算了**。
+/// 断了、回答读到一半连接断了、流在第一段内容之前报了错。**上游可能已经收下了它、在算了**。
 ///
 /// 别的 `error` 都没发出去：这家满着（`skipped`）、规则拒绝、格式对不上、发给它的名字对不上、
 /// 插件拒绝、转换不了、凭据取不到、签不了名，还有连不上（地址不通、握手失败）—— 那时上游
@@ -1757,6 +1757,7 @@ pub struct AttemptView {
 pub const FAILED_AFTER_SENDING: &[&str] = &[
     "gw.upstream.timeout",
     "gw.upstream.forward_failed",
+    "gw.upstream.body_broken",
     "gw.upstream.stream_opening_error",
 ];
 
@@ -6626,6 +6627,7 @@ mod tests {
             attempt(Aborted, None, Some("gw.request.aborted")),
             attempt(Estimated, Some(404), None),
             attempt(Error, None, Some("gw.upstream.timeout")),
+            attempt(Error, None, Some("gw.upstream.body_broken")),
             attempt(Error, None, Some("gw.upstream.stream_opening_error")),
         ] {
             assert!(a.sent(), "{a:?}");
