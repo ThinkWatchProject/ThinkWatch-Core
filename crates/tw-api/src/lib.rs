@@ -940,7 +940,16 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `replaced`，[`OutcomeDetail`] 的 `replaced` 多了可选的 `segments`（换了几段）和
 /// `replacement`（换成的文字），回答里的命中 `direction` 是 `response`；[`SecurityCounts`] 多了
 /// `content_replaced`。照 47 写的界面不认 `placeholder`、`replace` 这两个动作。
-pub const CONTROL_API_VERSION: u32 = 48;
+///
+/// **49 起 `/live` 的速度是此刻的**：[`LiveView::tokens_per_sec`] 从「最近一分钟跑完的请求」
+/// 改成在跑的请求最近 [`LIVE_RATE_WINDOW_MS`] 毫秒的合计生成速度，按流里收到的内容现估；
+/// 没有在跑的请求是 null，有请求却都还没开始生成是 0。[`RunningView`] 多了 `tokens_per_sec`
+/// （这一个请求此刻的速度）和 `output_tokens`（到目前为止估的输出 token），第一个 token 之前、
+/// 非流式的是 null。
+pub const CONTROL_API_VERSION: u32 = 49;
+
+/// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
+pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1956,7 +1965,7 @@ impl Event {
     }
 }
 
-/// 此刻的实时读数（`GET /live`）：在跑的请求，和最近跑完的请求生成得多快。
+/// 此刻的实时读数（`GET /live`）：在跑的请求，和它们此刻生成得多快。
 ///
 /// **按事件数出来的，core 里只数一份。**以前菜单栏自己听事件流、自己记在跑的和
 /// 跑完的：半路才开始听的那一段要拿 `/in-flight` 对账，丢过事件要重对，而这些
@@ -1966,10 +1975,13 @@ impl Event {
 pub struct LiveView {
     /// 开始了、还没有结局的请求，开始得早的在前。和 `/in-flight` 是同一批
     pub running: Vec<RunningView>,
-    /// 最近一分钟跑完的请求平均每秒生成多少 token：每个请求的速度（见
-    /// `RequestFinished::tokens_per_sec`）按它生成用的时间加权，也就是这些请求
-    /// 吐出的 token 合计除以生成用的时间合计。**只数有速度的**：非流式的不算。这一分钟里
-    /// 没有的是空，不是 0
+    /// 此刻每秒生成多少 token：在跑的请求各自的速度（[`RunningView::tokens_per_sec`]）加起来。
+    /// **没有在跑的请求是空**；有请求在跑、却都还在等第一个 token（或者是非流式的）是 0。
+    ///
+    /// 是估的：流里每到一段正文、推理文字、工具参数就按字数估 token（同输入的估算），再乘上
+    /// 这家上游这个模型此前实测的比例 —— 每个流式请求结束时，拿上游报的输出 token 数校准
+    /// 一次。上游在流里报累计数的（Gemini）用它报的。**请求结束后记下的速度
+    /// （`RequestFinished::tokens_per_sec`）照旧按上游报的实数算**，和这里不是一个数
     pub tokens_per_sec: Option<u32>,
 }
 
@@ -2000,6 +2012,12 @@ pub struct RunningView {
     /// 实际接下它的上游：尝试链里接下了的那一跳。**路由报出结论之前没有**
     /// （还在等上游的响应头，或者正在故障转移）
     pub upstream: Option<String>,
+    /// 这个请求此刻每秒生成多少 token：最近 [`LIVE_RATE_WINDOW_MS`] 毫秒（刚开口不到这么久
+    /// 的，从第一个 token 算起）里估出的输出除以这段时间，估法见 [`LiveView::tokens_per_sec`]。
+    /// 停下来不吐字的时候往下掉到 0。**第一个 token 之前、非流式的没有**
+    pub tokens_per_sec: Option<u32>,
+    /// 到目前为止估的输出 token（同上的估法）。**第一个 token 之前、非流式的没有**
+    pub output_tokens: Option<u64>,
 }
 
 /// 此刻还在跑的请求（`GET /in-flight`）：每一个到目前为止的事件，和 core 此刻的

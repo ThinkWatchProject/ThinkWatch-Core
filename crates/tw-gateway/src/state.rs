@@ -210,6 +210,8 @@ pub struct AppState {
     ///
     /// **跨重载存活**：改一条规则不该让所有上游回到「没测过」。
     pub latency: Arc<crate::latency::Latency>,
+    /// 流里估的 token 和上游实数之比，按上游 + 模型（见 [`crate::pace`]）。`/live` 的速度乘它
+    pub pace: Arc<crate::pace::Pace>,
     /// 价格簿：默认价目表 + 自定义价目表 + 哪个上游用哪张。
     ///
     /// **全进程只有这一份。**`cheapest` 排序、记账、测速报价、回放都从这
@@ -320,6 +322,7 @@ impl AppState {
             listening: Arc::new(std::sync::Mutex::new(Default::default())),
             oauth: Arc::new(crate::oauth::Cache::new()),
             latency: Arc::new(crate::latency::Latency::new()),
+            pace: Arc::new(crate::pace::Pace::new()),
             pricing: tw_pricing::shared(tw_pricing::PriceBook::new(
                 Arc::new(tw_pricing::Table::builtin().unwrap_or_else(|e| {
                     // **加载不了不能挡住启动**：那时成本显示「未知」，
