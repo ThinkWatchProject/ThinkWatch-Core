@@ -781,9 +781,11 @@ async fn content_then_silence_ends_with_an_error_the_client_understands() {
 
 #[tokio::test]
 async fn waiting_for_a_slot_is_not_counted_as_silence() {
-    // 唯一的一家满着：等了 1.5 秒才空出来，之后 600 毫秒出内容。等的那段不算，照常答上
+    // 唯一的一家满着：等了 1.5 秒才空出来，之后 200 毫秒出内容。等的那段不算，照常答上。
+    // 等的比窗口（1 秒）长，算进去就必然超时；出内容那一段离窗口要留足余量 —— 600 毫秒时
+    // 在忙的 CI 机器上撞过一次超时
     let late = upstream(Script {
-        steps: vec![(0, MESSAGE_START), (600, answer("patience"))],
+        steps: vec![(0, MESSAGE_START), (200, answer("patience"))],
         ..Default::default()
     })
     .await;
