@@ -63,9 +63,9 @@ pub struct Ending {
     /// 一条连接上每一次回答报的用量加起来（[`Ending::add_usage`]）。有它就不看嗅探器
     total: Option<Usage>,
     tap: ResponseTap,
-    /// 认第一个 token 的。**只在上游回的是成功的流时才有**（见 [`Ending::streaming`]），
-    /// 认出来就扔掉 —— 之后的字节不必再解析
-    first: Option<FirstToken>,
+    /// 读着回答的流：认第一个 token，之后估生成了多少（`/live` 的速度）。**只在上游回的是
+    /// 成功的流时才有**（见 [`Ending::streaming`]）
+    stream: Option<Stream>,
     /// 第一个 token 是什么时候、以什么开的头
     opened: Option<Opened>,
     /// 第一个 token 到的时候给回答的这一家记一个快慢样本（见 [`Ending::timed`]）
@@ -176,11 +176,95 @@ impl Watch {
     }
 }
 
-/// 还在等第一个 token。
-struct FirstToken {
+/// 读着回答的流。先认第一个 token；认出来之后接着读，每段输出按字数估 token，记到这个
+/// 请求的速度表上（`/live`，见 [`tw_observe::Meter`]）。
+struct Stream {
     reader: Reader,
-    /// 在那之前有过推理块，却一个推理的字都没有：推理被隐藏了
+    /// 上游的格式。Gemini 在流里一段段报累计的输出数，有它就用它
+    upstream: ir::Dialect,
+    /// 在第一个 token 之前有过推理块，却一个推理的字都没有：推理被隐藏了
     hidden_thought: bool,
+    /// 认出第一个 token 了
+    opened: bool,
+    /// 第一个 token 起的正文、推理文字、工具参数
+    text: tw_engine::TextTokens,
+    /// 一个推理块开了头还没见到字（见 [`Stream::count`]）
+    thought_pending: bool,
+    /// 有过一个字都没有的推理块：上游报的输出里有看不见的推理，不拿来校准
+    thought_hidden_later: bool,
+    /// 见过推理的字
+    thought_text: bool,
+    /// 上游在流里报的累计输出数（Gemini）
+    reported: u64,
+    /// 已经记到速度表上的
+    added: u64,
+    /// 这个请求的速度表。总线上已经没有它（结局报过了）的话是空的
+    meter: Option<std::sync::Arc<tw_observe::Meter>>,
+    /// 估数乘多少（见 [`crate::pace`]），和结束时校准记到哪儿
+    pace: std::sync::Arc<crate::pace::Pace>,
+    provider: String,
+    ratio: f64,
+}
+
+impl Stream {
+    /// 第一个 token 之后的一个事件：输出的字数进账，Gemini 报的累计数记下
+    fn count(&mut self, e: &ir::Event) {
+        match e {
+            ir::Event::Delta {
+                delta: ir::Delta::Text(t) | ir::Delta::ToolInput(t),
+                ..
+            } => self.text.add(t),
+            ir::Event::Delta {
+                delta: ir::Delta::Thinking(t),
+                ..
+            } => {
+                self.text.add(t);
+                if !t.is_empty() {
+                    self.thought_text = true;
+                    self.thought_pending = false;
+                }
+            }
+            ir::Event::BlockStart {
+                kind: ir::BlockKind::Thinking,
+                ..
+            } => self.thought_pending = true,
+            ir::Event::BlockStop { .. } if self.thought_pending => {
+                self.thought_pending = false;
+                self.thought_hidden_later = true;
+            }
+            ir::Event::Usage(u) if self.upstream == ir::Dialect::Gemini => {
+                self.reported = self.reported.max(u.output);
+            }
+            _ => {}
+        }
+    }
+
+    /// 这一块读完了：估到目前为止一共多少，多出来的记到速度表上。开口那一刻哪怕估出 0 个
+    /// 也记一笔 —— 速度从那一刻算起
+    fn tally(&mut self) {
+        if !self.opened {
+            return;
+        }
+        let estimated = (self.text.tokens() as f64 * self.ratio).round() as u64;
+        let total = estimated.max(self.reported);
+        let Some(m) = &self.meter else { return };
+        if total > self.added || self.added == 0 {
+            m.add(total.saturating_sub(self.added));
+            self.added = total.max(self.added);
+        }
+    }
+
+    /// 结束了，上游报了用量：拿它校准这家这个模型的估法。**有看不见的推理就不校**：上游报
+    /// 的输出里有推理 token，流里却没有它们的字，比出来的比例会偏高
+    fn learn(&self, model: &str, usage: &Usage) {
+        let hidden = self.hidden_thought
+            || self.thought_hidden_later
+            || (usage.reasoning > 0 && !self.thought_text);
+        if self.opened && !hidden {
+            self.pace
+                .learn(&self.provider, model, self.text.tokens(), usage.output);
+        }
+    }
 }
 
 /// 回答的这一家的快慢样本记到哪儿、从什么时候算起（见 [`crate::latency`]）。
@@ -226,7 +310,7 @@ impl Ending {
             sniffer: Sniffer::new(),
             total: None,
             tap: ResponseTap::new(),
-            first: None,
+            stream: None,
             opened: None,
             lap: None,
             watch: None,
@@ -249,10 +333,30 @@ impl Ending {
     ///
     /// **流里报了错的不是成功。**上游先回 200、写到一半才报 `overloaded_error` 的，客户端
     /// 拿到的是半截回答加一个错误；记成成功的话，这家上游看起来从不出错。
-    pub fn streaming(&mut self, upstream: ir::Dialect, provider: &str) {
-        self.first = Some(FirstToken {
+    ///
+    /// 认出第一个 token 之后接着读，估生成了多少记到这个请求的速度表上（`/live`），估数乘上
+    /// `pace` 里这家这个模型的比例；成功结束时按上游报的实数校准它（见 [`crate::pace`]）。
+    pub fn streaming(
+        &mut self,
+        upstream: ir::Dialect,
+        provider: &str,
+        pace: &std::sync::Arc<crate::pace::Pace>,
+    ) {
+        self.stream = Some(Stream {
             reader: Reader::new(upstream),
+            upstream,
             hidden_thought: false,
+            opened: false,
+            text: Default::default(),
+            thought_pending: false,
+            thought_hidden_later: false,
+            thought_text: false,
+            reported: 0,
+            added: 0,
+            meter: self.bus.meter(self.id),
+            pace: pace.clone(),
+            provider: provider.to_string(),
+            ratio: pace.ratio(provider, &self.model),
         });
         self.watch = Some(Watch {
             provider: provider.to_string(),
@@ -387,26 +491,32 @@ impl Ending {
         }
     }
 
-    /// 在这一块里找第一个 token。找到就报，之后不再解析。
+    /// 读这一块：认第一个 token，认出来就报；之后的输出估数记到速度表上（见 [`Stream`]）。
     fn spot(&mut self, chunk: &[u8]) {
-        let Some(f) = self.first.as_mut() else {
+        let Some(f) = self.stream.as_mut() else {
             return;
         };
         let mut opened = None;
         for e in f.reader.feed(chunk) {
-            match opening(&e) {
-                Some(with_thought) => {
-                    opened = Some((with_thought, f.hidden_thought));
-                    break;
+            if !f.opened {
+                match opening(&e) {
+                    Some(with_thought) => {
+                        f.opened = true;
+                        opened = Some((with_thought, f.hidden_thought));
+                    }
+                    None if hides_thought(&e) => {
+                        f.hidden_thought = true;
+                        continue;
+                    }
+                    None => continue,
                 }
-                None if hides_thought(&e) => f.hidden_thought = true,
-                None => {}
             }
+            f.count(&e);
         }
+        f.tally();
         let Some((with_thought, hidden_thought)) = opened else {
             return;
         };
-        self.first = None;
         if let Some(lap) = self.lap.take() {
             lap.latency
                 .record(&lap.provider, crate::latency::ms(lap.sent.elapsed()));
@@ -502,6 +612,11 @@ impl Ending {
             return;
         }
         let (usage, answered_model) = self.settle();
+        if let (Some(s), Some(u)) = (self.stream.take(), usage.as_ref())
+            && (200..300).contains(&status)
+        {
+            s.learn(&self.model, u);
+        }
         if let Some(t) = self.answer.take()
             && (200..300).contains(&status)
         {
@@ -857,7 +972,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Anthropic, "官方");
+        e.streaming(ir::Dialect::Anthropic, "官方", &Default::default());
         e.feed(MESSAGE_START);
         // 错误帧被切成一个字节一个字节地到
         for b in OVERLOADED {
@@ -891,7 +1006,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Chat, "中转");
+        e.streaming(ir::Dialect::Chat, "中转", &Default::default());
         e.feed(b"data: {\"error\":{\"message\":\"Provider disconnected\"}}");
         e.finished(200);
         assert!(
@@ -1233,7 +1348,7 @@ mod tests {
             Some(tx),
         );
         e.responded(200);
-        e.streaming(ir::Dialect::Responses, "chatgpt");
+        e.streaming(ir::Dialect::Responses, "chatgpt", &Default::default());
         wire(&mut e, COMPLETED);
         e.delivered();
         drop(e);
@@ -1264,7 +1379,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Responses, "chatgpt");
+        e.streaming(ir::Dialect::Responses, "chatgpt", &Default::default());
         e.feed(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n");
         e.delivered();
         drop(e);
@@ -1345,7 +1460,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Anthropic, "up");
+        e.streaming(ir::Dialect::Anthropic, "up", &Default::default());
         e.feed(MESSAGE_START);
         e.feed(TEXT_BLOCK);
         assert!(drain(&mut rx).is_empty(), "开场帧被当成了第一个 token");
@@ -1376,7 +1491,7 @@ mod tests {
         for _ in 0..3 {
             let mut e = Ending::new(bus.clone(), 7, MODEL.into(), arrived, 1_000, None);
             e.responded(200);
-            e.streaming(ir::Dialect::Anthropic, "up");
+            e.streaming(ir::Dialect::Anthropic, "up", &Default::default());
             let sent = Instant::now() - std::time::Duration::from_millis(300);
             e.timed(lap(&latency, sent));
             e.feed(MESSAGE_START);
@@ -1397,7 +1512,7 @@ mod tests {
         let latency = std::sync::Arc::new(crate::latency::Latency::new());
         for _ in 0..3 {
             let mut e = responding(&bus);
-            e.streaming(ir::Dialect::Anthropic, "up");
+            e.streaming(ir::Dialect::Anthropic, "up", &Default::default());
             e.timed(lap(&latency, Instant::now()));
             e.feed(MESSAGE_START);
             e.feed(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n");
@@ -1418,7 +1533,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Anthropic, "up");
+        e.streaming(ir::Dialect::Anthropic, "up", &Default::default());
         e.feed(MESSAGE_START);
         e.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}}\n\n");
         assert_eq!(first_tokens(&drain(&mut rx)).len(), 1);
@@ -1548,7 +1663,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Responses, "up");
+        e.streaming(ir::Dialect::Responses, "up", &Default::default());
         let frames = [
             r#"{"type":"response.created","response":{"id":"r","status":"in_progress","model":"gpt-5","output":[]}}"#,
             r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#,
