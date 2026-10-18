@@ -565,7 +565,7 @@ fn unzip(bytes: &[u8]) -> Result<Pack, PackError> {
     let mut budget = MAX_BYTES;
     for i in 0..z.len() {
         let mut f = z.by_index(i).map_err(corrupt)?;
-        let name = f.name().to_string();
+        let name = f.name().map_err(corrupt)?.to_string();
         let Some(kind) = entry_of(&name) else {
             return Err(PackError::BadEntry { name });
         };

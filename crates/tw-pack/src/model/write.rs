@@ -86,6 +86,7 @@ pub fn materialize_with(
         .iter()
         .map(|(id, o)| (id.clone(), o.files.clone()))
         .collect();
+    let (files, prefs) = (&files, &prefs);
     let finish = |text: String| Pack {
         manifest: local.manifest.clone(),
         config_yaml: text,
@@ -94,7 +95,7 @@ pub fn materialize_with(
     };
 
     let edited = by_edits(&local.config_yaml, &cfg, &current, target, &want, &plugins)
-        .map(&finish)
+        .map(finish)
         .ok()
         .filter(|p| matches(p, &want, codec));
     if let Some(p) = edited {
