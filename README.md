@@ -156,6 +156,7 @@ a time, and cannot stop core, take the diagnostic bundle or change
 | `tw-observe` | Event bus |
 | `tw-gateway` | Data plane: the life of a request |
 | `tw-plugin` | Script-plugin sandbox: QuickJS compiled to WebAssembly, run by Wasmtime |
+| `tw-pack` | Configuration packs (`.twconfig`): format, encryption, local backups, and the item model import and sync compare on |
 | `tw-control` | Control-plane server |
 
 ThinkWatch Enterprise depends only on the first four, which depend only on one
