@@ -28,6 +28,9 @@ members = [
     # crate、企业版用的第一层都不能沾上，tw-plugin 的 tests/boundary.rs 守着
     "crates/tw-plugin",
     "crates/tw-control",
+    # 配置包（.twconfig）：导出、导入、本机备份与同步共用的格式，以及把一份配置拆成
+    # 项目与合并单位的模型
+    "crates/tw-pack",
     # 控制通道的握手与加密。桌面端按 tag 依赖它，所以只依赖契约层和 tw-yaml
     "crates/tw-link",
     # ── bin ──────────────────────────────────────────────
@@ -76,6 +79,7 @@ tw-dialect  = { path = "crates/tw-dialect" }
 tw-bedrock  = { path = "crates/tw-bedrock" }
 tw-link     = { path = "crates/tw-link" }
 tw-plugin   = { path = "crates/tw-plugin" }
+tw-pack     = { path = "crates/tw-pack" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
@@ -161,6 +165,11 @@ rand = "0.10"
 zstd = { version = "0.13", default-features = false }
 
 clap = { version = "4", features = ["derive"] }
+# 配置包的口令加密（scrypt）与同步版本的密钥加密（X25519）。默认特性是空的：不要
+# SSH 密钥、插件、命令行那几样
+age = { version = "0.11", default-features = false }
+# 配置包本身是 ZIP。只要 deflate（走已经在依赖树里的 flate2），不要别的压缩算法和加密
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # 控制面契约导出成 TypeScript（tw-api 的 `ts` feature）。**不开任何 serde 以外的
 # 类型实现**：契约里只有 std 和 serde 的类型
 ts-rs = { version = "12", default-features = false, features = ["serde-compat"] }

@@ -1,0 +1,30 @@
+[package]
+name = "tw-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Configuration packs (.twconfig): format, encryption, local backups, and the item model that import and sync compare on"
+
+[dependencies]
+# 配置的形状、校验、按名字改一项（保留注释）都在这里
+tw-config = { workspace = true }
+tw-engine = { workspace = true }
+tw-pricing = { workspace = true }
+tw-types = { workspace = true }
+tw-yaml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+sha2 = { workspace = true }
+age = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
