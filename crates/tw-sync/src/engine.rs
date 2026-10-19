@@ -8,7 +8,8 @@
 //!    写着已关闭的 keyring 才算关了加密。
 //! 2. 列出 `versions/`，读出每个版本（加密的用版本密钥解开）。读不出来的分两种：**坏了**的（不是
 //!    配置包、不是这把密钥加密的、加密的位置上没加密）马上跳过；**可能没传完**的当作尚未到达，
-//!    最新那一层有没到的就等下一轮，等了 30 分钟还读不出来也跳过。跳过的计数报给界面。
+//!    最新那一层有没到的就等下一轮，等了 30 分钟还读不出来也跳过。云盘还没下载到本机的（iCloud
+//!    的占位文件，文件夹位置请求下载、读成空的）不算读不出来，等一天。跳过的计数报给界面。
 //! 3. 找出所有的**头**（没有别的版本依据它的版本）。不止一个时（两台设备同时上传、云盘晚到
 //!    的版本）先以它们共同的上一版本为基准两两合并，得到「同步位置的最新」。
 //! 4. 以本机基准（上次同步的那一版）为基准，和本机当前配置三方合并（[`crate::merge`]）。基准
@@ -57,6 +58,11 @@ const DEVICE_RECORD_EVERY_MS: u64 = 6 * 3600 * 1000;
 
 /// 一个可能没传完的版本（或者 keyring）等多久：之后跳过，不再让它挡着
 pub const SKIP_AFTER_MS: u64 = 30 * 60 * 1000;
+
+/// 云盘还没下载到本机的文件（iCloud 的占位文件，读出来是空的）等多久。**不算「读不出来」**：
+/// 它是好的，只是还没到（文件夹位置已经请求了下载），所以等得比读不出来的久。一天还没到才
+/// 跳过，免得一直挡着这台设备上传
+pub const ARRIVING_SKIP_AFTER_MS: u64 = 24 * 3600 * 1000;
 
 /// 同步位置看上去空了：连着这么多轮、过了这么久、自己的设备记录也不在了，才算真的清空了
 const EMPTY_ROUNDS: u32 = 3;
@@ -254,6 +260,8 @@ enum Got {
     Broken,
     /// 可能还没传完
     Pending,
+    /// 还没下载到本机（读出来是空的：云盘的占位文件）
+    Arriving,
     /// 列出来之后又没了
     Gone,
 }
@@ -602,6 +610,30 @@ fn key_value(it: &Item) -> Option<&Value> {
     it.units.get(unit::ALL)?.get("key")
 }
 
+/// 一份配置的默认网关密钥（`default_key` 指着的那一把，不写就是叫 `default` 的那把）的名字
+fn default_key_name(s: &Snapshot) -> String {
+    s.items
+        .get(&ItemId::new(ItemKind::Global, model::global::DEFAULT_KEY))
+        .and_then(|it| it.units.get(model::global::DEFAULT_KEY))
+        .and_then(Value::as_str)
+        .unwrap_or(tw_config::DEFAULT_KEY)
+        .to_string()
+}
+
+/// 加入时两边的默认网关密钥同名、值不同：**不当作冲突，采用同步数据的值**。每个安装都会
+/// 自动生成一把默认密钥，新加入的设备向已经在同步的那一方看齐 —— 反过来的话，加入的这一台
+/// 会把别的设备上的默认密钥改掉。本机已接管的客户端随之更新（`GatewayKeysChanged`）。是这样
+/// 时给出那一把的标识
+pub fn adopted_default_key(local: &Snapshot, remote: &Snapshot) -> Option<ItemId> {
+    let name = default_key_name(local);
+    if name != default_key_name(remote) {
+        return None;
+    }
+    let id = ItemId::new(ItemKind::Key, name);
+    let (l, r) = (local.items.get(&id)?, remote.items.get(&id)?);
+    (key_value(l) != key_value(r)).then_some(id)
+}
+
 // ─────────────────────────────────────────────── 等登录的上游
 
 /// 本机配置里的上游（带着这台设备自己的登录）
@@ -828,6 +860,18 @@ impl<S: Store, H: Host> Engine<S, H> {
             }
             return Ok(self.set_mode(None, None, None));
         };
+        // 还没下载到本机（云盘的占位文件）：等它到，不算读不出来
+        if bytes.is_empty() {
+            let since = *st
+                .arriving
+                .entry(KEYRING.to_string())
+                .or_insert_with(now_ms);
+            if now_ms().saturating_sub(since) >= ARRIVING_SKIP_AFTER_MS {
+                return Err(RoundError::KeyringMissing(KeyringError::Corrupt.msg()));
+            }
+            return Err(RoundError::NotArrived);
+        }
+        st.arriving.remove(KEYRING);
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         if self.mode_of == Some(Some(hash)) {
             return Ok(self.sealed);
@@ -902,7 +946,7 @@ impl<S: Store, H: Host> Engine<S, H> {
         };
         // 空的：云盘的占位文件、正在写
         if bytes.is_empty() {
-            return Ok(Got::Pending);
+            return Ok(Got::Arriving);
         }
         // 认得出是配置包（ZIP）或者加密过的：读不出来多半是没传完
         let shaped = keyring::is_age(&bytes) || bytes.starts_with(b"PK\x03\x04");
@@ -1011,24 +1055,38 @@ impl<S: Store, H: Host> Engine<S, H> {
             match self.fetch(n).await? {
                 Got::Ok(v) => {
                     st.unreadable.remove(&n.id());
+                    st.arriving.remove(&n.id());
                     sc.names.push(n.clone());
                     sc.ok.push(v);
                 }
                 Got::TooNew(cv) => {
                     st.unreadable.remove(&n.id());
+                    st.arriving.remove(&n.id());
                     sc.names.push(n.clone());
                     sc.too_new.push((n.clone(), cv));
                 }
                 Got::Broken => {
                     st.unreadable.remove(&n.id());
+                    st.arriving.remove(&n.id());
                     sc.skipped.push(n.clone());
                     if n.device == me {
                         sc.own_broken.push(n.clone());
                     }
                 }
                 Got::Pending => {
+                    st.arriving.remove(&n.id());
                     let since = *st.unreadable.entry(n.id()).or_insert(now);
                     if now.saturating_sub(since) >= SKIP_AFTER_MS {
+                        sc.skipped.push(n.clone());
+                    } else {
+                        sc.names.push(n.clone());
+                        sc.pending.push(n.clone());
+                    }
+                }
+                Got::Arriving => {
+                    st.unreadable.remove(&n.id());
+                    let since = *st.arriving.entry(n.id()).or_insert(now);
+                    if now.saturating_sub(since) >= ARRIVING_SKIP_AFTER_MS {
                         sc.skipped.push(n.clone());
                     } else {
                         sc.names.push(n.clone());
@@ -1038,8 +1096,9 @@ impl<S: Store, H: Host> Engine<S, H> {
                 Got::Gone => {}
             }
         }
-        st.unreadable
-            .retain(|k, _| k == KEYRING || all.iter().any(|n| &n.id() == k));
+        let listed = |k: &String| k == KEYRING || all.iter().any(|n| &n.id() == k);
+        st.unreadable.retain(|k, _| listed(k));
+        st.arriving.retain(|k, _| listed(k));
         sc.all = all;
         Ok(sc)
     }
@@ -2254,7 +2313,8 @@ impl<S: Store, H: Host> Engine<S, H> {
 
     /// 加入已有的同步。`merged` 是本机按导入的规则合并之后的完整配置包（「合并」）；`None` 是
     /// 用同步数据替换本机配置（新安装、或者选了「使用同步数据」）—— 那时本机已接管的客户端
-    /// 正在用的网关密钥并入同步数据，不同步的上游留在本机。
+    /// 正在用的网关密钥并入同步数据（默认密钥除外：采用同步数据的值，见
+    /// [`adopted_default_key`]），不同步的上游留在本机。
     ///
     /// 本机先照结果改，再上传一个依据同步位置最新版本的新版本，作为这台设备的基准。两种方式
     /// 下，别的设备上登录着、这台没登录的上游都在这台停用着，**上传的是同步的样子**（启用着）。
@@ -2297,10 +2357,12 @@ impl<S: Store, H: Host> Engine<S, H> {
         let mut target = match &merged {
             Some(p) => model::snapshot(p).map_err(|e| RoundError::Local(e.msg()))?,
             None => {
+                // 已接管的客户端在用的密钥并入同步数据；默认密钥例外，采用同步数据的值
                 let mut t = remote.snap.clone();
                 let pinned = self.host.pinned_keys();
+                let adopted = adopted_default_key(&local, &remote.snap);
                 for (id, it) in local.of_kind(ItemKind::Key) {
-                    if pinned.contains(&id.name) {
+                    if pinned.contains(&id.name) && adopted.as_ref() != Some(id) {
                         t.items.insert(id.clone(), it.clone());
                     }
                 }

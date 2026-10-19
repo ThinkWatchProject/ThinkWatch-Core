@@ -1522,6 +1522,11 @@ plugins and the general settings, keys included. `listen`, `retention` and
 OAuth tokens. An upstream signed in on another device stays turned off on this
 one until it is signed in here; that does not turn it off anywhere else.
 
+A device that joins with a configuration of its own merges it item by item;
+items that differ are chosen one by one, except the default gateway key: every
+installation makes one, so the joining device takes the sync data's value and
+the clients set up on it are updated.
+
 With encryption on, versions that are not encrypted are never read. A keyring
 that went missing, or an older one put back, does not turn encryption off: the
 app asks whether to put back the copy this device keeps. A location that reads

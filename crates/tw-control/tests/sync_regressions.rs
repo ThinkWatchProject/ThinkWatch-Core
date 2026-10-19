@@ -345,3 +345,107 @@ async fn turning_encryption_off_keeps_the_passphrase() {
     assert_eq!(v["encrypted"], true, "{v}");
     assert!(b.config().sync.unwrap().encrypt);
 }
+
+/// 收下 B 上的 `GatewayKeysChanged` 里的名字
+fn keys_changed(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let tw_api::Event::GatewayKeysChanged { names, .. } = ev {
+            out.extend(names);
+        }
+    }
+    out
+}
+
+/// 已有配置的设备以「合并」加入：两边的默认网关密钥同名、值不同 —— 不当作冲突（不用选，选了
+/// 「跳过」也不看），采用同步数据的值；A 上的那一把不变；B 发 `GatewayKeysChanged`
+#[tokio::test]
+async fn merging_in_adopts_the_default_key_of_the_sync_data() {
+    let loc = tempfile::tempdir().unwrap();
+    let a = Dev::new('a');
+    a.enable(loc.path(), false, "A", Value::Null).await;
+    let b = Dev::new('b');
+    b.edit(|t| {
+        add_raw(
+            t,
+            "  - name: mine\n    base_url: https://mine.example\n    key: sk-m\n",
+        )
+    })
+    .await;
+    b.ok("PUT", "/pinned-keys", json!({ "names": ["default"] }))
+        .await;
+    let preview = b
+        .ok(
+            "POST",
+            "/sync/enable/preview",
+            json!({ "target": folder(loc.path()) }),
+        )
+        .await;
+    assert_eq!(preview["initial"], false);
+    assert_eq!(
+        preview["auto"],
+        json!([{ "item": { "kind": "key", "name": "default" }, "action": "overwrite", "reason": "default_key" }]),
+        "{preview}"
+    );
+    assert!(
+        preview["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["item"]["name"] == "default"),
+        "那一行照常列出：{preview}"
+    );
+    let mut events = b.state.bus().subscribe();
+    // 命令行以前的缺省：给默认密钥选「跳过」—— 不看
+    b.enable(
+        loc.path(),
+        false,
+        "B",
+        json!({
+            "join": "merge",
+            "decisions": [ { "item": { "kind": "key", "name": "default" }, "action": "skip" } ],
+        }),
+    )
+    .await;
+    let key = |d: &Dev| {
+        d.config()
+            .clients
+            .into_iter()
+            .find(|c| c.name == "default")
+            .unwrap()
+            .key
+    };
+    assert_eq!(key(&b), "tw-default-a", "B 采用同步数据的值");
+    assert_eq!(keys_changed(&mut events), ["default"]);
+    let v = a.ok("POST", "/sync/now", Value::Null).await;
+    assert_eq!(v["conflicts"], 0, "{v}");
+    assert_eq!(key(&a), "tw-default-a", "A 的默认密钥没被改掉");
+    assert!(a.provider("mine").is_some());
+}
+
+/// 新安装（初始配置）上已经接管了客户端：用同步数据加入时，默认密钥也采用同步数据的值，不把
+/// 本机那一把传上去改掉别的设备的
+#[tokio::test]
+async fn a_fresh_device_with_clients_set_up_adopts_the_default_key() {
+    let loc = tempfile::tempdir().unwrap();
+    let a = Dev::new('a');
+    a.enable(loc.path(), false, "A", Value::Null).await;
+    let b = Dev::new('b');
+    b.ok("PUT", "/pinned-keys", json!({ "names": ["default"] }))
+        .await;
+    let preview = b
+        .ok(
+            "POST",
+            "/sync/enable/preview",
+            json!({ "target": folder(loc.path()) }),
+        )
+        .await;
+    assert_eq!(preview["initial"], true);
+    assert_eq!(preview["auto"][0]["reason"], "default_key", "{preview}");
+    let mut events = b.state.bus().subscribe();
+    b.enable(loc.path(), false, "B", Value::Null).await;
+    assert_eq!(b.config().clients[0].key, "tw-default-a");
+    assert_eq!(keys_changed(&mut events), ["default"]);
+    a.ok("POST", "/sync/now", Value::Null).await;
+    assert_eq!(a.config().clients[0].key, "tw-default-a");
+}

@@ -355,8 +355,6 @@ async fn joining_with_a_configuration_merges_by_the_import_rules() {
             "target": folder(loc.path()), "encrypt": false, "device_name": "B", "join": "merge",
             "decisions": [
                 { "item": { "kind": "provider", "name": "shared" }, "action": "rename", "new_name": "shared (A)" },
-                // 两边各自生成的默认密钥值不同：留本机的
-                { "item": { "kind": "key", "name": "default" }, "action": "skip" },
             ],
         }),
     )
@@ -369,11 +367,9 @@ async fn joining_with_a_configuration_merges_by_the_import_rules() {
     assert_eq!(names(&b), ["mine", "shared", "shared (A)"]);
     a.ok("POST", "/sync/now", Value::Null).await;
     assert_eq!(names(&a), ["mine", "shared", "shared (A)"], "{}", a.text());
-    assert_eq!(
-        a.config().clients[0].key,
-        "tw-default-b",
-        "选了留本机的那一把，A 跟着换"
-    );
+    // 两边各自生成的默认密钥值不同：不用选，B 采用同步数据的值，A 的不变
+    assert_eq!(b.config().clients[0].key, "tw-default-a");
+    assert_eq!(a.config().clients[0].key, "tw-default-a");
 }
 
 #[tokio::test]

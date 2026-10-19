@@ -60,6 +60,10 @@ pub struct State {
     /// 同步位置上读不出来的文件：名字 → 第一次读不出来的时刻。读出来了就去掉
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub unreadable: BTreeMap<String, u64>,
+    /// 同步位置上还没下载到本机的文件（云盘的占位文件）：名字 → 第一次看到的时刻。和读不出来
+    /// 的分开算（等得更久）
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub arriving: BTreeMap<String, u64>,
     /// 同步位置看上去是空的：从什么时候起、连着几轮
     pub empty_since_ms: Option<u64>,
     pub empty_rounds: u32,
