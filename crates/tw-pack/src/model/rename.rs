@@ -79,6 +79,18 @@ pub fn rename(snap: &mut Snapshot, id: &ItemId, new_name: &str) {
                     }
                 }
             }
+            (ItemKind::Provider, ItemKind::Plugin) => {
+                if let Some(Json::Array(list)) = item
+                    .units
+                    .get_mut(unit::SETTINGS)
+                    .and_then(|d| d.get_mut("match"))
+                    .and_then(|m| m.get_mut("upstreams"))
+                {
+                    for n in list {
+                        swap(Some(n), old, new);
+                    }
+                }
+            }
             (ItemKind::Proxy, ItemKind::Provider) => {
                 swap(
                     item.units

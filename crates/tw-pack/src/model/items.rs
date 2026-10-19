@@ -206,7 +206,19 @@ fn provider_unit(field: &str) -> &'static str {
 
 pub(crate) const PROVIDER_UNITS: &[&str] = &[unit::CONN, unit::MODELS, unit::BILLING, unit::OTHER];
 
-/// 去掉这台设备自己的部分：ChatGPT 的登录和账户 ID 请求头
+/// OAuth 里属于这台设备的那几项：换发来的令牌。**刷新令牌会轮换**：很多 OAuth 服务器每刷新
+/// 一次就换发一个新的、作废旧的（`tw_gateway::oauth` 收到新的就写回配置），同一个刷新令牌
+/// 在两台设备上用，先刷新的那台让另一台的失效。所以它和 ChatGPT 的登录一样留在本机，
+/// 端点、客户端 ID 和密钥照常比较、带走
+pub(crate) const OAUTH_TOKENS: &[&str] = &["refresh", "access", "expires_at"];
+
+/// 这一家的凭据里有属于这台设备的登录：ChatGPT 账号，或者 OAuth 的令牌
+pub fn holds_login(p: &Provider) -> bool {
+    is_chatgpt(p) || p.oauth.is_some()
+}
+
+/// 去掉这台设备自己的部分：ChatGPT 的登录和账户 ID 请求头（OAuth 的令牌在
+/// [`provider_units`] 里去掉：`refresh` 是必填的，结构体里去不掉）
 pub(crate) fn shareable(p: &Provider) -> Provider {
     let mut p = p.clone();
     if is_chatgpt(&p) {
@@ -228,6 +240,11 @@ fn provider_units(p: &Provider) -> Result<BTreeMap<String, Json>, String> {
         return Err("it does not serialize to an object".into());
     };
     obj.remove("name");
+    if let Some(Json::Object(o)) = obj.get_mut("oauth") {
+        for k in OAUTH_TOKENS {
+            o.remove(*k);
+        }
+    }
     // **请求头按写的顺序**：JSON 对象的键是排过序的，所以写成一串 [名字, 值]
     if obj.contains_key("headers") {
         obj.insert(
@@ -262,7 +279,8 @@ fn provider_units(p: &Provider) -> Result<BTreeMap<String, Json>, String> {
 }
 
 /// 上游的单位拼回配置里的那一项。`local` 是本机同名的那一家：它是 ChatGPT 账号、拼出来
-/// 的也是的话，登录和账户 ID 请求头取它的
+/// 的也是的话，登录和账户 ID 请求头取它的；两边都是 OAuth、令牌端点一样的话，令牌取它的。
+/// 本机没有令牌可取的 OAuth 上游，刷新令牌是空的（停用着才过得了校验，见导入、恢复）
 pub(crate) fn provider_mapping(
     id: &ItemId,
     units: &BTreeMap<String, Json>,
@@ -283,7 +301,21 @@ pub(crate) fn provider_mapping(
             m.insert(key(k), value);
         }
     }
+    if let Some(Yaml::Mapping(o)) = m.get_mut("oauth")
+        && !o.contains_key("refresh")
+    {
+        o.insert(key("refresh"), Yaml::String(String::new()));
+    }
     let (mut p, _) = typed_mapping::<Provider>(Yaml::Mapping(m)).map_err(|e| shape(id, e))?;
+    let chatgpt = is_chatgpt(&p);
+    if let (Some(mine), Some(theirs)) = (local.and_then(|l| l.oauth.as_ref()), p.oauth.as_mut())
+        && !chatgpt
+        && mine.endpoint == theirs.endpoint
+    {
+        theirs.refresh = mine.refresh.clone();
+        theirs.access = mine.access.clone();
+        theirs.expires_at = mine.expires_at.clone();
+    }
     if let Some(local) = local
         && is_chatgpt(&p)
         && is_chatgpt(local)
@@ -710,6 +742,22 @@ fn refs_of(
                     && aliases.contains(&m)
                 {
                     out.insert(ItemId::new(ItemKind::Alias, m));
+                }
+            }
+        }
+        ItemKind::Plugin => {
+            // 范围里写明的上游（`match.upstreams`）。**通配的不算**：`relay-*` 说的是一批名字，
+            // 不是哪一个上游
+            let listed = units
+                .get(unit::SETTINGS)
+                .and_then(|d| d.get("match"))
+                .and_then(|m| m.get("upstreams"))
+                .and_then(Json::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for n in listed.iter().filter_map(Json::as_str).map(str::trim) {
+                if !n.is_empty() && !n.contains(['*', '?', '[']) {
+                    out.insert(ItemId::new(ItemKind::Provider, n));
                 }
             }
         }

@@ -191,8 +191,12 @@ fn bad_pack(e: PackError) -> Fail {
 
 /// 配置（本机的、包里的）拆不开。**由更新的版本写的**说成「太新」
 fn model_fail(e: model::ModelError, pack: Option<&Pack>) -> Fail {
+    let newer = |p: &Pack| {
+        matches!(e, model::ModelError::TooNew { .. })
+            || (e.is_too_new() && p.manifest.from_newer_core())
+    };
     if let Some(p) = pack
-        && e.is_too_new()
+        && newer(p)
     {
         return bad_pack(PackError::TooNew {
             format: p.manifest.format,
@@ -271,6 +275,20 @@ fn file_of(pack: &Pack, pass: Option<&str>) -> Result<(String, String), Fail> {
         tw_pack::export::file_name(pack.manifest.created_at_ms),
         base64::engine::general_purpose::STANDARD.encode(bytes),
     ))
+}
+
+fn fix_view(f: tw_config::repair::Fix) -> tw_api::ConfigFix {
+    use tw_config::repair::FixKind;
+    tw_api::ConfigFix {
+        kind: match f.kind {
+            FixKind::UnknownValue => tw_api::ConfigFixKind::UnknownValue,
+            FixKind::UnknownField => tw_api::ConfigFixKind::UnknownField,
+        },
+        field: f.field,
+        line: f.line,
+        value: f.value,
+        now: f.now,
+    }
 }
 
 // ─────────────────────────────────────────────────────────── 此刻的样子
@@ -430,6 +448,7 @@ fn import_fail(e: tw_pack::import::ImportError, pack: &Pack) -> Fail {
         E::Exists(_) | E::NameTaken(..) => fail(StatusCode::CONFLICT, e.msg()),
         E::NotInPack(_) => fail(StatusCode::NOT_FOUND, e.msg()),
         E::Item(..) => fail(StatusCode::UNPROCESSABLE_ENTITY, e.msg()),
+        E::TooNew(p) => bad_pack(p),
     }
 }
 
@@ -464,7 +483,9 @@ async fn import_preview(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ImportSource>,
 ) -> Result<Json<tw_api::ImportPreview>, Fail> {
-    let incoming = open_pack(&req.data_b64, req.passphrase.as_deref())?;
+    let raw = open_pack(&req.data_b64, req.passphrase.as_deref())?;
+    let (incoming, repairs) =
+        tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Import)?;
     let rows = tw_pack::import::preview(&local, &incoming, &import_ctx())
         .map_err(|e| import_fail(e, &incoming))?;
@@ -473,6 +494,7 @@ async fn import_preview(
         base_version: cur.version(),
         rows: rows.into_iter().map(row_view).collect(),
         client_prefs: incoming.client_prefs.clone(),
+        repairs: repairs.into_iter().map(fix_view).collect(),
     }))
 }
 
@@ -480,7 +502,9 @@ async fn import(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ImportRequest>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let incoming = open_pack(&req.data_b64, req.passphrase.as_deref())?;
+    let raw = open_pack(&req.data_b64, req.passphrase.as_deref())?;
+    // 预览时修过的那几处，这里照样修一遍（同一份字节，修出来一样）
+    let (incoming, _) = tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Import)?;
     if cur.version() != req.base_version {
         return Err(apply_fail(ApplyError::Stale {
@@ -663,7 +687,10 @@ async fn restore_preview(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::RestorePreviewRequest>,
 ) -> Result<Json<tw_api::RestorePreview>, Fail> {
-    let backup = backup_pack(&s, &req.id).await?;
+    let raw = backup_pack(&s, &req.id).await?;
+    // 升级之前留的版本可能有这一版不认识的写法：和导入一样在内存里修好
+    let (backup, repairs) =
+        tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Restore)?;
     let sync_devices = match s.cfg.remote_backups() {
         Some(r) => r.other_devices().await,
@@ -693,6 +720,7 @@ async fn restore_preview(
         base_version: cur.version(),
         rows,
         sync_devices,
+        repairs: repairs.into_iter().map(fix_view).collect(),
     }))
 }
 
@@ -700,7 +728,8 @@ async fn restore(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::RestoreRequest>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let backup = backup_pack(&s, &req.id).await?;
+    let raw = backup_pack(&s, &req.id).await?;
+    let (backup, _) = tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Restore)?;
     if cur.version() != req.base_version {
         return Err(apply_fail(ApplyError::Stale {

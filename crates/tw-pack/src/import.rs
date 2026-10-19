@@ -103,6 +103,36 @@ pub enum ImportError {
     /// 导进来之后配置过不了校验
     #[error("{}", self.msg())]
     Rejected(Box<tw_config::Rejected>),
+    /// 由更新的版本写的
+    #[error("{}", self.msg())]
+    TooNew(crate::PackError),
+}
+
+/// 导入之前：包里的配置读得进来吗。由更新的版本写的是「太新」；较旧版本写的、有读不进来的
+/// 字段的，按一键修复的规矩在内存里修好（[`crate::repair`]），连同修了哪几处一起交回去
+pub fn prepare(incoming: Pack) -> Result<(Pack, Vec<tw_config::repair::Fix>), ImportError> {
+    let e = match model::snapshot(&incoming) {
+        Ok(_) => return Ok((incoming, Vec::new())),
+        Err(e) => e,
+    };
+    let newer = matches!(e, ModelError::TooNew { .. })
+        || (e.is_too_new() && incoming.manifest.from_newer_core());
+    if newer {
+        return Err(ImportError::TooNew(crate::PackError::TooNew {
+            format: incoming.manifest.format,
+            core_version: incoming.manifest.core_version.clone(),
+        }));
+    }
+    match crate::repair::repair(&incoming.config_yaml) {
+        Some((text, fixes)) => Ok((
+            Pack {
+                config_yaml: text,
+                ..incoming
+            },
+            fixes,
+        )),
+        None => Err(ImportError::Model(e)),
+    }
 }
 
 impl From<ModelError> for ImportError {
@@ -130,6 +160,7 @@ impl ImportError {
                 "The configuration pack has no {kind} named `{name}`."
             ),
             ImportError::Rejected(r) => r.msg(),
+            ImportError::TooNew(e) => e.msg(),
         }
     }
 }
@@ -249,11 +280,30 @@ fn flags(id: &ItemId, item: &Item, incoming: &Pack, l: &Snapshot) -> Vec<Flag> {
         if !here {
             out.push(Flag::NeedsLogin);
         }
+    } else if id.kind == ItemKind::Provider
+        && let Some(endpoint) = oauth_endpoint(item)
+    {
+        // OAuth 的令牌不随包带（会轮换，见 `model`）：本机同名的那一家用着同一个令牌端点时，
+        // 覆盖留着本机的令牌；否则要填上刷新令牌
+        let here = l.items.get(id).and_then(oauth_endpoint) == Some(endpoint);
+        if !here && !out.contains(&Flag::MissingKey) {
+            out.push(Flag::MissingKey);
+        }
     }
     if id.kind == ItemKind::Plugin {
         out.push(Flag::PluginDisabled);
     }
     out
+}
+
+/// 一个上游项目的 OAuth 令牌端点。不是 OAuth 的是 None
+fn oauth_endpoint(item: &Item) -> Option<String> {
+    item.units
+        .get(unit::CONN)?
+        .get("oauth")?
+        .get("endpoint")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn provider_is_chatgpt(id: &ItemId, item: &Item) -> bool {
@@ -273,9 +323,10 @@ fn problem(
     ctx: &Context,
     codec: &dyn PluginCodec,
 ) -> Option<Msg> {
-    // 引用了本机和包里都没有的
+    // 引用了本机和包里都没有的。**插件不算**：它范围里写的上游这里没有，只是管不着什么，
+    // 不是导入不了
     for r in &both.items[id].refs {
-        if !both.items.contains_key(r) && !builtin(r) {
+        if id.kind != ItemKind::Plugin && !both.items.contains_key(r) && !builtin(r) {
             return Some(missing_ref(id, r));
         }
     }
@@ -540,10 +591,11 @@ pub fn apply_with(
     }
     target.relink();
 
-    // 导进来的项目引用的东西都得在：被跳过的那些不在
+    // 导进来的项目引用的东西都得在：被跳过的那些不在。插件只看包里有、却被跳过的那些
     for id in &taken {
         for r in &target.items[id].refs {
-            if !target.items.contains_key(r) && !builtin(r) {
+            let soft = id.kind == ItemKind::Plugin && !i.items.contains_key(r);
+            if !soft && !target.items.contains_key(r) && !builtin(r) {
                 return Err(ImportError::Item(id.clone(), Box::new(skipped_ref(id, r))));
             }
         }

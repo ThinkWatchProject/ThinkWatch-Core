@@ -169,6 +169,22 @@ fn describe(id: &ItemId) -> String {
     }
 }
 
+/// 较旧版本写的、读不进来的字段在内存里修过的那几处
+fn print_repairs(fixes: &[tw_config::repair::Fix]) {
+    if fixes.is_empty() {
+        return;
+    }
+    println!("written by an older version; repaired before reading:");
+    for f in fixes {
+        let what = match f.kind {
+            tw_config::repair::FixKind::UnknownValue => "back to the default",
+            tw_config::repair::FixKind::UnknownField => "removed",
+        };
+        let line = f.line.map(|l| format!(" (line {l})")).unwrap_or_default();
+        println!("  {}{line}: {what}", f.field);
+    }
+}
+
 // ─────────────────────────────────────────────────────────── export
 
 pub fn export(
@@ -248,6 +264,8 @@ pub fn import(
 ) -> Result<()> {
     use tw_pack::import::{Action, Decision, Status};
     let incoming = read_pack(file)?;
+    let (incoming, repairs) = tw_pack::import::prepare(incoming).map_err(|e| anyhow!("{e}"))?;
+    print_repairs(&repairs);
     let (cur, local) = current(path, PackOrigin::Import)?;
     let ctx = tw_pack::import::Context {
         has_aws_profile: &|p| tw_config::aws_profile::credentials(p).is_ok(),
@@ -357,6 +375,8 @@ pub fn restore(path: &Path, id: &str, dry_run: bool) -> Result<()> {
     use tw_pack::restore::{Change, Kept};
     let b = tw_pack::backup::find(path, id).map_err(|e| anyhow!("{e}"))?;
     let backup = tw_pack::backup::open(&b).map_err(|e| anyhow!("{e}"))?;
+    let (backup, repairs) = tw_pack::import::prepare(backup).map_err(|e| anyhow!("{e}"))?;
+    print_repairs(&repairs);
     let (cur, local) = current(path, PackOrigin::Restore)?;
     let pinned = tw_pack::disk::read_pinned(path);
     let after = if tw_pack::model::snapshot(&local).is_err() {

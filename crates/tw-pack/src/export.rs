@@ -29,7 +29,7 @@ pub struct Exported {
     pub pack: Pack,
     /// 包里有哪些项目（随附的也在），顺序项目不算
     pub included: Vec<ItemId>,
-    /// 登录没有随包带走的上游（ChatGPT 账号）
+    /// 登录没有随包带走的上游：ChatGPT 账号，和令牌留在本机的 OAuth 上游
     pub omitted_logins: Vec<String>,
 }
 
@@ -81,7 +81,7 @@ pub fn export_with(
     let omitted_logins = cfg
         .providers
         .iter()
-        .filter(|p| picked.contains(p.name.as_str()) && model::is_chatgpt(p))
+        .filter(|p| picked.contains(p.name.as_str()) && model::holds_login(p))
         .map(|p| p.name.clone())
         .collect();
     let kind = if opts.scope.is_some() {

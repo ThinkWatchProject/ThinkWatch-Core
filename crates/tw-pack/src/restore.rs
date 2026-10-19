@@ -119,6 +119,8 @@ pub fn apply_with(
     let picked: Option<BTreeSet<&ItemId>> = items.map(|xs| xs.iter().collect());
     let mut target = l.clone();
     let mut kept = Vec::new();
+    // 那一版有、现在没有的 OAuth 上游：令牌不在快照里，落下去之后从那一版里取回来
+    let mut tokens_from_backup: Vec<String> = Vec::new();
     for row in rows(&l, &b, pinned, with_prefs) {
         if picked.as_ref().is_some_and(|p| !p.contains(&row.item)) {
             continue;
@@ -130,13 +132,20 @@ pub fn apply_with(
         match b.items.get(&row.item) {
             Some(it) => {
                 let mut it = it.clone();
-                // 那一版有、现在没有的 ChatGPT 账号上游：没有登录，停用着回来
-                if row.item.kind == ItemKind::Provider
-                    && !l.items.contains_key(&row.item)
-                    && model::provider_of(&row.item, &it).is_ok_and(|p| model::is_chatgpt(&p))
-                    && let Some(Json::Object(other)) = it.units.get_mut(unit::OTHER)
-                {
-                    other.insert("disabled".into(), Json::Bool(true));
+                // 那一版有、现在没有的 ChatGPT 账号上游：它的登录随删除吊销了，停用着回来。
+                // 别的 OAuth 上游：令牌从那一版里取回来（落下去之后补上）
+                let back = !l.items.contains_key(&row.item);
+                let p = (row.item.kind == ItemKind::Provider)
+                    .then(|| model::provider_of(&row.item, &it).ok())
+                    .flatten();
+                if back && let Some(p) = &p {
+                    if model::is_chatgpt(p) {
+                        if let Some(Json::Object(other)) = it.units.get_mut(unit::OTHER) {
+                            other.insert("disabled".into(), Json::Bool(true));
+                        }
+                    } else if p.oauth.is_some() {
+                        tokens_from_backup.push(row.item.name.clone());
+                    }
                 }
                 target.items.insert(row.item.clone(), it);
             }
@@ -146,13 +155,73 @@ pub fn apply_with(
         }
     }
     target.relink();
-    let pack = model::materialize_with(local, &target, codec)?;
+    let mut pack = model::materialize_with(local, &target, codec)?;
+    if !tokens_from_backup.is_empty() {
+        pack.config_yaml = tokens_back(&pack.config_yaml, backup, &tokens_from_backup)?;
+    }
     tw_config::try_parse(&pack.config_yaml).map_err(|r| ModelError::Config(Box::new(r)))?;
     Ok(Applied {
         changed_keys: import::changed_keys(local, &pack),
         pack,
         kept,
     })
+}
+
+/// 把那一版里这几家 OAuth 上游的令牌写回 `text`。那一版里没有令牌（空的）的那家停用着回来
+fn tokens_back(text: &str, backup: &Pack, names: &[String]) -> Result<String, ModelError> {
+    let then = model::parse(&backup.config_yaml)?;
+    let mut out = text.to_string();
+    for name in names {
+        let Some(o) = then
+            .providers
+            .iter()
+            .find(|p| &p.name == name)
+            .and_then(|p| p.oauth.as_ref())
+        else {
+            continue;
+        };
+        if o.refresh.trim().is_empty() {
+            out = tw_config::edit::set(
+                &out,
+                &provider_field(&out, name, "disabled")?,
+                Some(&serde_yaml_ng::Value::Bool(true)),
+            )?;
+            continue;
+        }
+        let tokens = tw_config::RenewedTokens {
+            access: o.access.as_deref().unwrap_or_default(),
+            expires_at: o.expires_at.as_deref(),
+            refresh: Some(&o.refresh),
+        };
+        out = tw_config::patch_oauth_tokens(&out, name, tokens).map_err(|e| ModelError::Shape {
+            item: format!("provider `{name}`"),
+            detail: e.to_string(),
+        })?;
+        // 没有 access token 的：去掉写进去的空值，下一次用到时拿 refresh 换
+        if o.access.is_none() {
+            let at = provider_field(&out, name, "oauth")?;
+            let mut p = at.clone();
+            p.push(tw_yaml::Step::key("access"));
+            out = tw_config::edit::set(&out, &p, None)?;
+        }
+    }
+    Ok(out)
+}
+
+/// 配置里上游 `name` 的某个字段的路径
+fn provider_field(text: &str, name: &str, field: &str) -> Result<Vec<tw_yaml::Step>, ModelError> {
+    let doc = tw_config::edit::parse(text)?;
+    let i = tw_config::edit::PROVIDERS
+        .index_of(&doc, name)
+        .ok_or_else(|| ModelError::Shape {
+            item: format!("provider `{name}`"),
+            detail: "it is not in the configuration".into(),
+        })?;
+    Ok(vec![
+        tw_yaml::Step::key("providers"),
+        tw_yaml::Step::Index(i),
+        tw_yaml::Step::key(field),
+    ])
 }
 
 /// 配置读不进来（安全模式）时的恢复：整份换成那一版，**只有控制面的钥匙换成现在这一把**

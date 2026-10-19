@@ -103,3 +103,34 @@ fn in_safe_mode_the_whole_version_comes_back_with_todays_key() {
     assert!(!out.config_yaml.contains(tw_api::control::KEY_MASK));
     assert!(out.config_yaml.contains("port: 8000"));
 }
+
+/// OAuth 上游：现在还在的留着现在的令牌；那一版有、现在没有的，令牌从那一版里取回来
+#[test]
+fn oauth_tokens_come_from_now_or_from_the_version_it_comes_back_from() {
+    let oauth = |name: &str, rt: &str| {
+        format!(
+            "  - name: {name}\n    base_url: https://{name}.example\n    oauth:\n      refresh: {rt}\n      access: at-{rt}\n      endpoint: https://auth.example/token\n"
+        )
+    };
+    let head = format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproviders:\n"
+    );
+    let now = pack(&format!("{head}{}", oauth("kept", "rt-now")));
+    let then = pack(&format!(
+        "{head}{}{}{}",
+        oauth("kept", "rt-then").replace("kept.example", "kept.example/v0"),
+        oauth("gone", "rt-gone"),
+        "  - name: blank\n    base_url: https://blank.example\n    disabled: true\n    oauth:\n      refresh: ''\n      endpoint: https://auth.example/token\n",
+    ));
+    let out = apply_with(&now, &then, None, &BTreeSet::new(), true, &WholeFile).unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.pack.config_yaml));
+    let p = |n: &str| cfg.providers.iter().find(|p| p.name == n).unwrap();
+    assert_eq!(p("kept").base_url, "https://kept.example/v0");
+    assert_eq!(p("kept").oauth.as_ref().unwrap().refresh, "rt-now");
+    let gone = p("gone").oauth.as_ref().unwrap();
+    assert_eq!(gone.refresh, "rt-gone");
+    assert_eq!(gone.access.as_deref(), Some("at-rt-gone"));
+    assert!(!p("gone").disabled);
+    assert!(p("blank").disabled);
+}

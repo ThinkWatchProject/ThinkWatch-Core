@@ -1549,9 +1549,9 @@ async fn repair_config(
         return Err(fail(
             StatusCode::BAD_REQUEST,
             msg!(
-                "control.config_not_repairable" =>
+                "control.config_unrepairable" =>
                 "The configuration has no error that can be repaired automatically. Edit the \
-                 configuration file, or roll back to an earlier version"
+                 configuration file, or restore an earlier version from the backups"
             ),
         ));
     };

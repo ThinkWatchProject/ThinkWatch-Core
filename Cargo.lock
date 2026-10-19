@@ -3900,6 +3900,7 @@ dependencies = [
  "tw-config",
  "tw-engine",
  "tw-pricing",
+ "tw-secret",
  "tw-types",
  "tw-yaml",
  "zip",

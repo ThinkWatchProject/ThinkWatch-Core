@@ -18,6 +18,8 @@ tw-engine = { workspace = true }
 tw-pricing = { workspace = true }
 tw-types = { workspace = true }
 tw-yaml = { workspace = true }
+# 修导入的旧配置包时，原值给人看之前脱敏
+tw-secret = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }

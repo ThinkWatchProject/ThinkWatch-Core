@@ -972,8 +972,11 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`Event::GatewayKeysChanged`]。[`ConfigOrigin`] 删了 `rollback`，多了 `sync`、`import`、
 /// `restore`、`repair`（一键修复以前记成 `ui`）。备份相关的端点在安全模式下照样可用。配置包的
 /// 码是 `pack.*`，导入的是 `import.*`，备份与恢复的是 `backup.*`。停用着的上游可以缺凭据
-/// （密钥、OAuth、AWS 访问密钥空着，ChatGPT 账号没登录）：导入时就是这样进来的。照 49 写的
-/// 界面调不到删掉的那两个端点。
+/// （密钥、OAuth、AWS 访问密钥空着，ChatGPT 账号没登录）：导入时就是这样进来的。较旧版本
+/// 导出的包、升级之前留的版本里读不进来的字段按一键修复的规矩在内存里修好，[`ImportPreview`]
+/// 和 [`RestorePreview`] 的 `repairs` 列出修了哪几处。OAuth 上游换发来的令牌（刷新令牌会轮换）
+/// 和 ChatGPT 的登录一样留在本机，不随导出带走、导入覆盖时留着本机的。一键修复修不了时的码换成
+/// `control.config_unrepairable`（句子改说从备份恢复）。照 49 写的界面调不到删掉的那两个端点。
 pub const CONTROL_API_VERSION: u32 = 50;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
