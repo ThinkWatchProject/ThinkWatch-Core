@@ -3896,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pack"
-version = "0.76.0"
+version = "0.77.0"
 dependencies = [
  "age",
  "blake3",
@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "tw-sync"
-version = "0.76.0"
+version = "0.77.0"
 dependencies = [
  "age",
  "axum",
