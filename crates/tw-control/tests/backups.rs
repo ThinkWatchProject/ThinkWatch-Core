@@ -564,3 +564,64 @@ async fn in_safe_mode_a_backup_comes_back_whole() {
     let text = std::fs::read_to_string(&p).unwrap();
     assert_eq!(text, mine());
 }
+
+/// 较旧版本导出的包：读不进来的字段在内存里修好，预览说修了哪几处；更新的版本写的说太新
+#[tokio::test]
+async fn an_older_pack_is_previewed_repaired_and_a_newer_one_is_too_new() {
+    let dst = bed(&mine());
+    let pack_b64 = |core: &str| {
+        let mut m = tw_pack::Manifest::new(tw_pack::PackKind::Full, tw_pack::PackOrigin::Export);
+        m.core_version = core.to_string();
+        let p = tw_pack::Pack {
+            manifest: m,
+            config_yaml: "version: 1\nproviders:\n  - name: old\n    base_url: https://old.example\n    retired_field: 1\nclient_probes:\n  titling: passthrough\n".into(),
+            plugins: Default::default(),
+            client_prefs: None,
+        };
+        base64::engine::general_purpose::STANDARD
+            .encode(tw_pack::write(&p, tw_pack::Seal::None).unwrap())
+    };
+    let old = pack_b64("0.1.0");
+    let (st, preview) = call(
+        &dst.app,
+        "POST",
+        "/config/import/preview",
+        serde_json::json!({ "data_b64": old }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    let fields: Vec<&str> = preview["repairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["field"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        fields,
+        ["providers[0].retired_field", "client_probes.titling"]
+    );
+    assert_eq!(preview["repairs"][1]["kind"], "unknown_value");
+    let (st, v) = call(
+        &dst.app,
+        "POST",
+        "/config/import",
+        serde_json::json!({
+            "data_b64": old,
+            "base_version": preview["base_version"],
+            "decisions": [{ "item": { "kind": "provider", "name": "old" }, "action": "import" }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(dst.file().contains("https://old.example"));
+    assert!(!dst.file().contains("retired_field"));
+    let (st, v) = call(
+        &dst.app,
+        "POST",
+        "/config/import/preview",
+        serde_json::json!({ "data_b64": pack_b64("999.0.0") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "pack.too_new");
+}

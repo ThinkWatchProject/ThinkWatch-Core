@@ -26,8 +26,9 @@
 //! # 本机设置
 //!
 //! 不进快照，[`materialize`] 时保留本机的值：`listen`、`retention`、`sync` 三节，ChatGPT
-//! 上游的登录（`oauth`）和登录所得的 `ChatGPT-Account-Id` 请求头，Core 自带的默认插件的
-//! 脚本（它的设置和开关照常比较）。
+//! 上游的登录（`oauth`）和登录所得的 `ChatGPT-Account-Id` 请求头，别的 OAuth 上游换发来的
+//! 令牌（`oauth.refresh` / `access` / `expires_at`：刷新令牌会轮换，两台设备共用一个会互相
+//! 作废），Core 自带的默认插件的脚本（它的设置和开关照常比较）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -45,7 +46,7 @@ mod rename;
 mod write;
 
 pub use codec::{PluginCodec, WholeFile};
-pub use items::{is_chatgpt, sha256_hex};
+pub use items::{holds_login, is_chatgpt, sha256_hex};
 pub use rename::{free_name, rename};
 pub(crate) use write::materialize_for_export;
 pub use write::{materialize, materialize_with};

@@ -141,8 +141,8 @@ control.chatgpt_login.expired
 control.chatgpt_login.no_code
 control.chatgpt_login.page_error
 control.client_unknown
-control.config_not_repairable
 control.config_stale
+control.config_unrepairable
 control.control_key_locked
 control.default_key_cannot_delete
 control.default_key_cannot_disable

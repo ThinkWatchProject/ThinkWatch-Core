@@ -522,3 +522,168 @@ fn client_preferences_import_only_when_core_keeps_them() {
     .unwrap();
     assert_eq!(applied.pack.client_prefs, Some(json!({"language": "en"})));
 }
+
+/// 第一行是 `// data: <JSON>` 的插件源码：数据单独拆出来（同 `model` 的测试）
+struct DataLine;
+
+impl PluginCodec for DataLine {
+    fn split(&self, source: &str) -> Option<(String, serde_json::Value)> {
+        let (first, rest) = source.split_once('\n')?;
+        let data = serde_json::from_str(first.strip_prefix("// data: ")?).ok()?;
+        Some((format!("// data: null\n{rest}"), data))
+    }
+    fn join(&self, source: &str, data: &serde_json::Value) -> Option<String> {
+        let (_, rest) = source.split_once('\n')?;
+        Some(format!("// data: {data}\n{rest}"))
+    }
+    fn shipped(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn needs_approval(&self, _: &str) -> bool {
+        false
+    }
+}
+
+/// OAuth 上游的令牌不随包带：新来的停用着、标成缺密钥；覆盖本机同一个令牌端点的留着本机的令牌
+#[test]
+fn an_oauth_upstream_arrives_without_its_tokens() {
+    let oauth = "  - name: corp\n    base_url: https://corp.example\n    oauth:\n      refresh: rt-theirs\n      endpoint: https://auth.example/token\n";
+    let incoming = pack_of(
+        &format!(
+            "version: 1\nproviders:\n{oauth}  - name: corp2\n    base_url: https://corp2.example\n    oauth:\n      refresh: rt-2\n      endpoint: https://auth.example/token\n    max_concurrent: 2\n"
+        ),
+        true,
+    );
+    let local = pack_of(
+        &local_text("").replace(
+            "providers:\n",
+            "providers:\n  - name: corp2\n    base_url: https://corp2.example\n    oauth:\n      refresh: rt-mine\n      endpoint: https://auth.example/token\n",
+        ),
+        true,
+    );
+    let r = rows(&local, &incoming);
+    assert_eq!(r["provider `corp`"].flags, [Flag::MissingKey]);
+    assert_eq!(r["provider `corp2`"].flags, Vec::<Flag>::new());
+    assert_eq!(r["provider `corp2`"].status, Status::Conflict);
+    let applied = apply_with(
+        &local,
+        &incoming,
+        &[
+            Decision {
+                item: ItemId::new(ItemKind::Provider, "corp"),
+                action: Action::Import,
+            },
+            Decision {
+                item: ItemId::new(ItemKind::Provider, "corp2"),
+                action: Action::Overwrite,
+            },
+        ],
+        &ctx(),
+        &WholeFile,
+    )
+    .unwrap();
+    let cfg = tw_config::try_parse(&applied.pack.config_yaml).unwrap();
+    let p = |n: &str| cfg.providers.iter().find(|p| p.name == n).unwrap();
+    assert!(p("corp").disabled);
+    assert_eq!(p("corp").oauth.as_ref().unwrap().refresh, "");
+    assert!(!applied.pack.config_yaml.contains("rt-theirs"));
+    assert_eq!(p("corp2").oauth.as_ref().unwrap().refresh, "rt-mine");
+    assert_eq!(p("corp2").max_concurrent, Some(2));
+    assert!(!p("corp2").disabled);
+}
+
+/// 插件范围里写明的上游：跳过它，插件就导入不了；本机和包里都没有的不碍事
+#[test]
+fn skipping_an_upstream_a_plugin_names_refuses_the_plugin() {
+    let src = "// data: {\"match\":{\"upstreams\":[\"relay\",\"nowhere\"]}}\nscoped\n";
+    let sha = model::sha256_hex(src.as_bytes());
+    let mut incoming = pack_of(
+        &format!(
+            "version: 1\nproviders:\n  - name: relay\n    base_url: https://relay.example\nplugins:\n  - id: scoped\n    file: plugins/scoped.js\n    sha256: {sha}\n"
+        ),
+        true,
+    );
+    incoming.plugins.insert(
+        "scoped".into(),
+        PluginFiles {
+            script: src.as_bytes().to_vec(),
+            approved: Some(src.as_bytes().to_vec()),
+        },
+    );
+    let local = pack_of(&local_text(""), true);
+    let r: BTreeMap<String, Row> = preview_with(&local, &incoming, &ctx(), &DataLine)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.item.to_string(), r))
+        .collect();
+    let plugin = &r["plugin `scoped`"];
+    assert_eq!(plugin.status, Status::New, "{plugin:?}");
+    assert_eq!(
+        plugin
+            .refs
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>(),
+        ["provider `relay`"]
+    );
+    let d = |kind, name: &str, action| Decision {
+        item: ItemId::new(kind, name),
+        action,
+    };
+    let e = apply_with(
+        &local,
+        &incoming,
+        &[
+            d(ItemKind::Plugin, "scoped", Action::Import),
+            d(ItemKind::Provider, "relay", Action::Skip),
+        ],
+        &ctx(),
+        &DataLine,
+    )
+    .unwrap_err();
+    assert_eq!(e.msg().code, "import.skipped_reference");
+    // 一起导入就成；改名导入的上游，插件的范围跟着改
+    let applied = apply_with(
+        &local,
+        &incoming,
+        &[
+            d(ItemKind::Plugin, "scoped", Action::Import),
+            d(
+                ItemKind::Provider,
+                "relay",
+                Action::Rename("relay-cn".into()),
+            ),
+        ],
+        &ctx(),
+        &DataLine,
+    )
+    .unwrap();
+    let script = String::from_utf8(applied.pack.plugins["scoped"].script.clone()).unwrap();
+    assert!(script.contains("relay-cn"), "{script}");
+}
+
+/// 较旧版本导出的、有这一版不认识的写法的包：修好再看；更新的版本写的说太新
+#[test]
+fn an_older_pack_is_repaired_and_a_newer_one_is_too_new() {
+    let text =
+        "version: 1\nproviders:\n  - name: a\n    base_url: https://a.example\n    retired: 1\n";
+    let mut old = pack_of(text, true);
+    old.manifest.core_version = "0.1.0".into();
+    let (fixed, fixes) = prepare(old.clone()).unwrap();
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0].field, "providers[0].retired");
+    assert!(!fixed.config_yaml.contains("retired"));
+    let r = rows(&pack_of(&local_text(""), true), &fixed);
+    assert_eq!(r["provider `a`"].status, Status::New);
+    // 读得进来的不动
+    let (same, none) = prepare(pack_of("version: 1\n", true)).unwrap();
+    assert!(none.is_empty());
+    assert_eq!(same.config_yaml, "version: 1\n");
+    // 更新的 Core 写的
+    let mut new = old.clone();
+    new.manifest.core_version = "999.0.0".into();
+    assert_eq!(prepare(new).unwrap_err().msg().code, "pack.too_new");
+    // 修不了的照旧是读不进来的那句话
+    let broken = pack_of("version: 1\nproviders: [\n", true);
+    assert!(prepare(broken).is_err());
+}

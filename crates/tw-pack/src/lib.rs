@@ -38,6 +38,7 @@ pub mod disk;
 pub mod export;
 pub mod import;
 pub mod model;
+pub mod repair;
 pub mod restore;
 
 /// 配置包格式的版本。**读到更大的就拒绝**（[`PackError::TooNew`]）：新版本的格式旧版本

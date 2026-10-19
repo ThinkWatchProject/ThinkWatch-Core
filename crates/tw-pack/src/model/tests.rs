@@ -1018,3 +1018,102 @@ fn retain_trims_the_orders_too() {
         json!(["relay"])
     );
 }
+
+// ─────────────────────────────────────────────────────────── OAuth 的令牌、插件的范围
+
+const OAUTH: &str = "    oauth:\n      refresh: rt-mine\n      access: at-mine\n      expires_at: '2026-10-19T00:00:00Z'\n      endpoint: https://auth.example/token\n      client_id: cid\n";
+
+fn with_oauth(endpoint: &str) -> String {
+    format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproviders:\n  - name: corp\n    base_url: https://corp.example\n{}",
+        OAUTH.replace("https://auth.example/token", endpoint)
+    )
+}
+
+/// 刷新令牌会轮换：令牌留在本机，端点和客户端 ID 照常比较
+#[test]
+fn oauth_tokens_stay_on_this_device() {
+    let p = pack(&with_oauth("https://auth.example/token"));
+    let s = snap(&p);
+    let conn = &s.items[&id(ItemKind::Provider, "corp")].units["conn"];
+    assert_eq!(
+        conn["oauth"],
+        json!({"endpoint": "https://auth.example/token", "client_id": "cid"})
+    );
+    // 轮换不算改动
+    let rotated = pack(&with_oauth("https://auth.example/token").replace("rt-mine", "rt-rotated"));
+    assert_eq!(snap(&rotated), s);
+    assert_eq!(rotated.content_id(), p.content_id());
+    // 别处来的（同一个端点）改了别的：令牌留着本机的
+    let mut t = s.clone();
+    t.items
+        .get_mut(&id(ItemKind::Provider, "corp"))
+        .unwrap()
+        .units
+        .insert("other".into(), json!({"max_concurrent": 2}));
+    let out = mat(&p, &t);
+    assert!(
+        out.config_yaml.contains("refresh: rt-mine"),
+        "{}",
+        out.config_yaml
+    );
+    assert!(
+        out.config_yaml.contains("access: at-mine"),
+        "{}",
+        out.config_yaml
+    );
+    // 换了令牌端点：本机的令牌不是那个服务器发的，不留
+    let mut t = snap(&pack(&with_oauth("https://other.example/token")));
+    t.items
+        .get_mut(&id(ItemKind::Provider, "corp"))
+        .unwrap()
+        .units
+        .insert("other".into(), json!({"disabled": true}));
+    let out = mat(&p, &t);
+    let cfg = tw_config::try_parse(&out.config_yaml).unwrap();
+    let o = cfg.providers[0].oauth.as_ref().unwrap();
+    assert_eq!(o.endpoint, "https://other.example/token");
+    assert_eq!(o.refresh, "");
+    // 落到一份空配置上（导出）：令牌不在
+    let out = mat(&pack("version: 1\n"), &s);
+    assert!(!out.config_yaml.contains("rt-mine"), "{}", out.config_yaml);
+}
+
+fn with_scoped_plugin(upstreams: &str) -> Pack {
+    let src = format!("// data: {{\"match\":{{\"upstreams\":{upstreams}}}}}\nscoped code\n");
+    let base = with_plugins(&[("scoped", &src, true)]);
+    Pack {
+        config_yaml: base.config_yaml.replace(
+            "plugins:\n",
+            "providers:\n  - name: relay\n    base_url: https://relay.example\n  - name: other\n    base_url: https://other.example\nplugins:\n",
+        ),
+        ..base
+    }
+}
+
+/// 插件范围里写明的上游是它的引用：导出带上它，改名跟着改；通配的不算
+#[test]
+fn a_plugin_refers_to_the_upstreams_its_scope_names() {
+    let p = with_scoped_plugin(r#"["relay", "rel*", "  "]"#);
+    let s = snap(&p);
+    let refs: Vec<String> = s.items[&id(ItemKind::Plugin, "scoped")]
+        .refs
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    assert_eq!(refs, ["provider `relay`"]);
+    let picked = s.closure(&[id(ItemKind::Plugin, "scoped")]);
+    assert!(picked.contains(&id(ItemKind::Provider, "relay")));
+    assert!(!picked.contains(&id(ItemKind::Provider, "other")));
+    let mut s2 = s.clone();
+    rename(&mut s2, &id(ItemKind::Provider, "relay"), "relay (2)");
+    let settings = &s2.items[&id(ItemKind::Plugin, "scoped")].units["settings"];
+    assert_eq!(
+        settings["match"]["upstreams"],
+        json!(["relay (2)", "rel*", "  "])
+    );
+    // 改了名的落下去，插件文件里的范围跟着改
+    let out = mat(&p, &s2);
+    let script = String::from_utf8(out.plugins["scoped"].script.clone()).unwrap();
+    assert!(script.contains("relay (2)"), "{script}");
+}

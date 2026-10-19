@@ -180,6 +180,9 @@ pub struct ImportPreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub client_prefs: Option<serde_json::Value>,
+    /// 较旧版本导出的包里读不进来的字段，按一键修复的规矩（不认识的字段删掉、取值不合法的
+    /// 回到默认值）**在内存里修过了**：预览和导入都按修好的算，包本身不变。没修过是空的
+    pub repairs: Vec<crate::ConfigFix>,
 }
 
 slug_enum! {
@@ -320,6 +323,9 @@ pub struct RestorePreview {
     pub rows: Vec<RestoreRow>,
     /// 开着同步时，恢复的结果会同步到几台别的设备。没开同步是 0
     pub sync_devices: u32,
+    /// 那一版里这一版 Core 读不进来的字段（升级之前留的版本），按一键修复的规矩在内存里修过了。
+    /// 没修过是空的
+    pub repairs: Vec<crate::ConfigFix>,
 }
 
 slug_enum! {
