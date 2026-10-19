@@ -1158,9 +1158,10 @@ fn is_initial(snap: &Snapshot) -> bool {
 /// 加入时「合并」：和导入同一套规矩（`tw_pack::import`），本机打底，同步数据逐项并进来。
 /// 新增的默认导入，冲突的必须选（覆盖、改名导入、跳过），没选是 `sync.join_undecided`。
 ///
-/// **两处和导入不一样**：导入进来的插件按导入的规矩是停用的，加入同步时照同步数据里的开关
+/// **三处和导入不一样**：导入进来的插件按导入的规矩是停用的，加入同步时照同步数据里的开关
 /// （各设备一致，见方案 6.2；不加密时同步一轮里另有停用的规矩）；导入预览里只有本机有的
-/// 项目不出现，这里也一样 —— 它们会随这次加入上传
+/// 项目不出现，这里也一样 —— 它们会随这次加入上传；两边的默认网关密钥同名、值不同时不用选，
+/// 采用同步数据的值（[`engine::adopted_default_key`]，给了别的选择也不看）
 fn merge_join(
     local: &Pack,
     remote: &Pack,
@@ -1172,8 +1173,18 @@ fn merge_join(
         .iter()
         .map(|d| (crate::backups::item_id(&d.item), d))
         .collect();
+    let adopt = model::snapshot(local)
+        .ok()
+        .and_then(|l| adopted(&l, remote));
     let mut out = Vec::new();
     for r in &rows {
+        if adopt.as_ref() == Some(&r.item) {
+            out.push(tw_pack::import::Decision {
+                item: r.item.clone(),
+                action: tw_pack::import::Action::Overwrite,
+            });
+            continue;
+        }
         let action = match decided.get(&r.item) {
             Some(d) => match d.action {
                 tw_api::ImportAction::Import => tw_pack::import::Action::Import,
@@ -1340,17 +1351,13 @@ async fn join_preview(
     let (target, store) = config_target(&s, &req.target)?;
     let cur = current_pack(&s.cfg).map_err(|m| fail(StatusCode::INTERNAL_SERVER_ERROR, m))?;
     let local = model::snapshot(&cur.pack).map_err(|e| fail(StatusCode::BAD_REQUEST, e.msg()))?;
-    if is_initial(&local) {
-        return Ok(Json(tw_api::SyncJoinPreview {
-            initial: true,
-            rows: Vec::new(),
-        }));
-    }
+    let initial = is_initial(&local);
     let probe = Eng::probe(&store, req.passphrase.as_deref()).await;
     if probe.existing.is_none() {
         return Ok(Json(tw_api::SyncJoinPreview {
-            initial: false,
+            initial,
             rows: Vec::new(),
+            auto: Vec::new(),
         }));
     }
     let encrypted = probe.existing.as_ref().is_some_and(|e| e.encrypted);
@@ -1360,14 +1367,47 @@ async fn join_preview(
         store,
         &draft(target.clone(), encrypted, req.passphrase.clone(), "preview"),
     );
-    let remote = e.latest().await.map_err(|e| round_fail(&e))?;
+    let remote = match e.latest().await {
+        Ok(r) => r,
+        // 初始配置不出现合并这一步：读不到同步数据（口令还没给）也照样答
+        Err(_) if initial => {
+            return Ok(Json(tw_api::SyncJoinPreview {
+                initial,
+                rows: Vec::new(),
+                auto: Vec::new(),
+            }));
+        }
+        Err(e) => return Err(round_fail(&e)),
+    };
+    let auto = adopted(&local, &remote)
+        .map(|id| tw_api::SyncJoinAuto {
+            item: item_ref(&id),
+            action: tw_api::ImportAction::Overwrite,
+            reason: tw_api::SyncJoinAutoReason::DefaultKey,
+        })
+        .into_iter()
+        .collect();
+    if initial {
+        return Ok(Json(tw_api::SyncJoinPreview {
+            initial,
+            rows: Vec::new(),
+            auto,
+        }));
+    }
     // 和导入预览同一套规矩
     let rows = tw_pack::import::preview(&cur.pack, &remote, &crate::backups::import_ctx())
         .map_err(|e| import_fail(&e))?;
     Ok(Json(tw_api::SyncJoinPreview {
-        initial: false,
+        initial,
         rows: rows.into_iter().map(crate::backups::row_view).collect(),
+        auto,
     }))
+}
+
+/// 加入时不用选、采用同步数据的那一把默认网关密钥（[`engine::adopted_default_key`]）
+fn adopted(local: &Snapshot, remote: &Pack) -> Option<ItemId> {
+    let remote = model::snapshot(remote).ok()?;
+    engine::adopted_default_key(local, &remote)
 }
 
 async fn enable(

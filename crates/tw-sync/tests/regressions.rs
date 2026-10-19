@@ -215,7 +215,7 @@ fn forge_plain_version(loc: &Path, config_yaml: String) -> String {
 /// 把本机记着的「从什么时候起」往前拨，模拟时间过去了
 fn age_state(e: &Engine<AnyStore, Dev>, by_ms: u64) {
     let mut st = e.local().state();
-    for t in st.unreadable.values_mut() {
+    for t in st.unreadable.values_mut().chain(st.arriving.values_mut()) {
         *t = t.saturating_sub(by_ms);
     }
     st.empty_since_ms = st.empty_since_ms.map(|t| t.saturating_sub(by_ms));
@@ -953,7 +953,8 @@ async fn a_version_that_never_finishes_arriving_is_skipped_after_a_while() {
     assert!(t.b.provider("one").is_some());
 }
 
-/// iCloud 还没下载的最新版本（只有占位文件）：当作尚未到达
+/// iCloud 还没下载的最新版本（只有旧式占位文件）：当作尚未到达，**不算读不出来**——过了
+/// 30 分钟照样等（文件夹位置请求了下载）；一天还没到才跳过
 #[tokio::test]
 async fn an_icloud_placeholder_on_top_is_waited_for() {
     let mut t = bed(false).await;
@@ -972,9 +973,39 @@ async fn an_icloud_placeholder_on_top_is_waited_for() {
     )
     .unwrap();
     assert!(matches!(t.eb.round().await, Err(RoundError::NotArrived)));
+    age_state(&t.eb, SKIP_AFTER_MS + 1000);
+    assert!(
+        matches!(t.eb.round().await, Err(RoundError::NotArrived)),
+        "占位文件不按读不出来的 30 分钟跳过"
+    );
     std::fs::rename(parked.path().join(&file), &real).unwrap();
     t.eb.round().await.unwrap();
     assert!(t.b.provider("one").is_some());
+    assert!(t.eb.state().arriving.is_empty());
+}
+
+/// 一直没下载下来的占位文件：一天之后跳过，不再挡着这台设备上传
+#[tokio::test]
+async fn an_icloud_placeholder_that_never_downloads_is_skipped_after_a_day() {
+    let mut t = bed(false).await;
+    let up = t.ea.round().await.unwrap().uploaded;
+    assert!(up.is_none());
+    let head = versions(t.loc.path()).last().unwrap().clone();
+    let seq: u64 = head[..10].parse().unwrap();
+    std::fs::write(
+        t.loc
+            .path()
+            .join("versions")
+            .join(format!(".{:010}-cccccccc.twconfig.icloud", seq + 1)),
+        b"placeholder",
+    )
+    .unwrap();
+    t.b.edit(|s| add_provider(s, "fromb", "https://b.example", "sk-b"));
+    assert!(matches!(t.eb.round().await, Err(RoundError::NotArrived)));
+    age_state(&t.eb, tw_sync::engine::ARRIVING_SKIP_AFTER_MS + 1000);
+    let r = t.eb.round().await.unwrap();
+    assert_eq!(r.skipped, 1);
+    assert!(r.uploaded.is_some());
 }
 
 // ─────────────────────────────────────────────── 空的同步位置

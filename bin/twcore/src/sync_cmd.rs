@@ -179,19 +179,94 @@ pub fn disable(config: &Path, purge: bool) -> Result<()> {
     Ok(())
 }
 
-fn host_name() -> String {
-    for var in ["COMPUTERNAME", "HOSTNAME"] {
-        if let Ok(v) = std::env::var(var)
-            && !v.trim().is_empty()
-        {
-            return v.trim().to_string();
-        }
+/// 一段机器名能不能当设备名：去掉首尾空白，不能有控制字符，太长的截短
+fn usable_name(raw: &str) -> Option<String> {
+    let n = raw.trim();
+    if n.is_empty() || n.chars().any(char::is_control) {
+        return None;
     }
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
+    Some(n.chars().take(tw_config::sync::DEVICE_NAME_MAX).collect())
+}
+
+/// 跑一个系统自带的命令，取它输出的第一行
+#[cfg(unix)]
+fn command_line(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    usable_name(String::from_utf8_lossy(&out.stdout).lines().next()?)
+}
+
+/// 这台计算机的名称，当设备名称的缺省值：macOS 是系统设置里的「电脑名称」（ComputerName，
+/// 取不到用 LocalHostName），Linux 是主机名，Windows 是计算机名
+fn host_name() -> String {
+    #[cfg(target_os = "macos")]
+    let found = command_line("/usr/sbin/scutil", &["--get", "ComputerName"])
+        .or_else(|| command_line("/usr/sbin/scutil", &["--get", "LocalHostName"]))
+        .or_else(|| command_line("/bin/hostname", &[]));
+    #[cfg(windows)]
+    let found = std::env::var("COMPUTERNAME")
         .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "server".into())
+        .and_then(|v| usable_name(&v));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let found = ["/etc/hostname", "/proc/sys/kernel/hostname"]
+        .iter()
+        .find_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| usable_name(&s))
+        })
+        .or_else(|| command_line("hostname", &[]))
+        .or_else(|| std::env::var("HOSTNAME").ok().and_then(|v| usable_name(&v)));
+    #[cfg(not(any(unix, windows)))]
+    let found: Option<String> = None;
+    found.unwrap_or_else(|| "server".into())
+}
+
+/// 合并加入时，同步数据里和本机不一样的一项怎么办。**缺省是采用同步数据**：留本机的那一份
+/// 会随这次加入上传，把别的设备上的那一项也改成本机的 —— 那要明确选
+fn decide(row: &tw_api::ImportRow) -> Result<serde_json::Value> {
+    let differs = if row.differs.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", row.differs.join(", "))
+    };
+    let what = match row.item.name.as_str() {
+        "" => row.item.kind.slug().to_string(),
+        name => format!("{} `{name}`", row.item.kind.slug()),
+    };
+    eprintln!("{what}{differs} differs between this device and the sync data:");
+    eprintln!("  u  use the sync data (default)");
+    eprintln!(
+        "  k  keep this device's version; it is uploaded and replaces the other devices' one"
+    );
+    let rename = row.suggested_name.clone().filter(|_| !row.global);
+    if let Some(n) = &rename {
+        eprintln!("  r  keep both: the sync data's one is added as {n}");
+    }
+    loop {
+        let a = ask("Choice", Some("u"))?;
+        let action = match a.to_ascii_lowercase().as_str() {
+            "u" => "overwrite",
+            "k" => "skip",
+            "r" if rename.is_some() => "rename",
+            _ => {
+                eprintln!("type u, k{}", if rename.is_some() { " or r" } else { "" });
+                continue;
+            }
+        };
+        let mut d = serde_json::json!({ "item": row.item, "action": action });
+        if action == "rename" {
+            d["new_name"] = rename.clone().into();
+        }
+        return Ok(d);
+    }
 }
 
 pub fn enable(config: &Path) -> Result<()> {
@@ -275,11 +350,23 @@ pub fn enable(config: &Path) -> Result<()> {
                 "/sync/enable/preview",
                 Some(serde_json::json!({ "target": target, "passphrase": body.get("passphrase") })),
             )?;
+            for a in &preview.auto {
+                match a.reason {
+                    tw_api::SyncJoinAutoReason::DefaultKey => eprintln!(
+                        "The default gateway key ({}) takes the sync data's value; clients set up \
+                         on this device are updated to it",
+                        a.item.name
+                    ),
+                }
+            }
             if !preview.initial {
+                let auto: Vec<&tw_api::ItemRef> = preview.auto.iter().map(|a| &a.item).collect();
                 let conflicts: Vec<&tw_api::ImportRow> = preview
                     .rows
                     .iter()
-                    .filter(|r| r.status == tw_api::ImportStatus::Conflict)
+                    .filter(|r| {
+                        r.status == tw_api::ImportStatus::Conflict && !auto.contains(&&r.item)
+                    })
                     .collect();
                 let new = preview
                     .rows
@@ -292,16 +379,17 @@ pub fn enable(config: &Path) -> Result<()> {
                     conflicts.len()
                 );
                 let replace = yes(
-                    "Replace this device's configuration with the sync data (no keeps this \
-                     device's version of every item that differs)",
+                    "Replace this device's configuration with the sync data (no merges them; \
+                     each item that differs is asked)",
                     false,
                 )?;
                 if !replace {
                     body["join"] = "merge".into();
-                    body["decisions"] = conflicts
-                        .iter()
-                        .map(|r| serde_json::json!({ "item": r.item, "action": "skip" }))
-                        .collect();
+                    let mut decisions = Vec::new();
+                    for r in &conflicts {
+                        decisions.push(decide(r)?);
+                    }
+                    body["decisions"] = decisions.into();
                 }
             }
         }
@@ -310,4 +398,42 @@ pub fn enable(config: &Path) -> Result<()> {
     let v: tw_api::SyncView = send(config, "GET", "/sync", None)?;
     print_view(&v);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machine_name_is_trimmed_and_cut_to_a_device_name() {
+        assert_eq!(usable_name("  Mac mini \n").as_deref(), Some("Mac mini"));
+        assert_eq!(usable_name("   "), None);
+        assert_eq!(usable_name("a\u{7}b"), None);
+        let long = "名".repeat(100);
+        assert_eq!(
+            usable_name(&long).unwrap().chars().count(),
+            tw_config::sync::DEVICE_NAME_MAX
+        );
+    }
+
+    /// macOS 上缺省是「电脑名称」（ComputerName），不是 `server`
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_default_device_name_is_the_computer_name() {
+        let want = command_line("/usr/sbin/scutil", &["--get", "ComputerName"])
+            .or_else(|| command_line("/usr/sbin/scutil", &["--get", "LocalHostName"]));
+        let got = host_name();
+        assert_ne!(got, "server");
+        if let Some(w) = want {
+            assert_eq!(got, w);
+        }
+    }
+
+    /// 别的 Unix 上是主机名
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn elsewhere_the_default_device_name_is_the_host_name() {
+        let got = host_name();
+        assert!(!got.is_empty());
+    }
 }

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ImportDecision, ImportRow, ItemRef, Msg};
+use crate::{ImportAction, ImportDecision, ImportRow, ItemRef, Msg};
 
 fn direct() -> String {
     "direct".to_string()
@@ -179,6 +179,29 @@ pub struct SyncJoinPreview {
     pub initial: bool,
     /// 同步数据里的每个项目和本机比（[`ImportRow`]）。`initial` 时是空的
     pub rows: Vec<ImportRow>,
+    /// core 替人定了、不用选的那几项（两种加入方式都照它办，`decisions` 里给了也不看）。它们
+    /// 在 `rows` 里照常列出，界面那一行显示成定下的处理和原因，不当作冲突
+    pub auto: Vec<SyncJoinAuto>,
+}
+
+/// 加入时不用选的一项（[`SyncJoinPreview::auto`]）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SyncJoinAuto {
+    pub item: ItemRef,
+    /// 怎么处理。现在只有 `overwrite`：采用同步数据
+    pub action: ImportAction,
+    pub reason: SyncJoinAutoReason,
+}
+
+slug_enum! {
+    /// 为什么不用选。
+    pub enum SyncJoinAutoReason {
+        /// 两边的默认网关密钥（`default_key` 指着的那一把）同名、值不同：每个安装都会自动生成
+        /// 一把，加入的设备采用同步数据的值。本机已接管的客户端随之自动更新
+        /// （`GatewayKeysChanged`）
+        DefaultKey = "default_key",
+    }
 }
 
 slug_enum! {

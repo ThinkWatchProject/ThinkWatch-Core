@@ -18,8 +18,69 @@ use super::{
     too_large,
 };
 
-/// iCloud Drive 还没下载到本机的文件，在目录里是一个 `.名字.icloud` 的占位文件
+/// iCloud Drive 还没下载到本机的文件，在目录里是一个 `.名字.icloud` 的占位文件（macOS 13 及
+/// 以前；之后的 iCloud Drive 文件照真名列出，读的时候系统自己去下载）
 const ICLOUD: &str = ".icloud";
+
+/// 同一个占位文件多久才再请求一次下载
+#[cfg(target_os = "macos")]
+const DOWNLOAD_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// 请求下载的脚本（JavaScript for Automation）：路径是第一个参数，答 `true` / `false`
+#[cfg(target_os = "macos")]
+const DOWNLOAD_SCRIPT: &str = "function run(argv) { ObjC.import('Foundation'); \
+    return String($.NSFileManager.defaultManager.startDownloadingUbiquitousItemAtURLError(\
+    $.NSURL.fileURLWithPath(argv[0]), null)); }";
+
+/// 让 iCloud 把一个还没下载的文件下载下来。**旧式占位文件读真名不会触发下载**，要明确请求：
+/// 苹果的接口是 `-[NSFileManager startDownloadingUbiquitousItemAtURL:error:]`（macOS 10.7 起都有；
+/// `brctl download` 在新系统上已经没有了）。经系统自带的 `osascript` 以 JavaScript for
+/// Automation 调它，core 里不写原生调用；路径作为参数传进去，不拼进脚本。只请求、不等下载完：
+/// 下载完了真名的文件就出现了，文件夹的监听随之再来一轮。别的系统什么都不做
+fn start_download(real: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::Instant;
+        static ASKED: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+        let asked = ASKED.get_or_init(Default::default);
+        if let Ok(mut m) = asked.lock() {
+            if m.get(real)
+                .is_some_and(|t| t.elapsed() < DOWNLOAD_AGAIN_AFTER)
+            {
+                return;
+            }
+            m.retain(|_, t| t.elapsed() < DOWNLOAD_AGAIN_AFTER);
+            m.insert(real.to_path_buf(), Instant::now());
+        }
+        let child = std::process::Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", DOWNLOAD_SCRIPT])
+            .arg(real)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            // 不等它：另起一个线程收尸，最多等 10 秒
+            Ok(mut c) => {
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        if !matches!(c.try_wait(), Ok(None)) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let _ = c.kill();
+                    let _ = c.wait();
+                });
+            }
+            Err(e) => tracing::debug!("iCloud could not be asked to download a file: {e}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = real;
+}
 
 /// 读一个文件，**边读边数**：超过上限就不读了
 fn read_limited(p: &Path) -> std::io::Result<Result<Vec<u8>, ()>> {
@@ -206,11 +267,12 @@ impl Store for Folder {
                 if !root.is_dir() {
                     return Err(io(&root, e));
                 }
-                // iCloud 还没下载的：有，只是还没到 —— 读成空的（调用方当作尚未到达）
+                // iCloud 还没下载的：有，只是还没到 —— 请求下载，读成空的（调用方当作尚未到达）
                 let placeholder = p
                     .file_name()
                     .map(|n| p.with_file_name(format!(".{}{ICLOUD}", n.to_string_lossy())));
                 if placeholder.is_some_and(|ph| ph.is_file()) {
+                    start_download(&p);
                     Ok(Some(Vec::new()))
                 } else {
                     Ok(None)
@@ -469,6 +531,23 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// 请求下载的那段脚本在这台 Mac 上跑得通：对一个不在 iCloud 里的文件，接口答 `false`（不是
+    /// 脚本出错、不是 osascript 崩了）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_download_request_script_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("x");
+        std::fs::write(&f, b"x").unwrap();
+        let out = std::process::Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", DOWNLOAD_SCRIPT])
+            .arg(&f)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "false");
     }
 
     #[tokio::test]
