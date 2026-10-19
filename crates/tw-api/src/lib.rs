@@ -94,6 +94,9 @@ macro_rules! slug_enum {
 // 配置包那一半：导出、导入、备份与恢复（`slug_enum!` 在上面定义，所以在这里声明）
 mod pack;
 pub use pack::*;
+// 多设备同步那一半（`slug_enum!` 在上面定义，所以在这里声明）
+mod sync;
+pub use sync::*;
 
 // ---------------------------------------------------------------- 取值固定的词
 //
@@ -977,6 +980,17 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 和 [`RestorePreview`] 的 `repairs` 列出修了哪几处。OAuth 上游换发来的令牌（刷新令牌会轮换）
 /// 和 ChatGPT 的登录一样留在本机，不随导出带走、导入覆盖时留着本机的。一键修复修不了时的码换成
 /// `control.config_unrepairable`（句子改说从备份恢复）。照 49 写的界面调不到删掉的那两个端点。
+///
+/// **50 起有多设备同步**：`GET /sync`（[`SyncView`]）、`POST /sync/test`（[`SyncTestRequest`] →
+/// [`SyncProbe`]）、`POST /sync/enable/preview`（→ [`SyncJoinPreview`]，规则和导入预览一样）、
+/// `POST /sync/enable`（[`SyncEnable`]：空的同步位置新建，有数据的加入，`merge` 或 `use_remote`）、
+/// `PUT /sync/settings`（[`SyncSettingsSave`]）、`POST /sync/now`、`GET` / `POST /sync/conflicts`
+/// （[`SyncConflict`]、[`SyncResolve`]：采用本机、另一边或两者都保留）、`POST /sync/encryption`
+/// （[`SyncEncryption`]：开启、关闭、更改口令）、`POST /sync/unlock`（[`SyncUnlock`]）、
+/// `POST /sync/disable`（[`SyncDisable`]）。状态变了发 [`Event::SyncStatus`]；应用别的设备的
+/// 版本时配置的来源是 `sync`，改了网关密钥时发 `GatewayKeysChanged`。[`ProviderView`] 多了
+/// `sync_excluded`（不同步的上游）和 `sync_url_changed`（地址经同步变更，改之前的地址）。
+/// 同步的码是 `sync.*`。安全模式下不自动同步（`paused`）
 pub const CONTROL_API_VERSION: u32 = 50;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
@@ -1710,6 +1724,9 @@ pub enum Event {
     /// 「进行中」的计数和每一行的状态都靠事件，丢一个结局，那一行就永远停在
     /// 「进行中」。
     EventsDropped { id: u64, count: u64, at_ms: u64 },
+    /// 同步的状态、冲突数或设备列表变了（`GET /sync` 的那一份）。正常运转的同步不发系统通知，
+    /// 要人处理的状态（冲突、连不上、拒绝访问、口令、版本过新）由界面按通知总开关提醒一次
+    SyncStatus { id: u64, view: SyncView, at_ms: u64 },
     /// 这几把网关密钥的值变了或者没了：导入覆盖、恢复、同步改的。
     ///
     /// **本机接管的客户端配置里写着密钥的值**：界面收到它，照「更换密钥后更新客户端」那一套
@@ -1982,6 +1999,7 @@ impl Event {
             | Event::RequestCancelled { id, .. }
             | Event::LocallyAnswered { id, .. }
             | Event::EventsDropped { id, .. }
+            | Event::SyncStatus { id, .. }
             | Event::GatewayKeysChanged { id, .. }
             | Event::ClientPrefsChanged { id, .. }
             | Event::ConfigReloaded { id, .. }
@@ -2372,6 +2390,14 @@ pub struct ProviderView {
     /// 密钥是用哪一家的账号登录换来的（配置里的 `signed_in:`）：`zai` / `bigmodel`。手填的
     /// 密钥、别的上游、这一项出现之前登录的都是空。在界面里手动换掉密钥之后也是空
     pub signed_in: Option<ZaiFamily>,
+    /// 不同步的上游（同步设置里选的）：不上传，也不被别的设备的同名上游覆盖。没开同步是 false
+    #[serde(default)]
+    pub sync_excluded: bool,
+    /// 地址经同步变更：不加密的同步最近一次把这家的地址改了（改之前的地址、哪台设备、什么
+    /// 时候）。「提示一次」由界面自己记已读；在本机改过这家的地址就没有了。加密的同步不给
+    /// （没有口令的人写不进来）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_url_changed: Option<SyncUrlChange>,
 }
 
 /// 一行请求头，配置里写的原样。

@@ -424,6 +424,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         default_route: None,
         default_key: None,
         plugins: Vec::new(),
+        sync: None,
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {

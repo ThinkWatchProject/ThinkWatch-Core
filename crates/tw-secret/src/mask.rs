@@ -280,6 +280,8 @@ fn is_secret_name(name: &str) -> bool {
         "access_key_id",
         "secret_access_key",
         "session_token",
+        // 同步口令（`sync:` 那一段）：解得开同步位置上的每一个版本
+        "passphrase",
     ];
     NAMES.contains(&name)
 }
@@ -752,6 +754,23 @@ mod body_tests {
         assert!(out.contains("region: us-east-1"), "{out}");
         // 临时凭证的访问密钥 ID 出现在别处（请求体、报错）也认得出
         assert!(!mask_body("the key is ASIAIOSFODNN7EXAMPLE here").contains("IOSFODNN7"));
+    }
+
+    /// 同步那一节：口令、WebDAV 的密码、S3 的密钥都不能进诊断包
+    #[test]
+    fn the_sync_sections_secrets_are_masked() {
+        let cfg = "sync:\n  device_id: 3f9a2c1e-0b1d\n  device_name: Mac mini\n  encrypt: true\n  passphrase: horse battery staple correct\n  target:\n    type: webdav\n    url: https://dav.example.com/tw\n    user: me\n    pass: app-password-value\n";
+        let out = mask_config_yaml(cfg);
+        for secret in ["battery staple", "app-password-value"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("device_name: Mac mini"), "{out}");
+        let s3 = "sync:\n  target:\n    type: s3\n    access_key_id: AKIDEXAMPLEVALUE1\n    secret_access_key: plainlookingsecretvalue\n";
+        let out = mask_config_yaml(s3);
+        assert!(
+            !out.contains("plainlookingsecretvalue") && !out.contains("EXAMPLEVALUE1"),
+            "{out}"
+        );
     }
 
     #[test]

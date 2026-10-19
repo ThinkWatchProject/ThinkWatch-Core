@@ -31,6 +31,8 @@ pub struct ConfigManager {
     pinned: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// 同步位置上的备份版本。没开同步是 None
     remote: std::sync::RwLock<Option<Arc<dyn crate::backups::RemoteBackups>>>,
+    /// 这份配置的同步服务，第一次用到时建（见 `crate::sync::service`）
+    sync: std::sync::OnceLock<Arc<crate::sync::Sync>>,
 }
 
 /// 一次配置改动没成的原因。
@@ -127,6 +129,7 @@ impl ConfigManager {
             applied: tokio::sync::Notify::new(),
             pinned: std::sync::Mutex::new(pinned),
             remote: std::sync::RwLock::new(None),
+            sync: std::sync::OnceLock::new(),
         }
     }
 
@@ -147,6 +150,16 @@ impl ConfigManager {
             });
         }
         self
+    }
+
+    /// 同步服务放在这里（`crate::sync::service`）
+    pub(crate) fn sync_slot(&self) -> &std::sync::OnceLock<Arc<crate::sync::Sync>> {
+        &self.sync
+    }
+
+    /// 事件总线
+    pub fn bus(&self) -> &tw_observe::EventBus {
+        &self.bus
     }
 
     /// 数据面。管理面里要碰插件文件、编插件的那几处从这里拿

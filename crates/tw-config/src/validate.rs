@@ -156,6 +156,9 @@ pub enum ValidationError {
         days: u64,
         min: u64,
     },
+    /// `sync` 一节写得不对（[`crate::sync::SyncError`]）
+    #[error("{}", self.msg())]
+    Sync(crate::sync::SyncError),
 }
 
 impl ValidationError {
@@ -443,6 +446,7 @@ impl ValidationError {
                  After a restart the total for the {per} is added up again from the request \
                  records, so row_days has to be at least {min}"
             ),
+            Sync(e) => e.msg(),
         }
     }
 }
@@ -676,6 +680,12 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 });
             }
         }
+    }
+    // 同步。**代理名要对得上** `proxies`：同步位置的请求经它发出，指到一个不存在的代理上，
+    // 表现是每一次同步都失败，而原因不在同步设置里
+    if let Some(sync) = &cfg.sync {
+        sync.check().map_err(ValidationError::Sync)?;
+        crate::sync::check_proxy(&sync.target, &cfg.proxies).map_err(ValidationError::Sync)?;
     }
     Ok(())
 }

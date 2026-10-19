@@ -18,6 +18,27 @@ pub fn run(
     data: Option<String>,
     out: Option<PathBuf>,
 ) -> Result<()> {
+    let (status, body) = request(config, method, endpoint, data)?;
+    match out {
+        Some(file) => {
+            std::fs::write(&file, &body).with_context(|| format!("writing {}", file.display()))?;
+            println!("{status}");
+        }
+        None => {
+            use std::io::Write;
+            std::io::stdout().write_all(&body)?;
+        }
+    }
+    Ok(())
+}
+
+/// 发一个请求，拿回状态码和响应体。`twcore sync` 这类命令也走它
+pub fn request(
+    config: &Path,
+    method: &str,
+    endpoint: &str,
+    data: Option<String>,
+) -> Result<(u16, Bytes)> {
     let dir = config
         .parent()
         .map(PathBuf::from)
@@ -36,7 +57,7 @@ pub fn run(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let (status, body) = rt.block_on(async move {
+    rt.block_on(async move {
         match Address::in_dir(&dir) {
             #[cfg(unix)]
             Address::Socket(p) => {
@@ -59,18 +80,7 @@ pub fn run(
                 send(s, &key, method, &endpoint, data).await
             }
         }
-    })?;
-    match out {
-        Some(file) => {
-            std::fs::write(&file, &body).with_context(|| format!("writing {}", file.display()))?;
-            println!("{status}");
-        }
-        None => {
-            use std::io::Write;
-            std::io::stdout().write_all(&body)?;
-        }
-    }
-    Ok(())
+    })
 }
 
 async fn send<S>(

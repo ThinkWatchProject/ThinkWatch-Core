@@ -432,7 +432,7 @@ async fn export(
 
 // ─────────────────────────────────────────────────────────── 导入
 
-fn import_ctx() -> tw_pack::import::Context<'static> {
+pub(crate) fn import_ctx() -> tw_pack::import::Context<'static> {
     tw_pack::import::Context {
         has_aws_profile: &|p| tw_config::aws_profile::credentials(p).is_ok(),
         new_key: &tw_config::generate_key,
@@ -452,7 +452,7 @@ fn import_fail(e: tw_pack::import::ImportError, pack: &Pack) -> Fail {
     }
 }
 
-fn row_view(r: tw_pack::import::Row) -> tw_api::ImportRow {
+pub(crate) fn row_view(r: tw_pack::import::Row) -> tw_api::ImportRow {
     use tw_pack::import::{Flag, Status};
     tw_api::ImportRow {
         item: item_ref(&r.item),
@@ -568,7 +568,8 @@ async fn backups(State(s): State<ControlState>) -> Result<Json<Vec<tw_api::Backu
                 id: b.id.clone(),
                 at_ms: b.at_ms,
                 origin: b.origin.into(),
-                device: None,
+                // 经同步应用的那一版记着是从哪台设备来的
+                device: tw_pack::backup::device_of(&pack),
                 local: true,
                 sync: false,
                 counts: tw_api::BackupCounts {

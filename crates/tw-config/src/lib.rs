@@ -29,6 +29,7 @@ pub mod repair;
 mod retention;
 mod security;
 pub mod store;
+pub mod sync;
 mod validate;
 pub mod watch;
 mod wire;
@@ -129,6 +130,10 @@ pub struct Config {
     /// 脚本插件，**从上到下就是运行的顺序**。不写就没有
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<plugins::Plugin>,
+    /// 多设备同步（见 [`sync`]）。**本机设置**：配置包不带它，恢复备份时保留当前值。
+    /// 没开同步就没有这一节
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<sync::Sync>,
 }
 
 /// 便于构造，**不代表一份可用的配置** —— `providers` 和 `clients` 都是
@@ -153,6 +158,7 @@ impl Default for Config {
             default_route: None,
             default_key: None,
             plugins: Vec::new(),
+            sync: None,
         }
     }
 }

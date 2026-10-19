@@ -207,6 +207,25 @@ fn save(
     })
 }
 
+/// 同步应用的那一版是从哪台设备来的：记在这一版的 manifest 里（`sync.device_name`），备份列表
+/// 里写「同步自 MacBook Air」。**只改这一个字段**，别的字节照旧
+pub fn note_device(b: &Backup, device: &str) -> Result<(), BackupError> {
+    let mut pack = open(b)?;
+    pack.manifest.sync = Some(serde_json::json!({ "device_name": device }));
+    let bytes = crate::write(&pack, Seal::None).map_err(BackupError::Pack)?;
+    disk::write_private(&b.path, &bytes).map_err(io(&b.path))
+}
+
+/// 一版是从哪台设备同步来的（[`note_device`] 记下的）
+pub fn device_of(pack: &Pack) -> Option<String> {
+    pack.manifest
+        .sync
+        .as_ref()?
+        .get("device_name")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// 超出 [`KEEP`] 的老版本删掉，以前的修改记录（`*.yaml`）也删掉
 fn prune(config_path: &Path) -> Result<(), BackupError> {
     let all = list(config_path)?;
@@ -373,6 +392,22 @@ mod tests {
             open(&v3).unwrap().client_prefs,
             Some(serde_json::json!({"language": "en"}))
         );
+    }
+
+    /// 经同步应用的那一版记着来源设备，别的照旧
+    #[test]
+    fn a_synced_version_remembers_which_device_it_came_from() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.yaml");
+        let text = "version: 1\nclients:\n  - name: default\n    key: tw-k\n";
+        std::fs::write(&p, text).unwrap();
+        let b = record(&p, text, Origin::Sync).unwrap().unwrap();
+        assert_eq!(device_of(&open(&b).unwrap()), None);
+        note_device(&b, "MacBook Air").unwrap();
+        let back = open(&b).unwrap();
+        assert_eq!(device_of(&back).as_deref(), Some("MacBook Air"));
+        assert_eq!(back.config_yaml, open(&b).unwrap().config_yaml);
+        assert_eq!(list(&p).unwrap().len(), 1, "不多出一版");
     }
 
     #[test]

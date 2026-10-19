@@ -2,7 +2,8 @@
 //!
 //! - [`endpoint`]：区域、runtime 和控制面的地址、模型 id 怎么写进路径
 //! - [`beta`]：客户端的 `anthropic-beta` 里哪些能带给 Bedrock 上的 Claude
-//! - [`sign`]：SigV4 签名，以及「带 API Key 就不签」这条规则
+//! - [`sign`]：SigV4 签名，以及「带 API Key 就不签」这条规则；S3 兼容存储（core 的同步位置）
+//!   也借它签
 //! - [`eventstream`]：ConverseStream 的二进制帧 → SSE
 //! - [`catalog`]：一个区域能路由到哪些模型
 //! - [`error`]：AWS 的错误里能拿出来什么、能给谁看
@@ -21,4 +22,4 @@ pub mod error;
 pub mod eventstream;
 pub mod sign;
 
-pub use sign::{Credentials, SignError, carries_api_key};
+pub use sign::{Credentials, SignError, carries_api_key, sign_service};
