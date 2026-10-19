@@ -91,6 +91,10 @@ macro_rules! slug_enum {
     };
 }
 
+// 配置包那一半：导出、导入、备份与恢复（`slug_enum!` 在上面定义，所以在这里声明）
+mod pack;
+pub use pack::*;
+
 // ---------------------------------------------------------------- 取值固定的词
 //
 // 下面这些是散在各处的字段共用的词表，按主题排。只在一个地方用到的集合写在
@@ -368,12 +372,18 @@ slug_enum! {
         Cli = "cli",
         /// 别的程序或者编辑器
         External = "external",
-        /// 回滚
-        Rollback = "rollback",
-        /// OAuth 凭据轮换之后写回
+        /// OAuth 凭据轮换之后写回。**不留备份版本**
         Rotation = "rotation",
         /// core 自己：装上它自带的默认插件，或者把没动过的默认插件换成新版
         Defaults = "defaults",
+        /// 应用了另一台设备经同步位置传来的版本
+        Sync = "sync",
+        /// 导入了一个配置包
+        Import = "import",
+        /// 恢复了一个备份版本
+        Restore = "restore",
+        /// 一键修复
+        Repair = "repair",
     }
 }
 
@@ -946,7 +956,25 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 没有在跑的请求是 null，有请求却都还没开始生成是 0。[`RunningView`] 多了 `tokens_per_sec`
 /// （这一个请求此刻的速度）和 `output_tokens`（到目前为止估的输出 token），第一个 token 之前、
 /// 非流式的是 null。
-pub const CONTROL_API_VERSION: u32 = 49;
+///
+/// **50 起有配置包（`.twconfig`）和本机备份**，修改记录换成了备份：`GET /config/history`、
+/// `POST /config/rollback`（`ConfigVersion`、`RollbackRequest`）删了，换成 `GET /backups`
+/// （[`BackupEntry`]：本机最近 10 个版本，开着同步时连同同步位置上的，同一个版本一行）、
+/// `POST /backups/file`（另存为配置包）、`POST /backups/preview`（[`RestorePreview`]：按项目
+/// 列出差异）、`POST /backups/restore`（可以只恢复几项，本机设置和 ChatGPT 的登录留着，接管的
+/// 客户端在用的密钥不删）。一版是一个完整的配置包，连同插件和 Lite 的通用偏好。新端点
+/// `GET /config/items`（[`ItemNode`]）、`POST /config/export`（[`ExportRequest`] →
+/// [`ExportedFile`]）、`POST /config/import/preview`（[`ImportSource`] → [`ImportPreview`]：逐项
+/// 新增、相同、冲突、错误）和 `POST /config/import`（[`ImportRequest`]：逐项导入、覆盖、改名
+/// 导入或跳过）。Lite 的通用偏好由 core 存：`GET` / `PUT /client-prefs`（[`ClientPrefs`]，
+/// 不解析，最大 64 KiB），变了发 [`Event::ClientPrefsChanged`]。`PUT /pinned-keys`
+/// （[`PinnedKeys`]）报告接管的客户端在用哪几把密钥。导入覆盖、恢复改了或删了网关密钥时发
+/// [`Event::GatewayKeysChanged`]。[`ConfigOrigin`] 删了 `rollback`，多了 `sync`、`import`、
+/// `restore`、`repair`（一键修复以前记成 `ui`）。备份相关的端点在安全模式下照样可用。配置包的
+/// 码是 `pack.*`，导入的是 `import.*`，备份与恢复的是 `backup.*`。停用着的上游可以缺凭据
+/// （密钥、OAuth、AWS 访问密钥空着，ChatGPT 账号没登录）：导入时就是这样进来的。照 49 写的
+/// 界面调不到删掉的那两个端点。
+pub const CONTROL_API_VERSION: u32 = 50;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1601,7 +1629,7 @@ pub enum Event {
         id: u64,
         /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
         version: String,
-        /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
+        /// 谁写的，见 [`ConfigOrigin`]
         origin: ConfigOrigin,
         at_ms: u64,
     },
@@ -1619,7 +1647,7 @@ pub enum Event {
         line: Option<usize>,
         /// 出错那一行的原文，**已脱敏**
         excerpt: Option<String>,
-        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`。
+        /// 这一版是谁写的（[`ConfigOrigin`]）。
         ///
         /// **界面靠它区分「用户在编辑器里写错了」和「界面自己刚写坏了」** ——
         /// 前者要提醒，后者是保存失败，那条路自己会报。
@@ -1679,6 +1707,17 @@ pub enum Event {
     /// 「进行中」的计数和每一行的状态都靠事件，丢一个结局，那一行就永远停在
     /// 「进行中」。
     EventsDropped { id: u64, count: u64, at_ms: u64 },
+    /// 这几把网关密钥的值变了或者没了：导入覆盖、恢复、同步改的。
+    ///
+    /// **本机接管的客户端配置里写着密钥的值**：界面收到它，照「更换密钥后更新客户端」那一套
+    /// 改写用着这几把的客户端。名字是变之前的那些
+    GatewayKeysChanged {
+        id: u64,
+        names: Vec<String>,
+        at_ms: u64,
+    },
+    /// Lite 的通用偏好变了（导入、恢复、同步、别的界面存的）：重读 `GET /client-prefs` 并应用
+    ClientPrefsChanged { id: u64, at_ms: u64 },
 }
 
 slug_enum! {
@@ -1940,6 +1979,8 @@ impl Event {
             | Event::RequestCancelled { id, .. }
             | Event::LocallyAnswered { id, .. }
             | Event::EventsDropped { id, .. }
+            | Event::GatewayKeysChanged { id, .. }
+            | Event::ClientPrefsChanged { id, .. }
             | Event::ConfigReloaded { id, .. }
             | Event::ListenChanged { id, .. }
             | Event::ConfigRejected { id, .. }
@@ -4001,29 +4042,6 @@ pub struct ConfigAtQuery {
 pub struct BaseVersion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
-}
-
-/// 历史里的一版。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ConfigVersion {
-    pub version: String,
-    pub at_ms: u64,
-    /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
-    pub origin: ConfigOrigin,
-    pub bytes: u64,
-    /// 这一版是现在跑着的那一版吗。
-    ///
-    /// **历史里包括当前版本**，所以列表最上面那条通常就是它 —— 不标
-    /// 出来的话，用户会以为第一条是「上一版」然后回滚到自己身上。
-    #[serde(default)]
-    pub current: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct RollbackRequest {
-    pub version: String,
 }
 
 /// 一段时间的汇总。

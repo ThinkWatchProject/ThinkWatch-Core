@@ -45,7 +45,9 @@ mod rename;
 mod write;
 
 pub use codec::{PluginCodec, WholeFile};
+pub use items::{is_chatgpt, sha256_hex};
 pub use rename::{free_name, rename};
+pub(crate) use write::materialize_for_export;
 pub use write::{materialize, materialize_with};
 
 /// 配置里属于这台设备、不随导出和同步带走的几节
@@ -485,6 +487,16 @@ pub(crate) fn parse(text: &str) -> Result<tw_config::Config, ModelError> {
         });
     }
     Ok(cfg)
+}
+
+/// 一个上游项目的单位读成配置里的上游（没有本机的登录）
+pub fn provider_of(id: &ItemId, item: &Item) -> Result<tw_config::Provider, ModelError> {
+    items::provider_mapping(id, &item.units, None).map(|(p, _)| p)
+}
+
+/// 一棵 JSON 摊平成通用偏好那样的单位（`a.b` → 值）
+pub(crate) fn json_flatten(v: &Json, out: &mut BTreeMap<String, Json>) {
+    json::flatten("", v, out);
 }
 
 /// [`Pack::content_id`]

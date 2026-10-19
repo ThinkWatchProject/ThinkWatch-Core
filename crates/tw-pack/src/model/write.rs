@@ -66,18 +66,38 @@ pub fn materialize(local: &Pack, target: &Snapshot) -> Result<Pack, ModelError> 
 /// - 代码没变的（包括默认插件）在本机的文件上改数据，字节尽量不动；代码变了的、新来的用
 ///   目标里带着的原文件（[`Item::files`]），没有就按单位拼出源码；默认插件在本机没有时
 ///   用这一份 Core 自带的那一份，也没有就不加
-/// - **改得了工具调用的插件，开着、而代码在本机没批准过（新来的、代码变了的、本机原来
-///   停用着的）时不批准**：文件写下去，配置里的哈希留着本机原来批准的那一份（没有就是
-///   一个谁都对不上的），插件停在「待批准」，要在本机点过头才跑
+/// - **改得了工具调用的插件，代码在本机没批准过（新来的、代码变了的），或者在本机原来停用着、
+///   落下去是开着的，就不批准**：文件写下去，配置里的哈希是一个谁都对不上的，插件停在
+///   「待批准」，要在本机点过头（确认过的那条路）才跑。和插件页上一样：装上、打开、改代码都要
+///   点头
 /// - 别的照目标批准：哈希就是写下去的文件的
 pub fn materialize_with(
     local: &Pack,
     target: &Snapshot,
     codec: &dyn PluginCodec,
 ) -> Result<Pack, ModelError> {
+    land(local, target, codec, true)
+}
+
+/// 同 [`materialize_with`]，**插件照目标批准，不管它改不改得了工具调用**。只给生成配置包用
+/// （导出）：落的是包里的内容，不是这台设备要跑的东西
+pub(crate) fn materialize_for_export(
+    local: &Pack,
+    target: &Snapshot,
+    codec: &dyn PluginCodec,
+) -> Result<Pack, ModelError> {
+    land(local, target, codec, false)
+}
+
+fn land(
+    local: &Pack,
+    target: &Snapshot,
+    codec: &dyn PluginCodec,
+    gate: bool,
+) -> Result<Pack, ModelError> {
     let cfg = parse(&local.config_yaml)?;
     let current = snapshot_with(local, codec)?;
-    let plugins = plugin_outcomes(local, &cfg, &current, target, codec)?;
+    let plugins = plugin_outcomes(local, &cfg, &current, target, codec, gate)?;
     let want = complete_orders(normalized(target), &cfg, &plugins);
     let prefs = target
         .get(&ItemId::new(ItemKind::ClientPrefs, ""))
@@ -224,6 +244,7 @@ fn plugin_outcomes(
     current: &Snapshot,
     target: &Snapshot,
     codec: &dyn PluginCodec,
+    gate: bool,
 ) -> Result<BTreeMap<String, PluginOut>, ModelError> {
     let mut out = BTreeMap::new();
     for (id, t) in target.of_kind(ItemKind::Plugin) {
@@ -264,7 +285,8 @@ fn plugin_outcomes(
         } else if let Some(f) = t.files.as_ref().filter(|f| {
             let src = text(&f.script);
             let code = codec.split(&src).map_or(src, |(c, _)| c);
-            t_script.and_then(Json::as_str) == Some(code.as_str())
+            // 默认插件没有脚本这个单位：带着的就是它在那一边的文件
+            t_script.is_none_or(|s| s.as_str() == Some(code.as_str()))
         }) {
             Some(text(&f.script))
         } else if let Some(s) = t_script.and_then(Json::as_str) {
@@ -286,26 +308,23 @@ fn plugin_outcomes(
             })?,
             None => base,
         };
-        let approved_here =
-            le.is_some_and(|le| le.enabled) && same_code && local_approved.is_some();
-        let gated = enabled && codec.needs_approval(&source) && !approved_here;
+        // 本机批准过这份代码；打开它也是本机的人打开的
+        let approved_here = same_code && local_approved.is_some();
+        let turned_on = enabled && !le.is_some_and(|le| le.enabled);
+        let gated = gate && codec.needs_approval(&source) && (!approved_here || turned_on);
         let pending_edit = match (le, lf) {
             (Some(le), Some(lf)) => sha256_hex(&lf.script) != le.sha256,
             _ => false,
         };
         let (files, sha256) = if gated {
-            // 哈希留着本机原来批准的那一份（界面拿它和底稿比出改了什么）；它恰好就是要写下去
-            // 的这一份（本机停用着、批准过同一份代码）时也不能留：留着就等于替人点了头
-            let sha = match le {
-                Some(le) if le.sha256 != sha256_hex(source.as_bytes()) => le.sha256.clone(),
-                _ => NOT_APPROVED.to_string(),
-            };
+            // 哈希写成一个谁都对不上的：插件停在「文件变了、待批准」，批准要走确认过的那条路。
+            // 本机原来批准的底稿留着，界面拿它比出改了什么
             (
                 PluginFiles {
                     script: source.into_bytes(),
                     approved: local_approved.clone(),
                 },
-                sha,
+                NOT_APPROVED.to_string(),
             )
         } else if same_code && pending_edit {
             // 本机有一处还没批准的改动：留着它，底稿和哈希换成新的

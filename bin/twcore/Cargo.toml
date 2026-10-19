@@ -16,6 +16,8 @@ categories.workspace = true
 [dependencies]
 tw-config = { workspace = true }
 tw-control = { workspace = true }
+# `twcore export` / `import` / `backup`：配置包和本机备份
+tw-pack = { workspace = true }
 tw-gateway = { workspace = true }
 tw-yaml = { workspace = true }
 tw-api = { workspace = true }

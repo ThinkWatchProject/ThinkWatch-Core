@@ -130,13 +130,7 @@ async fn failures_the_framework_answers_are_messages_too() {
     assert_eq!(error(&body.unwrap()).code, "control.method_not_allowed");
 
     // 请求体读不成请求类型
-    let (st, body) = send(
-        &app,
-        "POST",
-        ep::ConfigRollback::PATH,
-        Some("{\"version\":5}"),
-    )
-    .await;
+    let (st, body) = send(&app, "POST", ep::RestorePreview::PATH, Some("{\"id\":5}")).await;
     assert!(st.is_client_error(), "{st}");
     let m = error(&body.unwrap());
     assert_eq!(m.code, "control.request_rejected");

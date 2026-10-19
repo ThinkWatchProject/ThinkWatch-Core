@@ -184,6 +184,107 @@ pub fn with_values(m: &Manifest, source: &str) -> Option<Manifest> {
     Some(out)
 }
 
+/// 把一份源码拆成**代码**和**数据**，给配置包、同步按这两样分开比较（`tw_pack::model`）。
+///
+/// 数据是出错时怎么办、范围、每个设置的值；代码是完整的源码，manifest 字面量里的数据去掉，
+/// 字面量按固定的样子重写（[`literal::write`]）—— 只差数据的两份源码拆出来的代码一字不差，
+/// 字面量原来怎么排版都一样。代码本身还是一份能读的源码：数据都是不写时的值。读不出 manifest
+/// 是 None
+pub fn split_data(source: &str) -> Option<(String, serde_json::Value)> {
+    let lit = literal::find(source).ok()?;
+    let values = lit.values()?;
+    let literal::Data::Object(fields) = &lit.data else {
+        return None;
+    };
+    let code_fields = fields
+        .iter()
+        .filter(|(k, _)| k != "on_error" && k != "match")
+        .map(|(k, v)| {
+            let v = match (k.as_str(), v) {
+                ("settings", literal::Data::Object(specs)) => literal::Data::Object(
+                    specs
+                        .iter()
+                        .map(|(name, spec)| {
+                            let spec = match spec {
+                                literal::Data::Object(f) => literal::Data::Object(
+                                    f.iter().filter(|(k, _)| k != "value").cloned().collect(),
+                                ),
+                                other => other.clone(),
+                            };
+                            (name.clone(), spec)
+                        })
+                        .collect(),
+                ),
+                _ => v.clone(),
+            };
+            (k.clone(), v)
+        })
+        .collect();
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let code = format!(
+        "{}{}{}",
+        &source[..lit.span.start],
+        literal::write(&literal::Data::Object(code_fields), "", newline),
+        &source[lit.span.end..]
+    );
+    let data = serde_json::json!({
+        "on_error": values.on_error.as_str(),
+        "match": {
+            "clients": values.scope.clients,
+            "models": values.scope.models,
+            "upstreams": values.scope.upstreams,
+        },
+        "settings": values.settings.into_iter().collect::<serde_json::Map<_, _>>(),
+    });
+    Some((code, data))
+}
+
+/// [`split_data`] 反过来：把数据写进源码，**只换 manifest 那一段**。数据和源码声明的对不上
+/// （设置不在、类型不对）是 None
+pub fn join_data(source: &str, data: &serde_json::Value) -> Option<String> {
+    let strings = |v: Option<&serde_json::Value>| -> Option<Vec<String>> {
+        match v {
+            None | Some(serde_json::Value::Null) => Some(Vec::new()),
+            Some(serde_json::Value::Array(a)) => {
+                a.iter().map(|x| x.as_str().map(str::to_string)).collect()
+            }
+            _ => None,
+        }
+    };
+    let on_error = match data.get("on_error").and_then(serde_json::Value::as_str) {
+        Some(s) => tw_plugin::OnError::from_manifest(s)?,
+        None => tw_plugin::OnError::Reject,
+    };
+    let m = data.get("match");
+    let values = Values {
+        on_error,
+        scope: tw_plugin::Scope {
+            clients: strings(m.and_then(|m| m.get("clients")))?,
+            models: strings(m.and_then(|m| m.get("models")))?,
+            upstreams: strings(m.and_then(|m| m.get("upstreams")))?,
+        },
+        settings: match data.get("settings") {
+            Some(serde_json::Value::Object(o)) => {
+                o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(_) => return None,
+        },
+    };
+    literal::rewrite(source, &values).ok()
+}
+
+/// 这份源码的插件改不改得了回答里的工具调用（权限有 `reply_tool_calls`），**不编译**，照
+/// 文件里写着的 manifest 判断。读不出来的按改得了算
+pub fn steers_declared(source: &[u8]) -> bool {
+    display_manifest(source)
+        .is_none_or(|m| m.permissions.contains(&tw_api::Permission::ReplyToolCalls))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +432,39 @@ mod tests {
         assert_eq!(patched, load(&out));
         assert_eq!(patched.on_error, OnError::Skip);
         assert_eq!(patched.settings[0].value, json!("b"));
+    }
+
+    /// 只差数据的两份源码拆出来代码一样；数据写回去就是原来的数据
+    #[test]
+    fn code_and_data_split_apart_and_join_back() {
+        let a = SRC;
+        let b = rewrite(
+            SRC,
+            OnError::Skip,
+            &scope(&["claude-*"]),
+            &BTreeMap::from([("note".to_string(), SettingValue::String("b".into()))]),
+        )
+        .unwrap();
+        let (code_a, data_a) = split_data(a).unwrap();
+        let (code_b, data_b) = split_data(&b).unwrap();
+        assert_eq!(code_a, code_b, "只差数据，代码就该一样");
+        assert_ne!(data_a, data_b);
+        assert_eq!(data_b["on_error"], "skip");
+        assert_eq!(data_b["match"]["models"], json!(["claude-*"]));
+        assert_eq!(data_b["settings"]["note"], "b");
+        // 代码本身读得出 manifest，数据都是不写时的值
+        let (_, empty) = split_data(&code_a).unwrap();
+        assert_eq!(empty["settings"]["note"], "");
+        // 数据写回代码：和原来那一份数据一样
+        let back = join_data(&code_a, &data_b).unwrap();
+        assert_eq!(split_data(&back).unwrap().1, data_b);
+        assert!(back.contains("export function onRequest(req) { return req; }"));
+        // 数据写回原文件：只差数据时原样返回
+        assert_eq!(join_data(a, &data_a).unwrap(), a);
+        // 数据和源码对不上
+        assert!(join_data(a, &json!({"settings": {"unknown": 1}})).is_none());
+        assert!(split_data("no manifest here").is_none());
+        assert!(steers_declared(b"no manifest here"));
+        assert!(!steers_declared(SRC.as_bytes()));
     }
 }

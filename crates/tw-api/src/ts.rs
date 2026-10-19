@@ -446,7 +446,7 @@ mod tests {
         // core 自己写配置（默认插件）的那一版有自己的来源
         assert_eq!(
             decl_of(&ts, "ConfigOrigin"),
-            "export type ConfigOrigin = \"ui\" | \"cli\" | \"external\" | \"rollback\" | \"rotation\" | \"defaults\""
+            "export type ConfigOrigin = \"ui\" | \"cli\" | \"external\" | \"rotation\" | \"defaults\" | \"sync\" | \"import\" | \"restore\" | \"repair\""
         );
     }
 

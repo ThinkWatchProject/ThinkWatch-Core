@@ -1588,22 +1588,28 @@ async fn raw_configuration_writes_cannot_bypass_the_confirmation() {
     assert_eq!(b.config(), before);
     std::fs::write(b.file(&id), rewrite_calls()).unwrap();
 
-    // 回滚到它开着的那一版：拒绝
+    // 恢复到它开着的那一版：恢复了，但插件停在待批准，跑不起来 —— 打开它要在这里点头
     let (st, v) = b.save_confirmed(&id, &rewrite_calls(), true).await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    let on = b.version().await;
+    let on_backup = tw_pack::backup::list(&b.dir.join("config.yaml"))
+        .unwrap()
+        .last()
+        .unwrap()
+        .id
+        .clone();
     let (st, v) = b.save(&id, &rewrite_calls(), false).await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    let before = b.config();
     let (st, v) = call(
         &b.app,
         "POST",
-        "/config/rollback",
-        Some(json!({"version": on})),
+        "/backups/restore",
+        Some(json!({"id": on_backup, "base_version": b.version().await})),
     )
     .await;
-    refused(st, &v, "rolling back to a version where it was on");
-    assert_eq!(b.config(), before);
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let p = b.parsed().plugins.into_iter().find(|p| p.id == id).unwrap();
+    assert!(p.enabled);
+    assert_ne!(p.sha256, sha(&rewrite_calls()), "恢复替人批准了");
 
     // 和插件无关的改动照常
     let (st, v) = put(shown().await.replace("# 默认那把", "# 改了一个注释")).await;

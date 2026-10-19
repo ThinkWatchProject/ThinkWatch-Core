@@ -28,13 +28,37 @@ endpoints! {
     /// 诊断包（Markdown，已脱敏）
     Diagnostics: GET "/diagnostics", () => String, text;
 
-    // ─────────────────────────────────────────────── 配置原文与历史
+    // ─────────────────────────────────────────────── 配置原文
     GetConfig: GET "/config", () => api::ConfigText;
     PatchConfig: PATCH "/config", api::ConfigPatch => api::ConfigWritten;
     PutConfig: PUT "/config", api::ConfigWrite => api::ConfigWritten;
-    ConfigHistory: GET "/config/history", () => Vec<api::ConfigVersion>;
     ConfigAt: GET "/config/at", api::ConfigAtQuery => api::ConfigAt;
-    ConfigRollback: POST "/config/rollback", api::RollbackRequest => api::ConfigWritten;
+    // ─────────────────────────────────────────────── 配置包、导入导出、备份
+    //
+    // 一个项目是配置里有名字的一样东西（上游、密钥、路由……），加上全局设置的每一节和
+    // Lite 的通用偏好。导入、恢复都按项目列、按项目选。**备份的几个在安全模式下照样可用**：
+    // 配置读不进来时从备份恢复。
+    /// 配置里的每个项目，和它引用的项目
+    ConfigItems: GET "/config/items", () => Vec<api::ItemNode>;
+    /// 导出成配置包：全部，或者选的几项连同它们引用的。**不写任何东西**
+    ExportConfig: POST "/config/export", api::ExportRequest => api::ExportedFile;
+    /// 导入会怎么做：逐项新增、相同、冲突、错误。**不写任何东西**
+    ImportPreview: POST "/config/import/preview", api::ImportSource => api::ImportPreview;
+    /// 照逐项的处理导入。预览之后配置变了是 409，重新预览
+    ImportConfig: POST "/config/import", api::ImportRequest => api::ConfigWritten;
+    /// 备份版本，新的在前
+    Backups: GET "/backups", () => Vec<api::BackupEntry>;
+    /// 一个版本另存为配置包
+    BackupFile: POST "/backups/file", api::BackupFileRequest => api::ExportedFile;
+    /// 恢复到一个版本会改什么。**不写任何东西**
+    RestorePreview: POST "/backups/preview", api::RestorePreviewRequest => api::RestorePreview;
+    /// 恢复到一个版本（全部，或者选的几项）。恢复本身也留一个版本
+    Restore: POST "/backups/restore", api::RestoreRequest => api::ConfigWritten;
+    /// Lite 的通用偏好
+    GetClientPrefs: GET "/client-prefs", () => api::ClientPrefs;
+    PutClientPrefs: PUT "/client-prefs", api::ClientPrefs => ();
+    /// 本机接管的客户端在用的网关密钥
+    PinKeys: PUT "/pinned-keys", api::PinnedKeys => ();
     /// 配置读不进来时，一键修复会改哪几处
     ConfigRepairPlan: GET "/config/repair", () => api::ConfigRepair;
     /// 照那几处修好写回：取值改回默认值、删掉不认识的字段
