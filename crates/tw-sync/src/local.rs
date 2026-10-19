@@ -64,6 +64,10 @@ pub struct State {
     /// 的分开算（等得更久）
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub arriving: BTreeMap<String, u64>,
+    /// 同步位置上的通用偏好太大、这台留着自己的：留下时本机偏好的指纹。之后同步位置上的变回
+    /// 能写的、本机的又没改过，就照同步的样子落地（本机的不算改动）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_prefs: Option<String>,
     /// 同步位置看上去是空的：从什么时候起、连着几轮
     pub empty_since_ms: Option<u64>,
     pub empty_rounds: u32,

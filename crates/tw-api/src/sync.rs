@@ -136,6 +136,9 @@ pub struct SyncView {
     /// 同步位置上跳过了的文件：坏了的、不是这把密钥加密的、加密的位置上没加密的、等了
     /// 30 分钟还没传完的。不是 0 时界面提一句
     pub skipped: u32,
+    /// 同步成了，但有没照办的地方（上一轮的）：界面提一句，**不是失败**，不计入连不上。现在
+    /// 只有 `sync.prefs_too_large`：同步数据里的通用偏好超出上限，这台留着自己的，其余照常
+    pub notices: Vec<Msg>,
 }
 
 /// `POST /sync/test`、`POST /sync/enable/preview`：连上去看看。

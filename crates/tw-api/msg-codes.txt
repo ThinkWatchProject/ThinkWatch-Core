@@ -586,6 +586,7 @@ sync.passphrase_changed
 sync.passphrase_short
 sync.passphrase_wrong
 sync.place_changed
+sync.prefs_too_large
 sync.proxy_unusable
 sync.s3.bad_listing
 sync.s3.sign
@@ -611,6 +612,7 @@ t.boom test
 t.broke test
 t.limited test
 t.plugin_threw test
+t.prefs test
 t.upstream test
 t.x test
 yaml.anchor_or_alias

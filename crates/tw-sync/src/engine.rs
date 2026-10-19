@@ -233,6 +233,18 @@ pub struct Report {
     /// 同步位置上跳过了的文件：坏了的、不是这把密钥加密的、加密的位置上没加密的、等了太久
     /// 还没传完的
     pub skipped: u32,
+    /// 同步成了，但有没照办的地方，要告诉人（现在只有：通用偏好太大，没应用，
+    /// [`prefs_too_large_msg`]）
+    pub notices: Vec<Msg>,
+}
+
+/// 同步来的通用偏好超出上限、没有应用（其余照常）
+pub fn prefs_too_large_msg() -> Msg {
+    msg!(
+        "sync.prefs_too_large", limit = tw_api::CLIENT_PREFS_MAX / 1024 =>
+        "the general preferences in the sync data are larger than {limit} KiB, so this device \
+         keeps its own; everything else was synced"
+    )
 }
 
 /// 读出来的一个版本
@@ -353,7 +365,7 @@ fn local_err(e: impl std::fmt::Display) -> RoundError {
 }
 
 /// 内容的 SHA-256：配置原文、插件、通用偏好（不加密的版本带着它，发现传输损坏）
-fn content_sha256(p: &Pack) -> String {
+pub fn content_sha256(p: &Pack) -> String {
     let mut h = Sha256::new();
     h.update(p.config_yaml.as_bytes());
     for (id, f) in &p.plugins {
@@ -632,6 +644,49 @@ pub fn adopted_default_key(local: &Snapshot, remote: &Snapshot) -> Option<ItemId
     let id = ItemId::new(ItemKind::Key, name);
     let (l, r) = (local.items.get(&id)?, remote.items.get(&id)?);
     (key_value(l) != key_value(r)).then_some(id)
+}
+
+// ─────────────────────────────────────────────── 太大的通用偏好
+
+fn prefs_id() -> ItemId {
+    ItemId::new(ItemKind::ClientPrefs, "")
+}
+
+/// 这一份里的通用偏好写不进本机：拼回 JSON 之后超出上限（[`tw_pack::disk::prefs_too_large`]，
+/// 写偏好的地方都按它拒收）
+fn prefs_oversized(s: &Snapshot) -> bool {
+    let Some(it) = s.items.get(&prefs_id()) else {
+        return false;
+    };
+    let only = Snapshot {
+        items: BTreeMap::from([(prefs_id(), it.clone())]),
+    };
+    let empty = Pack {
+        manifest: tw_pack::Manifest::new(PackKind::Full, PackOrigin::Sync),
+        config_yaml: format!("version: {}\n", tw_config::SCHEMA_VERSION),
+        plugins: Default::default(),
+        client_prefs: None,
+    };
+    model::materialize(&empty, &only)
+        .ok()
+        .and_then(|p| p.client_prefs)
+        .is_some_and(|p| tw_pack::disk::prefs_too_large(&p))
+}
+
+/// 本机通用偏好此刻的指纹（[`State::held_prefs`]）
+fn prefs_print(s: &Snapshot) -> String {
+    let units = s.items.get(&prefs_id()).map(|it| &it.units);
+    let json = serde_json::to_string(&units).unwrap_or_default();
+    let out: [u8; 32] = Sha256::digest(json.as_bytes()).into();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 一个项目照 `from` 的样子（`from` 里没有就去掉）
+fn put_item(dst: &mut Snapshot, from: &Snapshot, id: &ItemId) {
+    match from.items.get(id) {
+        Some(it) => dst.items.insert(id.clone(), it.clone()),
+        None => dst.items.remove(id),
+    };
 }
 
 // ─────────────────────────────────────────────── 等登录的上游
@@ -1598,6 +1653,7 @@ impl<S: Store, H: Host> Engine<S, H> {
             return Ok(Report {
                 encrypted: kr,
                 conflicts: self.last_report.conflicts.clone(),
+                notices: self.last_report.notices.clone(),
                 devices: self.devices().await?,
                 skipped,
                 ..Default::default()
@@ -1644,6 +1700,16 @@ impl<S: Store, H: Host> Engine<S, H> {
             if let (Some(it), Some(s)) = (local.items.get_mut(&id), synced) {
                 copy_disabled(it, &s);
             }
+        }
+        // 同步位置上的偏好太大时这台留着自己的（见下）。之后同步位置上的变回能写的：这台的偏好
+        // 一直没动过的话，不算本机改了（换回同步的样子再合并），同步位置上的照常落地
+        let hold_prefs = prefs_oversized(&remote.snap);
+        if let Some(print) = st.held_prefs.take()
+            && !hold_prefs
+            && prefs_print(&local) == print
+        {
+            let synced = base.as_ref().map(|b| &b.snap).unwrap_or(&remote.snap);
+            put_item(&mut local, synced, &prefs_id());
         }
         // 别的设备处理掉了的冲突：照同步版本改
         let open_ids: BTreeSet<&str> = remote.conflicts.iter().map(|c| c.id.as_str()).collect();
@@ -1761,6 +1827,14 @@ impl<S: Store, H: Host> Engine<S, H> {
         for (o, _) in ORDERS {
             hold_items.insert(ItemId::new(*o, ""));
         }
+        // 同步位置上的通用偏好太大、写不进本机：两边各留各的 —— 本机不应用，上传的也不拿本机
+        // 的去换掉别的设备的。其余照常
+        let mut notices = Vec::new();
+        if hold_prefs {
+            hold_items.insert(prefs_id());
+            notices.push(prefs_too_large_msg());
+            st.held_prefs = Some(prefs_print(&local_snap));
+        }
         // 不加密时经同步停用的插件：本机启用了就放开
         st.held_plugins.retain(|id, _| {
             let item = local.items.get(&ItemId::new(ItemKind::Plugin, id.clone()));
@@ -1860,6 +1934,15 @@ impl<S: Store, H: Host> Engine<S, H> {
                 });
             }
         }
+        // 两边各自不大、合起来太大：本机留本机的，上传的留同步位置的
+        if prefs_oversized(&target) {
+            put_item(&mut target, &local_snap, &prefs_id());
+            put_item(&mut shared, &remote.snap, &prefs_id());
+            if notices.is_empty() {
+                notices.push(prefs_too_large_msg());
+            }
+            st.held_prefs = Some(prefs_print(&local_snap));
+        }
         target.relink();
         shared.relink();
         // 没登录的上游在这台停用着
@@ -1937,6 +2020,7 @@ impl<S: Store, H: Host> Engine<S, H> {
         let mut report = Report {
             encrypted: kr,
             skipped,
+            notices,
             ..Default::default()
         };
         let mut content_after = quiet.content.clone();
@@ -2407,6 +2491,14 @@ impl<S: Store, H: Host> Engine<S, H> {
             set_order(&mut target, *o, m.local);
             set_order(&mut shared, *o, m.shared);
         }
+        // 通用偏好太大、写不进本机：本机留本机的，上传的照同步数据
+        let mut notices = Vec::new();
+        if prefs_oversized(&target) {
+            put_item(&mut target, &local, &prefs_id());
+            put_item(&mut shared, &remote.snap, &prefs_id());
+            notices.push(prefs_too_large_msg());
+            st.held_prefs = Some(prefs_print(&local));
+        }
         target.relink();
         shared.relink();
         // 本机这一份：没登录的停用着；同步的样子是启用着的，记成等登录
@@ -2447,6 +2539,7 @@ impl<S: Store, H: Host> Engine<S, H> {
         let mut report = Report {
             encrypted: self.sealed,
             skipped: sc.skipped.len() as u32,
+            notices,
             ..Default::default()
         };
         if model::normalized(&target) != model::normalized(&local) {

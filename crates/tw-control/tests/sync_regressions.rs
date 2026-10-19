@@ -449,3 +449,64 @@ async fn a_fresh_device_with_clients_set_up_adopts_the_default_key() {
     a.ok("POST", "/sync/now", Value::Null).await;
     assert_eq!(a.config().clients[0].key, "tw-default-a");
 }
+
+/// 同步位置上来了一份超出上限的通用偏好（别处写进来的）：这一轮不失败，偏好不应用、其余照常，
+/// 视图里如实说（`notices`），不是错误、也不计入连不上
+#[tokio::test]
+async fn oversized_preferences_in_the_sync_data_do_not_fail_the_round() {
+    let loc = tempfile::tempdir().unwrap();
+    let (a, b) = (Dev::new('a'), Dev::new('b'));
+    a.enable(loc.path(), false, "A", Value::Null).await;
+    b.enable(loc.path(), false, "B", Value::Null).await;
+    // 依据最新的那个版本，写一个带着很大偏好的版本进去
+    let mut names: Vec<String> = std::fs::read_dir(loc.path().join("versions"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    let head = names
+        .last()
+        .unwrap()
+        .trim_end_matches(".twconfig")
+        .to_string();
+    let seq: u64 = head[..10].parse().unwrap();
+    let text = add_raw(
+        &tw_pack::read(
+            &std::fs::read(loc.path().join("versions").join(format!("{head}.twconfig"))).unwrap(),
+            tw_pack::Unseal::None,
+        )
+        .unwrap()
+        .config_yaml,
+        "  - name: elsewhere\n    base_url: https://e.example\n    key: sk-e\n",
+    );
+    let mut pack = tw_pack::Pack {
+        manifest: tw_pack::Manifest::new(tw_pack::PackKind::Full, tw_pack::PackOrigin::Sync),
+        config_yaml: text,
+        plugins: Default::default(),
+        client_prefs: Some(json!({ "notes": "x".repeat(70 * 1024) })),
+    };
+    let meta = tw_sync::record::Meta {
+        seq: seq + 1,
+        device: "eeeeeeee-0000-4000-8000-00000000000e".into(),
+        device_name: "Elsewhere".into(),
+        parents: vec![head],
+        sha256: Some(tw_sync::engine::content_sha256(&pack)),
+        ..Default::default()
+    };
+    pack.manifest.sync = Some(serde_json::to_value(&meta).unwrap());
+    std::fs::write(
+        loc.path()
+            .join("versions")
+            .join(format!("{:010}-eeeeeeee.twconfig", seq + 1)),
+        tw_pack::write(&pack, tw_pack::Seal::None).unwrap(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let v = b.ok("POST", "/sync/now", Value::Null).await;
+        assert_eq!(v["state"], "idle", "{v}");
+        assert!(v["error"].is_null(), "{v}");
+        assert!(v["failing_since_ms"].is_null(), "{v}");
+        assert_eq!(v["notices"][0]["code"], "sync.prefs_too_large", "{v}");
+    }
+    assert!(b.provider("elsewhere").is_some(), "其余照常应用");
+}
