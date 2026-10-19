@@ -132,8 +132,14 @@ async fn apply_pack(
                 e,
             )
         })?;
-    // 远程连接下偏好在 Lite 那边；同步这一路跑在 core 自己的任务里，不是远程连接
-    let prefs_changed = after.client_prefs.is_some() && after.client_prefs != before.client_prefs;
+    // 远程连接下偏好在 Lite 那边；同步这一路跑在 core 自己的任务里，不是远程连接。太大的偏好
+    // 不写（引擎已经不会给，也报了 `sync.prefs_too_large`）：其余照常，不让整轮失败
+    let prefs_changed = after.client_prefs.is_some()
+        && after.client_prefs != before.client_prefs
+        && !after
+            .client_prefs
+            .as_ref()
+            .is_some_and(tw_pack::disk::prefs_too_large);
     if prefs_changed && let Err(e) = tw_pack::disk::write_prefs(&path, after.client_prefs.as_ref())
     {
         undo.restore();
@@ -613,6 +619,7 @@ impl Sync {
             excluded: Vec::new(),
             excluded_cascade: Vec::new(),
             skipped: 0,
+            notices: Vec::new(),
         };
         let Some(mgr) = self.mgr() else { return off };
         let cfg = mgr.gateway().config();
@@ -640,6 +647,11 @@ impl Sync {
             .map(|r| r.skipped)
             .or(prev.as_ref().map(|p| p.skipped))
             .unwrap_or(0);
+        let notices = report
+            .as_ref()
+            .map(|r| r.notices.clone())
+            .or(prev.as_ref().map(|p| p.notices.clone()))
+            .unwrap_or_default();
         let devices = match &report {
             Some(r) => r
                 .devices
@@ -694,6 +706,7 @@ impl Sync {
             excluded: sync.exclude.clone(),
             excluded_cascade: cascade,
             skipped,
+            notices,
         }
     }
 

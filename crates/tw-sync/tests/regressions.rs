@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use sha2::Digest;
 use tw_pack::{Pack, PackKind, PackOrigin, Seal};
 use tw_sync::engine::{
     ApplyError, Current, Decision, Engine, Host, RoundError, SKIP_AFTER_MS, Settings, Take,
@@ -47,6 +46,11 @@ impl Dev {
     fn path(&self) -> PathBuf {
         self.dir.path().join("config.yaml")
     }
+    /// 通用偏好（和控制面一样存在配置旁边）
+    fn prefs(&self) -> Option<serde_json::Value> {
+        let b = std::fs::read(self.dir.path().join("prefs.json")).ok()?;
+        serde_json::from_slice(&b).ok()
+    }
     fn text(&self) -> String {
         std::fs::read_to_string(self.path()).unwrap()
     }
@@ -75,7 +79,7 @@ impl Host for Dev {
                 manifest: tw_pack::Manifest::new(PackKind::Full, PackOrigin::Ui),
                 config_yaml: text.clone(),
                 plugins: Default::default(),
-                client_prefs: None,
+                client_prefs: self.prefs(),
             },
             version: tw_config::version_of(&text),
             changed_ms: 1,
@@ -86,7 +90,24 @@ impl Host for Dev {
             return Err(ApplyError::Stale);
         }
         tw_config::try_parse(&pack.config_yaml).map_err(|r| ApplyError::Rejected(r.msg()))?;
+        // 和控制面一样：写不进的偏好（超出上限）整个应用就失败
+        if pack
+            .client_prefs
+            .as_ref()
+            .is_some_and(tw_pack::disk::prefs_too_large)
+        {
+            return Err(ApplyError::Rejected(tw_types::msg!(
+                "t.prefs" => "preferences too large"
+            )));
+        }
         std::fs::write(self.path(), &pack.config_yaml).unwrap();
+        let prefs = self.dir.path().join("prefs.json");
+        match &pack.client_prefs {
+            Some(p) => std::fs::write(prefs, serde_json::to_vec(p).unwrap()).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(prefs);
+            }
+        }
         Ok(())
     }
     fn pinned_keys(&self) -> BTreeSet<String> {
@@ -183,6 +204,15 @@ fn read_version(loc: &Path, id: &str) -> Vec<u8> {
 /// 没有口令的人往同步位置里放一个不加密的版本（manifest.sync 照格式写、带 SHA-256），依据
 /// 最新的那一个
 fn forge_plain_version(loc: &Path, config_yaml: String) -> String {
+    forge_plain_version_with(loc, config_yaml, None)
+}
+
+/// 同上，带着通用偏好
+fn forge_plain_version_with(
+    loc: &Path,
+    config_yaml: String,
+    client_prefs: Option<serde_json::Value>,
+) -> String {
     let head = versions(loc)
         .last()
         .unwrap()
@@ -193,10 +223,9 @@ fn forge_plain_version(loc: &Path, config_yaml: String) -> String {
         manifest: tw_pack::Manifest::new(PackKind::Full, PackOrigin::Sync),
         config_yaml,
         plugins: Default::default(),
-        client_prefs: None,
+        client_prefs,
     };
-    let sha: [u8; 32] = sha2::Sha256::digest(pack.config_yaml.as_bytes()).into();
-    let sha: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+    let sha = tw_sync::engine::content_sha256(&pack);
     let meta = tw_sync::record::Meta {
         seq: seq + 1,
         device: "eeeeeeee-0000-4000-8000-00000000000e".into(),
@@ -1006,6 +1035,42 @@ async fn an_icloud_placeholder_that_never_downloads_is_skipped_after_a_day() {
     let r = t.eb.round().await.unwrap();
     assert_eq!(r.skipped, 1);
     assert!(r.uploaded.is_some());
+}
+
+// ─────────────────────────────────────────────── 太大的通用偏好
+
+/// 同步位置上的通用偏好超出上限（别处写进来的，这台写不进）：偏好不应用、其余照常，报
+/// `sync.prefs_too_large`，**不算失败**；之后上传的版本也不拿本机的偏好去换掉同步位置上的
+#[tokio::test]
+async fn oversized_preferences_are_left_out_and_the_rest_applies() {
+    let mut t = bed(false).await;
+    let big = serde_json::json!({ "notes": "x".repeat(70 * 1024) });
+    assert!(tw_pack::disk::prefs_too_large(&big));
+    let cfg = add_provider(&t.a.text(), "elsewhere", "https://e.example", "sk-e");
+    forge_plain_version_with(t.loc.path(), cfg, Some(big.clone()));
+    let r = t.eb.round().await.unwrap();
+    let codes: Vec<&str> = r.notices.iter().map(|m| m.code.as_str()).collect();
+    assert_eq!(codes, ["sync.prefs_too_large"]);
+    assert!(t.b.provider("elsewhere").is_some(), "其余照常应用");
+    assert!(r.uploaded.is_none(), "不拿本机的偏好去换");
+    // 下一轮（走捷径）还说着
+    let r = t.eb.round().await.unwrap();
+    assert_eq!(r.notices.len(), 1);
+    // B 改了别的：上传的版本里偏好还是同步位置上的那一份
+    t.b.edit(|s| add_provider(s, "bnew", "https://bnew.example", "sk-bn"));
+    let up = t.eb.round().await.unwrap().uploaded.unwrap();
+    let p = tw_pack::read(&read_version(t.loc.path(), &up), tw_pack::Unseal::None).unwrap();
+    assert_eq!(p.client_prefs, Some(big));
+    assert_eq!(t.b.prefs(), None, "B 的偏好没动");
+    // 同步位置上的偏好变回不大的：照常落地（B 的偏好一直没动过，不算 B 改了），提示没了
+    let small = serde_json::json!({ "notes": "short" });
+    forge_plain_version_with(t.loc.path(), t.b.text(), Some(small.clone()));
+    let r = t.eb.round().await.unwrap();
+    assert!(r.notices.is_empty(), "{:?}", r.notices);
+    assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+    assert_eq!(t.b.prefs(), Some(small.clone()));
+    t.ea.round().await.unwrap();
+    assert_eq!(t.a.prefs(), Some(small));
 }
 
 // ─────────────────────────────────────────────── 空的同步位置

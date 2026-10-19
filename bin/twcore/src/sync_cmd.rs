@@ -93,6 +93,9 @@ fn print_view(v: &tw_api::SyncView) {
     if let Some(e) = &v.error {
         println!("problem: {}", e.text);
     }
+    for n in &v.notices {
+        println!("note: {}", n.text);
+    }
     if v.conflicts > 0 {
         println!(
             "conflicts: {} (resolve them in ThinkWatch Lite, Settings → Sync and backup)",
@@ -242,13 +245,18 @@ fn decide(row: &tw_api::ImportRow) -> Result<serde_json::Value> {
         name => format!("{} `{name}`", row.item.kind.slug()),
     };
     eprintln!("{what}{differs} differs between this device and the sync data:");
-    eprintln!("  u  use the sync data (default)");
+    eprintln!("  u  use the sync data (default): this device takes the other devices' version");
     eprintln!(
-        "  k  keep this device's version; it is uploaded and replaces the other devices' one"
+        "  k  keep this device's version: it is uploaded with this join and replaces the \
+         other devices' version"
     );
     let rename = row.suggested_name.clone().filter(|_| !row.global);
     if let Some(n) = &rename {
-        eprintln!("  r  keep both: the sync data's one is added as {n}");
+        eprintln!(
+            "  r  keep both: the sync data's version is added here as {n}; this device's \
+             version keeps the name and is uploaded with this join, replacing the item of \
+             that name on the other devices (they get {n} too)"
+        );
     }
     loop {
         let a = ask("Choice", Some("u"))?;

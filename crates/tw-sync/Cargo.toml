@@ -14,6 +14,8 @@ description = "Multi-device configuration sync: folder, WebDAV and S3 locations,
 # `sync` 一节的形状、地址规则
 tw-config = { workspace = true }
 tw-types = { workspace = true }
+# 通用偏好的上限
+tw-api = { workspace = true }
 # 配置包的格式与加密、把一份配置拆成项目与合并单位
 tw-pack = { workspace = true }
 # S3 的 SigV4 和 Bedrock 用的是同一份
