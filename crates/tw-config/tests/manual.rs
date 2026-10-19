@@ -378,8 +378,10 @@ fn check_section(s: &Section, all: &[Section], errs: &mut Vec<String>) {
                         s.path, r.name
                     ));
                 }
-                // 一个列表可以是必填的（策略组的成员）：它自己是值，不是一个有默认值的对象
-                let list = matches!(r.kind, Kind::StrsOrObjs(_)) && matches!(r.def, Def::Required);
+                // 一个列表可以是必填的（策略组的成员）：它自己是值，不是一个有默认值的对象。
+                // 一个对象也可以是必填的（同步位置）：不写它这一节就不成立
+                let list = matches!(r.kind, Kind::StrsOrObjs(_) | Kind::Obj(_))
+                    && matches!(r.def, Def::Required);
                 if !list && !matches!(r.def, Def::Section | Def::Is(_) | Def::Unset) {
                     errs.push(format!(
                         "{}.{} is an object; its default is the section's own",

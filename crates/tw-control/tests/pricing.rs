@@ -211,7 +211,7 @@ async fn a_sheet_is_created_chosen_renamed_and_deleted_only_once_nobody_uses_it(
 async fn a_sheet_saved_with_its_upstreams_assigns_them_in_the_same_version() {
     let b = bed(BASE);
     let versions = || {
-        tw_config::history::list(&b.dir.path().join("config.yaml"))
+        tw_pack::backup::list(&b.dir.path().join("config.yaml"))
             .unwrap()
             .len()
     };

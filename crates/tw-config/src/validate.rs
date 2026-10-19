@@ -28,6 +28,14 @@ pub enum ValidationError {
     DuplicateClientKey(String, String, String),
     #[error("{}", self.msg())]
     BadBaseUrl { name: String, url: String },
+    /// 地址里有反斜杠：URL 库把它当成路径的分隔（`https://a\\@b/` 连的是 a），人读起来
+    /// 像是 b —— 两种读法对不上的地址一律不收
+    #[error("{}", self.msg())]
+    BaseUrlBackslash { name: String, url: String },
+    /// 地址的主机前面写了用户名或密码（`https://user:pass@host`）：凭据写在 `key` 或
+    /// `headers` 里。消息里不带地址：那一段就是密码
+    #[error("{}", self.msg())]
+    BaseUrlUserinfo { name: String },
     #[error("{}", self.msg())]
     EmptyKey { name: String },
     #[error("{}", self.msg())]
@@ -156,6 +164,9 @@ pub enum ValidationError {
         days: u64,
         min: u64,
     },
+    /// `sync` 一节写得不对（[`crate::sync::SyncError`]）
+    #[error("{}", self.msg())]
+    Sync(crate::sync::SyncError),
 }
 
 impl ValidationError {
@@ -204,6 +215,16 @@ impl ValidationError {
             BadBaseUrl { name, url } => msg!(
                 "config.bad_base_url", upstream = name, url = url =>
                 "the endpoint of upstream `{upstream}` is neither http nor https: {url}"
+            ),
+            BaseUrlBackslash { name, url } => msg!(
+                "config.base_url_backslash", upstream = name, url = url =>
+                "the endpoint of upstream `{upstream}` contains a backslash: {url}. Write the \
+                 address with forward slashes only"
+            ),
+            BaseUrlUserinfo { name } => msg!(
+                "config.base_url_userinfo", upstream = name =>
+                "the endpoint of upstream `{upstream}` has a user name or password before the \
+                 host. Put the credential in `key` or `headers` instead"
             ),
             EmptyKey { name } => msg!(
                 "config.empty_key", key = name =>
@@ -443,6 +464,7 @@ impl ValidationError {
                  After a restart the total for the {per} is added up again from the request \
                  records, so row_days has to be at least {min}"
             ),
+            Sync(e) => e.msg(),
         }
     }
 }
@@ -479,6 +501,19 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             return Err(ValidationError::BadBaseUrl {
                 name: p.name.clone(),
                 url: p.base_url.clone(),
+            });
+        }
+        if p.base_url.contains('\\') {
+            return Err(ValidationError::BaseUrlBackslash {
+                name: p.name.clone(),
+                url: p.base_url.clone(),
+            });
+        }
+        if let Ok(u) = url::Url::parse(p.base_url.trim())
+            && (!u.username().is_empty() || u.password().is_some())
+        {
+            return Err(ValidationError::BaseUrlUserinfo {
+                name: p.name.clone(),
             });
         }
         p.check_credential()
@@ -676,6 +711,12 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 });
             }
         }
+    }
+    // 同步。**代理名要对得上** `proxies`：同步位置的请求经它发出，指到一个不存在的代理上，
+    // 表现是每一次同步都失败，而原因不在同步设置里
+    if let Some(sync) = &cfg.sync {
+        sync.check().map_err(ValidationError::Sync)?;
+        crate::sync::check_proxy(&sync.target, &cfg.proxies).map_err(ValidationError::Sync)?;
     }
     Ok(())
 }
@@ -1210,6 +1251,46 @@ mod tests {
             validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "api.example.com")])),
             Err(ValidationError::BadBaseUrl { .. })
         ));
+    }
+
+    /// 两种读法对不上的地址不收：反斜杠（URL 库当成路径分隔，人读成主机前的一段）、主机前
+    /// 的用户名和密码
+    #[test]
+    fn a_base_url_that_reads_two_ways_is_refused() {
+        for url in [
+            "https://evil.example\\@relay.example/v1",
+            "https://relay.example\\v1",
+        ] {
+            let e = validate(&cfg(vec![c("d", "tw-1")], vec![p("r", url)])).unwrap_err();
+            assert!(
+                matches!(e, ValidationError::BaseUrlBackslash { .. }),
+                "{url}: {e}"
+            );
+            assert_eq!(e.msg().code, "config.base_url_backslash");
+        }
+        for url in [
+            "https://user:pass@relay.example/v1",
+            "https://user@relay.example",
+            "http://:secret@10.0.0.1:3000",
+        ] {
+            let e = validate(&cfg(vec![c("d", "tw-1")], vec![p("r", url)])).unwrap_err();
+            assert!(
+                matches!(e, ValidationError::BaseUrlUserinfo { .. }),
+                "{url}: {e}"
+            );
+            assert!(
+                !e.to_string().contains("user:pass") && !e.to_string().contains("secret"),
+                "{e}"
+            );
+        }
+        // `@` 在路径里没关系
+        assert!(
+            validate(&cfg(
+                vec![c("d", "tw-1")],
+                vec![p("r", "https://relay.example/v1/@team")]
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1853,6 +1934,11 @@ mod msg_codes {
                 name: "a".into(),
                 url: "ftp://x".into(),
             },
+            BaseUrlBackslash {
+                name: "a".into(),
+                url: "https://a\\@b".into(),
+            },
+            BaseUrlUserinfo { name: "a".into() },
             EmptyKey { name: "k".into() },
             ZeroConcurrency { name: "k".into() },
             ProviderConcurrency {

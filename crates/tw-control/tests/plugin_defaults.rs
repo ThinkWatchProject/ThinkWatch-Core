@@ -314,8 +314,8 @@ async fn the_first_run_adds_every_default_turned_off() {
             .is_some()
     );
 
-    // 写配置的这一版来源是 defaults，一版、一条历史
-    let (_, history) = call(&b.app, "GET", "/config/history", None).await;
+    // 写配置的这一版来源是 defaults，一版、一个备份版本
+    let (_, history) = call(&b.app, "GET", "/backups", None).await;
     let now = history
         .as_array()
         .unwrap()

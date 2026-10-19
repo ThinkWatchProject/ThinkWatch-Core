@@ -5,7 +5,7 @@ mod common;
 use std::time::{Duration, SystemTime};
 
 use axum::http::StatusCode;
-use common::{AK, Fake, SK, keys, signature_of};
+use common::{AK, Fake, SK, keys, signature_for, signature_of};
 use serde_json::json;
 use tw_bedrock::sign::sign;
 
@@ -184,4 +184,63 @@ async fn aws_computes_the_same_signature_from_what_arrives() {
     let (claimed, expected) = signature_of(&seen[0], SK, "us-east-2");
     assert_eq!(claimed, expected);
     assert!(seen[0].header("authorization").unwrap().contains(AK));
+}
+
+/// S3 兼容存储（core 的同步位置）也用这一份签名：服务名是 `s3`，路径收到什么签什么（不再
+/// 编一遍），带上调用方要一起签的头。签过的请求真的发出去，在收到的一端按 S3 的规矩重算
+#[tokio::test]
+async fn an_s3_request_signs_the_way_s3_checks_it() {
+    let fake = Fake::start(|_| (StatusCode::OK, vec![], json!({}))).await;
+    let path = "/tw-sync/me/versions/0000000001-3f9a2c1e.twconfig";
+    let url = reqwest::Url::parse(&format!("{}{path}", fake.uri())).unwrap();
+    let body = b"PK\x03\x04 not really a zip";
+    let extra = [
+        ("content-type", "application/octet-stream"),
+        ("if-none-match", "*"),
+    ];
+    let signed = tw_bedrock::sign_service(
+        &keys(),
+        "auto",
+        "s3",
+        "PUT",
+        url.as_str(),
+        &extra,
+        body,
+        now(),
+    )
+    .unwrap();
+    assert_eq!(
+        signed_headers(&signed),
+        "content-type;host;if-none-match;x-amz-content-sha256;x-amz-date"
+    );
+    let mut req = reqwest::Client::new().put(url);
+    for (k, v) in extra {
+        req = req.header(k, v);
+    }
+    for (k, v) in signed {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.body(body.to_vec()).send().await.unwrap().status(), 200);
+
+    let seen = fake.seen();
+    let (claimed, expected) = signature_for(&seen[0], SK, "auto", "s3");
+    assert_eq!(claimed, expected);
+
+    // 列目录：查询串里的斜杠和等号签的是编过一遍的样子
+    let list = reqwest::Url::parse(&format!(
+        "{}/tw-sync?list-type=2&prefix=me%2Fversions%2F&delimiter=%2F",
+        fake.uri()
+    ))
+    .unwrap();
+    let signed =
+        tw_bedrock::sign_service(&keys(), "auto", "s3", "GET", list.as_str(), &[], b"", now())
+            .unwrap();
+    let mut req = reqwest::Client::new().get(list);
+    for (k, v) in signed {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status(), 200);
+    let seen = fake.seen();
+    let (claimed, expected) = signature_for(&seen[1], SK, "auto", "s3");
+    assert_eq!(claimed, expected);
 }

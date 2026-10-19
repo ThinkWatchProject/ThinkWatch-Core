@@ -126,9 +126,8 @@ pub fn rotate_file(path: &Path) -> Result<ControlKey, EnsureError> {
     let cur = store::read(path)?;
     let (next, key) = rotate(&cur.text)?;
     crate::try_parse(&next).map_err(|r| EnsureError::Rejected(Box::new(r)))?;
-    let _ = crate::history::snapshot(path, &cur.text, crate::history::Origin::Cli);
+    // **不留备份版本**：备份里的钥匙是打码的，换钥匙前后的两版存下来一模一样
     store::write_if_unchanged(path, &cur.fingerprint, &next)?;
-    let _ = crate::history::snapshot(path, &next, crate::history::Origin::Cli);
     Ok(key)
 }
 

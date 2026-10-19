@@ -127,6 +127,32 @@ async fn two_b_a_path_by_index_and_a_path_by_name_mean_the_same_thing() {
     assert_eq!(by_name, by_index);
 }
 
+/// 回到备份里内容是 `version` 那一版：和界面上「恢复…」同一套（`tw_pack::restore`）
+async fn restore(mgr: &tw_control::ConfigManager, version: &str) {
+    let path = mgr.path().to_path_buf();
+    let b = tw_pack::backup::list(&path)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|b| {
+            let text = tw_pack::backup::open(b).unwrap().config_yaml;
+            let real = tw_config::control_key::unmask(
+                &text,
+                tw_config::control_key::raw_in(REAL).unwrap().as_deref(),
+            )
+            .unwrap();
+            tw_config::store::version_of(&real) == version
+        })
+        .expect("这一版在备份里");
+    let backup = tw_pack::backup::open(&b).unwrap();
+    let cur = mgr.current().unwrap();
+    let local = tw_pack::disk::current(&path, &cur.text, tw_pack::PackOrigin::Restore);
+    let out = tw_pack::restore::apply(&local, &backup, None, &Default::default(), true).unwrap();
+    mgr.write(&out.pack.config_yaml, Some(&cur.version()), Origin::Restore)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn three_a_bad_edit_can_be_undone_in_one_step() {
     let (_d, mgr) = setup();
@@ -145,17 +171,17 @@ async fn three_a_bad_edit_can_be_undone_in_one_step() {
             .contains("坏的")
     );
 
-    mgr.rollback(&good).await.unwrap();
+    restore(&mgr, &good).await;
     assert_eq!(
         std::fs::read_to_string(mgr.path()).unwrap(),
         REAL,
-        "回滚没有精确还原"
+        "恢复没有精确还原"
     );
 }
 
 #[tokio::test]
-async fn three_b_a_rollback_can_itself_be_rolled_back() {
-    // 「回滚之后发现回错了」是回滚最常见的用法之一。
+async fn three_b_a_restore_can_itself_be_undone() {
+    // 「恢复之后发现回错了」是恢复最常见的用法之一：恢复本身也留一个版本
     let (_d, mgr) = setup();
     let v0 = mgr.current().unwrap().version();
     mgr.patch(&patch("/providers/官方/key", "sk-new"), None, Origin::Ui)
@@ -163,14 +189,14 @@ async fn three_b_a_rollback_can_itself_be_rolled_back() {
         .unwrap();
     let v1 = mgr.current().unwrap().version();
 
-    mgr.rollback(&v0).await.unwrap();
+    restore(&mgr, &v0).await;
     assert!(
         !std::fs::read_to_string(mgr.path())
             .unwrap()
             .contains("sk-new")
     );
 
-    mgr.rollback(&v1).await.unwrap();
+    restore(&mgr, &v1).await;
     assert!(
         std::fs::read_to_string(mgr.path())
             .unwrap()

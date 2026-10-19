@@ -19,7 +19,12 @@ tw-types = { workspace = true }
 tw-link = { workspace = true }
 # 列网卡用 getifaddrs —— 比引一个 crate 便宜
 libc = { workspace = true }
+# 配置包（导出、导入、本机备份、恢复）。文件内容在线上是 base64
+tw-pack = { workspace = true }
+base64 = { workspace = true }
 tw-config = { workspace = true }
+# 多设备同步：同步位置、合并、加密
+tw-sync = { workspace = true }
 tw-guard = { workspace = true }
 bytes = { workspace = true }
 tw-engine = { workspace = true }

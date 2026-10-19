@@ -165,7 +165,7 @@ async fn an_error_that_is_not_fixable_offers_nothing() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
-    assert_eq!(e["code"], "control.config_not_repairable", "{e}");
+    assert_eq!(e["code"], "control.config_unrepairable", "{e}");
 }
 
 #[tokio::test]

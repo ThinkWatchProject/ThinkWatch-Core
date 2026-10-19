@@ -144,6 +144,11 @@ pub fn aws_encode(s: &str) -> String {
 /// 在规范请求里是 `%252F`），查询参数解码后重新编码、排序，签过的头按名字写出来，
 /// 请求体的哈希取自 `x-amz-content-sha256`，并核对它就是收到的请求体的哈希。
 pub fn signature_of(req: &Seen, secret: &str, region: &str) -> (String, String) {
+    signature_for(req, secret, region, "bedrock")
+}
+
+/// 同上，换一个服务名。`s3` 照 S3 的规矩：路径不再编一遍，收到什么就签什么
+pub fn signature_for(req: &Seen, secret: &str, region: &str, service: &str) -> (String, String) {
     let header = |name: &str| {
         req.header(name)
             .unwrap_or_else(|| panic!("no {name} on {} {}", req.method, req.path))
@@ -166,12 +171,15 @@ pub fn signature_of(req: &Seen, secret: &str, region: &str) -> (String, String) 
         "the signed payload hash is not the hash of what arrived"
     );
 
-    let path = req
-        .path
-        .split('/')
-        .map(aws_encode)
-        .collect::<Vec<_>>()
-        .join("/");
+    let path = if service == "s3" {
+        req.path.clone()
+    } else {
+        req.path
+            .split('/')
+            .map(aws_encode)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     let mut query: Vec<(String, String)> = req
         .params()
         .iter()
@@ -193,7 +201,7 @@ pub fn signature_of(req: &Seen, secret: &str, region: &str) -> (String, String) 
     );
 
     let date = &amz_date[..8];
-    let scope = format!("{date}/{region}/bedrock/aws4_request");
+    let scope = format!("{date}/{region}/{service}/aws4_request");
     let credential = field("Credential");
     assert!(
         credential.ends_with(&format!("/{scope}")),
@@ -205,7 +213,7 @@ pub fn signature_of(req: &Seen, secret: &str, region: &str) -> (String, String) 
     );
     let key = hmac(format!("AWS4{secret}").as_bytes(), date);
     let key = hmac(&key, region);
-    let key = hmac(&key, "bedrock");
+    let key = hmac(&key, service);
     let key = hmac(&key, "aws4_request");
     (field("Signature"), hex::encode(hmac(&key, &string_to_sign)))
 }

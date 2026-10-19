@@ -96,7 +96,10 @@ pub fn disable(text: &str) -> Result<Option<String>, PatchError> {
     }
 }
 
-/// 改完先校验、再写，前后两版进历史。和 `control_key::rotate_file` 同一条路。
+/// 改完先校验、再写。和 `control_key::rotate_file` 同一条路。
+///
+/// **备份版本不在这里留**：备份在 `tw-pack`，这个 crate 够不着它。core 正在跑时文件监听
+/// 换入这一版、留下它；没在跑时下一次启动留（`twcore` 起来时先记一版磁盘上的样子）
 fn write_checked(
     path: &Path,
     f: impl FnOnce(&str) -> Result<Option<String>, PatchError>,
@@ -106,9 +109,7 @@ fn write_checked(
         return Ok(current(&cur.text));
     };
     let cfg = crate::try_parse(&next).map_err(|r| EnsureError::Rejected(Box::new(r)))?;
-    let _ = crate::history::snapshot(path, &cur.text, crate::history::Origin::Cli);
     store::write_if_unchanged(path, &cur.fingerprint, &next)?;
-    let _ = crate::history::snapshot(path, &next, crate::history::Origin::Cli);
     Ok(cfg.listen.control.remote)
 }
 

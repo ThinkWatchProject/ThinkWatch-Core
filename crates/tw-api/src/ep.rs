@@ -28,13 +28,37 @@ endpoints! {
     /// 诊断包（Markdown，已脱敏）
     Diagnostics: GET "/diagnostics", () => String, text;
 
-    // ─────────────────────────────────────────────── 配置原文与历史
+    // ─────────────────────────────────────────────── 配置原文
     GetConfig: GET "/config", () => api::ConfigText;
     PatchConfig: PATCH "/config", api::ConfigPatch => api::ConfigWritten;
     PutConfig: PUT "/config", api::ConfigWrite => api::ConfigWritten;
-    ConfigHistory: GET "/config/history", () => Vec<api::ConfigVersion>;
     ConfigAt: GET "/config/at", api::ConfigAtQuery => api::ConfigAt;
-    ConfigRollback: POST "/config/rollback", api::RollbackRequest => api::ConfigWritten;
+    // ─────────────────────────────────────────────── 配置包、导入导出、备份
+    //
+    // 一个项目是配置里有名字的一样东西（上游、密钥、路由……），加上全局设置的每一节和
+    // Lite 的通用偏好。导入、恢复都按项目列、按项目选。**备份的几个在安全模式下照样可用**：
+    // 配置读不进来时从备份恢复。
+    /// 配置里的每个项目，和它引用的项目
+    ConfigItems: GET "/config/items", () => Vec<api::ItemNode>;
+    /// 导出成配置包：全部，或者选的几项连同它们引用的。**不写任何东西**
+    ExportConfig: POST "/config/export", api::ExportRequest => api::ExportedFile;
+    /// 导入会怎么做：逐项新增、相同、冲突、错误。**不写任何东西**
+    ImportPreview: POST "/config/import/preview", api::ImportSource => api::ImportPreview;
+    /// 照逐项的处理导入。预览之后配置变了是 409，重新预览
+    ImportConfig: POST "/config/import", api::ImportRequest => api::ConfigWritten;
+    /// 备份版本，新的在前
+    Backups: GET "/backups", () => Vec<api::BackupEntry>;
+    /// 一个版本另存为配置包
+    BackupFile: POST "/backups/file", api::BackupFileRequest => api::ExportedFile;
+    /// 恢复到一个版本会改什么。**不写任何东西**
+    RestorePreview: POST "/backups/preview", api::RestorePreviewRequest => api::RestorePreview;
+    /// 恢复到一个版本（全部，或者选的几项）。恢复本身也留一个版本
+    Restore: POST "/backups/restore", api::RestoreRequest => api::RestoreWritten;
+    /// Lite 的通用偏好
+    GetClientPrefs: GET "/client-prefs", () => api::ClientPrefs;
+    PutClientPrefs: PUT "/client-prefs", api::ClientPrefs => ();
+    /// 本机接管的客户端在用的网关密钥
+    PinKeys: PUT "/pinned-keys", api::PinnedKeys => ();
     /// 配置读不进来时，一键修复会改哪几处
     ConfigRepairPlan: GET "/config/repair", () => api::ConfigRepair;
     /// 照那几处修好写回：取值改回默认值、删掉不认识的字段
@@ -232,6 +256,36 @@ endpoints! {
     TrialPlugin: POST "/plugins/{id}/trial" [id], api::PluginTrial => api::PluginTrialResult;
     /// 最近的日志，老的在前。**网页可以调**
     PluginLogs: GET "/plugins/{id}/logs" [id], () => Vec<api::PluginLogEntry>;
+
+    // ─────────────────────────────────────────────── 多设备同步
+    //
+    // 同步设置写在 config.yaml 的 `sync` 一节（本机设置，不随导出和同步带出）。改设置的几个
+    // 端点（开启、改设置、加密、解锁、停止）回的是写完之后的版本号或同步状态
+    /// 同步此刻怎么样：状态、同步位置、设备、冲突数、不同步的上游和随之不同步的项目
+    SyncStatus: GET "/sync", () => api::SyncView;
+    /// 连上去看看：读写行不行，是空的还是已经有同步数据（加没加密、有哪些设备）。**不写配置**
+    SyncTest: POST "/sync/test", api::SyncTestRequest => api::SyncProbe;
+    /// 加入已有的同步时，本机配置和同步数据怎么合（规则和导入预览一样）。**不写配置**
+    SyncJoinPreview: POST "/sync/enable/preview", api::SyncTestRequest => api::SyncJoinPreview;
+    /// 开启同步：空的同步位置新建，有数据的加入
+    SyncEnable: POST "/sync/enable", api::SyncEnable => api::ConfigWritten;
+    /// 改连接参数、设备名称、不同步的上游
+    SyncSave: PUT "/sync/settings", api::SyncSettingsSave => api::ConfigWritten;
+    /// 立即同步一轮（打开主窗口时 Lite 也调它）
+    SyncNow: POST "/sync/now", () => api::SyncView;
+    SyncConflicts: GET "/sync/conflicts", () => Vec<api::SyncConflict>;
+    /// 处理冲突：结果作为新版本上传，别的设备随之清除
+    SyncResolve: POST "/sync/conflicts", api::SyncResolve => api::SyncView;
+    /// 开启、关闭加密，更改同步口令
+    SyncEncryption: POST "/sync/encryption", api::SyncEncryption => api::SyncView;
+    /// 其他设备改了口令之后，在这台设备上输入新口令
+    SyncUnlock: POST "/sync/unlock", api::SyncUnlock => api::SyncView;
+    /// 停止同步；`purge` 时连同步位置上的数据一起删掉
+    SyncDisable: POST "/sync/disable", api::SyncDisable => ();
+    /// 同步位置空了（`emptied`）、keyring 不见了（`keyring_missing`）之后由人选的「重新上传本机
+    /// 配置」：keyring 放回这台设备记着的那一份（没有就新建），没有读得出来的版本时以本机配置
+    /// 上传一个，然后同步一轮
+    SyncRepublish: POST "/sync/republish", () => api::SyncView;
 
     // ─────────────────────────────────────────────── 账号登录
     StartChatgptLogin: POST "/chatgpt/login", api::ChatgptLoginStart => api::ChatgptLogin;

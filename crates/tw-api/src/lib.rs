@@ -91,6 +91,13 @@ macro_rules! slug_enum {
     };
 }
 
+// 配置包那一半：导出、导入、备份与恢复（`slug_enum!` 在上面定义，所以在这里声明）
+mod pack;
+pub use pack::*;
+// 多设备同步那一半（`slug_enum!` 在上面定义，所以在这里声明）
+mod sync;
+pub use sync::*;
+
 // ---------------------------------------------------------------- 取值固定的词
 //
 // 下面这些是散在各处的字段共用的词表，按主题排。只在一个地方用到的集合写在
@@ -368,12 +375,18 @@ slug_enum! {
         Cli = "cli",
         /// 别的程序或者编辑器
         External = "external",
-        /// 回滚
-        Rollback = "rollback",
-        /// OAuth 凭据轮换之后写回
+        /// OAuth 凭据轮换之后写回。**不留备份版本**
         Rotation = "rotation",
         /// core 自己：装上它自带的默认插件，或者把没动过的默认插件换成新版
         Defaults = "defaults",
+        /// 应用了另一台设备经同步位置传来的版本
+        Sync = "sync",
+        /// 导入了一个配置包
+        Import = "import",
+        /// 恢复了一个备份版本
+        Restore = "restore",
+        /// 一键修复
+        Repair = "repair",
     }
 }
 
@@ -946,7 +959,52 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 没有在跑的请求是 null，有请求却都还没开始生成是 0。[`RunningView`] 多了 `tokens_per_sec`
 /// （这一个请求此刻的速度）和 `output_tokens`（到目前为止估的输出 token），第一个 token 之前、
 /// 非流式的是 null。
-pub const CONTROL_API_VERSION: u32 = 49;
+///
+/// **50 起有配置包（`.twconfig`）和本机备份**，修改记录换成了备份：`GET /config/history`、
+/// `POST /config/rollback`（`ConfigVersion`、`RollbackRequest`）删了，换成 `GET /backups`
+/// （[`BackupEntry`]：本机最近 10 个版本，开着同步时连同同步位置上的，同一个版本一行）、
+/// `POST /backups/file`（另存为配置包）、`POST /backups/preview`（[`RestorePreview`]：按项目
+/// 列出差异；给了 `items` 是只恢复这几项时会动什么）、`POST /backups/restore`（可以只恢复几项，
+/// 本机设置和 ChatGPT 的登录留着，接管的客户端在用的密钥不删；→ [`RestoreWritten`]，`rows` 是
+/// 实际动了的项目，和同样条件下的预览一样）。一版是一个完整的配置包，连同插件和 Lite 的通用偏好。新端点
+/// `GET /config/items`（[`ItemNode`]）、`POST /config/export`（[`ExportRequest`] →
+/// [`ExportedFile`]）、`POST /config/import/preview`（[`ImportSource`] → [`ImportPreview`]：逐项
+/// 新增、相同、冲突、错误）和 `POST /config/import`（[`ImportRequest`]：逐项导入、覆盖、改名
+/// 导入或跳过）。Lite 的通用偏好由 core 存：`GET` / `PUT /client-prefs`（[`ClientPrefs`]，
+/// 不解析，最大 64 KiB），变了发 [`Event::ClientPrefsChanged`]。`PUT /pinned-keys`
+/// （[`PinnedKeys`]：`source` 是这个 Lite 的标识，几个 Lite 各报各的、core 取并集，来源不过期，
+/// 超出上限是 `backup.pinned.*`）报告接管的客户端在用哪几把密钥。恢复时留下的项目还引用着的、
+/// 同步设置走的出站代理不删（[`KeptReason`] 的 `referenced`），所选项目引用的、本机已没有的一起
+/// 恢复；恢复同步位置上的版本时本机不同步的上游不列成删除。不带密钥的包导入时比较和覆盖都沿用
+/// 本机的密钥，**只在目的地不变时**（协议、主机、端口按 URL 库规范化后一样，AWS 区域、OAuth
+/// 令牌端点、所走的出站代理、代理地址一样）；改名导入的不沿用，缺着的标 `missing_key`（代理的
+/// 密码也算），[`ImportRow`] 的 `rename_flags` 说改名导入时会带的标记。上游地址里有反斜杠、
+/// 主机前写了用户名或密码的不收（`config.base_url_backslash`、`config.base_url_userinfo`）。导入覆盖、恢复改了或删了网关密钥时发
+/// [`Event::GatewayKeysChanged`]。[`ConfigOrigin`] 删了 `rollback`，多了 `sync`、`import`、
+/// `restore`、`repair`（一键修复以前记成 `ui`）。备份相关的端点在安全模式下照样可用。配置包的
+/// 码是 `pack.*`，导入的是 `import.*`，备份与恢复的是 `backup.*`。停用着的上游可以缺凭据
+/// （密钥、OAuth、AWS 访问密钥空着，ChatGPT 账号没登录）：导入时就是这样进来的。较旧版本
+/// 导出的包、升级之前留的版本里读不进来的字段按一键修复的规矩在内存里修好，[`ImportPreview`]
+/// 和 [`RestorePreview`] 的 `repairs` 列出修了哪几处。OAuth 上游换发来的令牌（刷新令牌会轮换）
+/// 和 ChatGPT 的登录一样留在本机，不随导出带走、导入覆盖时留着本机的。一键修复修不了时的码换成
+/// `control.config_unrepairable`（句子改说从备份恢复）。照 49 写的界面调不到删掉的那两个端点。
+///
+/// **50 起有多设备同步**：`GET /sync`（[`SyncView`]）、`POST /sync/test`（[`SyncTestRequest`] →
+/// [`SyncProbe`]）、`POST /sync/enable/preview`（→ [`SyncJoinPreview`]，规则和导入预览一样）、
+/// `POST /sync/enable`（[`SyncEnable`]：空的同步位置新建，有数据的加入，`merge` 或 `use_remote`）、
+/// `PUT /sync/settings`（[`SyncSettingsSave`]）、`POST /sync/now`、`GET` / `POST /sync/conflicts`
+/// （[`SyncConflict`]、[`SyncResolve`]：采用本机、另一边或两者都保留）、`POST /sync/encryption`
+/// （[`SyncEncryption`]：开启、关闭、更改口令）、`POST /sync/unlock`（[`SyncUnlock`]）、
+/// `POST /sync/disable`（[`SyncDisable`]）、`POST /sync/republish`（同步位置空了、keyring 不见了
+/// 之后由人选的「重新上传本机配置」，→ [`SyncView`]）。[`SyncState`] 里要人处理的有
+/// `keyring_missing`、`emptied`、`misconfigured`，[`SyncView`] 的 `skipped` 是同步位置上跳过了的
+/// 文件数，`notices` 是同步成了但没照办的地方（`sync.prefs_too_large`），[`SyncConflict`] 的
+/// `options` 是能选的处理，[`SyncJoinPreview`] 的 `auto` 是加入时
+/// 不用选的项（两边的默认网关密钥同名、值不同时采用同步数据的值）。状态变了发 [`Event::SyncStatus`]；应用别的设备的
+/// 版本时配置的来源是 `sync`，改了网关密钥时发 `GatewayKeysChanged`。[`ProviderView`] 多了
+/// `sync_excluded`（不同步的上游）和 `sync_url_changed`（地址经同步变更，改之前的地址）。
+/// 同步的码是 `sync.*`。安全模式下不自动同步（`paused`）
+pub const CONTROL_API_VERSION: u32 = 50;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1601,7 +1659,7 @@ pub enum Event {
         id: u64,
         /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
         version: String,
-        /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
+        /// 谁写的，见 [`ConfigOrigin`]
         origin: ConfigOrigin,
         at_ms: u64,
     },
@@ -1619,7 +1677,7 @@ pub enum Event {
         line: Option<usize>,
         /// 出错那一行的原文，**已脱敏**
         excerpt: Option<String>,
-        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`。
+        /// 这一版是谁写的（[`ConfigOrigin`]）。
         ///
         /// **界面靠它区分「用户在编辑器里写错了」和「界面自己刚写坏了」** ——
         /// 前者要提醒，后者是保存失败，那条路自己会报。
@@ -1679,6 +1737,20 @@ pub enum Event {
     /// 「进行中」的计数和每一行的状态都靠事件，丢一个结局，那一行就永远停在
     /// 「进行中」。
     EventsDropped { id: u64, count: u64, at_ms: u64 },
+    /// 同步的状态、冲突数或设备列表变了（`GET /sync` 的那一份）。正常运转的同步不发系统通知，
+    /// 要人处理的状态（冲突、连不上、拒绝访问、口令、版本过新）由界面按通知总开关提醒一次
+    SyncStatus { id: u64, view: SyncView, at_ms: u64 },
+    /// 这几把网关密钥的值变了或者没了：导入覆盖、恢复、同步改的。
+    ///
+    /// **本机接管的客户端配置里写着密钥的值**：界面收到它，照「更换密钥后更新客户端」那一套
+    /// 改写用着这几把的客户端。名字是变之前的那些
+    GatewayKeysChanged {
+        id: u64,
+        names: Vec<String>,
+        at_ms: u64,
+    },
+    /// Lite 的通用偏好变了（导入、恢复、同步、别的界面存的）：重读 `GET /client-prefs` 并应用
+    ClientPrefsChanged { id: u64, at_ms: u64 },
 }
 
 slug_enum! {
@@ -1940,6 +2012,9 @@ impl Event {
             | Event::RequestCancelled { id, .. }
             | Event::LocallyAnswered { id, .. }
             | Event::EventsDropped { id, .. }
+            | Event::SyncStatus { id, .. }
+            | Event::GatewayKeysChanged { id, .. }
+            | Event::ClientPrefsChanged { id, .. }
             | Event::ConfigReloaded { id, .. }
             | Event::ListenChanged { id, .. }
             | Event::ConfigRejected { id, .. }
@@ -2328,6 +2403,14 @@ pub struct ProviderView {
     /// 密钥是用哪一家的账号登录换来的（配置里的 `signed_in:`）：`zai` / `bigmodel`。手填的
     /// 密钥、别的上游、这一项出现之前登录的都是空。在界面里手动换掉密钥之后也是空
     pub signed_in: Option<ZaiFamily>,
+    /// 不同步的上游（同步设置里选的）：不上传，也不被别的设备的同名上游覆盖。没开同步是 false
+    #[serde(default)]
+    pub sync_excluded: bool,
+    /// 地址经同步变更：不加密的同步最近一次把这家的地址改了（改之前的地址、哪台设备、什么
+    /// 时候）。「提示一次」由界面自己记已读；在本机改过这家的地址就没有了。加密的同步不给
+    /// （没有口令的人写不进来）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_url_changed: Option<SyncUrlChange>,
 }
 
 /// 一行请求头，配置里写的原样。
@@ -4001,29 +4084,6 @@ pub struct ConfigAtQuery {
 pub struct BaseVersion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
-}
-
-/// 历史里的一版。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ConfigVersion {
-    pub version: String,
-    pub at_ms: u64,
-    /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
-    pub origin: ConfigOrigin,
-    pub bytes: u64,
-    /// 这一版是现在跑着的那一版吗。
-    ///
-    /// **历史里包括当前版本**，所以列表最上面那条通常就是它 —— 不标
-    /// 出来的话，用户会以为第一条是「上一版」然后回滚到自己身上。
-    #[serde(default)]
-    pub current: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct RollbackRequest {
-    pub version: String,
 }
 
 /// 一段时间的汇总。

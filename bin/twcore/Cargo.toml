@@ -16,6 +16,8 @@ categories.workspace = true
 [dependencies]
 tw-config = { workspace = true }
 tw-control = { workspace = true }
+# `twcore export` / `import` / `backup`：配置包和本机备份
+tw-pack = { workspace = true }
 tw-gateway = { workspace = true }
 tw-yaml = { workspace = true }
 tw-api = { workspace = true }
@@ -23,6 +25,8 @@ tw-observe = { workspace = true }
 tw-store = { workspace = true }
 tw-pricing = { workspace = true }
 chrono = { workspace = true }
+# `twcore sync` 和控制面说 JSON
+serde_json = { workspace = true }
 tw-secret = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

@@ -104,9 +104,12 @@ impl From<crate::history::Origin> for tw_api::ConfigOrigin {
             Origin::Ui => Self::Ui,
             Origin::Cli => Self::Cli,
             Origin::External => Self::External,
-            Origin::Rollback => Self::Rollback,
-            Origin::Rotation => Self::Rotation,
             Origin::Defaults => Self::Defaults,
+            Origin::Sync => Self::Sync,
+            Origin::Import => Self::Import,
+            Origin::Restore => Self::Restore,
+            Origin::Repair => Self::Repair,
+            Origin::Rotation => Self::Rotation,
         }
     }
 }

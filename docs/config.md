@@ -19,7 +19,7 @@ when they disagree, so a field listed here is a field the binary reads.
 
 `THINKWATCH_HOME` replaces the directory, and `--config <path>` names the
 file for a single command. The directory holds everything else core keeps
-as well: the request database (`data.db`), the configuration history
+as well: the request database (`data.db`), the backups of the configuration
 (`history/`), the downloaded price table (`model_prices.json`) and the local
 control socket (`twcore.sock`; on Windows a loopback port recorded in
 `control.port`). The directory is private to its owner (`0700`), the file is
@@ -116,23 +116,43 @@ reports why. Retention changes are applied on the next hourly clean-up.
 When two writers edit at once (the app and a hand edit), the second write
 is refused with a version mismatch instead of overwriting the first.
 
-### History and rollback
+### Backups, export and import
 
-Every version that was in effect is kept in `history/` beside the file,
-with where it came from (the app, the command line, an outside edit, a
-rollback, a credential rotation). The last 50 are kept.
+Every change to the configuration leaves a version in `history/` beside the
+file: a configuration pack (`.twconfig`) with the plugins and the app's
+preferences, recording where the change came from (the app, the command
+line, an outside edit, an import, a restore, sync). The last 10 are kept; a
+credential rotation does not make one. The control key is masked in them.
 
 ```sh
 twcore check                      # validate the file without starting anything
 twcore config show                # print it, with its version
-twcore config history             # list the versions, newest first
-twcore config rollback 3f9a2c     # go back to a version (a prefix is enough)
+twcore backup list                # list the versions, newest first
+twcore backup restore 1792315800000 --dry-run   # what going back would change
+twcore backup restore 1792315800000             # go back to a version
+twcore export -o all.twconfig     # the whole configuration as a pack
+twcore export --providers relay --no-secrets --encrypt -o relay.twconfig
+twcore import all.twconfig --dry-run            # what importing would do
 twcore config set /listen/gateway/port 8790 --int
 ```
 
-These commands work on the file directly, so they work when core is not
-running, which is when a rollback is most needed. A running core picks
-their changes up like any other save.
+A restore keeps the settings that belong to this machine (listening, the
+control key, retention, sync), the ChatGPT sign-ins and the gateway keys that
+clients set up on this machine use. An import adds what is not here and asks,
+item by item, what to do with what differs (`--on-conflict` answers for all).
+A pack carries no settings of this machine and no ChatGPT sign-in; without
+`--no-secrets` it holds keys in plain text unless `--encrypt` is given (the
+passphrase is asked for, or read from `TWCORE_PASSPHRASE`). Overwriting an
+item here with one from a pack without keys keeps this machine's keys only
+while the item still points at the same place (scheme, host and port; AWS
+region; OAuth token endpoint; the outbound proxy it goes through; a proxy's
+address); otherwise, and for an item imported under another name, the
+upstream comes in disabled until its key is entered.
+
+These commands work on the files directly, so they work when core is not
+running, which is when a restore is most needed; when the file does not
+load at all, a restore brings the whole version back with the current
+control key. A running core picks their changes up like any other save.
 
 `twcore config set <path> <value>` changes one value that is already written
 in the file. The path names list items by their `name`
@@ -178,6 +198,7 @@ means.
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
 | `default_key` | string | — | The gateway key for clients that were not given a key of their own. Unset: the key named `default`, or the first key. It cannot be disabled. |
 | `plugins` | list of [`plugins[]`](#cfg-plugins) | `[]` | Script plugins, in the order they run. The app installs them; each one's code and settings are a file next to this one. |
+| `sync` | object, [`sync`](#cfg-sync) | — | Multi-device sync. A local setting: configuration packs and other devices never carry it, and restoring a backup keeps the current one. Unset: sync is off. |
 <!-- /generated -->
 
 ### `listen`
@@ -244,7 +265,7 @@ complete the first message.
 
 `key` is written by `twcore serve` before the control channel starts
 listening, if it is missing, and by `twcore init`. It is masked wherever the
-configuration is shown or kept in the history; saving a masked value back
+configuration is shown or kept in a backup; saving a masked value back
 keeps the real one. A missing or malformed key (not 64 hexadecimal
 characters) makes the whole file invalid, so it cannot be replaced by a
 short, guessable one.
@@ -389,7 +410,7 @@ Upstreams: the APIs requests are forwarded to.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the upstream; unique, and not the name of a group. Names starting with `__` are reserved. |
-| `base_url` | string | **required** | Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. |
+| `base_url` | string | **required** | Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. No backslashes, and no user name or password before the host (credentials go in `key` or `headers`). |
 | `key` | string, `${VAR}` allowed | — | API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI, and a Bedrock API key), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth` or `aws`. |
 | `headers` | map of header name → value | `{}` | Additional request headers, in the order written; values may use `${VAR}`, and `{{access_token}}` where `oauth` is set. At most 32. Headers HTTP or the gateway manages (`host`, `content-length`, `connection`, …) cannot be set. |
 | `oauth` | object, [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth credential: an access token obtained from a refresh token. Instead of `key`. |
@@ -1485,6 +1506,108 @@ export const manifest = {
     note: { type: "string", label: "Note", value: "Answer in English." },
   },
 };
+```
+
+### `sync`
+
+Several devices (this Mac, a laptop, a server running a remote core) can keep
+one configuration in step through a sync location you choose: a folder that a
+cloud drive carries between devices, a WebDAV server, or S3-compatible
+storage. Each change is merged object by object with what the other devices
+did since the last sync; only when two devices change the same part of the
+same object to different values is there a conflict, which the app shows on
+every device until one of them resolves it. Turn sync on, join a location and
+resolve conflicts in the app (Settings, Sync and backup) or with
+`twcore sync enable` on a server; this section records the result.
+
+What syncs is the configuration a configuration pack carries: upstreams,
+proxies, gateway keys, aliases, groups, routes, price sheets, security rules,
+plugins and the general settings, keys included. `listen`, `retention` and
+`sync` itself stay on this device, and so do a ChatGPT account's sign-in and
+OAuth tokens. An upstream signed in on another device stays turned off on this
+one until it is signed in here; that does not turn it off anywhere else.
+
+A device that joins with a configuration of its own merges it item by item;
+items that differ are chosen one by one, except the default gateway key: every
+installation makes one, so the joining device takes the sync data's value and
+the clients set up on it are updated.
+
+With encryption on, versions that are not encrypted are never read. A keyring
+that went missing, or an older one put back, does not turn encryption off: the
+app asks whether to put back the copy this device keeps. A location that reads
+as empty is checked a few more times before the app says so, and turning sync
+off is still up to you.
+
+<!-- generated: table sync -->
+<a id="cfg-sync"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `device_id` | string | **required** | Generated when sync is turned on. File names at the sync location show its first 8 characters. |
+| `device_name` | string | **required** | Shown in the device list of every device that syncs here. |
+| `encrypt` | bool | `true` | Encrypt what goes to the sync location with the sync passphrase. Every device at one location uses the same setting; change it in the app, which re-uploads the latest version. |
+| `passphrase` | string | — | The sync passphrase; required when `encrypt` is on, and kept after encryption is turned off: the keyring that says it is off is checked with it. Kept here in the clear, like the other keys in this file. |
+| `exclude` | list of strings | `[]` | Upstreams, by name, that are not synced: they are not uploaded and another device's upstream of the same name does not replace them. Routes, aliases and groups that refer to them are not synced either. |
+| `target` | object, [`sync.target`](#cfg-sync-target) | **required** | The sync location. The keyring, `versions/` and `devices/` live directly in it. |
+<!-- /generated -->
+
+<!-- generated: table sync.target -->
+<a id="cfg-sync-target"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | `folder` \| `webdav` \| `s3` | **required** | Which kind of location; the other fields depend on it, see the three tables below. |
+<!-- /generated -->
+
+<!-- generated: table sync.target (folder) -->
+<a id="cfg-sync-target-folder"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | **required** | `folder` |
+| `path` | string | **required** | An absolute path on the machine core runs on: a folder that iCloud Drive, Dropbox, OneDrive, Syncthing or a NAS share carries between devices. |
+| `proxy` | string | `direct` | Not used for a folder. |
+<!-- /generated -->
+
+<!-- generated: table sync.target (webdav) -->
+<a id="cfg-sync-target-webdav"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | **required** | `webdav` |
+| `url` | string | **required** | The WebDAV address of the folder. `https://`, with the certificate checked; `http://` only for this machine and the local network. |
+| `user` | string | `''` | User name. |
+| `pass` | string | `''` | Password, or the app password the service issues for WebDAV. |
+| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. An `http://` address on this machine or the local network has to be `direct`. |
+<!-- /generated -->
+
+<!-- generated: table sync.target (s3) -->
+<a id="cfg-sync-target-s3"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | **required** | `s3` |
+| `endpoint` | string | **required** | The S3 endpoint. Hosts ending in `amazonaws.com`, `aliyuncs.com` or `myqcloud.com` put the bucket in the host name; every other endpoint (Cloudflare R2, MinIO, an address) puts it in the path. `http://` only for this machine and the local network. |
+| `region` | string | **required** | The signing region; `auto` for Cloudflare R2. |
+| `bucket` | string | **required** | The bucket. Keep it private. |
+| `prefix` | string | `''` | A folder inside the bucket. No `..` parts, and not starting with `/`. |
+| `access_key_id` | string | **required** | Access key ID. |
+| `secret_access_key` | string | **required** | Secret access key. |
+| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. An `http://` address on this machine or the local network has to be `direct`. |
+<!-- /generated -->
+
+```yaml
+sync:
+  device_id: 3f9a2c1e-0b1d-4e2f-9a3b-5c6d7e8f9a0b
+  device_name: Mac mini
+  encrypt: true
+  passphrase: "correct horse battery staple"
+  exclude: [local ollama]
+  target:
+    type: webdav
+    url: https://dav.example.com/dav/ThinkWatch
+    user: name@example.com
+    pass: "app password"
 ```
 
 ## Environment variables
