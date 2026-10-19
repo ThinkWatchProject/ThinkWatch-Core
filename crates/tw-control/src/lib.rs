@@ -23,6 +23,7 @@ use tw_types::{Msg, msg};
 use contract::RouterExt;
 
 pub mod aliases;
+pub mod backups;
 pub mod chatgpt;
 pub mod clients;
 pub mod config;
@@ -104,9 +105,8 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::GetConfig, get_config)
         .at(ep::PatchConfig, patch_config)
         .at(ep::PutConfig, put_config)
-        .at(ep::ConfigHistory, config_history)
         .at(ep::ConfigAt, config::path_at)
-        .at(ep::ConfigRollback, config_rollback)
+        .merge(backups::router())
         .at(ep::ConfigRepairPlan, config_repair_plan)
         .at(ep::RepairConfig, repair_config)
         .at(ep::Summary, summary)
@@ -1515,50 +1515,6 @@ async fn put_config(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-async fn config_history(
-    State(s): State<ControlState>,
-) -> Result<Json<Vec<tw_api::ConfigVersion>>, Fail> {
-    let all = tw_config::history::list(s.config_path()).map_err(unreadable_config)?;
-    let now = s.cfg.current().map(|c| c.version()).unwrap_or_default();
-    // **新的在前。**用户找的几乎总是最近那几版。
-    Ok(Json(
-        all.into_iter()
-            .rev()
-            .map(|v| tw_api::ConfigVersion {
-                current: v.version == now,
-                version: v.version,
-                at_ms: v.at_ms,
-                origin: v.origin.into(),
-                bytes: v.bytes,
-            })
-            .collect(),
-    ))
-}
-
-async fn config_rollback(
-    State(s): State<ControlState>,
-    Json(req): Json<tw_api::RollbackRequest>,
-) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let cur = s
-        .cfg
-        .current()
-        .map_err(|e| apply_fail(ApplyError::Store(e)))?;
-    let text = s.cfg.rollback_text(&req.version).map_err(apply_fail)?;
-    // 回到一份打开着工具调用插件的旧配置，同样要点头
-    plugins::guard_raw_write(&s, &cur.text, &text).await?;
-    // 回滚也走同一条写入路径：校验、存历史、防回环
-    let version = s
-        .cfg
-        .write(
-            &text,
-            Some(&cur.version()),
-            tw_config::history::Origin::Rollback,
-        )
-        .await
-        .map_err(apply_fail)?;
-    Ok(Json(tw_api::ConfigWritten { version }))
-}
-
 /// 一键修复会改哪几处。修不了、或者本来就读得进来，`fixes` 是空的
 async fn config_repair_plan(
     State(s): State<ControlState>,
@@ -1606,7 +1562,7 @@ async fn repair_config(
         .write(
             &r.text,
             Some(&cur.version()),
-            tw_config::history::Origin::Ui,
+            tw_config::history::Origin::Repair,
         )
         .await
         .map_err(apply_fail)?;

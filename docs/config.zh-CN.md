@@ -13,7 +13,7 @@ ThinkWatch Core 只读一个文件：`config.yaml`。本文逐项说明其中每
 | macOS、Linux | `~/.thinkwatch/config.yaml` |
 | Windows | `%APPDATA%\ThinkWatch\config.yaml` |
 
-`THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、配置历史（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
+`THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、配置的备份（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
 
 这两项权限就是这份文件在本机上的全部保护：挡得住其他用户，挡不住以同一用户身份运行的程序。这样的程序能读到文件里的每一把密钥，也能用其中的控制通道密钥经控制通道修改配置。出站脱敏不改变这一点：它保护的是请求带出本机的内容，不是磁盘上的文件。显示配置时给控制通道密钥打码，是为了让经控制通道的写入改不了它（见 [`listen.control`](#cfg-listen-control)），而不是对本机程序隐藏它；上游密钥和网关密钥按原样显示。
 
@@ -65,19 +65,25 @@ providers:
 
 两方同时修改时（应用和手工编辑），后写入的一方因版本不一致被拒绝，不会覆盖先写入的内容。
 
-### 历史与回滚
+### 备份、导出与导入
 
-每个生效过的版本都保存在配置文件旁边的 `history/` 目录中，并记录来源（应用、命令行、外部编辑、回滚、凭据轮换）。保留最近 50 个版本。
+配置每改动一次，配置文件旁边的 `history/` 目录中就留下一个版本：一个配置包（`.twconfig`），连同插件和应用的通用偏好，并记录来源（应用、命令行、外部编辑、导入、恢复、同步）。保留最近 10 个版本；凭据轮换不生成版本。版本中的控制面密钥一律打码。
 
 ```sh
 twcore check                      # 只校验配置，不启动任何服务
 twcore config show                # 打印当前配置及其版本
-twcore config history             # 列出历史版本，最新的在前
-twcore config rollback 3f9a2c     # 回滚到某个版本（写前几位即可）
+twcore backup list                # 列出备份版本，最新的在前
+twcore backup restore 1792315800000 --dry-run   # 恢复会改动什么
+twcore backup restore 1792315800000             # 恢复到某个版本
+twcore export -o all.twconfig     # 把全部配置导出为配置包
+twcore export --providers relay --no-secrets --encrypt -o relay.twconfig
+twcore import all.twconfig --dry-run            # 导入会做什么
 twcore config set /listen/gateway/port 8790 --int
 ```
 
-这些命令直接操作文件，因此 core 没有运行时也能使用，而那往往正是最需要回滚的时候。正在运行的 core 会像对待其他保存一样接收这些改动。
+恢复时保留本机设置（监听、控制面密钥、保留期限、同步设置）、ChatGPT 的登录，以及本机已接管的客户端正在使用的网关密钥。导入时加入本机没有的项目，与本机不同的项目逐项选择处理方式（`--on-conflict` 一次指定全部）。配置包不含本机设置与 ChatGPT 登录；未指定 `--no-secrets` 时其中以明文保存密钥，除非指定 `--encrypt`（口令在终端输入，或取自环境变量 `TWCORE_PASSPHRASE`）。
+
+这些命令直接操作文件，因此 core 没有运行时也能使用，而那往往正是最需要恢复的时候；配置完全无法读取时，恢复把整个版本写回，控制面密钥保持现在的值。正在运行的 core 会像对待其他保存一样接收这些改动。
 
 `twcore config set <路径> <值>` 修改文件中已经写出的一个值。路径中的列表项按其 `name` 定位（`/providers/anthropic/base_url`）；数字表示下标（`/routes/0/rules/1/to`）。值默认按字符串写入，`--int`、`--bool`、`--null` 另作指定。写入前先校验结果。要添加文件中还没有的字段，请直接编辑文件。
 
@@ -164,7 +170,7 @@ listen:
 | `remote` | 对象，见 [`listen.control.remote`](#cfg-listen-control-remote) | — | 供另一台机器上的桌面应用连接的网络端口。它是本地通道之外额外开的，不取代本地通道。 |
 <!-- /generated -->
 
-`key` 缺失时，由 `twcore serve` 在控制通道开始监听之前写入；`twcore init` 生成的配置也带有它。凡是显示配置或写入配置历史的地方，这个字段一律打码；把打码值原样存回时保留原值。密钥缺失或格式不对（不是 64 个十六进制字符）时整份配置无效，因此无法把它换成一把容易猜到的短密钥。
+`key` 缺失时，由 `twcore serve` 在控制通道开始监听之前写入；`twcore init` 生成的配置也带有它。凡是显示配置或写入备份的地方，这个字段一律打码；把打码值原样存回时保留原值。密钥缺失或格式不对（不是 64 个十六进制字符）时整份配置无效，因此无法把它换成一把容易猜到的短密钥。
 
 ```sh
 twcore control-key            # 显示密钥，用于粘贴到桌面应用

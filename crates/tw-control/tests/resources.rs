@@ -443,14 +443,15 @@ async fn renaming_an_upstream_moves_its_references_in_the_same_version() {
     let cfg = b.parsed();
     assert_eq!(cfg.providers[0].name, "anthropic");
     assert_eq!(cfg.groups[0].names(), ["anthropic"]);
-    // 一次保存一个版本：历史里只多了改之前的那一份
-    let history = tw_config::history::list(&b.dir.path().join("config.yaml")).unwrap();
+    // 一次保存一个版本：备份里是改之前（来源说不清，记成外部改动）和改之后的那两份
+    let history = tw_pack::backup::list(&b.dir.path().join("config.yaml")).unwrap();
+    let origins: Vec<_> = history.iter().map(|v| v.origin).collect();
     assert_eq!(
-        history
-            .iter()
-            .filter(|v| v.origin == tw_config::history::Origin::Ui)
-            .count(),
-        2
+        origins,
+        [
+            tw_config::history::Origin::External,
+            tw_config::history::Origin::Ui
+        ]
     );
 }
 

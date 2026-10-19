@@ -14,7 +14,7 @@ use crate::{Pack, PluginFiles};
 pub(crate) const ACCOUNT_HEADER: &str = tw_config::chatgpt::ACCOUNT_HEADER;
 
 /// 一个上游是 ChatGPT 账号。它的登录（`oauth`）和账户 ID 请求头属于这台设备
-pub(crate) fn is_chatgpt(p: &Provider) -> bool {
+pub fn is_chatgpt(p: &Provider) -> bool {
     p.effective_protocol() == Some(Protocol::Chatgpt)
 }
 
@@ -412,7 +412,12 @@ fn plugin_units(
     if let Some(d) = data {
         units.insert(unit::SETTINGS.to_string(), d);
     }
-    (units, Some(files.clone()))
+    // 带着走的是批准过的那一份：和单位说的是同一份代码
+    let carried = PluginFiles {
+        script: source.to_vec(),
+        approved: Some(source.to_vec()),
+    };
+    (units, Some(carried))
 }
 
 /// 批准过的那一份：哈希对得上配置的脚本或底稿。都对不上是脚本
@@ -426,7 +431,7 @@ pub(crate) fn approved_source<'a>(entry: &tw_config::Plugin, files: &'a PluginFi
     }
 }
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     let d = sha2::Sha256::digest(bytes);
     d.iter().map(|b| format!("{b:02x}")).collect()

@@ -13,6 +13,7 @@ description = "Configuration packs (.twconfig): format, encryption, local backup
 [dependencies]
 # 配置的形状、校验、按名字改一项（保留注释）都在这里
 tw-config = { workspace = true }
+tw-api = { workspace = true }
 tw-engine = { workspace = true }
 tw-pricing = { workspace = true }
 tw-types = { workspace = true }
@@ -21,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 age = { workspace = true }

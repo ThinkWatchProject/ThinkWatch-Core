@@ -3,6 +3,10 @@
 # A second column marks codes a UI does not translate:
 #   passthrough  the sentence is only placeholders (system or upstream text); show `text`
 #   test         only produced by tests; never reaches a UI
+backup.io
+backup.not_found
+backup.prefs_too_large
+backup.write_failed
 config.alias_blank_model
 config.alias_chained
 config.alias_duplicate
@@ -174,7 +178,6 @@ control.name_taken_not_zai
 control.name_whitespace
 control.no_keys
 control.no_such_endpoint
-control.no_such_version
 control.not_a_chatgpt_account
 control.patch.no_entry
 control.patch.not_an_entry
@@ -432,6 +435,15 @@ gw.ws.proxy_unsupported
 gw.ws.send_failed
 gw.ws.upstream_broke
 gw.ws.upstream_closed
+import.exists
+import.key_value_taken
+import.missing_reference
+import.name_taken
+import.no_aws_profile
+import.not_in_pack
+import.plugin_mismatch
+import.plugin_missing
+import.skipped_reference
 l1.config.bad_url
 l1.config.no_host
 l1.config.proxy_addr_form
@@ -498,6 +510,9 @@ pack.item_shape
 pack.missing_entry
 pack.need_key
 pack.need_passphrase
+pack.no_such_item
+pack.not_base64
+pack.passphrase_short
 pack.schema_too_new
 pack.too_large
 pack.too_new

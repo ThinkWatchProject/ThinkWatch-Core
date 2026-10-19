@@ -825,7 +825,7 @@ fn a_steering_plugin_from_elsewhere_waits_for_approval_here() {
         "批准了别处来的代码"
     );
     assert_eq!(out.plugins["steerer"].approved, None);
-    // 停用着来的照常批准：打开时才问
+    // 停用着来的也不批准：装上这种插件本身就要点头
     let mut off = t.clone();
     off.items
         .get_mut(&id(ItemKind::Plugin, "steerer"))
@@ -834,6 +834,11 @@ fn a_steering_plugin_from_elsewhere_waits_for_approval_here() {
         .insert("enabled".into(), json!(false));
     let out = materialize_with(&with_plugins(&[]), &off, &codec).unwrap();
     let cfg = tw_config::try_parse(&out.config_yaml).unwrap();
+    assert!(!cfg.plugins[0].enabled);
+    assert_ne!(cfg.plugins[0].sha256, items::sha256_hex(src.as_bytes()));
+    // 导出不管这些：包里的是那一边批准过的样子
+    let exported = super::materialize_for_export(&with_plugins(&[]), &t, &codec).unwrap();
+    let cfg = tw_config::try_parse(&exported.config_yaml).unwrap();
     assert_eq!(cfg.plugins[0].sha256, items::sha256_hex(src.as_bytes()));
     // 本机停用着、批准过同一份代码，别处把它打开了：这里照样要点头
     let off_here = with_plugins(&[("steerer", src, false)]);

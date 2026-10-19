@@ -159,41 +159,21 @@ async fn a_write_that_would_not_parse_never_reaches_the_disk() {
 }
 
 #[tokio::test]
-async fn a_rollback_goes_through_the_same_door_as_everything_else() {
-    // 三条路各写一遍，就会有两条忘了存历史、一条忘了防回环。
-    let (_d, mgr, _bus) = setup();
-    let v0 = mgr.current().unwrap().version();
-    mgr.write(&format!("{BASE}providers: []\n"), None, Origin::Ui)
-        .await
-        .unwrap();
-    assert!(
-        std::fs::read_to_string(mgr.path())
-            .unwrap()
-            .contains("providers")
-    );
-
-    mgr.rollback(&v0).await.unwrap();
-    let back = std::fs::read_to_string(mgr.path()).unwrap();
-    assert_eq!(back, BASE);
-    assert!(back.contains("别动我这句注释"), "注释没回来");
-}
-
-#[tokio::test]
 async fn every_write_leaves_the_previous_version_in_history() {
     // 「回滚」这个动作要的是「回到我动它之前」。
     let (_d, mgr, _bus) = setup();
     mgr.write(&format!("{BASE}providers: []\n"), None, Origin::Ui)
         .await
         .unwrap();
-    let hist = tw_config::history::list(mgr.path()).unwrap();
+    let hist = tw_pack::backup::list(mgr.path()).unwrap();
     let texts: Vec<String> = hist
         .iter()
-        .map(|v| tw_config::history::read(v).unwrap())
+        .map(|v| tw_pack::backup::open(v).unwrap().config_yaml)
         .collect();
-    // 历史里存的钥匙是打码的
+    // 备份里存的钥匙是打码的
     assert!(
         texts.contains(&tw_config::control_key::mask(BASE)),
-        "改之前那一版没进历史：{texts:?}"
+        "改之前那一版没进备份：{texts:?}"
     );
 }
 
@@ -208,10 +188,10 @@ async fn an_external_edit_also_lands_in_history_so_it_can_be_undone() {
         .await
         .unwrap()
         .expect("该被当成外部改动");
-    let hist = tw_config::history::list(mgr.path()).unwrap();
+    let hist = tw_pack::backup::list(mgr.path()).unwrap();
     assert!(
         hist.iter().any(|v| v.origin == Origin::External),
-        "外部改动没进历史"
+        "外部改动没进备份"
     );
 }
 

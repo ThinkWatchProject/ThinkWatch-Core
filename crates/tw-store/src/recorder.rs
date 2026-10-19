@@ -695,6 +695,9 @@ impl Recorder {
             | Event::PluginFailed { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
             | Event::RequestPriced { .. }
+            // 配置那一边的事：哪几把密钥换了、界面的偏好变了
+            | Event::GatewayKeysChanged { .. }
+            | Event::ClientPrefsChanged { .. }
             // 只发给事件流上掉队的那一个订阅者，从不进总线
             | Event::EventsDropped { .. } => {}
         }

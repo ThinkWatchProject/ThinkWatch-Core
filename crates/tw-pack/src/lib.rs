@@ -33,7 +33,12 @@ use std::io::{Read, Write};
 use serde::{Deserialize, Serialize};
 use tw_types::{Msg, msg};
 
+pub mod backup;
+pub mod disk;
+pub mod export;
+pub mod import;
 pub mod model;
+pub mod restore;
 
 /// 配置包格式的版本。**读到更大的就拒绝**（[`PackError::TooNew`]）：新版本的格式旧版本
 /// 猜不准，猜错了会悄悄丢东西
@@ -41,6 +46,9 @@ pub const FORMAT: u32 = 1;
 
 /// 一个配置包（连同解压之后的内容）最大多少字节
 pub const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// 口令最少几个字符
+pub const MIN_PASSPHRASE: usize = 8;
 
 /// 扩展名，不带点
 pub const EXTENSION: &str = "twconfig";
@@ -194,7 +202,10 @@ impl From<tw_config::history::Origin> for PackOrigin {
             O::Cli => PackOrigin::Cli,
             O::External => PackOrigin::External,
             O::Defaults => PackOrigin::Defaults,
-            O::Rollback => PackOrigin::Restore,
+            O::Sync => PackOrigin::Sync,
+            O::Import => PackOrigin::Import,
+            O::Restore => PackOrigin::Restore,
+            O::Repair => PackOrigin::Repair,
             // 轮换不留版本，走到这里也只是一个说不出来源的版本
             O::Rotation => PackOrigin::Other,
         }

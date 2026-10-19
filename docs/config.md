@@ -19,7 +19,7 @@ when they disagree, so a field listed here is a field the binary reads.
 
 `THINKWATCH_HOME` replaces the directory, and `--config <path>` names the
 file for a single command. The directory holds everything else core keeps
-as well: the request database (`data.db`), the configuration history
+as well: the request database (`data.db`), the backups of the configuration
 (`history/`), the downloaded price table (`model_prices.json`) and the local
 control socket (`twcore.sock`; on Windows a loopback port recorded in
 `control.port`). The directory is private to its owner (`0700`), the file is
@@ -116,23 +116,38 @@ reports why. Retention changes are applied on the next hourly clean-up.
 When two writers edit at once (the app and a hand edit), the second write
 is refused with a version mismatch instead of overwriting the first.
 
-### History and rollback
+### Backups, export and import
 
-Every version that was in effect is kept in `history/` beside the file,
-with where it came from (the app, the command line, an outside edit, a
-rollback, a credential rotation). The last 50 are kept.
+Every change to the configuration leaves a version in `history/` beside the
+file: a configuration pack (`.twconfig`) with the plugins and the app's
+preferences, recording where the change came from (the app, the command
+line, an outside edit, an import, a restore, sync). The last 10 are kept; a
+credential rotation does not make one. The control key is masked in them.
 
 ```sh
 twcore check                      # validate the file without starting anything
 twcore config show                # print it, with its version
-twcore config history             # list the versions, newest first
-twcore config rollback 3f9a2c     # go back to a version (a prefix is enough)
+twcore backup list                # list the versions, newest first
+twcore backup restore 1792315800000 --dry-run   # what going back would change
+twcore backup restore 1792315800000             # go back to a version
+twcore export -o all.twconfig     # the whole configuration as a pack
+twcore export --providers relay --no-secrets --encrypt -o relay.twconfig
+twcore import all.twconfig --dry-run            # what importing would do
 twcore config set /listen/gateway/port 8790 --int
 ```
 
-These commands work on the file directly, so they work when core is not
-running, which is when a rollback is most needed. A running core picks
-their changes up like any other save.
+A restore keeps the settings that belong to this machine (listening, the
+control key, retention, sync), the ChatGPT sign-ins and the gateway keys that
+clients set up on this machine use. An import adds what is not here and asks,
+item by item, what to do with what differs (`--on-conflict` answers for all).
+A pack carries no settings of this machine and no ChatGPT sign-in; without
+`--no-secrets` it holds keys in plain text unless `--encrypt` is given (the
+passphrase is asked for, or read from `TWCORE_PASSPHRASE`).
+
+These commands work on the files directly, so they work when core is not
+running, which is when a restore is most needed; when the file does not
+load at all, a restore brings the whole version back with the current
+control key. A running core picks their changes up like any other save.
 
 `twcore config set <path> <value>` changes one value that is already written
 in the file. The path names list items by their `name`
@@ -244,7 +259,7 @@ complete the first message.
 
 `key` is written by `twcore serve` before the control channel starts
 listening, if it is missing, and by `twcore init`. It is masked wherever the
-configuration is shown or kept in the history; saving a masked value back
+configuration is shown or kept in a backup; saving a masked value back
 keeps the real one. A missing or malformed key (not 64 hexadecimal
 characters) makes the whole file invalid, so it cannot be replaced by a
 short, guessable one.

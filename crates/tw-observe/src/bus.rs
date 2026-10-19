@@ -125,6 +125,8 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::ListenChanged { .. }
         | E::ConfigReloaded { .. }
         | E::ConfigRejected { .. }
+        | E::GatewayKeysChanged { .. }
+        | E::ClientPrefsChanged { .. }
         | E::EventsDropped { .. } => false,
     }
 }
