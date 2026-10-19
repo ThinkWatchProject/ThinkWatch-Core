@@ -964,17 +964,20 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `POST /config/rollback`（`ConfigVersion`、`RollbackRequest`）删了，换成 `GET /backups`
 /// （[`BackupEntry`]：本机最近 10 个版本，开着同步时连同同步位置上的，同一个版本一行）、
 /// `POST /backups/file`（另存为配置包）、`POST /backups/preview`（[`RestorePreview`]：按项目
-/// 列出差异）、`POST /backups/restore`（可以只恢复几项，本机设置和 ChatGPT 的登录留着，接管的
-/// 客户端在用的密钥不删）。一版是一个完整的配置包，连同插件和 Lite 的通用偏好。新端点
+/// 列出差异；给了 `items` 是只恢复这几项时会动什么）、`POST /backups/restore`（可以只恢复几项，
+/// 本机设置和 ChatGPT 的登录留着，接管的客户端在用的密钥不删；→ [`RestoreWritten`]，`rows` 是
+/// 实际动了的项目，和同样条件下的预览一样）。一版是一个完整的配置包，连同插件和 Lite 的通用偏好。新端点
 /// `GET /config/items`（[`ItemNode`]）、`POST /config/export`（[`ExportRequest`] →
 /// [`ExportedFile`]）、`POST /config/import/preview`（[`ImportSource`] → [`ImportPreview`]：逐项
 /// 新增、相同、冲突、错误）和 `POST /config/import`（[`ImportRequest`]：逐项导入、覆盖、改名
 /// 导入或跳过）。Lite 的通用偏好由 core 存：`GET` / `PUT /client-prefs`（[`ClientPrefs`]，
 /// 不解析，最大 64 KiB），变了发 [`Event::ClientPrefsChanged`]。`PUT /pinned-keys`
-/// （[`PinnedKeys`]：`source` 是这个 Lite 的标识，几个 Lite 各报各的、core 取并集，30 天没更新
-/// 的来源不算）报告接管的客户端在用哪几把密钥。恢复时留下的项目还引用着的不删
-/// （[`KeptReason`] 的 `referenced`），所选项目引用的、本机已没有的一起恢复；不带密钥的包导入时
-/// 比较和覆盖都沿用本机的密钥。导入覆盖、恢复改了或删了网关密钥时发
+/// （[`PinnedKeys`]：`source` 是这个 Lite 的标识，几个 Lite 各报各的、core 取并集，来源不过期，
+/// 超出上限是 `backup.pinned.*`）报告接管的客户端在用哪几把密钥。恢复时留下的项目还引用着的、
+/// 同步设置走的出站代理不删（[`KeptReason`] 的 `referenced`），所选项目引用的、本机已没有的一起
+/// 恢复；恢复同步位置上的版本时本机不同步的上游不列成删除。不带密钥的包导入时比较和覆盖都沿用
+/// 本机的密钥，**只在目的地不变时**（协议、主机、端口、AWS 区域、OAuth 令牌端点、代理地址
+/// 一样）；改名导入的不沿用，缺着的标 `missing_key`（代理的密码也算）。导入覆盖、恢复改了或删了网关密钥时发
 /// [`Event::GatewayKeysChanged`]。[`ConfigOrigin`] 删了 `rollback`，多了 `sync`、`import`、
 /// `restore`、`repair`（一键修复以前记成 `ui`）。备份相关的端点在安全模式下照样可用。配置包的
 /// 码是 `pack.*`，导入的是 `import.*`，备份与恢复的是 `backup.*`。停用着的上游可以缺凭据

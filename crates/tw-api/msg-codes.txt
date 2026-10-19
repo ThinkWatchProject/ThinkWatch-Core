@@ -5,6 +5,9 @@
 #   test         only produced by tests; never reaches a UI
 backup.io
 backup.not_found
+backup.pinned.name_too_long
+backup.pinned.source_too_long
+backup.pinned.too_many
 backup.prefs_too_large
 backup.write_failed
 config.alias_blank_model
@@ -516,6 +519,7 @@ pack.not_encrypted
 pack.passphrase_short
 pack.schema_too_new
 pack.too_large
+pack.too_much_work
 pack.too_new
 pack.verify_failed
 pack.wrong_key

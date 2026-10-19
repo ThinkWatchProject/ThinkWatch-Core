@@ -381,9 +381,7 @@ pub fn restore(path: &Path, id: &str, dry_run: bool) -> Result<()> {
     let pinned = tw_pack::disk::read_pinned(path);
     let after = if tw_pack::model::snapshot(&local).is_err() {
         println!("the configuration here does not load; the whole version comes back");
-        let last = tw_pack::backup::list(path)
-            .ok()
-            .and_then(|all| all.last().and_then(|b| tw_pack::backup::open(b).ok()));
+        let last = tw_pack::backup::last_readable(path, &cur.text);
         tw_pack::restore::whole(&backup, &cur.text, last.as_ref())
     } else {
         let rows = tw_pack::restore::preview(&local, &backup, &pinned, true).map_err(model)?;

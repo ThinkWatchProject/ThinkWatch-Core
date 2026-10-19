@@ -165,8 +165,15 @@ pub fn strip_secrets(snap: &mut Snapshot) {
 
 /// 不带密钥的包里的一项，**空着的密钥换成本机同一项里的**：上游的密钥、请求头的值（按名字）、
 /// AWS 访问密钥、OAuth 的客户端密钥，代理的密码，网关密钥的值。比较和覆盖都照这个样子：除了
-/// 密钥都一样的就是「相同」，覆盖不会把本机的密钥抹成空的
+/// 密钥都一样的就是「相同」，覆盖不会把本机的密钥抹成空的。
+///
+/// **只在目的地不变时**（[`same_destination`]）：包里的上游换了主机、端口、AWS 区域或 OAuth
+/// 令牌端点，代理换了地址，本机的密钥就不跟过去 —— 否则一份不带密钥的包改个地址，覆盖之后
+/// 本机的密钥就发给了包里写的那个地方
 pub fn fill_secrets(id: &ItemId, item: &mut model::Item, mine: &model::Item) {
+    if !same_destination(id, item, mine) {
+        return;
+    }
     let empty = |v: Option<&Json>| v.and_then(Json::as_str) == Some("");
     let take = |at: Option<&mut Json>, from: Option<&Json>| {
         if let (Some(v), Some(f)) = (at, from)
@@ -237,6 +244,67 @@ pub fn fill_secrets(id: &ItemId, item: &mut model::Item, mine: &model::Item) {
     }
 }
 
+/// 两份同名的项目，密钥是发去同一个地方的吗：上游的协议、主机、端口一样，AWS 区域一样，
+/// OAuth 的令牌端点一样；代理的类型和地址一样。网关密钥是发给这台网关自己的，总是
+pub fn same_destination(id: &ItemId, theirs: &model::Item, mine: &model::Item) -> bool {
+    let at = |it: &model::Item, u: &str, path: &[&str]| -> Option<Json> {
+        let mut cur = it.units.get(u)?;
+        for p in path {
+            cur = cur.get(*p)?;
+        }
+        Some(cur.clone())
+    };
+    match id.kind {
+        ItemKind::Provider => {
+            let url = |it: &model::Item| {
+                at(it, unit::CONN, &["base_url"]).and_then(|v| v.as_str().and_then(destination))
+            };
+            url(theirs).is_some()
+                && url(theirs) == url(mine)
+                && at(theirs, unit::CONN, &["aws", "region"])
+                    == at(mine, unit::CONN, &["aws", "region"])
+                && at(theirs, unit::CONN, &["oauth", "endpoint"])
+                    == at(mine, unit::CONN, &["oauth", "endpoint"])
+        }
+        ItemKind::Proxy => {
+            let addr = |it: &model::Item| {
+                at(it, unit::ALL, &["addr"])
+                    .and_then(|v| v.as_str().map(|a| a.trim().to_ascii_lowercase()))
+            };
+            addr(theirs).is_some()
+                && addr(theirs) == addr(mine)
+                && at(theirs, unit::ALL, &["type"]) == at(mine, unit::ALL, &["type"])
+        }
+        _ => true,
+    }
+}
+
+/// 一个地址发去哪儿：协议、主机（小写）、端口（没写时按协议的缺省）。读不懂是 None
+pub fn destination(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
+        let (h, after) = v6.split_once(']')?;
+        (h.to_string(), after.strip_prefix(':'))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (hostport.to_string(), None),
+        }
+    };
+    let port = match port {
+        Some(p) => p.parse().ok()?,
+        None => match scheme.as_str() {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        },
+    };
+    (!host.is_empty()).then(|| (scheme, host.to_ascii_lowercase(), port))
+}
+
 /// 一项里有没有被去掉的密钥（空字符串）
 pub fn missing_secret(id: &ItemId, item: &model::Item) -> bool {
     let empty = |v: Option<&Json>| v.and_then(Json::as_str) == Some("");
@@ -260,6 +328,12 @@ pub fn missing_secret(id: &ItemId, item: &model::Item) -> bool {
                     .is_some_and(|o| empty(o.get("refresh")) || empty(o.get("client_secret")))
         }
         ItemKind::Key => empty(item.units.get(unit::ALL).and_then(|a| a.get("key"))),
+        ItemKind::Proxy => empty(
+            item.units
+                .get(unit::ALL)
+                .and_then(|a| a.get("auth"))
+                .and_then(|a| a.get("pass")),
+        ),
         _ => false,
     }
 }
@@ -287,6 +361,26 @@ fn civil(days: u64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_destination_is_scheme_host_and_port() {
+        let d = |u| destination(u);
+        assert_eq!(
+            d("https://Relay.example/v1"),
+            Some(("https".into(), "relay.example".into(), 443))
+        );
+        assert_eq!(
+            d("https://relay.example:443/x"),
+            d("https://relay.example/y")
+        );
+        assert_ne!(d("https://relay.example:8443"), d("https://relay.example"));
+        assert_ne!(d("http://relay.example"), d("https://relay.example"));
+        assert_eq!(
+            d("http://user:pw@[::1]:8080/p"),
+            Some(("http".into(), "::1".into(), 8080))
+        );
+        assert_eq!(d("not a url"), None);
+    }
 
     #[test]
     fn the_file_name_carries_the_date() {

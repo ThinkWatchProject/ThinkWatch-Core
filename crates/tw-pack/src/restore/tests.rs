@@ -32,13 +32,22 @@ fn then() -> Pack {
     ))
 }
 
+fn opts(items: Option<&[ItemId]>) -> Options {
+    Options {
+        pinned: pinned(),
+        with_prefs: true,
+        items: items.map(|xs| xs.iter().cloned().collect()),
+        ..Default::default()
+    }
+}
+
 fn pinned() -> BTreeSet<String> {
     ["claude-code".to_string()].into_iter().collect()
 }
 
 #[test]
 fn the_preview_lists_what_differs_by_item() {
-    let rows = preview_with(&now(), &then(), &pinned(), true, &WholeFile).unwrap();
+    let rows = preview_with(&now(), &then(), &opts(None), &WholeFile).unwrap();
     let got: Vec<(String, Change, Option<Kept>)> = rows
         .iter()
         .map(|r| (r.item.to_string(), r.change, r.kept))
@@ -62,7 +71,7 @@ fn the_preview_lists_what_differs_by_item() {
 
 #[test]
 fn restoring_everything_keeps_local_settings_logins_and_keys_in_use() {
-    let out = apply_with(&now(), &then(), None, &pinned(), true, &WholeFile).unwrap();
+    let out = apply_with(&now(), &then(), &opts(None), &WholeFile).unwrap();
     let cfg = tw_config::try_parse(&out.pack.config_yaml)
         .unwrap_or_else(|e| panic!("{e}\n{}", out.pack.config_yaml));
     assert_eq!(cfg.listen.gateway.port, 9000, "本机设置留着现在的");
@@ -87,7 +96,7 @@ fn restoring_everything_keeps_local_settings_logins_and_keys_in_use() {
 #[test]
 fn restoring_a_few_items_leaves_the_rest_as_it_is() {
     let pick = [ItemId::new(ItemKind::Provider, "deleted")];
-    let out = apply_with(&now(), &then(), Some(&pick), &pinned(), true, &WholeFile).unwrap();
+    let out = apply_with(&now(), &then(), &opts(Some(&pick)), &WholeFile).unwrap();
     let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
     let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["kept", "chatgpt", "deleted"]);
@@ -122,7 +131,16 @@ fn oauth_tokens_come_from_now_or_from_the_version_it_comes_back_from() {
         oauth("gone", "rt-gone"),
         "  - name: blank\n    base_url: https://blank.example\n    disabled: true\n    oauth:\n      refresh: ''\n      endpoint: https://auth.example/token\n",
     ));
-    let out = apply_with(&now, &then, None, &BTreeSet::new(), true, &WholeFile).unwrap();
+    let out = apply_with(
+        &now,
+        &then,
+        &Options {
+            with_prefs: true,
+            ..Default::default()
+        },
+        &WholeFile,
+    )
+    .unwrap();
     let cfg = tw_config::try_parse(&out.pack.config_yaml)
         .unwrap_or_else(|e| panic!("{e}\n{}", out.pack.config_yaml));
     let p = |n: &str| cfg.providers.iter().find(|p| p.name == n).unwrap();

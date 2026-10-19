@@ -308,6 +308,10 @@ pub enum PackError {
     /// 要求加密的地方读到了一个没加密的包（[`read_strict`]）
     #[error("{}", self.msg())]
     NotEncrypted,
+    /// 口令加密的工作量超出了这一版肯解的上限（[`MAX_WORK_FACTOR`]）。不是包坏了：别的工具
+    /// 用更高的工作量加密的
+    #[error("{}", self.msg())]
+    TooMuchWork { required: u8, max: u8 },
 }
 
 impl PackError {
@@ -357,6 +361,11 @@ impl PackError {
             PackError::TooLarge { limit } => msg!(
                 "pack.too_large", limit = limit / (1024 * 1024) =>
                 "This configuration pack is larger than {limit} MiB."
+            ),
+            PackError::TooMuchWork { required, max } => msg!(
+                "pack.too_much_work", required = required, max = max =>
+                "The passphrase encryption of this configuration pack takes more work than this \
+                 version allows (work factor {required}, at most {max}), so it was not opened."
             ),
         }
     }
@@ -524,6 +533,10 @@ fn decrypt(bytes: &[u8], unseal: Unseal) -> Result<Vec<u8>, PackError> {
                 age::DecryptError::DecryptionFailed | age::DecryptError::NoMatchingKeys => {
                     PackError::WrongPassphrase
                 }
+                age::DecryptError::ExcessiveWork { required, .. } => PackError::TooMuchWork {
+                    required,
+                    max: MAX_WORK_FACTOR,
+                },
                 other => corrupt(other),
             })?
     } else {

@@ -788,3 +788,283 @@ async fn in_safe_mode_a_synced_version_comes_back_whole() {
     assert_eq!(cfg.listen.control.key.as_deref(), Some(KEY));
     assert!(cfg.providers.iter().any(|p| p.name == "relay"));
 }
+
+fn rows_of(v: &serde_json::Value) -> Vec<String> {
+    v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}/{}{}",
+                r["change"].as_str().unwrap(),
+                r["item"]["kind"].as_str().unwrap(),
+                r["item"]["name"].as_str().unwrap(),
+                r["kept"]
+                    .as_str()
+                    .map(|k| format!(" ({k})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// 只恢复几项：预览接收所选的项目，和写入走同一个计划；写入的结果说实际动了哪几项
+#[tokio::test]
+async fn a_partial_restore_writes_what_its_preview_listed() {
+    let with = format!(
+        "{}proxies:\n  - name: px\n    type: http\n    addr: 10.0.0.1:8080\n",
+        mine()
+    )
+    .replace(
+        "routes:",
+        "  - name: gone\n    base_url: https://gone.example\n    key: sk-g\n    proxy: px\nroutes:",
+    );
+    tw_config::try_parse(&with).unwrap();
+    let b = bed(&with);
+    b.state.cfg.record_startup();
+    b.state
+        .cfg
+        .write(&mine(), None, tw_config::history::Origin::Ui)
+        .await
+        .unwrap();
+    let (_, list) = call(&b.app, "GET", "/backups", serde_json::json!(null)).await;
+    let oldest = list.as_array().unwrap().last().unwrap()["id"].clone();
+    let items = serde_json::json!([{ "kind": "provider", "name": "gone" }]);
+    let (st, preview) = call(
+        &b.app,
+        "POST",
+        "/backups/preview",
+        serde_json::json!({ "id": oldest, "items": items }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    assert_eq!(rows_of(&preview), ["add provider/gone", "add proxy/px"]);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/backups/restore",
+        serde_json::json!({ "id": oldest, "base_version": preview["base_version"], "items": items }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(rows_of(&v), rows_of(&preview));
+    assert_eq!(v["version"], serde_json::json!(b.version()));
+    let cfg = tw_config::try_parse(&b.file()).unwrap();
+    assert_eq!(cfg.proxies.len(), 1);
+}
+
+/// 恢复同步位置上的版本：本机不同步的上游（和指向它的路由）那一版里本来就没有，不列成删除
+#[tokio::test]
+async fn restoring_a_synced_version_leaves_what_this_machine_does_not_sync() {
+    let d = tempfile::tempdir().unwrap();
+    let here = format!(
+        "{}sync:\n  device_id: 3f9a2c1e0b1d4e2f\n  device_name: srv\n  encrypt: false\n  exclude: [ollama]\n  target:\n    type: folder\n    path: {}\n",
+        mine().replace(
+            "routes:",
+            "  - name: ollama\n    base_url: http://127.0.0.1:11434\nroutes:\n  - name: local\n    rules:\n      - name: all\n        to: ollama\n"
+        ),
+        d.path().join("sync").display()
+    );
+    tw_config::try_parse(&here).unwrap_or_else(|e| panic!("{e}\n{here}"));
+    // 同步位置上的那一版：没有 ollama 和 local，官方的地址不一样
+    let synced = {
+        let mut m = tw_pack::Manifest::new(tw_pack::PackKind::Full, tw_pack::PackOrigin::Sync);
+        m.secrets = true;
+        tw_pack::Pack {
+            manifest: m,
+            config_yaml: mine()
+                .replace("https://api.anthropic.com\n", "https://synced.example\n")
+                .replace(&format!("listen:\n  control:\n    key: {KEY}\n"), ""),
+            plugins: Default::default(),
+            client_prefs: None,
+        }
+    };
+    let b = bed(&here);
+    b.state
+        .cfg
+        .set_remote_backups(Some(Arc::new(OneRemote(synced))));
+    let (_, list) = call(&b.app, "GET", "/backups", serde_json::json!(null)).await;
+    let id = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"].as_str().unwrap().starts_with("sync-"))
+        .unwrap()["id"]
+        .clone();
+    let (st, preview) = call(
+        &b.app,
+        "POST",
+        "/backups/preview",
+        serde_json::json!({ "id": id }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    assert_eq!(rows_of(&preview), ["modify provider/官方"]);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/backups/restore",
+        serde_json::json!({ "id": id, "base_version": preview["base_version"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let cfg = tw_config::try_parse(&b.file()).unwrap();
+    let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["官方", "ollama"]);
+    assert_eq!(cfg.providers[0].base_url, "https://synced.example");
+    assert!(cfg.routes.iter().any(|r| r.name == "local"));
+}
+
+/// 固定密钥：来源不过期，有上限；早先的文件照样算；同时报的几个来源谁也不盖掉谁
+#[tokio::test]
+async fn pinned_keys_have_limits_and_an_older_file_still_counts() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("config.yaml");
+    std::fs::write(&p, mine()).unwrap();
+    std::fs::write(
+        tw_pack::disk::pinned_path(&p),
+        br#"{"names":["claude-code"]}"#,
+    )
+    .unwrap();
+    let gw = tw_gateway::AppState::new(tw_config::try_parse(&mine()).unwrap()).unwrap();
+    let bus = gw.bus.clone();
+    let mgr = Arc::new(ConfigManager::new(p.clone(), gw.clone(), bus));
+    assert!(mgr.pinned_keys().contains("claude-code"));
+    let app = tw_control::router(state_for(p.clone(), mgr.clone(), gw));
+    for (body, code) in [
+        (
+            serde_json::json!({ "source": "x".repeat(129), "names": ["default"] }),
+            "backup.pinned.source_too_long",
+        ),
+        (
+            serde_json::json!({ "source": "a", "names": ["n".repeat(257)] }),
+            "backup.pinned.name_too_long",
+        ),
+        (
+            serde_json::json!({ "source": "a", "names": (0..1025).map(|i| i.to_string()).collect::<Vec<_>>() }),
+            "backup.pinned.too_many",
+        ),
+    ] {
+        let (st, v) = call(&app, "PUT", "/pinned-keys", body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], code);
+    }
+    let tasks: Vec<_> = (0..16)
+        .map(|i| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                call(
+                    &app,
+                    "PUT",
+                    "/pinned-keys",
+                    serde_json::json!({ "source": format!("lite-{i}"), "names": [format!("k{i}")] }),
+                )
+                .await
+                .0
+            })
+        })
+        .collect();
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), StatusCode::OK);
+    }
+    let on_disk = tw_pack::disk::read_pinned(&p);
+    for i in 0..16 {
+        assert!(on_disk.contains(&format!("k{i}")), "{on_disk:?}");
+    }
+    assert!(on_disk.contains("claude-code"));
+    assert_eq!(on_disk, mgr.pinned_keys());
+}
+
+/// 已经存着一份超大的通用偏好（上限之前存的）：恢复、导入照样能做，只有要写下去的新偏好才查
+#[tokio::test]
+async fn a_large_preference_already_here_does_not_block_a_restore() {
+    let b = bed(&mine());
+    let big = serde_json::json!({ "big": "x".repeat(tw_api::CLIENT_PREFS_MAX + 1) });
+    std::fs::write(
+        tw_pack::disk::prefs_path(&b.path()),
+        serde_json::to_vec(&big).unwrap(),
+    )
+    .unwrap();
+    b.state.cfg.record_startup();
+    b.state
+        .cfg
+        .write(
+            &mine().replace("https://api.anthropic.com\n", "https://changed.example\n"),
+            None,
+            tw_config::history::Origin::Ui,
+        )
+        .await
+        .unwrap();
+    let (_, list) = call(&b.app, "GET", "/backups", serde_json::json!(null)).await;
+    let oldest = list.as_array().unwrap().last().unwrap()["id"].clone();
+    let (_, preview) = call(
+        &b.app,
+        "POST",
+        "/backups/preview",
+        serde_json::json!({ "id": oldest }),
+    )
+    .await;
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/backups/restore",
+        serde_json::json!({ "id": oldest, "base_version": preview["base_version"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(tw_pack::disk::read_prefs(&b.path()), Some(big));
+}
+
+/// 启动时从备份里找回插件文件（写插件文件和写配置之间断过电）：网关照找回来的重读，插件
+/// 照常跑。读不成 YAML 的原文不记成版本
+#[tokio::test]
+async fn a_plugin_put_back_at_startup_runs_again() {
+    use tw_gateway::plugin::fake::{FakeEngine, source};
+    let v1 = source(
+        serde_json::json!({"name": "A", "api": 1, "permissions": ["system"]}),
+        &["onRequest"],
+    );
+    let v2 = source(
+        serde_json::json!({"name": "A2", "api": 1, "permissions": ["system"]}),
+        &["onRequest"],
+    );
+    let sha = tw_gateway::plugin::load::sha256_hex(v1.as_bytes());
+    let text = format!(
+        "{}plugins:\n  - id: a\n    file: plugins/a.js\n    sha256: {sha}\n",
+        mine()
+    );
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("config.yaml");
+    std::fs::write(&p, &text).unwrap();
+    let files = |s: &str| tw_pack::PluginFiles {
+        script: s.as_bytes().to_vec(),
+        approved: Some(s.as_bytes().to_vec()),
+    };
+    let one = |s: &str| std::collections::BTreeMap::from([("a".to_string(), files(s))]);
+    tw_pack::disk::write_plugins(&p, &Default::default(), &one(&v1)).unwrap();
+    tw_pack::backup::record(&p, &text, tw_config::history::Origin::Ui).unwrap();
+    // 断在半路：两份文件都已经是新的，配置还是旧的
+    tw_pack::disk::write_plugins(&p, &one(&v1), &one(&v2)).unwrap();
+    let gw = tw_gateway::AppState::new(tw_config::try_parse(&text).unwrap()).unwrap();
+    gw.set_plugin_engine(Arc::new(FakeEngine));
+    let bus = gw.bus.clone();
+    let mgr = Arc::new(ConfigManager::new(p.clone(), gw.clone(), bus));
+    let app = tw_control::router(state_for(p.clone(), mgr.clone(), gw));
+    let status = || async {
+        let (_, v) = call(&app, "GET", "/plugins", serde_json::json!(null)).await;
+        v[0]["status"].clone()
+    };
+    assert_eq!(status().await, serde_json::json!({"kind": "changed"}));
+    mgr.record_startup();
+    assert_eq!(status().await, serde_json::json!({"kind": "ok"}));
+    assert_eq!(
+        std::fs::read_to_string(tw_config::plugins::file_path(d.path(), "a")).unwrap(),
+        v1
+    );
+
+    let before = tw_pack::backup::list(&p).unwrap().len();
+    std::fs::write(&p, "listen: [\n  :::\n").unwrap();
+    mgr.record_startup();
+    assert_eq!(tw_pack::backup::list(&p).unwrap().len(), before);
+}

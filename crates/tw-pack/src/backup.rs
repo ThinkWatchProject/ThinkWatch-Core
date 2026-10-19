@@ -133,7 +133,7 @@ pub fn record(
     text: &str,
     origin: Origin,
 ) -> Result<Option<Backup>, BackupError> {
-    if origin == Origin::Rotation {
+    if origin == Origin::Rotation || !readable(text) {
         return Ok(None);
     }
     let pack = disk::current(config_path, text, PackOrigin::from(origin));
@@ -157,7 +157,7 @@ pub fn record_before(
     text: &str,
     origin: Origin,
 ) -> Result<Option<Backup>, BackupError> {
-    if origin == Origin::Rotation {
+    if origin == Origin::Rotation || !readable(text) {
         return Ok(None);
     }
     let all = list(config_path)?;
@@ -170,6 +170,23 @@ pub fn record_before(
     }
     let pack = disk::current(config_path, text, PackOrigin::External);
     save(config_path, &pack, Origin::External, all.last()).map(Some)
+}
+
+/// 读得成 YAML（一个映射）吗。**读不成的原文不记成版本**（安全模式下启动时、改坏了的文件）：
+/// 恢复不了它，它还会挤掉一个恢复得了的版本，整份恢复取本机那几节时也取不到东西
+fn readable(text: &str) -> bool {
+    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text).is_ok_and(|v| v.is_mapping())
+}
+
+/// 从新往旧第一个读得成 YAML、和现在这份原文不一样的本机版本：配置坏到读不成 YAML 时，整份
+/// 恢复从这里取本机那几节（[`crate::restore::whole`]）
+pub fn last_readable(config_path: &Path, current_text: &str) -> Option<Pack> {
+    let now = text_fingerprint(&tw_config::control_key::mask(current_text));
+    list(config_path).ok()?.iter().rev().find_map(|b| {
+        open(b)
+            .ok()
+            .filter(|p| readable(&p.config_yaml) && text_fingerprint(&p.config_yaml) != now)
+    })
 }
 
 fn masked(pack: &Pack) -> Pack {
@@ -252,11 +269,16 @@ pub fn heal_plugins(config_path: &Path) -> Vec<String> {
     let mut healed = Vec::new();
     let mut backups: Option<Vec<Pack>> = None;
     for (id, sha) in entries {
-        let files = disk::read_plugin(config_path, &id);
-        let fine = files.as_ref().is_some_and(|f| {
-            hash(&f.script) == sha || f.approved.as_ref().is_some_and(|a| hash(a) == sha)
-        });
-        if fine {
+        // **只在脚本和底稿都对不上批准的哈希时**才找回来（写插件文件和写配置之间断过电）。
+        // 底稿对得上、脚本对不上是用户改了脚本还没批准：不动它，网关照常把它停用、等批准。
+        // 没有底稿的说不清是哪一种，也不动；脚本文件没了的找回来，盖不掉谁的改动
+        let heal = match disk::read_plugin(config_path, &id) {
+            None => true,
+            Some(f) => {
+                hash(&f.script) != sha && f.approved.as_ref().is_some_and(|a| hash(a) != sha)
+            }
+        };
+        if !heal {
             continue;
         }
         let packs = backups.get_or_insert_with(|| {
@@ -481,7 +503,7 @@ mod tests {
         };
         let sha = crate::model::sha256_hex(b"v1");
         let text = format!(
-            "{}plugins:\n  - id: a\n    file: plugins/a.js\n    sha256: {sha}\n  - id: b\n    file: plugins/b.js\n    sha256: {sha}\n",
+            "{}plugins:\n  - id: a\n    file: plugins/a.js\n    sha256: {sha}\n  - id: b\n    file: plugins/b.js\n    sha256: {sha}\n  - id: c\n    file: plugins/c.js\n    sha256: {sha}\n",
             cfg(1)
         );
         std::fs::write(&p, &text).unwrap();
@@ -491,19 +513,22 @@ mod tests {
             &[
                 ("a".to_string(), files("v1", Some("v1"))),
                 ("b".to_string(), files("v1", Some("v1"))),
+                ("c".to_string(), files("v1", Some("v1"))),
             ]
             .into_iter()
             .collect(),
         )
         .unwrap();
         record(&p, &text, Origin::Ui).unwrap().unwrap();
-        // a：两份都换成了新的（断在半路）；b：用户改了脚本，底稿还是批准的那份
+        // a：两份都换成了新的（断在半路）；b：用户改了脚本，底稿还是批准的那份；c：用户改了
+        // 脚本，底稿没了（说不清是哪一种，不动）
         disk::write_plugins(
             &p,
             &Default::default(),
             &[
                 ("a".to_string(), files("v2", Some("v2"))),
                 ("b".to_string(), files("edited", Some("v1"))),
+                ("c".to_string(), files("edited", None)),
             ]
             .into_iter()
             .collect(),
@@ -512,7 +537,31 @@ mod tests {
         assert_eq!(heal_plugins(&p), ["a"]);
         assert_eq!(disk::read_plugin(&p, "a").unwrap().script, b"v1");
         assert_eq!(disk::read_plugin(&p, "b").unwrap().script, b"edited");
+        assert_eq!(disk::read_plugin(&p, "c").unwrap().script, b"edited");
         assert!(heal_plugins(&p).is_empty());
+    }
+
+    /// 读不成 YAML 的原文不记成版本；整份恢复取本机那几节时从新往旧找第一个读得成的
+    #[test]
+    fn unreadable_text_is_no_version_and_the_last_readable_one_is_found() {
+        let (_d, p) = setup();
+        record(&p, &cfg(1), Origin::Ui).unwrap().unwrap();
+        record(&p, &cfg(2), Origin::Ui).unwrap().unwrap();
+        let garbage = "listen: [\n  :::\n";
+        assert!(serde_yaml_ng::from_str::<serde_yaml_ng::Value>(garbage).is_err());
+        assert!(record(&p, garbage, Origin::External).unwrap().is_none());
+        assert!(record_before(&p, garbage, Origin::Ui).unwrap().is_none());
+        assert!(
+            record(&p, "just a string\n", Origin::External)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(list(&p).unwrap().len(), 2);
+        let last = last_readable(&p, garbage).unwrap();
+        assert!(last.config_yaml.contains("port: 2"), "{}", last.config_yaml);
+        // 和现在这份一样的不算（它要是读得成，本机那几节本来就从现在这份取）
+        let last = last_readable(&p, &cfg(2)).unwrap();
+        assert!(last.config_yaml.contains("port: 1"), "{}", last.config_yaml);
     }
 
     #[test]

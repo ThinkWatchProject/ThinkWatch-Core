@@ -142,7 +142,12 @@ clients set up on this machine use. An import adds what is not here and asks,
 item by item, what to do with what differs (`--on-conflict` answers for all).
 A pack carries no settings of this machine and no ChatGPT sign-in; without
 `--no-secrets` it holds keys in plain text unless `--encrypt` is given (the
-passphrase is asked for, or read from `TWCORE_PASSPHRASE`).
+passphrase is asked for, or read from `TWCORE_PASSPHRASE`). Overwriting an
+item here with one from a pack without keys keeps this machine's keys only
+while the item still points at the same place (scheme, host and port; AWS
+region; OAuth token endpoint; proxy address); otherwise, and for an item
+imported under another name, the upstream comes in disabled until its key
+is entered.
 
 These commands work on the files directly, so they work when core is not
 running, which is when a restore is most needed; when the file does not
