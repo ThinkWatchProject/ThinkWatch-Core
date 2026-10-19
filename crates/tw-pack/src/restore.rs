@@ -40,6 +40,20 @@ pub struct Row {
     pub kept: Option<Kept>,
 }
 
+/// 恢复的条件。
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// 固定密钥的名字：接管的客户端在用，不删
+    pub pinned: BTreeSet<String>,
+    /// 通用偏好算不算。经远程连接恢复时不算：偏好在 Lite 那边
+    pub with_prefs: bool,
+    /// 只恢复这几项（连同它们要的，见 [`plan`]），None 是全部
+    pub items: Option<BTreeSet<ItemId>>,
+    /// 不参与比较、保持现在样子的项目：恢复同步位置上的版本时，本机不同步的上游和随之不同步
+    /// 的项目（规格 7.2）—— 那一版里本来就没有它们，不是删了
+    pub skip: BTreeSet<ItemId>,
+}
+
 /// 那一版和现在的差异。`pinned` 是固定密钥的名字。`with_prefs` 为 false 时通用偏好不算
 /// （经远程连接恢复：偏好在 Lite 那边）
 pub fn preview(
@@ -48,19 +62,130 @@ pub fn preview(
     pinned: &BTreeSet<String>,
     with_prefs: bool,
 ) -> Result<Vec<Row>, ModelError> {
-    preview_with(local, backup, pinned, with_prefs, model::codec())
+    preview_opts(
+        local,
+        backup,
+        &Options {
+            pinned: pinned.clone(),
+            with_prefs,
+            ..Default::default()
+        },
+    )
+}
+
+/// 照这些条件恢复会动哪几项。**和 [`apply_opts`] 是同一个计划**：只选了几项时，预览列出的
+/// 就是写下去的（连同一起恢复的、留着的）
+pub fn preview_opts(local: &Pack, backup: &Pack, opts: &Options) -> Result<Vec<Row>, ModelError> {
+    preview_with(local, backup, opts, model::codec())
 }
 
 pub fn preview_with(
     local: &Pack,
     backup: &Pack,
-    pinned: &BTreeSet<String>,
-    with_prefs: bool,
+    opts: &Options,
     codec: &dyn PluginCodec,
 ) -> Result<Vec<Row>, ModelError> {
     let l = model::snapshot_with(local, codec)?;
     let b = model::snapshot_with(backup, codec)?;
-    Ok(plan(&l, &b, pinned, with_prefs, None).0)
+    Ok(plan(&l, &b, &local_refs(local), opts).0)
+}
+
+/// 本机那几节（[`model::LOCAL_SECTIONS`]）引用的项目：同步设置走的出站代理。恢复留着本机那
+/// 几节，它们引用的就得留着 —— 那一版里没有这个代理的话，删了它同步设置就不成立
+fn local_refs(local: &Pack) -> BTreeSet<ItemId> {
+    local_refs_in(&local.config_yaml)
+}
+
+fn local_refs_in(text: &str) -> BTreeSet<ItemId> {
+    fn walk(v: &serde_yaml_ng::Value, out: &mut BTreeSet<ItemId>) {
+        match v {
+            serde_yaml_ng::Value::Mapping(m) => {
+                for (k, v) in m {
+                    if k.as_str() == Some("proxy")
+                        && let Some(name) = v.as_str()
+                        && name != tw_config::DIRECT
+                        && name != tw_config::SYSTEM
+                    {
+                        out.insert(ItemId::new(ItemKind::Proxy, name));
+                    }
+                    walk(v, out);
+                }
+            }
+            serde_yaml_ng::Value::Sequence(xs) => xs.iter().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    if let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) {
+        for section in model::LOCAL_SECTIONS {
+            if let Some(v) = doc.get(*section) {
+                walk(v, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// 那一版，`skip` 里的项目换成现在的样子：现在有的照现在的，现在没有的不在；排列顺序里它们
+/// 照现在的位置
+fn overlay(l: &Snapshot, b: &Snapshot, skip: &BTreeSet<ItemId>) -> Snapshot {
+    if skip.is_empty() {
+        return b.clone();
+    }
+    let mut out = b.clone();
+    for id in skip {
+        match l.items.get(id) {
+            Some(it) => {
+                out.items.insert(id.clone(), it.clone());
+            }
+            None => {
+                out.items.remove(id);
+            }
+        }
+    }
+    for kind in [ItemKind::Provider, ItemKind::Route, ItemKind::Plugin] {
+        let order = ItemId::new(kind.order().expect("has an order"), "");
+        let skipped = |n: &String| skip.contains(&ItemId::new(kind, n.clone()));
+        let here = names_of(l.items.get(&order));
+        let mut list: Vec<String> = names_of(out.items.get(&order))
+            .into_iter()
+            .filter(|n| !skipped(n))
+            .collect();
+        // 跳过的那几个插回现在的位置：紧跟在现在排在它前面、那一版里也有的那一个后面
+        for (i, n) in here.iter().enumerate().filter(|(_, n)| skipped(n)) {
+            let at = here[..i]
+                .iter()
+                .rev()
+                .find_map(|p| list.iter().position(|x| x == p))
+                .map_or(0, |p| p + 1);
+            list.insert(at, n.clone());
+        }
+        if list.is_empty() && !out.items.contains_key(&order) {
+            continue;
+        }
+        out.items.insert(
+            order,
+            model::Item {
+                units: std::collections::BTreeMap::from([(
+                    unit::ALL.to_string(),
+                    Json::Array(list.into_iter().map(Json::String).collect()),
+                )]),
+                ..Default::default()
+            },
+        );
+    }
+    out.relink();
+    out
+}
+
+fn names_of(it: Option<&model::Item>) -> Vec<String> {
+    match it.and_then(|it| it.units.get(unit::ALL)) {
+        Some(Json::Array(a)) => a
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// 两份之间的差异，按项目
@@ -95,24 +220,26 @@ fn hard(from: &ItemId, to: &ItemId) -> bool {
 /// - 是这次要删的：留着（[`Kept::Referenced`]），比如留着的固定密钥绑的那条路由；
 /// - 是那一版里有、没选上的：一起恢复，比如只选了一个已删的上游、它用的出站代理也删了。
 ///
-/// 一直补到没有缺的为止
+/// 一直补到没有缺的为止。路由的去处写的是一个名字：上游里找不到时按同名的策略组找（组删了
+/// 之后它读成一个不存在的上游）。`local` 是本机那几节引用的项目（[`local_refs`]），和别的
+/// 引用一样总得留着
 fn plan(
     l: &Snapshot,
     b: &Snapshot,
-    pinned: &BTreeSet<String>,
-    with_prefs: bool,
-    selected: Option<&BTreeSet<ItemId>>,
+    local: &BTreeSet<ItemId>,
+    opts: &Options,
 ) -> (Vec<Row>, Snapshot) {
-    let changes = diff(l, b, with_prefs);
+    let b = &overlay(l, b, &opts.skip);
+    let changes = diff(l, b, opts.with_prefs);
     let mut chosen: BTreeSet<ItemId> = changes
         .iter()
         .map(|(id, _)| id.clone())
-        .filter(|id| selected.is_none_or(|s| s.contains(id)))
+        .filter(|id| opts.items.as_ref().is_none_or(|s| s.contains(id)))
         .collect();
     let mut kept: std::collections::BTreeMap<ItemId, Kept> = changes
         .iter()
         .filter(|(id, c)| {
-            *c == Change::Remove && id.kind == ItemKind::Key && pinned.contains(&id.name)
+            *c == Change::Remove && id.kind == ItemKind::Key && opts.pinned.contains(&id.name)
         })
         .map(|(id, _)| (id.clone(), Kept::KeyInUse))
         .collect();
@@ -143,8 +270,28 @@ fn plan(
                     .cloned()
                     .collect::<Vec<_>>()
             })
+            .chain(
+                local
+                    .iter()
+                    .filter(|r| !target.items.contains_key(*r))
+                    .cloned(),
+            )
             .collect();
         for r in missing {
+            // 指向一个名字的：上游里没有就是同名的策略组
+            let group = ItemId::new(ItemKind::Group, r.name.clone());
+            let r = if r.kind == ItemKind::Provider
+                && !l.items.contains_key(&r)
+                && !b.items.contains_key(&r)
+                && (l.items.contains_key(&group) || b.items.contains_key(&group))
+            {
+                group
+            } else {
+                r
+            };
+            if target.items.contains_key(&r) {
+                continue;
+            }
             if l.items.contains_key(&r) {
                 // 这次要删的：留着
                 if let std::collections::btree_map::Entry::Vacant(e) = kept.entry(r) {
@@ -179,6 +326,8 @@ pub struct Applied {
     pub changed_keys: Vec<String>,
     /// 留着没删的：固定密钥，和留下来的项目还引用着的
     pub kept: Vec<ItemId>,
+    /// 实际动了的那几项（连同一起恢复的、留着的），和同样条件下的预览一样
+    pub rows: Vec<Row>,
 }
 
 /// 恢复。`items` 是只恢复这几项，None 是全部。所选项目引用的、本机已经没有的项目一起恢复
@@ -189,21 +338,31 @@ pub fn apply(
     pinned: &BTreeSet<String>,
     with_prefs: bool,
 ) -> Result<Applied, ModelError> {
-    apply_with(local, backup, items, pinned, with_prefs, model::codec())
+    apply_opts(
+        local,
+        backup,
+        &Options {
+            pinned: pinned.clone(),
+            with_prefs,
+            items: items.map(|xs| xs.iter().cloned().collect()),
+            ..Default::default()
+        },
+    )
+}
+
+pub fn apply_opts(local: &Pack, backup: &Pack, opts: &Options) -> Result<Applied, ModelError> {
+    apply_with(local, backup, opts, model::codec())
 }
 
 pub fn apply_with(
     local: &Pack,
     backup: &Pack,
-    items: Option<&[ItemId]>,
-    pinned: &BTreeSet<String>,
-    with_prefs: bool,
+    opts: &Options,
     codec: &dyn PluginCodec,
 ) -> Result<Applied, ModelError> {
     let l = model::snapshot_with(local, codec)?;
     let b = model::snapshot_with(backup, codec)?;
-    let picked: Option<BTreeSet<ItemId>> = items.map(|xs| xs.iter().cloned().collect());
-    let (rows, mut target) = plan(&l, &b, pinned, with_prefs, picked.as_ref());
+    let (rows, mut target) = plan(&l, &b, &local_refs(local), opts);
     let kept = rows
         .iter()
         .filter(|r| r.kept.is_some())
@@ -234,6 +393,7 @@ pub fn apply_with(
         changed_keys: import::changed_keys(local, &pack),
         pack,
         kept,
+        rows,
     })
 }
 
@@ -331,6 +491,38 @@ pub fn whole(backup: &Pack, current_text: &str, last_local: Option<&Pack>) -> Pa
         let v = source.as_ref().and_then(|d| d.get(*section)).cloned();
         if let Ok(t) = tw_config::edit::set(&text, &[tw_yaml::Step::key(*section)], v.as_ref()) {
             text = t;
+        }
+    }
+    // 本机那几节引用的出站代理（同步设置走的）那一版里没有：从取本机那几节的地方一起取来
+    if let Some(src) = &source {
+        let named = |d: &Yaml, name: &str| -> Option<Yaml> {
+            d.get("proxies")?
+                .as_sequence()?
+                .iter()
+                .find(|p| p.get("name").and_then(Yaml::as_str) == Some(name))
+                .cloned()
+        };
+        for r in local_refs_in(&text) {
+            let Some(now) = doc(&text) else { break };
+            if named(&now, &r.name).is_some() {
+                continue;
+            }
+            let Some(px) = named(src, &r.name) else {
+                continue;
+            };
+            let mut list = now
+                .get("proxies")
+                .and_then(Yaml::as_sequence)
+                .cloned()
+                .unwrap_or_default();
+            list.push(px);
+            if let Ok(t) = tw_config::edit::set(
+                &text,
+                &[tw_yaml::Step::key("proxies")],
+                Some(&Yaml::Sequence(list)),
+            ) {
+                text = t;
+            }
         }
     }
     if let Some(k) = real {

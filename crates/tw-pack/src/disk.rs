@@ -38,9 +38,23 @@ pub fn read_prefs(config_path: &Path) -> Option<serde_json::Value> {
 }
 
 /// 存下通用偏好。None 是删掉
+/// 这份通用偏好超出了上限吗（[`tw_api::CLIENT_PREFS_MAX`]，写成紧凑的 JSON 之后）
+pub fn prefs_too_large(prefs: &serde_json::Value) -> bool {
+    prefs.to_string().len() > tw_api::CLIENT_PREFS_MAX
+}
+
+/// 存下通用偏好，None 是删掉。**超出上限的不写**（`InvalidInput`）：界面、导入、恢复、同步、
+/// 命令行写偏好都走这里，谁也绕不过去
 pub fn write_prefs(config_path: &Path, prefs: Option<&serde_json::Value>) -> std::io::Result<()> {
     let path = prefs_path(config_path);
     match prefs {
+        Some(p) if prefs_too_large(p) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "the client preferences are larger than {} KiB",
+                tw_api::CLIENT_PREFS_MAX / 1024
+            ),
+        )),
         Some(p) => {
             let bytes = serde_json::to_vec_pretty(p).map_err(std::io::Error::other)?;
             write_private(&path, &bytes)
@@ -52,63 +66,141 @@ pub fn write_prefs(config_path: &Path, prefs: Option<&serde_json::Value>) -> std
     }
 }
 
-/// 一个来源（一个连着这台 core 的 Lite）报上来的固定密钥多久没更新就不算了：30 天
-pub const PINNED_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+/// 最多记几个来源。多出来的去掉最久没报过的那一个：**来源不过期**（Lite 每次连上 core 都
+/// 重报一次，一个来源再报是换掉它自己那一组），这个上限挡的是没完没了的新来源
+pub const PINNED_SOURCES_MAX: usize = 64;
+/// 来源标识最长几个字节
+pub const PINNED_SOURCE_MAX: usize = 128;
+/// 一个来源最多报几把密钥
+pub const PINNED_NAMES_MAX: usize = 1024;
+/// 一把密钥的名字最长几个字节
+pub const PINNED_NAME_MAX: usize = 256;
 
 /// 一个来源报上来的固定密钥。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinnedSource {
     pub names: BTreeSet<String>,
+    /// 最近一次报上来的时候。来源多过 [`PINNED_SOURCES_MAX`] 时去掉最久没报的
+    #[serde(default)]
     pub updated_at_ms: u64,
 }
 
 /// 存着的固定密钥，**按来源**：几个 Lite 连着同一个 core（远程模式）时各报各的，取并集。
-/// 没有、读不懂都是空的
+/// 没有、读不懂都是空的。早先的写法（一个名字数组，或者 `{"names": [...]}`）读作来源空串
 pub fn read_pinned_sources(config_path: &Path) -> BTreeMap<String, PinnedSource> {
     #[derive(serde::Deserialize)]
-    struct File {
-        sources: BTreeMap<String, PinnedSource>,
+    #[serde(untagged)]
+    enum File {
+        Sources {
+            sources: BTreeMap<String, PinnedSource>,
+        },
+        Names {
+            names: BTreeSet<String>,
+        },
+        Plain(BTreeSet<String>),
     }
-    std::fs::read(pinned_path(config_path))
+    let Some(file) = std::fs::read(pinned_path(config_path))
         .ok()
         .and_then(|b| serde_json::from_slice::<File>(&b).ok())
-        .map(|f| f.sources)
-        .unwrap_or_default()
+    else {
+        return BTreeMap::new();
+    };
+    match file {
+        File::Sources { sources } => sources,
+        File::Names { names } | File::Plain(names) => BTreeMap::from([(
+            String::new(),
+            PinnedSource {
+                names,
+                updated_at_ms: 0,
+            },
+        )]),
+    }
 }
 
-/// 各来源的并集，**过期的来源不算**（[`PINNED_TTL_MS`] 没更新：那个 Lite 多半已经不在了）
-pub fn pinned_union(sources: &BTreeMap<String, PinnedSource>, now_ms: u64) -> BTreeSet<String> {
+/// 各来源的并集
+pub fn pinned_union(sources: &BTreeMap<String, PinnedSource>) -> BTreeSet<String> {
     sources
         .values()
-        .filter(|s| now_ms.saturating_sub(s.updated_at_ms) <= PINNED_TTL_MS)
         .flat_map(|s| s.names.iter().cloned())
         .collect()
 }
 
-/// 存着的固定密钥：各个来源的并集，过期的不算
+/// 存着的固定密钥：各个来源的并集
 pub fn read_pinned(config_path: &Path) -> BTreeSet<String> {
-    pinned_union(&read_pinned_sources(config_path), crate::now_ms())
+    pinned_union(&read_pinned_sources(config_path))
 }
 
-/// 一个来源报上来一组固定密钥：换掉它上次报的，过期的来源顺手删掉。返回存下的全部来源
+/// 报上来的一组超出了上限
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedTooLarge {
+    Source,
+    Names,
+    Name,
+}
+
+/// 一个来源报上来一组固定密钥：换掉它上次报的。来源多过上限时去掉最久没报过的。**不写盘**
+pub fn with_pinned(
+    sources: &BTreeMap<String, PinnedSource>,
+    source: &str,
+    names: &BTreeSet<String>,
+    now_ms: u64,
+) -> Result<BTreeMap<String, PinnedSource>, PinnedTooLarge> {
+    if source.len() > PINNED_SOURCE_MAX {
+        return Err(PinnedTooLarge::Source);
+    }
+    if names.len() > PINNED_NAMES_MAX {
+        return Err(PinnedTooLarge::Names);
+    }
+    if names.iter().any(|n| n.len() > PINNED_NAME_MAX) {
+        return Err(PinnedTooLarge::Name);
+    }
+    let mut out = sources.clone();
+    out.insert(
+        source.to_string(),
+        PinnedSource {
+            names: names.clone(),
+            updated_at_ms: now_ms,
+        },
+    );
+    while out.len() > PINNED_SOURCES_MAX {
+        let Some(oldest) = out
+            .iter()
+            .filter(|(k, _)| k.as_str() != source)
+            .min_by_key(|(_, s)| s.updated_at_ms)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        out.remove(&oldest);
+    }
+    Ok(out)
+}
+
+/// 存下全部来源
+pub fn write_pinned_sources(
+    config_path: &Path,
+    sources: &BTreeMap<String, PinnedSource>,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "sources": sources }))
+        .map_err(std::io::Error::other)?;
+    write_private(&pinned_path(config_path), &bytes)
+}
+
+/// 一个来源报上来一组固定密钥，读文件、换掉、写回去。**只给单独一个进程用**（命令行、测试）；
+/// 跑着的 core 在锁里改它记着的那一份（`ConfigManager::set_pinned_keys`）
 pub fn write_pinned(
     config_path: &Path,
     source: &str,
     names: &BTreeSet<String>,
 ) -> std::io::Result<BTreeMap<String, PinnedSource>> {
-    let now = crate::now_ms();
-    let mut sources = read_pinned_sources(config_path);
-    sources.retain(|_, s| now.saturating_sub(s.updated_at_ms) <= PINNED_TTL_MS);
-    sources.insert(
-        source.to_string(),
-        PinnedSource {
-            names: names.clone(),
-            updated_at_ms: now,
-        },
-    );
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "sources": sources }))
-        .map_err(std::io::Error::other)?;
-    write_private(&pinned_path(config_path), &bytes)?;
+    let sources = with_pinned(
+        &read_pinned_sources(config_path),
+        source,
+        names,
+        crate::now_ms(),
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e:?}")))?;
+    write_pinned_sources(config_path, &sources)?;
     Ok(sources)
 }
 
@@ -315,6 +407,11 @@ mod tests {
         write_prefs(&cfg, None).unwrap();
         assert_eq!(read_prefs(&cfg), None);
         write_prefs(&cfg, None).unwrap();
+        // 超出上限的不写
+        let big = serde_json::json!({ "big": "x".repeat(tw_api::CLIENT_PREFS_MAX) });
+        let e = write_prefs(&cfg, Some(&big)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(read_prefs(&cfg), None);
         std::fs::write(prefs_path(&cfg), b"{not json").unwrap();
         assert_eq!(read_prefs(&cfg), None);
 
@@ -326,10 +423,53 @@ mod tests {
         assert_eq!(read_pinned(&cfg), a.union(&b).cloned().collect());
         write_pinned(&cfg, "lite-a", &BTreeSet::new()).unwrap();
         assert_eq!(read_pinned(&cfg), b);
-        // 30 天没更新的来源不算
+        // 来源不过期：很久以前报的照样算
         let mut sources = read_pinned_sources(&cfg);
         sources.get_mut("lite-b").unwrap().updated_at_ms = 1;
-        assert!(pinned_union(&sources, crate::now_ms()).is_empty());
+        assert_eq!(pinned_union(&sources), b);
+    }
+
+    /// 早先的写法读作来源空串，不读成空的
+    #[test]
+    fn an_older_pinned_file_reads_as_the_blank_source() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.yaml");
+        let codex: BTreeSet<String> = ["codex".to_string()].into();
+        for old in [&br#"{"names":["codex"]}"#[..], br#"["codex"]"#] {
+            std::fs::write(pinned_path(&cfg), old).unwrap();
+            assert_eq!(read_pinned(&cfg), codex);
+            assert_eq!(read_pinned_sources(&cfg)[""].names, codex);
+        }
+        // 再报一次（有来源的）：早先那一组还在，并集
+        let b: BTreeSet<String> = ["claude-code".to_string()].into();
+        write_pinned(&cfg, "lite-a", &b).unwrap();
+        assert_eq!(read_pinned(&cfg), codex.union(&b).cloned().collect());
+    }
+
+    #[test]
+    fn pinned_sources_have_limits() {
+        let none = BTreeMap::new();
+        let one: BTreeSet<String> = ["k".to_string()].into();
+        let long = "x".repeat(PINNED_SOURCE_MAX + 1);
+        assert_eq!(
+            with_pinned(&none, &long, &one, 1),
+            Err(PinnedTooLarge::Source)
+        );
+        let many: BTreeSet<String> = (0..=PINNED_NAMES_MAX).map(|i| i.to_string()).collect();
+        assert_eq!(
+            with_pinned(&none, "a", &many, 1),
+            Err(PinnedTooLarge::Names)
+        );
+        let wide: BTreeSet<String> = ["n".repeat(PINNED_NAME_MAX + 1)].into();
+        assert_eq!(with_pinned(&none, "a", &wide, 1), Err(PinnedTooLarge::Name));
+        // 来源多过上限：去掉最久没报过的那一个
+        let mut all = BTreeMap::new();
+        for i in 0..PINNED_SOURCES_MAX {
+            all = with_pinned(&all, &format!("s{i}"), &one, 10 + i as u64).unwrap();
+        }
+        let all = with_pinned(&all, "new", &one, 1000).unwrap();
+        assert_eq!(all.len(), PINNED_SOURCES_MAX);
+        assert!(!all.contains_key("s0") && all.contains_key("s1") && all.contains_key("new"));
     }
 
     #[test]

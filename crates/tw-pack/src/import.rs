@@ -501,7 +501,9 @@ pub fn apply_with(
     codec: &dyn PluginCodec,
 ) -> Result<Applied, ImportError> {
     let l = model::snapshot_with(local, codec)?;
-    let mut i = with_local_secrets(&l, model::snapshot_with(incoming, codec)?, incoming);
+    // **不在这里沿用本机的密钥**：改名导入的是另一个项目，不该带走本机那一项的密钥；覆盖时
+    // 逐项沿用（目的地不变才沿用，见 `export::fill_secrets`）
+    let mut i = model::snapshot_with(incoming, codec)?;
     let rows = preview_with(local, incoming, ctx, codec)?;
     let errors: BTreeMap<&ItemId, &Msg> = rows
         .iter()
@@ -548,12 +550,21 @@ pub fn apply_with(
         {
             return Err(ImportError::Item(d.item.clone(), Box::new((*e).clone())));
         }
-        let Some(item) = i.items.get(&id) else {
+        let Some(raw) = i.items.get(&id) else {
             if d.action == Action::Skip {
                 continue;
             }
             return Err(ImportError::NotInPack(d.item.clone()));
         };
+        // 不带密钥的包：覆盖本机同名的那一项时沿用本机的密钥（目的地不变才沿用）
+        let mut item = raw.clone();
+        if !incoming.manifest.secrets
+            && !matches!(d.action, Action::Rename(_))
+            && let Some(mine) = l.items.get(&id)
+        {
+            export::fill_secrets(&id, &mut item, mine);
+        }
+        let item = &item;
         match &d.action {
             Action::Skip => continue,
             Action::Import if l.items.contains_key(&id) && !is_global(id.kind) => {

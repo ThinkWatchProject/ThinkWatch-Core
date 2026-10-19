@@ -311,6 +311,10 @@ pub struct BackupFileRequest {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RestorePreviewRequest {
     pub id: String,
+    /// 只恢复这几项时会动什么（连同一起恢复的、留着的）。不给是全部。和
+    /// [`RestoreRequest::items`] 一样，预览和写入走同一个计划
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<ItemRef>>,
 }
 
 /// 恢复会改什么。**什么都不写**。
@@ -371,6 +375,17 @@ pub struct RestoreRequest {
     pub items: Option<Vec<ItemRef>>,
 }
 
+/// `POST /backups/restore` 的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RestoreWritten {
+    /// 写下去之后的配置版本
+    pub version: String,
+    /// 实际动了的项目：所选的，连同一起恢复的（`kept` 为空）和留着没改的（`kept` 写明原因）。
+    /// 和同样条件下的 [`RestorePreview::rows`] 一样。安全模式下整份换回时每一项都是新增
+    pub rows: Vec<RestoreRow>,
+}
+
 /// Lite 的通用偏好（语言、外观、菜单栏、通知、检查更新），**core 不解析**，最大 64 KiB。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -386,7 +401,8 @@ pub const CLIENT_PREFS_MAX: usize = 64 * 1024;
 /// `PUT /pinned-keys`：这一个 Lite 接管的客户端正在用的网关密钥。恢复、导入、同步不删它们。
 ///
 /// **按来源记**：几个 Lite 连着同一个 core（远程模式）时各报各的，core 取并集；一个来源报的
-/// 换掉它自己上次报的。30 天没更新的来源不再算
+/// 换掉它自己上次报的。来源不过期（Lite 每次连上 core 都重报一次）；最多记 64 个来源，多出来
+/// 的去掉最久没报的。来源最长 128 字节，一次最多 1024 把、每个名字最长 256 字节，超出是 400
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PinnedKeys {

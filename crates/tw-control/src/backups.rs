@@ -349,10 +349,12 @@ async fn land(
     changed_keys: Vec<String>,
 ) -> Result<String, Fail> {
     let path = s.config_path().to_path_buf();
-    // 偏好的上限导入、恢复也照样查：一份带着超大偏好的包不该绕过 `PUT /client-prefs` 的那道关
-    if core_keeps_prefs()
+    // 偏好的上限导入、恢复也照样查：一份带着超大偏好的包不该绕过 `PUT /client-prefs` 的那道关。
+    // **只查要写下去的新偏好**：已经存着的一份超大的（上限之前存的）不该让每一次导入、恢复都失败
+    let prefs_changed = core_keeps_prefs() && after.client_prefs != before.client_prefs;
+    if prefs_changed
         && let Some(p) = &after.client_prefs
-        && p.to_string().len() > tw_api::CLIENT_PREFS_MAX
+        && tw_pack::disk::prefs_too_large(p)
     {
         return Err(prefs_too_large());
     }
@@ -364,7 +366,6 @@ async fn land(
                 e,
             )
         })?;
-    let prefs_changed = core_keeps_prefs() && after.client_prefs != before.client_prefs;
     if prefs_changed && let Err(e) = tw_pack::disk::write_prefs(&path, after.client_prefs.as_ref())
     {
         undo.restore();
@@ -742,23 +743,10 @@ async fn restore_preview(
         None => 0,
     };
     // 配置读不进来：整份换回那一版，每一项都是「新增」
-    let rows = match tw_pack::restore::preview(
-        &local,
-        &backup,
-        &s.cfg.pinned_keys(),
-        core_keeps_prefs(),
-    ) {
+    let opts = restore_options(&s, &req.id, req.items.as_deref(), &local, &backup);
+    let rows = match tw_pack::restore::preview_opts(&local, &backup, &opts) {
         Ok(rows) => rows.into_iter().map(restore_row).collect(),
-        Err(_) if model::snapshot(&local).is_err() => model::snapshot(&backup)
-            .map_err(|e| model_fail(e, Some(&backup)))?
-            .items
-            .keys()
-            .map(|id| tw_api::RestoreRow {
-                item: item_ref(id),
-                change: tw_api::RestoreChange::Add,
-                kept: None,
-            })
-            .collect(),
+        Err(_) if model::snapshot(&local).is_err() => whole_rows(&backup)?,
         Err(e) => return Err(model_fail(e, Some(&backup))),
     };
     Ok(Json(tw_api::RestorePreview {
@@ -769,10 +757,54 @@ async fn restore_preview(
     }))
 }
 
+/// 安全模式下整份换回：那一版的每一项都是「新增」
+fn whole_rows(backup: &Pack) -> Result<Vec<tw_api::RestoreRow>, Fail> {
+    Ok(model::snapshot(backup)
+        .map_err(|e| model_fail(e, Some(backup)))?
+        .items
+        .keys()
+        .map(|id| tw_api::RestoreRow {
+            item: item_ref(id),
+            change: tw_api::RestoreChange::Add,
+            kept: None,
+        })
+        .collect())
+}
+
+/// 恢复的条件：预览和写入用同一份。恢复同步位置上的版本时，本机不同步的上游和随之不同步的
+/// 项目不参与比较（规格 7.2）：那一版里本来就没有它们
+fn restore_options(
+    s: &ControlState,
+    id: &str,
+    items: Option<&[tw_api::ItemRef]>,
+    local: &Pack,
+    backup: &Pack,
+) -> tw_pack::restore::Options {
+    let skip = if id.starts_with(SYNC_ID) {
+        let names: BTreeSet<String> = tw_config::try_parse(&local.config_yaml)
+            .ok()
+            .and_then(|c| c.sync)
+            .map(|sync| sync.exclude.into_iter().collect())
+            .unwrap_or_default();
+        match (model::snapshot(local), model::snapshot(backup)) {
+            (Ok(l), Ok(b)) if !names.is_empty() => tw_sync::engine::excluded(&names, &[&l, &b]),
+            _ => BTreeSet::new(),
+        }
+    } else {
+        BTreeSet::new()
+    };
+    tw_pack::restore::Options {
+        pinned: s.cfg.pinned_keys(),
+        with_prefs: core_keeps_prefs(),
+        items: items.map(|xs| xs.iter().map(item_id).collect()),
+        skip,
+    }
+}
+
 async fn restore(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::RestoreRequest>,
-) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+) -> Result<Json<tw_api::RestoreWritten>, Fail> {
     let raw = backup_pack(&s, &req.id).await?;
     let (backup, _) = tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Restore)?;
@@ -782,35 +814,26 @@ async fn restore(
             current: cur.version(),
         }));
     }
-    let picked: Option<Vec<ItemId>> = req
-        .items
-        .as_ref()
-        .map(|xs| xs.iter().map(item_id).collect());
-    let (after, changed) = if model::snapshot(&local).is_err() {
+    let (after, changed, rows) = if model::snapshot(&local).is_err() {
         // 安全模式：现在这份读不进来，整份换回去
-        // 本机那几节取不到时（原文坏到读不成 YAML）用最近一个本机备份里的
-        let last = tw_pack::backup::list(s.config_path())
-            .ok()
-            .and_then(|all| all.last().and_then(|b| tw_pack::backup::open(b).ok()));
+        // 本机那几节取不到时（原文坏到读不成 YAML）用最近一个读得成 YAML 的本机备份里的
+        let last = tw_pack::backup::last_readable(s.config_path(), &cur.text);
         let mut whole = tw_pack::restore::whole(&backup, &cur.text, last.as_ref());
         if !core_keeps_prefs() {
             whole.client_prefs = local.client_prefs.clone();
         }
-        (whole, Vec::new())
+        let rows = whole_rows(&backup)?;
+        (whole, Vec::new(), rows)
     } else {
-        let applied = tw_pack::restore::apply(
-            &local,
-            &backup,
-            picked.as_deref(),
-            &s.cfg.pinned_keys(),
-            core_keeps_prefs(),
-        )
-        .map_err(|e| model_fail(e, Some(&backup)))?;
-        (applied.pack, applied.changed_keys)
+        let opts = restore_options(&s, &req.id, req.items.as_deref(), &local, &backup);
+        let applied = tw_pack::restore::apply_opts(&local, &backup, &opts)
+            .map_err(|e| model_fail(e, Some(&backup)))?;
+        let rows = applied.rows.into_iter().map(restore_row).collect();
+        (applied.pack, applied.changed_keys, rows)
     };
     crate::plugins::guard_raw_write(&s, &cur.text, &after.config_yaml).await?;
     let version = land(&s, &local, &after, &cur.version(), Origin::Restore, changed).await?;
-    Ok(Json(tw_api::ConfigWritten { version }))
+    Ok(Json(tw_api::RestoreWritten { version, rows }))
 }
 
 // ─────────────────────────────────────────────────────────── 通用偏好、固定密钥
@@ -826,7 +849,7 @@ async fn put_prefs(
     Json(req): Json<tw_api::ClientPrefs>,
 ) -> Result<Json<()>, Fail> {
     if let Some(p) = &req.prefs
-        && p.to_string().len() > tw_api::CLIENT_PREFS_MAX
+        && tw_pack::disk::prefs_too_large(p)
     {
         return Err(prefs_too_large());
     }
@@ -853,10 +876,31 @@ async fn pin_keys(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::PinnedKeys>,
 ) -> Result<Json<()>, Fail> {
+    use crate::config::PinnedError;
+    use tw_pack::disk::{PINNED_NAME_MAX, PINNED_NAMES_MAX, PINNED_SOURCE_MAX, PinnedTooLarge};
     let names: BTreeSet<String> = req.names.into_iter().collect();
     s.cfg
         .set_pinned_keys(&req.source, names)
-        .map_err(|e| io_fail(&tw_pack::disk::pinned_path(s.config_path()), e))?;
+        .map_err(|e| match e {
+            PinnedError::Io(e) => io_fail(&tw_pack::disk::pinned_path(s.config_path()), e),
+            PinnedError::TooLarge(t) => fail(
+                StatusCode::BAD_REQUEST,
+                match t {
+                    PinnedTooLarge::Source => msg!(
+                        "backup.pinned.source_too_long", max = PINNED_SOURCE_MAX =>
+                        "The source of the pinned keys is longer than {max} bytes."
+                    ),
+                    PinnedTooLarge::Names => msg!(
+                        "backup.pinned.too_many", max = PINNED_NAMES_MAX =>
+                        "More than {max} pinned keys were reported at once."
+                    ),
+                    PinnedTooLarge::Name => msg!(
+                        "backup.pinned.name_too_long", max = PINNED_NAME_MAX =>
+                        "A pinned key name is longer than {max} bytes."
+                    ),
+                },
+            ),
+        })?;
     Ok(Json(()))
 }
 

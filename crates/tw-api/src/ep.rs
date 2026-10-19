@@ -53,7 +53,7 @@ endpoints! {
     /// 恢复到一个版本会改什么。**不写任何东西**
     RestorePreview: POST "/backups/preview", api::RestorePreviewRequest => api::RestorePreview;
     /// 恢复到一个版本（全部，或者选的几项）。恢复本身也留一个版本
-    Restore: POST "/backups/restore", api::RestoreRequest => api::ConfigWritten;
+    Restore: POST "/backups/restore", api::RestoreRequest => api::RestoreWritten;
     /// Lite 的通用偏好
     GetClientPrefs: GET "/client-prefs", () => api::ClientPrefs;
     PutClientPrefs: PUT "/client-prefs", api::ClientPrefs => ();

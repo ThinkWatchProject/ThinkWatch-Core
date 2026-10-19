@@ -292,6 +292,14 @@ fn every_error_speaks_with_its_own_code() {
             "pack.missing_entry",
         ),
         (PackError::TooLarge { limit: MAX_BYTES }, "pack.too_large"),
+        (PackError::NotEncrypted, "pack.not_encrypted"),
+        (
+            PackError::TooMuchWork {
+                required: 22,
+                max: 18,
+            },
+            "pack.too_much_work",
+        ),
     ];
     for (e, code) in all {
         assert_eq!(e.msg().code, code);
@@ -362,4 +370,29 @@ fn a_strict_read_refuses_a_plain_pack_when_a_key_is_given() {
     );
     // `read` 照收：导入的是用户自己挑的文件
     assert!(read(&plain, Unseal::Identity(&id)).is_ok());
+}
+
+/// 口令加密的工作量超出上限：说的是这件事，不是「包坏了」。**解之前就拒**，不会先占掉内存
+#[test]
+fn a_pack_that_takes_too_much_work_says_so() {
+    fast();
+    let bytes = write(&sample(), Seal::Passphrase("pw")).unwrap();
+    // 头里的 `-> scrypt <salt> 10` 改成 22：头的校验在解出文件密钥之后，工作量在那之前就查
+    let head = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let line_end = head + bytes[head..].iter().position(|b| *b == b'\n').unwrap();
+    let line = std::str::from_utf8(&bytes[head..line_end]).unwrap();
+    assert!(
+        line.starts_with("-> scrypt ") && line.ends_with(" 10"),
+        "{line}"
+    );
+    let mut patched = bytes[..line_end - 2].to_vec();
+    patched.extend_from_slice(b"22");
+    patched.extend_from_slice(&bytes[line_end..]);
+    assert_eq!(
+        read(&patched, Unseal::Passphrase("pw")).unwrap_err(),
+        PackError::TooMuchWork {
+            required: 22,
+            max: MAX_WORK_FACTOR
+        }
+    );
 }

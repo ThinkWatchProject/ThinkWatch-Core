@@ -258,3 +258,258 @@ fn an_oauth_upstream_whose_endpoint_changed_comes_back() {
     let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
     assert!(cfg.providers[0].disabled);
 }
+
+/// 不带密钥的包把上游指去了别的地方（换主机、换端口、换协议），或者改名导入：本机的密钥
+/// **不跟过去** —— 留空、标「缺少密钥」、停用。代理换了地址也一样。只换路径照样沿用（见上一条）
+#[test]
+fn a_pack_that_moves_an_upstream_does_not_take_the_key_along() {
+    let l = local();
+    let relay = ItemId::new(ItemKind::Provider, "relay");
+    let px = ItemId::new(ItemKind::Proxy, "px");
+    let with = |base_url: &str, addr: &str| {
+        let mut p = export(&l, false, PackOrigin::Export);
+        p.config_yaml = format!(
+            "version: 1\nproxies:\n  - name: px\n    type: http\n    addr: {addr}\n    auth: {{ user: u, pass: '' }}\nproviders:\n  - name: relay\n    base_url: {base_url}\n    key: ''\n    proxy: px\n    headers:\n      X-Token: ''\n"
+        );
+        p
+    };
+    for base_url in [
+        "https://evil.example",
+        "https://relay.example:8443",
+        "http://relay.example",
+    ] {
+        let incoming = with(base_url, "10.0.0.1:8080");
+        let rows = tw_pack::import::preview(&l, &incoming, &ctx()).unwrap();
+        let row = rows.iter().find(|r| r.item == relay).unwrap();
+        assert_eq!(row.status, Status::Conflict, "{base_url}");
+        assert_eq!(row.flags, [Flag::MissingKey], "{base_url}");
+        let out =
+            tw_pack::import::apply(&l, &incoming, &[decide(&relay, Action::Overwrite)], &ctx())
+                .unwrap();
+        let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+        let p = cfg.providers.iter().find(|p| p.name == "relay").unwrap();
+        assert_eq!(p.base_url, base_url);
+        assert_eq!(p.key.as_ref().map(|k| k.raw()), Some(""), "{base_url}");
+        assert_eq!(
+            p.headers.get("X-Token").unwrap().value.raw(),
+            "",
+            "{base_url}"
+        );
+        assert!(p.disabled, "{base_url}");
+    }
+
+    // 改名导入是另一个项目：地址没变也不带走本机那一家的密钥
+    let incoming = with("https://relay.example", "10.0.0.1:8080");
+    let out = tw_pack::import::apply(
+        &l,
+        &incoming,
+        &[decide(&relay, Action::Rename("relay (2)".into()))],
+        &ctx(),
+    )
+    .unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+    let p = |n: &str| cfg.providers.iter().find(|p| p.name == n).unwrap();
+    assert_eq!(p("relay (2)").key.as_ref().map(|k| k.raw()), Some(""));
+    assert!(p("relay (2)").disabled);
+    assert_eq!(p("relay").key.as_ref().map(|k| k.raw()), Some("sk-old"));
+
+    // 代理换了地址：密码不跟过去
+    let incoming = with("https://relay.example", "203.0.113.9:3128");
+    let rows = tw_pack::import::preview(&l, &incoming, &ctx()).unwrap();
+    let row = rows.iter().find(|r| r.item == px).unwrap();
+    assert_eq!(row.status, Status::Conflict);
+    assert_eq!(row.flags, [Flag::MissingKey]);
+    let out =
+        tw_pack::import::apply(&l, &incoming, &[decide(&px, Action::Overwrite)], &ctx()).unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+    assert_eq!(cfg.proxies[0].auth.as_ref().unwrap().pass.raw(), "");
+}
+
+/// AWS 区域、OAuth 令牌端点换了也是换了目的地
+#[test]
+fn a_moved_aws_region_or_oauth_endpoint_does_not_take_the_secret_along() {
+    let l = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-local\nproviders:\n  - name: br\n    base_url: https://bedrock.corp.example\n    protocol: bedrock\n    aws:\n      access_key_id: AKIAOLD\n      secret_access_key: old-secret\n      region: us-east-1\n  - name: oa\n    base_url: https://api.example\n    oauth:\n      refresh: r-old\n      endpoint: https://auth.example/token\n      client_id: cid\n      client_secret: cs-old\n"
+    ));
+    let incoming = {
+        let mut p = export(&l, false, PackOrigin::Export);
+        p.config_yaml = "version: 1\nproviders:\n  - name: br\n    base_url: https://bedrock.corp.example\n    protocol: bedrock\n    aws:\n      access_key_id: ''\n      secret_access_key: ''\n      region: eu-west-1\n  - name: oa\n    base_url: https://api.example\n    oauth:\n      refresh: ''\n      endpoint: https://other.example/token\n      client_id: cid\n      client_secret: ''\n".into();
+        p
+    };
+    let br = ItemId::new(ItemKind::Provider, "br");
+    let oa = ItemId::new(ItemKind::Provider, "oa");
+    let out = tw_pack::import::apply(
+        &l,
+        &incoming,
+        &[
+            decide(&br, Action::Overwrite),
+            decide(&oa, Action::Overwrite),
+        ],
+        &ctx(),
+    )
+    .unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.pack.config_yaml));
+    let p = |n: &str| cfg.providers.iter().find(|p| p.name == n).unwrap();
+    let aws = p("br").aws.as_ref().unwrap();
+    assert_eq!(aws.secret_access_key.as_ref().map(|k| k.raw()), Some(""));
+    assert!(p("br").disabled);
+    let oauth = p("oa").oauth.as_ref().unwrap();
+    assert_eq!(oauth.client_secret.as_deref(), Some(""));
+    assert!(p("oa").disabled);
+}
+
+/// 留着的固定密钥绑的路由指向一个策略组，那一版里路由和组都没有：路由和组一起留着，恢复照样
+/// 成。只选这条已删路由时，组一起恢复
+#[test]
+fn a_kept_route_that_points_at_a_group_keeps_the_group() {
+    let now = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\n  - name: codex\n    key: tw-cx\n    route: fast\nproviders:\n  - name: p1\n    base_url: https://p1.example\n    key: sk-1\ngroups:\n  - name: g\n    type: fallback\n    providers: [p1]\nroutes:\n  - name: fast\n    rules:\n      - name: all\n        to: g\n"
+    ));
+    let then = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproviders:\n  - name: p1\n    base_url: https://p1.example\n    key: sk-1\n"
+    ));
+    let pinned: BTreeSet<String> = ["codex".to_string()].into();
+    let rows = tw_pack::restore::preview(&now, &then, &pinned, true).unwrap();
+    let kept = |kind, name: &str| {
+        rows.iter()
+            .find(|r| r.item == ItemId::new(kind, name))
+            .and_then(|r| r.kept)
+    };
+    assert_eq!(kept(ItemKind::Key, "codex"), Some(Kept::KeyInUse));
+    assert_eq!(kept(ItemKind::Route, "fast"), Some(Kept::Referenced));
+    assert_eq!(kept(ItemKind::Group, "g"), Some(Kept::Referenced));
+    let out = tw_pack::restore::apply(&now, &then, None, &pinned, true).unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+    assert_eq!(cfg.groups.len(), 1);
+
+    // 反过来：现在没有路由和组，只选那一版里那条指向组的路由
+    let now2 = then.clone();
+    let then2 = now.clone();
+    let pick = [ItemId::new(ItemKind::Route, "fast")];
+    let out = tw_pack::restore::apply(&now2, &then2, Some(&pick), &BTreeSet::new(), true).unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.pack.config_yaml));
+    assert_eq!(
+        cfg.groups
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect::<Vec<_>>(),
+        ["g"]
+    );
+    assert!(
+        out.rows
+            .iter()
+            .any(|r| r.item == ItemId::new(ItemKind::Group, "g") && r.change == Change::Add)
+    );
+}
+
+const SYNC: &str = "sync:\n  device_id: 3f9a2c1e-0b1d-4e2f-9a3b-5c6d7e8f9a0b\n  device_name: srv\n  encrypt: false\n  target:\n    type: webdav\n    url: https://dav.example.com/tw\n    user: u\n    pass: p\n    proxy: corp\n";
+
+/// 同步设置走的出站代理那一版里没有：恢复留着它（本机那几节引用的），整份恢复从现在这份
+/// 原文里一起取来
+#[test]
+fn the_proxy_the_sync_settings_use_stays() {
+    let now = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproxies:\n  - name: corp\n    type: socks5h\n    addr: 127.0.0.1:7890\n{SYNC}"
+    ));
+    tw_config::try_parse(&now.config_yaml).unwrap();
+    let then = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\n"
+    ));
+    let rows = tw_pack::restore::preview(&now, &then, &BTreeSet::new(), true).unwrap();
+    let corp = ItemId::new(ItemKind::Proxy, "corp");
+    assert_eq!(
+        rows.iter().find(|r| r.item == corp).and_then(|r| r.kept),
+        Some(Kept::Referenced)
+    );
+    let out = tw_pack::restore::apply(&now, &then, None, &BTreeSet::new(), true).unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(out.kept, [corp]);
+
+    let synced = export(&then, true, PackOrigin::Sync);
+    let w = tw_pack::restore::whole(
+        &synced,
+        &format!("{}not_a_field: 1\n", now.config_yaml),
+        None,
+    );
+    let cfg =
+        tw_config::try_parse(&w.config_yaml).unwrap_or_else(|e| panic!("{e}\n{}", w.config_yaml));
+    assert_eq!(cfg.proxies[0].addr, "127.0.0.1:7890");
+    assert_eq!(cfg.sync.unwrap().target.proxy(), "corp");
+}
+
+/// 恢复同步位置上的版本：本机不同步的上游（和随之不同步的路由）那一版里本来就没有，不列成
+/// 删除，排列顺序里也照现在的位置
+#[test]
+fn restoring_a_synced_version_leaves_what_this_machine_does_not_sync() {
+    let now = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproviders:\n  - name: a\n    base_url: https://a.example\n    key: sk-a\n  - name: ollama\n    base_url: http://127.0.0.1:11434\n  - name: b\n    base_url: https://b.example\n    key: sk-b\nroutes:\n  - name: local\n    rules:\n      - name: all\n        to: ollama\n"
+    ));
+    tw_config::try_parse(&now.config_yaml).unwrap();
+    // 那一版：同步位置上的，没有 ollama 和指向它的路由；b 在 a 前面，a 的密钥不一样
+    let then = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproviders:\n  - name: b\n    base_url: https://b.example\n    key: sk-b\n  - name: a\n    base_url: https://a.example\n    key: sk-a2\n"
+    ));
+    let l = tw_pack::model::snapshot(&now).unwrap();
+    let b = tw_pack::model::snapshot(&then).unwrap();
+    let skip = {
+        // 和同步那一路的算法一样：不同步的上游，连同直接或间接引用它们的
+        let mut out: BTreeSet<ItemId> = [ItemId::new(ItemKind::Provider, "ollama")].into();
+        for s in [&l, &b] {
+            for (id, it) in &s.items {
+                if !id.kind.is_order() && it.refs.iter().any(|r| out.contains(r)) {
+                    out.insert(id.clone());
+                }
+            }
+        }
+        out
+    };
+    assert!(skip.contains(&ItemId::new(ItemKind::Route, "local")));
+    let opts = tw_pack::restore::Options {
+        with_prefs: true,
+        skip,
+        ..Default::default()
+    };
+    let rows = tw_pack::restore::preview_opts(&now, &then, &opts).unwrap();
+    assert!(
+        rows.iter().all(|r| r.change != Change::Remove),
+        "{:?}",
+        rows.iter()
+            .map(|r| (r.item.to_string(), r.change))
+            .collect::<Vec<_>>()
+    );
+    let out = tw_pack::restore::apply_opts(&now, &then, &opts).unwrap();
+    assert_eq!(out.rows, rows);
+    let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+    let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["b", "a", "ollama"]);
+    assert_eq!(cfg.routes.len(), 1);
+    let a = cfg.providers.iter().find(|p| p.name == "a").unwrap();
+    assert_eq!(a.key.as_ref().map(|k| k.raw()), Some("sk-a2"));
+}
+
+/// 只选几项时，预览和写入走同一个计划：预览列出的就是写下去的
+#[test]
+fn a_partial_preview_is_what_the_restore_writes() {
+    let now = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproviders:\n  - name: p1\n    base_url: https://p1.example\n    key: sk-1\n"
+    ));
+    let then = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\nproxies:\n  - name: px\n    type: http\n    addr: 10.0.0.1:8080\nproviders:\n  - name: p1\n    base_url: https://p1.example\n    key: sk-1\n  - name: gone\n    base_url: https://gone.example\n    key: sk-g\n    proxy: px\n"
+    ));
+    let opts = tw_pack::restore::Options {
+        with_prefs: true,
+        items: Some([ItemId::new(ItemKind::Provider, "gone")].into()),
+        ..Default::default()
+    };
+    let rows = tw_pack::restore::preview_opts(&now, &then, &opts).unwrap();
+    let ids: BTreeSet<String> = rows.iter().map(|r| r.item.to_string()).collect();
+    assert!(
+        ids.contains(&ItemId::new(ItemKind::Proxy, "px").to_string()),
+        "{ids:?}"
+    );
+    let out = tw_pack::restore::apply_opts(&now, &then, &opts).unwrap();
+    assert_eq!(out.rows, rows);
+}

@@ -379,6 +379,8 @@ impl ConfigManager {
                 plugins = ?healed,
                 "plugin files that did not match the configuration were put back from a backup"
             );
+            // 网关已经照找回来之前的文件读过插件（对不上的停用了）：照找回来的重读一遍
+            self.gateway.reload_plugins();
         }
         if let Ok(cur) = self.current() {
             self.backup(tw_pack::backup::record(
@@ -389,26 +391,31 @@ impl ConfigManager {
         }
     }
 
-    /// 本机接管的客户端在用的网关密钥（固定密钥）：各个来源报上来的并集，30 天没更新的来源
-    /// 不算。恢复、导入、同步不删它们
+    /// 本机接管的客户端在用的网关密钥（固定密钥）：各个来源报上来的并集。恢复、导入、同步
+    /// 不删它们
     pub fn pinned_keys(&self) -> std::collections::BTreeSet<String> {
         self.pinned
             .lock()
-            .map(|g| tw_pack::disk::pinned_union(&g, now_ms()))
+            .map(|g| tw_pack::disk::pinned_union(&g))
             .unwrap_or_default()
     }
 
     /// 一个来源（一个 Lite）报上来它的固定密钥：换掉它上次报的，存进数据目录
-    /// （`pinned-keys.json`），重启之后还在
+    /// （`pinned-keys.json`），重启之后还在。**读、改、写都在锁里**：两个 Lite 同时报，
+    /// 谁也不会盖掉谁的
     pub fn set_pinned_keys(
         &self,
         source: &str,
         names: std::collections::BTreeSet<String>,
-    ) -> std::io::Result<()> {
-        let all = tw_pack::disk::write_pinned(&self.path, source, &names)?;
-        if let Ok(mut g) = self.pinned.lock() {
-            *g = all;
-        }
+    ) -> Result<(), PinnedError> {
+        let mut g = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = tw_pack::disk::with_pinned(&g, source, &names, now_ms())
+            .map_err(PinnedError::TooLarge)?;
+        tw_pack::disk::write_pinned_sources(&self.path, &next).map_err(PinnedError::Io)?;
+        *g = next;
         Ok(())
     }
 
@@ -639,6 +646,14 @@ impl ConfigManager {
 
 fn bad_path(e: tw_yaml::PatchError) -> ApplyError {
     ApplyError::BadPath(e.msg())
+}
+
+/// 存固定密钥没成。
+#[derive(Debug)]
+pub enum PinnedError {
+    /// 报上来的超出了上限（[`tw_pack::disk::PINNED_SOURCE_MAX`] 这几个）
+    TooLarge(tw_pack::disk::PinnedTooLarge),
+    Io(std::io::Error),
 }
 
 #[cfg(test)]
