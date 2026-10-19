@@ -315,6 +315,35 @@ async fn an_old_keyring_that_says_off_is_not_believed() {
     }
 }
 
+/// 关了加密之后有人放进来一个只有明文标记的假 keyring（解不开）：记着口令的设备不认标记，
+/// 要输入口令；没有口令的设备（本来就不加密）照常不加密同步
+#[tokio::test]
+async fn a_fake_off_marker_does_not_fool_a_device_with_the_passphrase() {
+    let mut t = bed(true).await;
+    t.ea.disable_encryption(PASS).await.unwrap();
+    assert!(!t.eb.round().await.unwrap().encrypted);
+    let mut fake = tw_sync::keyring::OFF_MARK.to_vec();
+    fake.extend(Keyring::generate(0).seal("someone else's phrase"));
+    std::fs::write(t.loc.path().join("keyring"), fake).unwrap();
+    let r = t.eb.round().await;
+    assert!(
+        matches!(r, Err(RoundError::Locked(_))),
+        "{:?}",
+        r.map(|r| r.encrypted)
+    );
+    // 一台从没有过口令的设备照常
+    let c = Dev::new('c');
+    let mut s = settings(
+        "cccccccc-0000-4000-8000-000000000003",
+        "Mini PC",
+        false,
+        t.loc.path(),
+    );
+    s.passphrase = None;
+    let mut ec = Engine::new(folder(t.loc.path()), c.clone(), c.dir.path(), s);
+    assert!(!ec.join(None).await.unwrap().encrypted);
+}
+
 /// 加密的同步位置上，不加密的设备记录不列出来；之后开启加密时删掉不加密的设备记录
 #[tokio::test]
 async fn plaintext_device_records_do_not_count_once_encrypted() {

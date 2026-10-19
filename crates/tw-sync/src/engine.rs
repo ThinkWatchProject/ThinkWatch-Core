@@ -818,7 +818,8 @@ impl<S: Store, H: Host> Engine<S, H> {
     ///   —— **不当作关掉了加密**；
     /// - keyring 解得开：开着就加密；写着已关闭（有口令的人关的）就不加密，代号比见过的小
     ///   （有人放回了一份旧的）是 [`RoundError::KeyringMissing`]；
-    /// - 本来就不加密、没有口令的设备认明文的「已关闭」标记（见 [`crate::keyring`]）
+    /// - 本来就不加密、**没有口令**的设备认明文的「已关闭」标记（见 [`crate::keyring`]）；有口令
+    ///   的设备只认解开之后写着的
     async fn security(&mut self, st: &mut State) -> Result<bool, RoundError> {
         let Some(bytes) = self.store.get(KEYRING).await? else {
             st.unreadable.remove(KEYRING);
@@ -831,9 +832,10 @@ impl<S: Store, H: Host> Engine<S, H> {
         if self.mode_of == Some(Some(hash)) {
             return Ok(self.sealed);
         }
-        let trust_mark = keyring::marked_off(&bytes) && !self.settings.encrypt;
         let Some(pass) = self.settings.passphrase.clone().filter(|p| !p.is_empty()) else {
-            if trust_mark {
+            // 没有口令、本来就不加密的设备认明文的「已关闭」标记。**有口令的设备不认它**，只认
+            // 解开之后写着的：标记谁都加得上
+            if keyring::marked_off(&bytes) && !self.settings.encrypt {
                 return Ok(self.set_mode(Some(hash), None, None));
             }
             return Err(locked_new());
@@ -858,7 +860,6 @@ impl<S: Store, H: Host> Engine<S, H> {
                 st.keyring_gen = st.keyring_gen.max(k.generation());
                 Ok(self.set_mode(Some(hash), Some(k), Some(bytes)))
             }
-            Err(_) if trust_mark => Ok(self.set_mode(Some(hash), None, None)),
             Err(KeyringError::WrongPassphrase) => Err(RoundError::Locked(msg!(
                 "sync.passphrase_changed" =>
                 "the sync passphrase was changed on another device. Enter the new passphrase"
