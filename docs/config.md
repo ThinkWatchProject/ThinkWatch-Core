@@ -1518,7 +1518,15 @@ resolve conflicts in the app (Settings, Sync and backup) or with
 What syncs is the configuration a configuration pack carries: upstreams,
 proxies, gateway keys, aliases, groups, routes, price sheets, security rules,
 plugins and the general settings, keys included. `listen`, `retention` and
-`sync` itself stay on this device, and so does a ChatGPT account's sign-in.
+`sync` itself stay on this device, and so do a ChatGPT account's sign-in and
+OAuth tokens. An upstream signed in on another device stays turned off on this
+one until it is signed in here; that does not turn it off anywhere else.
+
+With encryption on, versions that are not encrypted are never read. A keyring
+that went missing, or an older one put back, does not turn encryption off: the
+app asks whether to put back the copy this device keeps. A location that reads
+as empty is checked a few more times before the app says so, and turning sync
+off is still up to you.
 
 <!-- generated: table sync -->
 <a id="cfg-sync"></a>
@@ -1528,7 +1536,7 @@ plugins and the general settings, keys included. `listen`, `retention` and
 | `device_id` | string | **required** | Generated when sync is turned on. File names at the sync location show its first 8 characters. |
 | `device_name` | string | **required** | Shown in the device list of every device that syncs here. |
 | `encrypt` | bool | `true` | Encrypt what goes to the sync location with the sync passphrase. Every device at one location uses the same setting; change it in the app, which re-uploads the latest version. |
-| `passphrase` | string | — | The sync passphrase; required when `encrypt` is on. Kept here in the clear, like the other keys in this file. |
+| `passphrase` | string | — | The sync passphrase; required when `encrypt` is on, and kept after encryption is turned off: the keyring that says it is off is checked with it. Kept here in the clear, like the other keys in this file. |
 | `exclude` | list of strings | `[]` | Upstreams, by name, that are not synced: they are not uploaded and another device's upstream of the same name does not replace them. Routes, aliases and groups that refer to them are not synced either. |
 | `target` | object, [`sync.target`](#cfg-sync-target) | **required** | The sync location. The keyring, `versions/` and `devices/` live directly in it. |
 <!-- /generated -->
@@ -1560,7 +1568,7 @@ plugins and the general settings, keys included. `listen`, `retention` and
 | `url` | string | **required** | The WebDAV address of the folder. `https://`, with the certificate checked; `http://` only for this machine and the local network. |
 | `user` | string | `''` | User name. |
 | `pass` | string | `''` | Password, or the app password the service issues for WebDAV. |
-| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. |
+| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. An `http://` address on this machine or the local network has to be `direct`. |
 <!-- /generated -->
 
 <!-- generated: table sync.target (s3) -->
@@ -1572,10 +1580,10 @@ plugins and the general settings, keys included. `listen`, `retention` and
 | `endpoint` | string | **required** | The S3 endpoint. Hosts ending in `amazonaws.com`, `aliyuncs.com` or `myqcloud.com` put the bucket in the host name; every other endpoint (Cloudflare R2, MinIO, an address) puts it in the path. `http://` only for this machine and the local network. |
 | `region` | string | **required** | The signing region; `auto` for Cloudflare R2. |
 | `bucket` | string | **required** | The bucket. Keep it private. |
-| `prefix` | string | `''` | A folder inside the bucket. |
+| `prefix` | string | `''` | A folder inside the bucket. No `..` parts, and not starting with `/`. |
 | `access_key_id` | string | **required** | Access key ID. |
 | `secret_access_key` | string | **required** | Secret access key. |
-| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. |
+| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. An `http://` address on this machine or the local network has to be `direct`. |
 <!-- /generated -->
 
 ```yaml

@@ -41,4 +41,5 @@ tempfile = "3"
 base64 = { workspace = true }
 # 两台设备的测试直接读写配置
 tw-config = { workspace = true }
+serde_yaml_ng = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -126,8 +126,8 @@ fn target_types() -> Vec<&'static str> {
 }
 
 const PROXY_DOC: T2 = t(
-    "Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`.",
-    "访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。",
+    "Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. An `http://` address on this machine or the local network has to be `direct`.",
+    "访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。本机、内网的 `http://` 地址只能是 `direct`。",
 );
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
@@ -1921,8 +1921,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Unset,
                     t(
-                        "The sync passphrase; required when `encrypt` is on. Kept here in the clear, like the other keys in this file.",
-                        "同步口令，`encrypt` 开着时必填。和本文件里的其他密钥一样以明文保存。",
+                        "The sync passphrase; required when `encrypt` is on, and kept after encryption is turned off: the keyring that says it is off is checked with it. Kept here in the clear, like the other keys in this file.",
+                        "同步口令，`encrypt` 开着时必填；关闭加密之后也留着：同步位置上写着「已关闭」的 keyring 要用它核对。和本文件里的其他密钥一样以明文保存。",
                     ),
                 ),
                 row(
@@ -2066,8 +2066,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Is("''"),
                     t(
-                        "A folder inside the bucket.",
-                        "存储桶里的一个前缀（文件夹）。",
+                        "A folder inside the bucket. No `..` parts, and not starting with `/`.",
+                        "存储桶里的一个前缀（文件夹）。不能有 `..`，不以 `/` 开头。",
                     ),
                 ),
                 row(

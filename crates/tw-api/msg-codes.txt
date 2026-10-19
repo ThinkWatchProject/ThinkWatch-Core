@@ -555,8 +555,9 @@ sync.config.device_name
 sync.config.folder_relative
 sync.config.multiline
 sync.config.passphrase_missing
+sync.config.plain_http_proxy
+sync.config.prefix
 sync.config.unknown_proxy
-sync.emptied
 sync.folder.denied
 sync.folder.io
 sync.folder.missing
@@ -564,11 +565,15 @@ sync.folder.task
 sync.http_client
 sync.join_undecided
 sync.keyring_corrupt
+sync.keyring_missing
+sync.keyring_rolled_back
 sync.keyring_too_new
 sync.local
 sync.local.io
+sync.location_empty
 sync.location_taken
 sync.locked_new
+sync.looks_empty
 sync.merge_invalid
 sync.not_arrived
 sync.not_encrypted
@@ -586,12 +591,16 @@ sync.store.bad_path
 sync.store.denied
 sync.store.exists
 sync.store.server_error
+sync.store.too_large
 sync.store.unexpected
 sync.store.unreachable
+sync.take_not_allowed
 sync.too_new
+sync.too_new_unknown
 sync.version_gone
 sync.webdav.bad_listing
 sync.webdav.bad_url
+sync.webdav.root_missing
 sync.write_section
 t.auth test
 t.boom test

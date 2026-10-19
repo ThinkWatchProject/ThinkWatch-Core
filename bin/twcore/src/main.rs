@@ -176,6 +176,9 @@ enum SyncCmd {
         #[arg(long)]
         purge: bool,
     },
+    /// After the sync location was emptied or lost its keyring: upload this device's
+    /// configuration again (and put back the keyring this device keeps)
+    Republish,
 }
 
 #[derive(Subcommand)]
@@ -289,6 +292,7 @@ fn main() -> Result<()> {
             SyncCmd::Now => sync_cmd::now(&path),
             SyncCmd::Enable => sync_cmd::enable(&path),
             SyncCmd::Disable { purge } => sync_cmd::disable(&path, purge),
+            SyncCmd::Republish => sync_cmd::republish(&path),
         },
         Command::Upgrade {
             check,

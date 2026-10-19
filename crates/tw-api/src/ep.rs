@@ -282,6 +282,10 @@ endpoints! {
     SyncUnlock: POST "/sync/unlock", api::SyncUnlock => api::SyncView;
     /// 停止同步；`purge` 时连同步位置上的数据一起删掉
     SyncDisable: POST "/sync/disable", api::SyncDisable => ();
+    /// 同步位置空了（`emptied`）、keyring 不见了（`keyring_missing`）之后由人选的「重新上传本机
+    /// 配置」：keyring 放回这台设备记着的那一份（没有就新建），没有读得出来的版本时以本机配置
+    /// 上传一个，然后同步一轮
+    SyncRepublish: POST "/sync/republish", () => api::SyncView;
 
     // ─────────────────────────────────────────────── 账号登录
     StartChatgptLogin: POST "/chatgpt/login", api::ChatgptLoginStart => api::ChatgptLogin;

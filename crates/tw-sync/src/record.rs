@@ -25,12 +25,31 @@ pub struct Meta {
     /// 位置上已经删了时，按它去本机备份里找基准
     #[serde(default)]
     pub parent_content: Vec<String>,
+    /// 更早的祖先（版本标识，老的在前，最多 [`HISTORY`] 个）：基准在同步位置上早删了时，靠它
+    /// 判断基准是不是这个版本的祖先
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<String>,
     /// 内容的 SHA-256（只在不加密时写）：发现传输中损坏。加密时 age 的认证加密已经管了
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     /// 还没处理的冲突
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<Conflict>,
+}
+
+/// 一个版本记多少个祖先
+pub const HISTORY: usize = 200;
+
+impl Meta {
+    /// 这个版本自己和它记得的全部祖先
+    pub fn lineage(&self, own_id: &str) -> BTreeSet<String> {
+        self.history
+            .iter()
+            .chain(&self.parents)
+            .cloned()
+            .chain([own_id.to_string()])
+            .collect()
+    }
 }
 
 /// 一处冲突：同一个对象（的几个单位）在两台设备上被改成了不同的内容。
@@ -80,6 +99,11 @@ impl Conflict {
     /// 没有第二份可言）
     pub fn both_allowed(&self) -> bool {
         !self.whole_item() && self.item.kind.is_named() && self.reason.is_none()
+    }
+
+    /// 「使用另一边」能不能选。合并结果过不了校验的（`invalid`）不能：选了还是过不了
+    pub fn remote_allowed(&self) -> bool {
+        self.reason != Some(Reason::Invalid)
     }
 
     /// 这台设备看这处冲突时，哪一边是「本机」：自己写的那一边；不是参与的设备时，是和本机
@@ -215,6 +239,7 @@ mod tests {
             device_name: "Mac mini".into(),
             parents: vec!["0000000006-aaaaaaaa".into()],
             parent_content: vec!["abc".into()],
+            history: vec!["0000000005-aaaaaaaa".into()],
             sha256: None,
             conflicts: vec![c(Some(json!({"base_url": "x"})), None, ItemKind::Key)],
         };
@@ -222,5 +247,13 @@ mod tests {
         assert_eq!(v["conflicts"][0]["item"]["kind"], "key");
         let back: Meta = serde_json::from_value(v).unwrap();
         assert_eq!(back, m);
+        assert_eq!(
+            m.lineage("0000000007-aaaaaaaa"),
+            BTreeSet::from([
+                "0000000005-aaaaaaaa".to_string(),
+                "0000000006-aaaaaaaa".to_string(),
+                "0000000007-aaaaaaaa".to_string()
+            ])
+        );
     }
 }

@@ -63,6 +63,10 @@ pub struct Input<'a, K> {
     pub hold_items: &'a BTreeSet<K>,
     /// 这几个单位各留各的：还没处理的冲突
     pub hold_units: &'a BTreeSet<(K, String)>,
+    /// 逐字段合并、全是默认值时整个对象不在的那几种（全局设置的一节、Lite 的通用偏好）：
+    /// **不在就是每个字段都是默认值**，不是被删了。一边把一节改回默认、另一边改了这一节的
+    /// 另一个字段，各管各的字段，不是「删了对改了」
+    pub fieldwise: &'a dyn Fn(&K) -> bool,
 }
 
 /// 合并的结果
@@ -93,13 +97,22 @@ pub fn merge<K: Ord + Clone>(i: Input<'_, K>) -> Outcome<K> {
         .chain(i.local.keys())
         .chain(i.remote.keys())
         .collect();
+    let none = Units::new();
     for k in keys {
-        let (b, l, r) = (base.get(k), i.local.get(k), i.remote.get(k));
+        let (mut b, mut l, mut r) = (base.get(k), i.local.get(k), i.remote.get(k));
+        let fieldwise = (i.fieldwise)(k);
+        if fieldwise {
+            // 没有基准时也照样：不在就是全是默认值
+            b = b.or(Some(&none));
+            l = l.or(Some(&none));
+            r = r.or(Some(&none));
+        }
         let mut put = |local: Option<&Units>, shared: Option<&Units>| {
-            if let Some(v) = local {
+            // 逐字段的那几种合并出来一个字段都没有：全是默认值，不写
+            if let Some(v) = local.filter(|v| !(fieldwise && v.is_empty())) {
                 out.local.insert(k.clone(), v.clone());
             }
-            if let Some(v) = shared {
+            if let Some(v) = shared.filter(|v| !(fieldwise && v.is_empty())) {
                 out.shared.insert(k.clone(), v.clone());
             }
         };
@@ -249,6 +262,7 @@ mod tests {
             remote: &r,
             hold_items: &BTreeSet::new(),
             hold_units: &BTreeSet::new(),
+            fieldwise: &|_| false,
         })
     }
 
@@ -533,6 +547,7 @@ mod tests {
             remote: &remote,
             hold_items: &hold_items,
             hold_units: &hold_units,
+            fieldwise: &|_| false,
         });
         assert!(o.conflicts.is_empty(), "{:?}", o.conflicts);
         assert_eq!(o.local["ollama"], obj(&[("conn", json!("local"))]));
@@ -553,9 +568,47 @@ mod tests {
             remote: &Objects::new(),
             hold_items: &hold_items,
             hold_units: &BTreeSet::new(),
+            fieldwise: &|_| false,
         });
         assert!(o.shared.is_empty());
         assert_eq!(o.local.len(), 1);
+    }
+
+    /// 全局设置一节：一边改回了默认（整节不在了），另一边改了这一节的另一个字段 —— 各管各的
+    /// 字段，不是删了对改了
+    #[test]
+    fn a_field_level_object_reset_to_defaults_is_not_a_delete() {
+        let base = objs(&[("failover", Some(obj(&[("pause_secs", json!(100))])))]);
+        let local = objs(&[(
+            "failover",
+            Some(obj(&[
+                ("pause_secs", json!(100)),
+                ("failures_to_pause", json!(7)),
+            ])),
+        )]);
+        let remote = Objects::new();
+        let o = merge(Input {
+            base: Some(&base),
+            local: &local,
+            remote: &remote,
+            hold_items: &BTreeSet::new(),
+            hold_units: &BTreeSet::new(),
+            fieldwise: &|k: &String| k == "failover",
+        });
+        assert!(o.conflicts.is_empty(), "{:?}", o.conflicts);
+        let want = obj(&[("failures_to_pause", json!(7))]);
+        assert_eq!(o.local["failover"], want);
+        assert_eq!(o.shared["failover"], want);
+        // 两边都改回默认：整节不在
+        let o = merge(Input {
+            base: Some(&base),
+            local: &Objects::new(),
+            remote: &Objects::new(),
+            hold_items: &BTreeSet::new(),
+            hold_units: &BTreeSet::new(),
+            fieldwise: &|_: &String| true,
+        });
+        assert!(o.local.is_empty() && o.shared.is_empty() && o.conflicts.is_empty());
     }
 
     #[test]

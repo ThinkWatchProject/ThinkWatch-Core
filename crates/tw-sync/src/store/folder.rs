@@ -5,14 +5,34 @@
 //! 版本。临时名以点开头，列目录时跳过；云盘客户端多数也不传点开头的临时文件。
 //!
 //! 云盘里还没下载到本机的文件（iCloud 的 `.名字.icloud` 占位文件、Dropbox 的在线文件）列目录
-//! 时要么不出现、要么读不出来 —— 调用方把读不出来的版本当成「尚未到达」，到了再合并。
+//! 时照真名列出、读出来是空的（iCloud）或者读不出来 —— 调用方把读不出来的版本当成「尚未到达」，
+//! 到了再合并。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tw_types::msg;
 
-use super::{Entry, Store, StoreError, check_path, split, temp_name};
+use super::{
+    Entry, MAX_FILE, Store, StoreError, TEMP_PREFIX, check_path, own_temp, split, temp_name,
+    too_large,
+};
+
+/// iCloud Drive 还没下载到本机的文件，在目录里是一个 `.名字.icloud` 的占位文件
+const ICLOUD: &str = ".icloud";
+
+/// 读一个文件，**边读边数**：超过上限就不读了
+fn read_limited(p: &Path) -> std::io::Result<Result<Vec<u8>, ()>> {
+    use std::io::Read;
+    let f = std::fs::File::open(p)?;
+    let mut out = Vec::new();
+    f.take(MAX_FILE as u64 + 1).read_to_end(&mut out)?;
+    Ok(if out.len() > MAX_FILE {
+        Err(())
+    } else {
+        Ok(out)
+    })
+}
 
 pub struct Folder {
     root: PathBuf,
@@ -144,7 +164,19 @@ impl Store for Folder {
             let mut out = Vec::new();
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                // 临时文件、云盘的占位文件、系统的 .DS_Store
+                // iCloud 还没下载的文件：照它的真名列出来，读的时候读不到 —— 当作尚未到达
+                if let Some(real) = name
+                    .strip_prefix('.')
+                    .and_then(|n| n.strip_suffix(ICLOUD))
+                    .filter(|n| !n.starts_with('.') && !d.join(n).exists())
+                {
+                    out.push(Entry {
+                        name: real.to_string(),
+                        size: 0,
+                    });
+                    continue;
+                }
+                // 临时文件、系统的 .DS_Store
                 if name.starts_with('.') {
                     continue;
                 }
@@ -166,13 +198,22 @@ impl Store for Folder {
     async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let root = self.root.clone();
         let p = self.at(path)?;
-        blocking(move || match std::fs::read(&p) {
-            Ok(b) => Ok(Some(b)),
+        let shown = path.to_string();
+        blocking(move || match read_limited(&p) {
+            Ok(Ok(b)) => Ok(Some(b)),
+            Ok(Err(())) => Err(too_large(&shown, MAX_FILE)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if root.is_dir() {
-                    Ok(None)
+                if !root.is_dir() {
+                    return Err(io(&root, e));
+                }
+                // iCloud 还没下载的：有，只是还没到 —— 读成空的（调用方当作尚未到达）
+                let placeholder = p
+                    .file_name()
+                    .map(|n| p.with_file_name(format!(".{}{ICLOUD}", n.to_string_lossy())));
+                if placeholder.is_some_and(|ph| ph.is_file()) {
+                    Ok(Some(Vec::new()))
                 } else {
-                    Err(io(&root, e))
+                    Ok(None)
                 }
             }
             Err(e) => Err(io(&p, e)),
@@ -251,6 +292,41 @@ impl Store for Folder {
             })
         })
         .await
+    }
+
+    /// 这台设备写到一半断了留下的临时文件：一小时以前的删掉（还在写的那一个不动）
+    async fn sweep(&self, tag: &str) {
+        let root = self.root.clone();
+        let tag = tag.to_string();
+        let _ = blocking(move || {
+            let hour = std::time::Duration::from_secs(3600);
+            for d in [
+                root.clone(),
+                root.join(crate::layout::VERSIONS),
+                root.join(crate::layout::DEVICES),
+            ] {
+                let Ok(rd) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if !name.starts_with(TEMP_PREFIX) || !own_temp(&name, &tag) {
+                        continue;
+                    }
+                    let old = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > hour);
+                    if old {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await;
     }
 }
 
@@ -336,15 +412,27 @@ mod tests {
             b"placeholder",
         )
         .unwrap();
+        std::fs::write(d.path().join("versions/.DS_Store"), b"x").unwrap();
         std::fs::create_dir(d.path().join("versions/sub")).unwrap();
         let got = f.list("versions").await.unwrap();
         assert_eq!(
             got,
-            [Entry {
-                name: "0000000002-bbbbbbbb.twconfig".into(),
-                size: 1
-            }]
+            [
+                Entry {
+                    name: "0000000002-bbbbbbbb.twconfig".into(),
+                    size: 1
+                },
+                Entry {
+                    name: "0000000003-cccccccc.twconfig".into(),
+                    size: 0
+                }
+            ]
         );
+        std::fs::remove_file(
+            d.path()
+                .join("versions/.0000000003-cccccccc.twconfig.icloud"),
+        )
+        .unwrap();
         f.delete("versions/0000000002-bbbbbbbb.twconfig")
             .await
             .unwrap();
@@ -352,6 +440,82 @@ mod tests {
             .await
             .unwrap();
         assert!(f.list("versions").await.unwrap().is_empty());
+    }
+
+    /// iCloud 还没下载的版本：列得出名字，读不到 —— 当作尚未到达，不是没有
+    #[tokio::test]
+    async fn an_icloud_placeholder_is_a_version_that_has_not_arrived() {
+        let (d, f) = bed();
+        std::fs::create_dir(d.path().join("versions")).unwrap();
+        std::fs::write(
+            d.path()
+                .join("versions/.0000000003-cccccccc.twconfig.icloud"),
+            b"placeholder",
+        )
+        .unwrap();
+        let got = f.list("versions").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "0000000003-cccccccc.twconfig");
+        assert_eq!(
+            f.get("versions/0000000003-cccccccc.twconfig")
+                .await
+                .unwrap(),
+            Some(Vec::new()),
+            "读成空的：有，还没到"
+        );
+        assert_eq!(
+            f.get("versions/0000000004-cccccccc.twconfig")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_file_is_not_read() {
+        let (d, f) = bed();
+        std::fs::create_dir(d.path().join("versions")).unwrap();
+        let big = vec![0u8; MAX_FILE + 1];
+        std::fs::write(d.path().join("versions/0000000001-aaaaaaaa.twconfig"), big).unwrap();
+        assert!(
+            f.get("versions/0000000001-aaaaaaaa.twconfig")
+                .await
+                .is_err()
+        );
+    }
+
+    /// 写到一半断了留下的临时文件：自己的、一小时以前的删掉，别人的和刚写的不动
+    #[tokio::test]
+    async fn leftover_temporary_files_of_this_device_are_swept() {
+        let (d, f) = bed();
+        std::fs::create_dir(d.path().join("versions")).unwrap();
+        let mine = d
+            .path()
+            .join("versions")
+            .join(temp_name("0000000002-aaaaaaaa.twconfig"));
+        let theirs = d
+            .path()
+            .join("versions")
+            .join(temp_name("0000000002-bbbbbbbb.twconfig"));
+        let fresh = d
+            .path()
+            .join("versions")
+            .join(temp_name("0000000003-aaaaaaaa.twconfig"));
+        for p in [&mine, &theirs, &fresh] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for p in [&mine, &theirs] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        f.sweep("aaaaaaaa").await;
+        assert!(!mine.exists());
+        assert!(theirs.exists() && fresh.exists());
     }
 
     #[tokio::test]
