@@ -637,12 +637,15 @@ impl Relay {
             None
         };
         let inspect = rt.config.security.inspect_tools.mode;
+        // 档位切不了（监控）时，所有规则等调用收完再查：记下的是完整的参数
         let wall = if !inspect.detects() {
             None
         } else if plan.client_sse {
-            Some(tw_guard::tools::wall::Wall::new(rt.tools.clone()))
+            Some(tw_guard::tools::wall::Wall::new(rt.tools.clone()).cut_early(inspect.acts()))
         } else if plan.client_json_stream {
-            Some(tw_guard::tools::wall::Wall::json_array(rt.tools.clone()))
+            Some(
+                tw_guard::tools::wall::Wall::json_array(rt.tools.clone()).cut_early(inspect.acts()),
+            )
         } else {
             Some(tw_guard::tools::wall::Wall::json_body(rt.tools.clone()))
         };
@@ -837,49 +840,64 @@ impl Relay {
 
     /// 工具调用审查这一块。切断的话返回该发的前缀和那个错误
     fn wall_cut(&mut self, out: &[u8]) -> Option<(Vec<u8>, Option<GatewayError>)> {
-        let w = self.wall.as_mut()?;
-        for v in w.feed(out) {
-            // 规则是切断 + 拦截档 = 切断
-            let blocked = v.cut && self.inspect.acts();
-            // **句子不说这个调用出自谁。**审查看的是最后交给客户端的那一份回答，
-            // 里面的工具调用不一定是上游给的 —— 有工具调用权限的插件也能造、能改。
-            // 上游照样在 `upstream` 参数和事件里，只是不当成调用的出处
-            let err = blocked.then(|| {
-                GatewayError::denied(msg!(
-                    "gw.toolcall.response_cut",
-                    upstream = self.provider.clone(), tool = v.tool.clone(),
-                    rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
-                    "The answer contained a {tool} call that matched rule “{name}”{}, \
-                     so the response was cut off.",
-                    because(&v.why)
-                ))
-            });
-            self.bus.emit(flagged(
-                self.id,
-                &self.provider,
-                &v,
-                blocked,
-                &self.redaction,
-                err.as_ref().map(|e| &e.detail),
-            ));
-            if let Some(err) = err {
-                tracing::warn!(
-                    provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                    "cut the response stream: a tool call in the answer matched a cut rule"
-                );
+        let hits = self.wall.as_mut()?.feed(out);
+        for v in hits {
+            if let Some(err) = self.hit(&v) {
                 // **命中那一帧之前的内容照常发。**模型在动手之前
                 // 通常先说了几句正常的话，一起吞掉的话用户看到的
                 // 是「什么都没发生然后报错了」。而从那一帧起一个
                 // 字节都不发 —— 「尽力阻断」的要点是客户端拼不出
                 // 完整的工具调用
                 let safe = v.safe_prefix.min(out.len());
-                // 切断之后回答过滤不再补任何字：攒着的命中留着报
-                if let Some(a) = self.answer.as_mut() {
-                    a.harvest();
-                    a.stream = None;
-                }
                 return Some((out[..safe].to_vec(), Some(err)));
             }
+        }
+        None
+    }
+
+    /// 流好好走完了：Chat 的调用这时才算收完（没写 `finish_reason`、也没发 `[DONE]` 的
+    /// 上游，见 [`tw_guard::tools::wall::Wall::finish`]）。切断的话交回那个错误
+    fn wall_finish(&mut self) -> Option<GatewayError> {
+        let hits = self.wall.as_mut()?.finish();
+        hits.iter().find_map(|v| self.hit(v))
+    }
+
+    /// 流上的一处命中：报出去。规则是切断、档位是拦截的话，交回告诉客户端的那个错误
+    fn hit(&mut self, v: &tw_guard::tools::wall::Verdict) -> Option<GatewayError> {
+        // 规则是切断 + 拦截档 = 切断
+        let blocked = v.cut && self.inspect.acts();
+        // **句子不说这个调用出自谁。**审查看的是最后交给客户端的那一份回答，
+        // 里面的工具调用不一定是上游给的 —— 有工具调用权限的插件也能造、能改。
+        // 上游照样在 `upstream` 参数和事件里，只是不当成调用的出处
+        let err = blocked.then(|| {
+            GatewayError::denied(msg!(
+                "gw.toolcall.response_cut",
+                upstream = self.provider.clone(), tool = v.tool.clone(),
+                rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
+                "The answer contained a {tool} call that matched rule “{name}”{}, \
+                 so the response was cut off.",
+                because(&v.why)
+            ))
+        });
+        self.bus.emit(flagged(
+            self.id,
+            &self.provider,
+            v,
+            blocked,
+            &self.redaction,
+            err.as_ref().map(|e| &e.detail),
+        ));
+        if let Some(err) = err {
+            tracing::warn!(
+                provider = %self.provider, tool = %v.tool, rule = %v.rule,
+                "cut the response stream: a tool call in the answer matched a cut rule"
+            );
+            // 切断之后回答过滤不再补任何字：攒着的命中留着报
+            if let Some(a) = self.answer.as_mut() {
+                a.harvest();
+                a.stream = None;
+            }
+            return Some(err);
         }
         None
     }
@@ -890,6 +908,8 @@ impl Relay {
     /// 返回要写给客户端的尾巴，和非流式审查扣下整份 body 时的那个错误。
     async fn finish(&mut self, broke: bool) -> (Vec<u8>, Option<GatewayError>) {
         let status = self.plan.status;
+        // 边收边发的那几条路（`chunk` 里一块一块过审查的）。整包、收齐再写的不算
+        let streamed_through = !(self.plan.convert_whole || self.hold) && self.collector.is_none();
         let tail = self.restorer.flush();
         let tail = match (&self.session, self.back.as_mut()) {
             (Some(s), None) if self.plan.convert_whole => {
@@ -996,8 +1016,9 @@ impl Relay {
         // 回答正文的过滤：插件改过的才是客户端将要看到的；审查看的是过滤之后的
         let tail = self.answer_tail(tail, broke);
         // 插件在收尾时补出来的（扣着的文字、攒着的工具调用）也要过审查。插件出错的，出错
-        // 之前能发的过一遍审查，再报这个错
-        let tail = if hooked {
+        // 之前能发的过一遍审查，再报这个错。**流的尾巴也一样**：还原器扣着的那几个字节、
+        // 转换器补的收尾帧（`content_block_stop`、`[DONE]`）—— 工具调用收完就在这一刻
+        let tail = if hooked || streamed_through {
             let (out, cut) = self.guard(tail);
             if let Some(e) = cut.or(failed) {
                 return (out, Some(e));
@@ -1006,6 +1027,14 @@ impl Relay {
         } else {
             tail
         };
+        // 流好好走完：没等到结束帧的 Chat 调用这时才算收完。要切断的话尾巴不发 ——
+        // 客户端是在流结束时拿去执行的
+        if streamed_through
+            && !broke
+            && let Some(e) = self.wall_finish()
+        {
+            return (Vec::new(), Some(e));
+        }
         /*
           非流式：**整份到手了才看得见工具调用，而它一个字节都还没发出去。**
 
@@ -1024,12 +1053,16 @@ impl Relay {
         if let (Some(sse), true, true, true) =
             (streamed, self.wall.is_some(), !broke, status.is_success())
         {
-            let mut w = if sse {
+            let w = if sse {
                 tw_guard::tools::wall::Wall::new(self.tools.clone())
             } else {
                 tw_guard::tools::wall::Wall::json_array(self.tools.clone())
             };
-            for v in w.feed(&tail) {
+            // 一个字节都还没发：所有规则等调用收完按全文查，记下的是完整的参数
+            let mut w = w.cut_early(false);
+            let mut hits = w.feed(&tail);
+            hits.extend(w.finish());
+            for v in hits {
                 if let Some(err) = self.flag(&v) {
                     return (Vec::new(), Some(err));
                 }

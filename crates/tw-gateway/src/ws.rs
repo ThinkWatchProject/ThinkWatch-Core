@@ -932,10 +932,11 @@ pub(crate) async fn proxy(
     let mut p = Pipes {
         ledger: tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
         restorer: None,
-        wall: rules
-            .inspect_mode
-            .detects()
-            .then(|| tw_guard::tools::wall::Wall::new(rules.tools.clone())),
+        // 档位切不了（监控）时，所有规则等调用收完再查：记下的是完整的参数
+        wall: rules.inspect_mode.detects().then(|| {
+            tw_guard::tools::wall::Wall::new(rules.tools.clone())
+                .cut_early(rules.inspect_mode.acts())
+        }),
         response: None,
         dropping: false,
         rules,
