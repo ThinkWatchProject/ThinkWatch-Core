@@ -118,35 +118,83 @@ impl Rule {
     /// 之所以要有这个口子，是因为代码规则的 `re` 是永不匹配的 —— 直接 `rule.re.find(...)`
     /// 的调用方得改到这里来，才看得见代码规则。
     pub fn find<'a>(&self, args: &'a str) -> Option<Found<'a>> {
+        self.find_in(args, false)
+    }
+
+    /// 同 [`Rule::find`]，`open` 为真时 `args` 还没收完（流式的工具调用参数攒到一半，或者
+    /// 攒到上限的那一截）。**命中要定下来才算**：后面不管再来什么字都还是命中。
+    ///
+    /// - 正则规则：没有前后查看，停在末尾之前的命中定了；碰到末尾的，要看它是不是靠
+    ///   末尾的 `$`、`\b` 成立的（`rm -rf /` 后面也许是 `tmp`），见 [`regex_settled`]。
+    /// - 代码规则：碰到末尾的都不算 —— 主机名还没收完（`http://127` 后面是 `.0.0.1`）。
+    pub fn find_in<'a>(&self, args: &'a str, open: bool) -> Option<Found<'a>> {
+        let r = match self.check {
+            None => {
+                let r = self.re.find(args)?.range();
+                let ok = !open || r.end < args.len() || regex_settled(&self.re, args);
+                return ok.then(|| Found {
+                    text: &args[r.clone()],
+                    start: r.start,
+                    end: r.end,
+                });
+            }
+            Some(check) => check.find_in(args, open)?,
+        };
+        settled(r.end, args, open).then(|| Found {
+            text: &args[r.clone()],
+            start: r.start,
+            end: r.end,
+        })
+    }
+
+    /// 这条规则在 `args` 里的每一处，按先后：正则规则是每一个不空的匹配，代码规则只有
+    /// [`Rule::find`] 找到的那一处。第一处和 [`Rule::find`] 的一样。
+    pub fn find_all(&self, args: &str) -> Vec<std::ops::Range<usize>> {
+        self.find_all_in(args, false)
+    }
+
+    /// 同 [`Rule::find_all`]，`open` 的意思同 [`Rule::find_in`]：碰到末尾的那一处不算
+    pub fn find_all_in(&self, args: &str, open: bool) -> Vec<std::ops::Range<usize>> {
         match self.check {
-            None => self.re.find(args).map(|m| Found {
-                start: m.start(),
-                end: m.end(),
-                text: m.as_str(),
-            }),
-            Some(check) => check.find(args).map(|r| Found {
-                text: &args[r.clone()],
-                start: r.start,
-                end: r.end,
-            }),
+            None => {
+                // 碰到末尾的那一处只在定下来时算，见 `find_in`
+                let tail = std::cell::OnceCell::new();
+                self.re
+                    .find_iter(args)
+                    .filter(|m| {
+                        !m.is_empty()
+                            && (settled(m.end(), args, open)
+                                || *tail.get_or_init(|| regex_settled(&self.re, args)))
+                    })
+                    .map(|m| m.range())
+                    .collect()
+            }
+            Some(check) => check
+                .find_in(args, open)
+                .filter(|r| settled(r.end, args, open))
+                .into_iter()
+                .collect(),
         }
     }
 }
 
-impl Rule {
-    /// 这条规则在 `args` 里的每一处，按先后：正则规则是每一个不空的匹配，代码规则只有
-    /// [`Rule::find`] 找到的那一处。第一处和 [`Rule::find`] 的一样。
-    pub fn find_all(&self, args: &str) -> Vec<std::ops::Range<usize>> {
-        match self.check {
-            None => self
-                .re
-                .find_iter(args)
-                .filter(|m| !m.is_empty())
-                .map(|m| m.range())
-                .collect(),
-            Some(check) => check.find(args).into_iter().collect(),
-        }
-    }
+/// 一处命中定下来了没有：收完的参数都算；没收完的，要停在末尾之前
+fn settled(end: usize, args: &str, open: bool) -> bool {
+    !open || end < args.len()
+}
+
+/// 没收完的 `args` 后面不管来什么字，`re` 都还有一处停在已收到的字里面的命中。
+///
+/// 正则没有前后查看：一处命中的成立只取决于它覆盖的字，和末尾那个位置上的 `$`、`\b`、
+/// `\B`。后者只看下一个字是不是单词字符（换行另算，但它只会让 `(?m)$` 多成立）。所以
+/// 接一个单词字符、接一个非单词字符各试一次，两次都有停在原来末尾以内的命中，就是定了。
+/// 只在第一处命中正好碰到末尾时才试，平常不走这里
+fn regex_settled(re: &Regex, args: &str) -> bool {
+    ["a", "#"].iter().all(|next| {
+        let probe = format!("{args}{next}");
+        re.find_iter(&probe)
+            .any(|m| !m.is_empty() && m.end() <= args.len())
+    })
 }
 
 /// 一条永不匹配任何输入的正则。代码规则的 `re` 用它。
@@ -623,6 +671,34 @@ mod tests {
         }
         // 单独试一条也能编出来（走 one_builtin → compile）
         assert!(one_builtin("secret-to-unknown-host", None).is_some());
+    }
+
+    /// 没收完的参数里，碰到末尾的命中不算：主机名、`$` 都可能被后面的字改掉
+    #[test]
+    fn a_hit_touching_the_end_of_an_open_argument_is_not_settled() {
+        let tools = tool_rules(&[], |_| None, []).unwrap();
+        let rule = |id: &str| tools.rules.iter().find(|r| r.id == id).unwrap().clone();
+        // 代码规则：主机名停在末尾
+        let up = rule("upload-file-to-host");
+        let half = "curl -T ./a.txt http://127";
+        assert!(up.find_in(half, true).is_none());
+        assert!(up.find(half).is_some(), "收完了的 `127` 就是它");
+        assert!(
+            up.find_in("curl -T ./a.txt http://127.0.0.1:9/u", true)
+                .is_none()
+        );
+        // 正则规则：`$` 落在末尾
+        let rm = rule("rm-rf-root");
+        assert!(rm.find_in("rm -rf /", true).is_none());
+        assert!(rm.find("rm -rf /").is_some());
+        // 末尾是规则吃进去的分隔符，不是 `$`：后面来什么都还是命中，定了
+        assert!(rm.find_in("rm -rf / ", true).is_some());
+        assert!(rm.find_all_in("rm -rf / ", true).len() == 1);
+        // 末尾的 `\b`：`crontab -r` 后面也许还有字
+        let cron = rule("crontab-install");
+        assert!(cron.find_in("crontab -r", true).is_none());
+        assert!(cron.find_in("crontab -r;", true).is_some());
+        assert!(rm.find_all_in("rm -rf /", true).is_empty());
     }
 
     #[test]
