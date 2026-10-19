@@ -81,7 +81,7 @@ twcore import all.twconfig --dry-run            # 导入会做什么
 twcore config set /listen/gateway/port 8790 --int
 ```
 
-恢复时保留本机设置（监听、控制面密钥、保留期限、同步设置）、ChatGPT 的登录，以及本机已接管的客户端正在使用的网关密钥。导入时加入本机没有的项目，与本机不同的项目逐项选择处理方式（`--on-conflict` 一次指定全部）。配置包不含本机设置与 ChatGPT 登录；未指定 `--no-secrets` 时其中以明文保存密钥，除非指定 `--encrypt`（口令在终端输入，或取自环境变量 `TWCORE_PASSPHRASE`）。以不含密钥的配置包覆盖本机项目时，只有目的地不变（协议、主机与端口，AWS 区域，OAuth 令牌端点，代理地址）才沿用本机的密钥；目的地变了的、改名导入的上游以停用状态导入，填入密钥后再启用。
+恢复时保留本机设置（监听、控制面密钥、保留期限、同步设置）、ChatGPT 的登录，以及本机已接管的客户端正在使用的网关密钥。导入时加入本机没有的项目，与本机不同的项目逐项选择处理方式（`--on-conflict` 一次指定全部）。配置包不含本机设置与 ChatGPT 登录；未指定 `--no-secrets` 时其中以明文保存密钥，除非指定 `--encrypt`（口令在终端输入，或取自环境变量 `TWCORE_PASSPHRASE`）。以不含密钥的配置包覆盖本机项目时，只有目的地不变（协议、主机与端口，AWS 区域，OAuth 令牌端点，所走的出站代理，代理的地址）才沿用本机的密钥；目的地变了的、改名导入的上游以停用状态导入，填入密钥后再启用。
 
 这些命令直接操作文件，因此 core 没有运行时也能使用，而那往往正是最需要恢复的时候；配置完全无法读取时，恢复把整个版本写回，控制面密钥保持现在的值。正在运行的 core 会像对待其他保存一样接收这些改动。
 
@@ -294,7 +294,7 @@ clients:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 上游的名字，不能重复，也不能和策略组同名。以 `__` 开头的名字保留给内置项。 |
-| `base_url` | 字符串 | **必填** | 接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。 |
+| `base_url` | 字符串 | **必填** | 接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。地址中不能有反斜杠，主机前不能写用户名或密码（凭据写在 `key` 或 `headers` 中）。 |
 | `key` | 字符串，可写 `${VAR}` | — | API 密钥，放进协议规定的请求头：`x-api-key`（Anthropic）、`Authorization: Bearer`（OpenAI，以及 Bedrock API Key）、`x-goog-api-key`（Gemini）。上游不需要密钥、或凭据写在 `headers` 里时不写。不能和 `oauth`、`aws` 同时写。 |
 | `headers` | 请求头名 → 值的映射 | `{}` | 额外的请求头，按书写顺序发送；值可以用 `${VAR}`，配置了 `oauth` 时可以用 `{{access_token}}`。最多 32 个。HTTP 或网关管理的请求头（`host`、`content-length`、`connection` 等）不能设置。 |
 | `oauth` | 对象，见 [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth 凭据：用 refresh token 换取 access token。与 `key` 二选一。 |

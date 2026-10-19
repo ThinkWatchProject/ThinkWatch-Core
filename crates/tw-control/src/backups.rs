@@ -496,8 +496,17 @@ fn import_fail(e: tw_pack::import::ImportError, pack: &Pack) -> Fail {
     }
 }
 
+fn flag_view(f: tw_pack::import::Flag) -> tw_api::ImportFlag {
+    use tw_pack::import::Flag;
+    match f {
+        Flag::MissingKey => tw_api::ImportFlag::MissingKey,
+        Flag::NeedsLogin => tw_api::ImportFlag::NeedsLogin,
+        Flag::PluginDisabled => tw_api::ImportFlag::PluginDisabled,
+    }
+}
+
 pub(crate) fn row_view(r: tw_pack::import::Row) -> tw_api::ImportRow {
-    use tw_pack::import::{Flag, Status};
+    use tw_pack::import::Status;
     tw_api::ImportRow {
         item: item_ref(&r.item),
         status: match r.status {
@@ -507,17 +516,10 @@ pub(crate) fn row_view(r: tw_pack::import::Row) -> tw_api::ImportRow {
             Status::Error => tw_api::ImportStatus::Error,
         },
         global: r.global,
-        flags: r
-            .flags
-            .into_iter()
-            .map(|f| match f {
-                Flag::MissingKey => tw_api::ImportFlag::MissingKey,
-                Flag::NeedsLogin => tw_api::ImportFlag::NeedsLogin,
-                Flag::PluginDisabled => tw_api::ImportFlag::PluginDisabled,
-            })
-            .collect(),
+        flags: r.flags.into_iter().map(flag_view).collect(),
         differs: r.differs,
         suggested_name: r.suggested_name,
+        rename_flags: r.rename_flags.into_iter().map(flag_view).collect(),
         error: r.error,
         refs: r.refs.iter().map(item_ref).collect(),
     }

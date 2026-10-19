@@ -145,9 +145,9 @@ A pack carries no settings of this machine and no ChatGPT sign-in; without
 passphrase is asked for, or read from `TWCORE_PASSPHRASE`). Overwriting an
 item here with one from a pack without keys keeps this machine's keys only
 while the item still points at the same place (scheme, host and port; AWS
-region; OAuth token endpoint; proxy address); otherwise, and for an item
-imported under another name, the upstream comes in disabled until its key
-is entered.
+region; OAuth token endpoint; the outbound proxy it goes through; a proxy's
+address); otherwise, and for an item imported under another name, the
+upstream comes in disabled until its key is entered.
 
 These commands work on the files directly, so they work when core is not
 running, which is when a restore is most needed; when the file does not
@@ -410,7 +410,7 @@ Upstreams: the APIs requests are forwarded to.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the upstream; unique, and not the name of a group. Names starting with `__` are reserved. |
-| `base_url` | string | **required** | Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. |
+| `base_url` | string | **required** | Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. No backslashes, and no user name or password before the host (credentials go in `key` or `headers`). |
 | `key` | string, `${VAR}` allowed | — | API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI, and a Bedrock API key), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth` or `aws`. |
 | `headers` | map of header name → value | `{}` | Additional request headers, in the order written; values may use `${VAR}`, and `{{access_token}}` where `oauth` is set. At most 32. Headers HTTP or the gateway manages (`host`, `content-length`, `connection`, …) cannot be set. |
 | `oauth` | object, [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth credential: an access token obtained from a refresh token. Instead of `key`. |

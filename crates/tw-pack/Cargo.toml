@@ -29,6 +29,8 @@ blake3 = { workspace = true }
 sha2 = { workspace = true }
 age = { workspace = true }
 zip = { workspace = true }
+# 比较上游地址发去哪儿：和 reqwest 同一个解析器，两边对同一个地址的读法一样
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1068,3 +1068,31 @@ async fn a_plugin_put_back_at_startup_runs_again() {
     mgr.record_startup();
     assert_eq!(tw_pack::backup::list(&p).unwrap().len(), before);
 }
+
+/// 导入预览的每一行带着改名导入时的标记：不带密钥的包里，改名导入的上游缺着密钥进来
+#[tokio::test]
+async fn an_import_row_says_what_a_rename_would_bring() {
+    let src = bed(&theirs());
+    let file = export_all(&src, false).await;
+    let dst = bed(&mine());
+    let (st, preview) = call(
+        &dst.app,
+        "POST",
+        "/config/import/preview",
+        serde_json::json!({ "data_b64": file["data_b64"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    let rows = preview["rows"].as_array().unwrap();
+    let official = rows
+        .iter()
+        .find(|r| r["item"]["kind"] == "provider" && r["item"]["name"] == "官方")
+        .unwrap();
+    assert_eq!(official["status"], "conflict", "{official}");
+    // 只换了路径：覆盖沿用本机的密钥，改名导入不沿用
+    assert_eq!(official["flags"], serde_json::json!([]));
+    assert_eq!(official["rename_flags"], serde_json::json!(["missing_key"]));
+    let relay = rows.iter().find(|r| r["item"]["name"] == "relay").unwrap();
+    assert_eq!(relay["status"], "new");
+    assert_eq!(relay["rename_flags"], serde_json::json!([]));
+}
