@@ -25,6 +25,8 @@ tw-observe = { workspace = true }
 tw-store = { workspace = true }
 tw-pricing = { workspace = true }
 chrono = { workspace = true }
+# `twcore sync` 和控制面说 JSON
+serde_json = { workspace = true }
 tw-secret = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

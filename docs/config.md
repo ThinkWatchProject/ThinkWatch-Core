@@ -193,6 +193,7 @@ means.
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
 | `default_key` | string | — | The gateway key for clients that were not given a key of their own. Unset: the key named `default`, or the first key. It cannot be disabled. |
 | `plugins` | list of [`plugins[]`](#cfg-plugins) | `[]` | Script plugins, in the order they run. The app installs them; each one's code and settings are a file next to this one. |
+| `sync` | object, [`sync`](#cfg-sync) | — | Multi-device sync. A local setting: configuration packs and other devices never carry it, and restoring a backup keeps the current one. Unset: sync is off. |
 <!-- /generated -->
 
 ### `listen`
@@ -1500,6 +1501,95 @@ export const manifest = {
     note: { type: "string", label: "Note", value: "Answer in English." },
   },
 };
+```
+
+### `sync`
+
+Several devices (this Mac, a laptop, a server running a remote core) can keep
+one configuration in step through a sync location you choose: a folder that a
+cloud drive carries between devices, a WebDAV server, or S3-compatible
+storage. Each change is merged object by object with what the other devices
+did since the last sync; only when two devices change the same part of the
+same object to different values is there a conflict, which the app shows on
+every device until one of them resolves it. Turn sync on, join a location and
+resolve conflicts in the app (Settings, Sync and backup) or with
+`twcore sync enable` on a server; this section records the result.
+
+What syncs is the configuration a configuration pack carries: upstreams,
+proxies, gateway keys, aliases, groups, routes, price sheets, security rules,
+plugins and the general settings, keys included. `listen`, `retention` and
+`sync` itself stay on this device, and so does a ChatGPT account's sign-in.
+
+<!-- generated: table sync -->
+<a id="cfg-sync"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `device_id` | string | **required** | Generated when sync is turned on. File names at the sync location show its first 8 characters. |
+| `device_name` | string | **required** | Shown in the device list of every device that syncs here. |
+| `encrypt` | bool | `true` | Encrypt what goes to the sync location with the sync passphrase. Every device at one location uses the same setting; change it in the app, which re-uploads the latest version. |
+| `passphrase` | string | — | The sync passphrase; required when `encrypt` is on. Kept here in the clear, like the other keys in this file. |
+| `exclude` | list of strings | `[]` | Upstreams, by name, that are not synced: they are not uploaded and another device's upstream of the same name does not replace them. Routes, aliases and groups that refer to them are not synced either. |
+| `target` | object, [`sync.target`](#cfg-sync-target) | **required** | The sync location. The keyring, `versions/` and `devices/` live directly in it. |
+<!-- /generated -->
+
+<!-- generated: table sync.target -->
+<a id="cfg-sync-target"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | `folder` \| `webdav` \| `s3` | **required** | Which kind of location; the other fields depend on it, see the three tables below. |
+<!-- /generated -->
+
+<!-- generated: table sync.target (folder) -->
+<a id="cfg-sync-target-folder"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | **required** | `folder` |
+| `path` | string | **required** | An absolute path on the machine core runs on: a folder that iCloud Drive, Dropbox, OneDrive, Syncthing or a NAS share carries between devices. |
+| `proxy` | string | `direct` | Not used for a folder. |
+<!-- /generated -->
+
+<!-- generated: table sync.target (webdav) -->
+<a id="cfg-sync-target-webdav"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | **required** | `webdav` |
+| `url` | string | **required** | The WebDAV address of the folder. `https://`, with the certificate checked; `http://` only for this machine and the local network. |
+| `user` | string | `''` | User name. |
+| `pass` | string | `''` | Password, or the app password the service issues for WebDAV. |
+| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. |
+<!-- /generated -->
+
+<!-- generated: table sync.target (s3) -->
+<a id="cfg-sync-target-s3"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | **required** | `s3` |
+| `endpoint` | string | **required** | The S3 endpoint. Hosts ending in `amazonaws.com`, `aliyuncs.com` or `myqcloud.com` put the bucket in the host name; every other endpoint (Cloudflare R2, MinIO, an address) puts it in the path. `http://` only for this machine and the local network. |
+| `region` | string | **required** | The signing region; `auto` for Cloudflare R2. |
+| `bucket` | string | **required** | The bucket. Keep it private. |
+| `prefix` | string | `''` | A folder inside the bucket. |
+| `access_key_id` | string | **required** | Access key ID. |
+| `secret_access_key` | string | **required** | Secret access key. |
+| `proxy` | string | `direct` | Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. |
+<!-- /generated -->
+
+```yaml
+sync:
+  device_id: 3f9a2c1e-0b1d-4e2f-9a3b-5c6d7e8f9a0b
+  device_name: Mac mini
+  encrypt: true
+  passphrase: "correct horse battery staple"
+  exclude: [local ollama]
+  target:
+    type: webdav
+    url: https://dav.example.com/dav/ThinkWatch
+    user: name@example.com
+    pass: "app password"
 ```
 
 ## Environment variables

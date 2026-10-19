@@ -257,6 +257,32 @@ endpoints! {
     /// 最近的日志，老的在前。**网页可以调**
     PluginLogs: GET "/plugins/{id}/logs" [id], () => Vec<api::PluginLogEntry>;
 
+    // ─────────────────────────────────────────────── 多设备同步
+    //
+    // 同步设置写在 config.yaml 的 `sync` 一节（本机设置，不随导出和同步带出）。改设置的几个
+    // 端点（开启、改设置、加密、解锁、停止）回的是写完之后的版本号或同步状态
+    /// 同步此刻怎么样：状态、同步位置、设备、冲突数、不同步的上游和随之不同步的项目
+    SyncStatus: GET "/sync", () => api::SyncView;
+    /// 连上去看看：读写行不行，是空的还是已经有同步数据（加没加密、有哪些设备）。**不写配置**
+    SyncTest: POST "/sync/test", api::SyncTestRequest => api::SyncProbe;
+    /// 加入已有的同步时，本机配置和同步数据怎么合（规则和导入预览一样）。**不写配置**
+    SyncJoinPreview: POST "/sync/enable/preview", api::SyncTestRequest => api::SyncJoinPreview;
+    /// 开启同步：空的同步位置新建，有数据的加入
+    SyncEnable: POST "/sync/enable", api::SyncEnable => api::ConfigWritten;
+    /// 改连接参数、设备名称、不同步的上游
+    SyncSave: PUT "/sync/settings", api::SyncSettingsSave => api::ConfigWritten;
+    /// 立即同步一轮（打开主窗口时 Lite 也调它）
+    SyncNow: POST "/sync/now", () => api::SyncView;
+    SyncConflicts: GET "/sync/conflicts", () => Vec<api::SyncConflict>;
+    /// 处理冲突：结果作为新版本上传，别的设备随之清除
+    SyncResolve: POST "/sync/conflicts", api::SyncResolve => api::SyncView;
+    /// 开启、关闭加密，更改同步口令
+    SyncEncryption: POST "/sync/encryption", api::SyncEncryption => api::SyncView;
+    /// 其他设备改了口令之后，在这台设备上输入新口令
+    SyncUnlock: POST "/sync/unlock", api::SyncUnlock => api::SyncView;
+    /// 停止同步；`purge` 时连同步位置上的数据一起删掉
+    SyncDisable: POST "/sync/disable", api::SyncDisable => ();
+
     // ─────────────────────────────────────────────── 账号登录
     StartChatgptLogin: POST "/chatgpt/login", api::ChatgptLoginStart => api::ChatgptLogin;
     ChatgptLoginStatus: GET "/chatgpt/login/{id}" [id], () => api::ChatgptLoginStatus;

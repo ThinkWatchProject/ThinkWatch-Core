@@ -127,6 +127,8 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::ConfigRejected { .. }
         | E::GatewayKeysChanged { .. }
         | E::ClientPrefsChanged { .. }
+        // 同步的状态：说的是配置，不是请求
+        | E::SyncStatus { .. }
         | E::EventsDropped { .. } => false,
     }
 }

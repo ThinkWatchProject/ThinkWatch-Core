@@ -43,6 +43,7 @@ pub mod rotation;
 pub mod routes;
 pub mod security;
 pub mod shutdown;
+pub mod sync;
 pub mod zai;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use shutdown::Shutdown;
@@ -153,6 +154,7 @@ pub fn router(state: ControlState) -> Router {
         .merge(pricing::router())
         .merge(chatgpt::router())
         .merge(zai::router())
+        .merge(sync::router())
         .fallback(contract::no_such_endpoint)
         .layer(axum::middleware::from_fn(contract::errors_are_messages))
         .with_state(state)
@@ -444,7 +446,13 @@ fn provider_view(
     p: &tw_config::Provider,
 ) -> tw_api::ProviderView {
     let listing = s.gateway.models.listing(p);
+    let synced = sync::service(s);
     tw_api::ProviderView {
+        sync_excluded: cfg
+            .sync
+            .as_ref()
+            .is_some_and(|y| y.exclude.iter().any(|n| n == &p.name)),
+        sync_url_changed: synced.url_changed(&p.name),
         name: p.name.clone(),
         base_url: p.base_url.clone(),
         key: p.key.as_ref().map(|k| k.raw().to_string()),

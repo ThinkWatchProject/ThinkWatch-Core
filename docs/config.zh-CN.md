@@ -118,6 +118,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `default_route` | 字符串 | — | 未指定路由的密钥走哪条路由。不写：名为 `default` 的路由；没有这条路由时走内置的故障转移。 |
 | `default_key` | 字符串 | — | 没有专用密钥的客户端使用哪一把。不写：名为 `default` 的那把，没有则取第一把。这把密钥不能停用。 |
 | `plugins` | 对象列表，见 [`plugins[]`](#cfg-plugins) | `[]` | 脚本插件，按运行的顺序。由应用安装，每个插件的代码和设置是本文件旁边的一个文件。 |
+| `sync` | 对象，见 [`sync`](#cfg-sync) | — | 多设备同步。属于本机设置：配置包和其他设备不会带走它，恢复备份时保留当前值。不写：不同步。 |
 <!-- /generated -->
 
 ### `listen`
@@ -1098,6 +1099,84 @@ export const manifest = {
     note: { type: "string", label: "Note", value: "用中文回答。" },
   },
 };
+```
+
+### `sync`
+
+多台设备（这台 Mac、一台笔记本、一台运行远程 core 的服务器）可以通过自选的同步位置保持同一份配置：由云盘在设备之间传送的文件夹、WebDAV 服务器或 S3 兼容存储。每次改动都按对象与其他设备自上次同步以来的改动合并；只有两台设备把同一对象的同一部分改成不同内容时才构成冲突，冲突在每台设备上显示，任一设备处理之后随之清除。开启同步、加入已有的同步和处理冲突在应用里进行（设置 → 同步与备份），服务器上用 `twcore sync enable`；本节记录的是结果。
+
+同步的内容即配置包带的内容：上游、出站代理、网关密钥、别名、分组、路由、价目表、安全规则、插件和全局设置，包括密钥。`listen`、`retention` 和 `sync` 本身留在本机，ChatGPT 账号的登录也一样。
+
+<!-- generated: table sync -->
+<a id="cfg-sync"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `device_id` | 字符串 | **必填** | 开启同步时生成。同步位置上的文件名里出现的是它的前 8 个字符。 |
+| `device_name` | 字符串 | **必填** | 在每台参与同步的设备的设备列表里显示的名字。 |
+| `encrypt` | 布尔 | `true` | 以同步口令加密存到同步位置的内容。同一同步位置上的所有设备采用同一设置；在应用里更改，应用会重新上传最新版本。 |
+| `passphrase` | 字符串 | — | 同步口令，`encrypt` 开着时必填。和本文件里的其他密钥一样以明文保存。 |
+| `exclude` | 字符串列表 | `[]` | 不同步的上游，按名字：不上传，也不被其他设备的同名上游覆盖。引用它们的路由、别名、分组随之不同步。 |
+| `target` | 对象，见 [`sync.target`](#cfg-sync-target) | **必填** | 同步位置。`keyring`、`versions/`、`devices/` 直接放在它里面。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target -->
+<a id="cfg-sync-target"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | `folder` \| `webdav` \| `s3` | **必填** | 同步位置的种类；其余字段随之不同，见下面三张表。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target (folder) -->
+<a id="cfg-sync-target-folder"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | 字符串 | **必填** | `folder` |
+| `path` | 字符串 | **必填** | core 所在机器上的绝对路径：由 iCloud Drive、Dropbox、OneDrive、Syncthing 或 NAS 共享在设备之间传送的文件夹。 |
+| `proxy` | 字符串 | `direct` | 文件夹用不到。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target (webdav) -->
+<a id="cfg-sync-target-webdav"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | 字符串 | **必填** | `webdav` |
+| `url` | 字符串 | **必填** | 文件夹的 WebDAV 地址。`https://`，校验证书；`http://` 只用于本机和局域网。 |
+| `user` | 字符串 | `''` | 用户名。 |
+| `pass` | 字符串 | `''` | 密码，或者服务为 WebDAV 签发的应用密码。 |
+| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target (s3) -->
+<a id="cfg-sync-target-s3"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | 字符串 | **必填** | `s3` |
+| `endpoint` | 字符串 | **必填** | S3 端点。主机以 `amazonaws.com`、`aliyuncs.com`、`myqcloud.com` 结尾的，存储桶名放进域名；其余端点（Cloudflare R2、MinIO、IP 地址）放进路径。`http://` 只用于本机和局域网。 |
+| `region` | 字符串 | **必填** | 签名用的区域；Cloudflare R2 填 `auto`。 |
+| `bucket` | 字符串 | **必填** | 存储桶，建议设为私有。 |
+| `prefix` | 字符串 | `''` | 存储桶里的一个前缀（文件夹）。 |
+| `access_key_id` | 字符串 | **必填** | Access Key ID。 |
+| `secret_access_key` | 字符串 | **必填** | Secret Access Key。 |
+| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。 |
+<!-- /generated -->
+
+```yaml
+sync:
+  device_id: 3f9a2c1e-0b1d-4e2f-9a3b-5c6d7e8f9a0b
+  device_name: Mac mini
+  encrypt: true
+  passphrase: "correct horse battery staple"
+  exclude: [本机 Ollama]
+  target:
+    type: webdav
+    url: https://dav.example.com/dav/ThinkWatch
+    user: name@example.com
+    pass: "应用密码"
 ```
 
 ## 环境变量

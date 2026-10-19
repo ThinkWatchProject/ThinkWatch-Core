@@ -2401,6 +2401,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3721,6 +3730,7 @@ dependencies = [
  "tw-types",
  "tw-watch",
  "tw-yaml",
+ "url",
  "windows-sys 0.61.2",
 ]
 
@@ -3763,6 +3773,7 @@ dependencies = [
  "tw-pricing",
  "tw-secret",
  "tw-store",
+ "tw-sync",
  "tw-types",
  "tw-watch",
  "tw-yaml",
@@ -3959,6 +3970,32 @@ dependencies = [
  "tw-observe",
  "tw-pricing",
  "tw-secret",
+]
+
+[[package]]
+name = "tw-sync"
+version = "0.76.0"
+dependencies = [
+ "age",
+ "axum",
+ "base64 0.22.1",
+ "percent-encoding",
+ "quick-xml",
+ "rand 0.10.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tw-bedrock",
+ "tw-config",
+ "tw-pack",
+ "tw-types",
+ "tw-watch",
+ "url",
 ]
 
 [[package]]

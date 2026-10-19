@@ -699,7 +699,8 @@ impl Recorder {
             | Event::GatewayKeysChanged { .. }
             | Event::ClientPrefsChanged { .. }
             // 只发给事件流上掉队的那一个订阅者，从不进总线
-            | Event::EventsDropped { .. } => {}
+            | Event::EventsDropped { .. }
+            | Event::SyncStatus { .. } => {}
         }
     }
 

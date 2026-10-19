@@ -140,6 +140,78 @@ pub fn sign(
         .collect())
 }
 
+/// 给别的 AWS 服务签名：S3 兼容存储（同步位置）也是 SigV4，只是服务名、要一起签的请求头不同。
+///
+/// - `service` 是签名用的服务名（`s3`）。S3 的规矩和别的服务不一样：路径**不再编一遍、
+///   不规范化**（`a/./b`、`%2F` 原样签），这里按服务名照办。
+/// - `headers` 是除了 host 以外要一起签的请求头（`content-type`、`if-none-match`……），发请求时
+///   一个不差地带上；host 从 `url` 里取。
+/// - `body` 是发出去的请求体，一个字节都不能差；没有请求体时给空的。
+///
+/// 返回的头和 [`sign`] 一样：`authorization`、`x-amz-date`、`x-amz-content-sha256`，临时凭证
+/// 还有 `x-amz-security-token`。
+#[allow(clippy::too_many_arguments)]
+pub fn sign_service(
+    credentials: &Credentials,
+    region: &str,
+    service: &str,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    at: SystemTime,
+) -> Result<Vec<(String, String)>, SignError> {
+    use aws_sigv4::http_request::{
+        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+        SigningSettings, UriPathNormalizationMode, sign,
+    };
+    use aws_sigv4::sign::v4;
+
+    let fail = |e: &dyn fmt::Display| SignError(e.to_string());
+    let identity = aws_credential_types::Credentials::new(
+        &credentials.access_key_id,
+        &credentials.secret_access_key,
+        credentials.session_token.clone(),
+        None,
+        "thinkwatch",
+    )
+    .into();
+
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    settings.signature_location = SignatureLocation::Headers;
+    if service == "s3" {
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    }
+
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name(service)
+        .time(at)
+        .settings(settings)
+        .build()
+        .map_err(|e| fail(&e))?;
+
+    let signable = SignableRequest::new(
+        method,
+        url,
+        headers.iter().copied(),
+        SignableBody::Bytes(body),
+    )
+    .map_err(|e| fail(&e))?;
+
+    let (instructions, _signature) = sign(signable, &params.into())
+        .map_err(|e| fail(&e))?
+        .into_parts();
+    let (headers, _query) = instructions.into_parts();
+    Ok(headers
+        .into_iter()
+        .map(|h| (h.name().to_ascii_lowercase(), h.value().to_string()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

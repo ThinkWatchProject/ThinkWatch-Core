@@ -13,6 +13,7 @@ mod call;
 mod lockfile;
 mod pack_cli;
 mod proc;
+mod sync_cmd;
 mod upgrade;
 
 use lockfile::{LockFile, LockOutcome};
@@ -138,6 +139,13 @@ enum Command {
         #[command(subcommand)]
         what: BackupCmd,
     },
+    /// Show or change multi-device sync. Talks to the running core
+    //
+    // 给没有界面的服务器（远程 core）用：和界面走同一套控制面端点
+    Sync {
+        #[command(subcommand)]
+        what: SyncCmd,
+    },
     /// Replace this twcore with another release from GitHub; the configuration is left alone
     //
     // 只给单独装的 twcore 用（服务器上）。桌面应用包里的那份由应用更新，见 upgrade.rs
@@ -151,6 +159,22 @@ enum Command {
         /// Install this version rather than the latest, such as 0.47.0
         #[arg(long)]
         version: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncCmd {
+    /// Print the sync state, the location and the devices
+    Status,
+    /// Sync once now
+    Now,
+    /// Turn sync on; asks for the location and the passphrase
+    Enable,
+    /// Turn sync off; this device keeps its configuration
+    Disable {
+        /// Also delete every version, device record and the keyring at the sync location
+        #[arg(long)]
+        purge: bool,
     },
 }
 
@@ -260,6 +284,12 @@ fn main() -> Result<()> {
             data,
             out,
         } => call::run(&path, &endpoint, &method, data, out),
+        Command::Sync { what } => match what {
+            SyncCmd::Status => sync_cmd::status(&path),
+            SyncCmd::Now => sync_cmd::now(&path),
+            SyncCmd::Enable => sync_cmd::enable(&path),
+            SyncCmd::Disable { purge } => sync_cmd::disable(&path, purge),
+        },
         Command::Upgrade {
             check,
             restart,
@@ -964,6 +994,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 这是一种（另一种是上面的默认插件）—— 理由是服务器换发新 refresh
         // token 的那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
+        // 多设备同步：启动时一轮，之后按本机改动、定时、文件夹变化、唤醒。安全模式下不自动同步
+        let sync = tw_control::sync::start(&control, safe);
         // 定期刷新默认价目表（`pricing.auto_update`，默认开）
         tw_control::pricing::spawn(control.clone());
 
@@ -1032,6 +1064,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             }
             _ = shutdown_requested(&shutdown) => {
                 tracing::info!("got a shutdown signal");
+                // 还没上传的本机改动，退出前上传（等不了太久：没传成的下次启动时传）
+                sync.flush().await;
                 Ok(())
             }
         }
