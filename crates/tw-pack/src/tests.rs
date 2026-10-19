@@ -332,3 +332,34 @@ fn origins_keep_their_words() {
     }
     assert_eq!(PackOrigin::from_slug("nope"), PackOrigin::Other);
 }
+
+/// 要求加密的地方：给了钥匙就不收明文；加密的照常解；没给钥匙时和 `read` 一样
+#[test]
+fn a_strict_read_refuses_a_plain_pack_when_a_key_is_given() {
+    fast();
+    let pack = sample();
+    let plain = write(&pack, Seal::None).unwrap();
+    let id = age::x25519::Identity::generate();
+    let sealed = write(&pack, Seal::Recipient(&id.to_public())).unwrap();
+    assert_eq!(
+        read_strict(&plain, Unseal::Identity(&id)).unwrap_err(),
+        PackError::NotEncrypted
+    );
+    assert_eq!(
+        read_strict(&plain, Unseal::Passphrase("whatever it is")).unwrap_err(),
+        PackError::NotEncrypted
+    );
+    assert_eq!(PackError::NotEncrypted.msg().code, "pack.not_encrypted");
+    assert_eq!(
+        read_strict(&sealed, Unseal::Identity(&id))
+            .unwrap()
+            .config_yaml,
+        pack.config_yaml
+    );
+    assert_eq!(
+        read_strict(&plain, Unseal::None).unwrap().config_yaml,
+        pack.config_yaml
+    );
+    // `read` 照收：导入的是用户自己挑的文件
+    assert!(read(&plain, Unseal::Identity(&id)).is_ok());
+}

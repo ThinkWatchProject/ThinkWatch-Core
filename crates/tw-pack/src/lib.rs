@@ -305,6 +305,9 @@ pub enum PackError {
     MissingEntry { name: String },
     #[error("{}", self.msg())]
     TooLarge { limit: usize },
+    /// 要求加密的地方读到了一个没加密的包（[`read_strict`]）
+    #[error("{}", self.msg())]
+    NotEncrypted,
 }
 
 impl PackError {
@@ -346,6 +349,10 @@ impl PackError {
             PackError::MissingEntry { name } => msg!(
                 "pack.missing_entry", name = name =>
                 "This configuration pack has no {name}."
+            ),
+            PackError::NotEncrypted => msg!(
+                "pack.not_encrypted" =>
+                "This configuration pack is not encrypted, though it has to be, so it was not opened."
             ),
             PackError::TooLarge { limit } => msg!(
                 "pack.too_large", limit = limit / (1024 * 1024) =>
@@ -452,8 +459,9 @@ fn work_factor() -> u8 {
     }
 }
 
-/// 解开时最多接受多大的工作量。比写的时候大一些：将来调高了，旧版本照样读得了新包
-const MAX_WORK_FACTOR: u8 = 22;
+/// 解开时最多接受多大的工作量：**和写的时候一样**（同步位置的 keyring 也是这个上限）。一个
+/// 不可信的包能指定工作量，放宽了就是让它一打开就占掉几个 GB 内存（`2^22` 约 4 GiB）
+const MAX_WORK_FACTOR: u8 = 18;
 
 /// **只给测试用**：把口令加密的工作量调低，测试不用每次等一秒。0 是不改
 #[doc(hidden)]
@@ -466,7 +474,19 @@ pub fn is_encrypted(bytes: &[u8]) -> bool {
     bytes.starts_with(b"age-encryption.org/")
 }
 
-/// 读一个配置包。
+/// 同 [`read`]，**加密得和给的钥匙对得上**：给了口令或密钥（[`Unseal::Passphrase`] /
+/// [`Unseal::Identity`]）时，没加密的包不收（[`PackError::NotEncrypted`]）。同步位置开着加密
+/// 时用它：一个照收的明文版本，等于对那个位置有写权限的谁都能把配置写进这台设备。不给
+/// （[`Unseal::None`]）时和 [`read`] 一样
+pub fn read_strict(bytes: &[u8], unseal: Unseal) -> Result<Pack, PackError> {
+    if !matches!(unseal, Unseal::None) && !is_encrypted(bytes) {
+        return Err(PackError::NotEncrypted);
+    }
+    read(bytes, unseal)
+}
+
+/// 读一个配置包。**给了钥匙也照收明文的包**：导入用户自己挑的文件时，加没加密都行；要求加密
+/// 的地方用 [`read_strict`]
 pub fn read(bytes: &[u8], unseal: Unseal) -> Result<Pack, PackError> {
     if bytes.len() > MAX_BYTES {
         return Err(PackError::TooLarge { limit: MAX_BYTES });
