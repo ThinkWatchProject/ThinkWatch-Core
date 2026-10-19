@@ -52,23 +52,64 @@ pub fn write_prefs(config_path: &Path, prefs: Option<&serde_json::Value>) -> std
     }
 }
 
-/// 存着的固定密钥。没有、读不懂都是空的
-pub fn read_pinned(config_path: &Path) -> BTreeSet<String> {
+/// 一个来源（一个连着这台 core 的 Lite）报上来的固定密钥多久没更新就不算了：30 天
+pub const PINNED_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+
+/// 一个来源报上来的固定密钥。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PinnedSource {
+    pub names: BTreeSet<String>,
+    pub updated_at_ms: u64,
+}
+
+/// 存着的固定密钥，**按来源**：几个 Lite 连着同一个 core（远程模式）时各报各的，取并集。
+/// 没有、读不懂都是空的
+pub fn read_pinned_sources(config_path: &Path) -> BTreeMap<String, PinnedSource> {
     #[derive(serde::Deserialize)]
     struct File {
-        names: BTreeSet<String>,
+        sources: BTreeMap<String, PinnedSource>,
     }
     std::fs::read(pinned_path(config_path))
         .ok()
         .and_then(|b| serde_json::from_slice::<File>(&b).ok())
-        .map(|f| f.names)
+        .map(|f| f.sources)
         .unwrap_or_default()
 }
 
-pub fn write_pinned(config_path: &Path, names: &BTreeSet<String>) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "names": names }))
+/// 各来源的并集，**过期的来源不算**（[`PINNED_TTL_MS`] 没更新：那个 Lite 多半已经不在了）
+pub fn pinned_union(sources: &BTreeMap<String, PinnedSource>, now_ms: u64) -> BTreeSet<String> {
+    sources
+        .values()
+        .filter(|s| now_ms.saturating_sub(s.updated_at_ms) <= PINNED_TTL_MS)
+        .flat_map(|s| s.names.iter().cloned())
+        .collect()
+}
+
+/// 存着的固定密钥：各个来源的并集，过期的不算
+pub fn read_pinned(config_path: &Path) -> BTreeSet<String> {
+    pinned_union(&read_pinned_sources(config_path), crate::now_ms())
+}
+
+/// 一个来源报上来一组固定密钥：换掉它上次报的，过期的来源顺手删掉。返回存下的全部来源
+pub fn write_pinned(
+    config_path: &Path,
+    source: &str,
+    names: &BTreeSet<String>,
+) -> std::io::Result<BTreeMap<String, PinnedSource>> {
+    let now = crate::now_ms();
+    let mut sources = read_pinned_sources(config_path);
+    sources.retain(|_, s| now.saturating_sub(s.updated_at_ms) <= PINNED_TTL_MS);
+    sources.insert(
+        source.to_string(),
+        PinnedSource {
+            names: names.clone(),
+            updated_at_ms: now,
+        },
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "sources": sources }))
         .map_err(std::io::Error::other)?;
-    write_private(&pinned_path(config_path), &bytes)
+    write_private(&pinned_path(config_path), &bytes)?;
+    Ok(sources)
 }
 
 /// 配置原文里列着的插件 id，按顺序。读不成 YAML 是空的
@@ -277,9 +318,18 @@ mod tests {
         std::fs::write(prefs_path(&cfg), b"{not json").unwrap();
         assert_eq!(read_prefs(&cfg), None);
 
-        let names: BTreeSet<String> = ["codex".to_string()].into_iter().collect();
-        write_pinned(&cfg, &names).unwrap();
-        assert_eq!(read_pinned(&cfg), names);
+        // 两个 Lite 各报各的，取并集；一个来源再报一次是换掉它自己的那一组
+        let a: BTreeSet<String> = ["codex".to_string()].into_iter().collect();
+        let b: BTreeSet<String> = ["claude-code".to_string()].into_iter().collect();
+        write_pinned(&cfg, "lite-a", &a).unwrap();
+        write_pinned(&cfg, "lite-b", &b).unwrap();
+        assert_eq!(read_pinned(&cfg), a.union(&b).cloned().collect());
+        write_pinned(&cfg, "lite-a", &BTreeSet::new()).unwrap();
+        assert_eq!(read_pinned(&cfg), b);
+        // 30 天没更新的来源不算
+        let mut sources = read_pinned_sources(&cfg);
+        sources.get_mut("lite-b").unwrap().updated_at_ms = 1;
+        assert!(pinned_union(&sources, crate::now_ms()).is_empty());
     }
 
     #[test]

@@ -98,7 +98,7 @@ fn restoring_a_few_items_leaves_the_rest_as_it_is() {
 #[test]
 fn in_safe_mode_the_whole_version_comes_back_with_todays_key() {
     let broken = format!("version: 1\nlisten:\n  control:\n    key: {OLD_KEY}\nproviders: [\n");
-    let out = whole(&then(), &broken);
+    let out = whole(&then(), &broken, None);
     assert!(out.config_yaml.contains(OLD_KEY), "{}", out.config_yaml);
     assert!(!out.config_yaml.contains(tw_api::control::KEY_MASK));
     assert!(out.config_yaml.contains("port: 8000"));

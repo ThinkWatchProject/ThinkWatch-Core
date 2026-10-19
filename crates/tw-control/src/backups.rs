@@ -36,12 +36,19 @@ use tw_types::{Msg, msg};
 use crate::contract::RouterExt;
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail, unreadable_config};
 
+/// 带着配置包内容的请求体最大多少字节：一个 [`tw_pack::MAX_BYTES`] 的包写成 base64，加上
+/// 请求里别的几个字段。**只给这两个端点放宽**，别的照 axum 的默认（2 MiB）
+pub const PACK_BODY_MAX: usize = tw_pack::MAX_BYTES / 3 * 4 + 1024 * 1024;
+
 pub fn router() -> axum::Router<ControlState> {
-    axum::Router::new()
-        .at(ep::ConfigItems, items)
-        .at(ep::ExportConfig, export)
+    let packs = axum::Router::new()
         .at(ep::ImportPreview, import_preview)
         .at(ep::ImportConfig, import)
+        .layer(axum::extract::DefaultBodyLimit::max(PACK_BODY_MAX));
+    axum::Router::new()
+        .merge(packs)
+        .at(ep::ConfigItems, items)
+        .at(ep::ExportConfig, export)
         .at(ep::Backups, backups)
         .at(ep::BackupFile, backup_file)
         .at(ep::RestorePreview, restore_preview)
@@ -256,21 +263,37 @@ fn passphrase(p: Option<&str>) -> Result<Option<&str>, Fail> {
     }
 }
 
-fn open_pack(data_b64: &str, pass: Option<&str>) -> Result<Pack, Fail> {
+/// 解开一个配置包。**在阻塞线程上**：口令解密要算 scrypt（零点几秒、上百 MB 内存），不能
+/// 占着处理请求的线程
+async fn open_pack(data_b64: &str, pass: Option<&str>) -> Result<Pack, Fail> {
     let bytes = decode(data_b64)?;
-    let unseal = match pass {
-        Some(p) => Unseal::Passphrase(p),
-        None => Unseal::None,
-    };
-    tw_pack::read(&bytes, unseal).map_err(bad_pack)
+    let pass = pass.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let unseal = match &pass {
+            Some(p) => Unseal::Passphrase(p),
+            None => Unseal::None,
+        };
+        tw_pack::read(&bytes, unseal)
+    })
+    .await
+    .map_err(crate::internal)?
+    .map_err(bad_pack)
 }
 
-fn file_of(pack: &Pack, pass: Option<&str>) -> Result<(String, String), Fail> {
-    let seal = match pass {
-        Some(p) => Seal::Passphrase(p),
-        None => Seal::None,
-    };
-    let bytes = tw_pack::write(pack, seal).map_err(bad_pack)?;
+/// 写成文件。口令加密同样在阻塞线程上
+async fn file_of(pack: &Pack, pass: Option<&str>) -> Result<(String, String), Fail> {
+    let owned = pack.clone();
+    let pass = pass.map(str::to_string);
+    let bytes = tokio::task::spawn_blocking(move || {
+        let seal = match &pass {
+            Some(p) => Seal::Passphrase(p),
+            None => Seal::None,
+        };
+        tw_pack::write(&owned, seal)
+    })
+    .await
+    .map_err(crate::internal)?
+    .map_err(bad_pack)?;
     Ok((
         tw_pack::export::file_name(pack.manifest.created_at_ms),
         base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -289,6 +312,16 @@ fn fix_view(f: tw_config::repair::Fix) -> tw_api::ConfigFix {
         value: f.value,
         now: f.now,
     }
+}
+
+fn prefs_too_large() -> Fail {
+    fail(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        msg!(
+            "backup.prefs_too_large", limit = tw_api::CLIENT_PREFS_MAX / 1024 =>
+            "The client preferences are larger than {limit} KiB."
+        ),
+    )
 }
 
 // ─────────────────────────────────────────────────────────── 此刻的样子
@@ -316,6 +349,13 @@ async fn land(
     changed_keys: Vec<String>,
 ) -> Result<String, Fail> {
     let path = s.config_path().to_path_buf();
+    // 偏好的上限导入、恢复也照样查：一份带着超大偏好的包不该绕过 `PUT /client-prefs` 的那道关
+    if core_keeps_prefs()
+        && let Some(p) = &after.client_prefs
+        && p.to_string().len() > tw_api::CLIENT_PREFS_MAX
+    {
+        return Err(prefs_too_large());
+    }
     let _edit = s.gateway.plugins.edits.lock().await;
     let undo =
         tw_pack::disk::write_plugins(&path, &before.plugins, &after.plugins).map_err(|e| {
@@ -336,6 +376,9 @@ async fn land(
         .await;
     let version = match written {
         Ok(v) => v,
+        // **配置已经写下去了**、只是网关换不进来：插件文件和偏好跟着磁盘上的配置，不还原 ——
+        // 还原的话 config.yaml 里批准的哈希就对不上磁盘上的插件文件了
+        Err(e @ ApplyError::Build(_)) => return Err(apply_fail(e)),
         Err(e) => {
             undo.restore();
             if prefs_changed {
@@ -421,7 +464,7 @@ async fn export(
         },
     )
     .map_err(|e| model_fail(e, None))?;
-    let (file_name, data_b64) = file_of(&out.pack, pass)?;
+    let (file_name, data_b64) = file_of(&out.pack, pass).await?;
     Ok(Json(tw_api::ExportedFile {
         file_name,
         data_b64,
@@ -483,7 +526,7 @@ async fn import_preview(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ImportSource>,
 ) -> Result<Json<tw_api::ImportPreview>, Fail> {
-    let raw = open_pack(&req.data_b64, req.passphrase.as_deref())?;
+    let raw = open_pack(&req.data_b64, req.passphrase.as_deref()).await?;
     let (incoming, repairs) =
         tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Import)?;
@@ -502,7 +545,7 @@ async fn import(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ImportRequest>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let raw = open_pack(&req.data_b64, req.passphrase.as_deref())?;
+    let raw = open_pack(&req.data_b64, req.passphrase.as_deref()).await?;
     // 预览时修过的那几处，这里照样修一遍（同一份字节，修出来一样）
     let (incoming, _) = tw_pack::import::prepare(raw.clone()).map_err(|e| import_fail(e, &raw))?;
     let (cur, local) = current(&s, PackOrigin::Import)?;
@@ -660,7 +703,7 @@ async fn backup_file(
     .map_err(|e| model_fail(e, Some(&pack)))?;
     let mut exported = out.pack;
     exported.manifest.created_at_ms = pack.manifest.created_at_ms;
-    let (file_name, data_b64) = file_of(&exported, pass)?;
+    let (file_name, data_b64) = file_of(&exported, pass).await?;
     Ok(Json(tw_api::ExportedFile {
         file_name,
         data_b64,
@@ -680,6 +723,7 @@ fn restore_row(r: tw_pack::restore::Row) -> tw_api::RestoreRow {
         },
         kept: r.kept.map(|k| match k {
             Kept::KeyInUse => tw_api::KeptReason::KeyInUse,
+            Kept::Referenced => tw_api::KeptReason::Referenced,
         }),
     }
 }
@@ -744,7 +788,11 @@ async fn restore(
         .map(|xs| xs.iter().map(item_id).collect());
     let (after, changed) = if model::snapshot(&local).is_err() {
         // 安全模式：现在这份读不进来，整份换回去
-        let mut whole = tw_pack::restore::whole(&backup, &cur.text);
+        // 本机那几节取不到时（原文坏到读不成 YAML）用最近一个本机备份里的
+        let last = tw_pack::backup::list(s.config_path())
+            .ok()
+            .and_then(|all| all.last().and_then(|b| tw_pack::backup::open(b).ok()));
+        let mut whole = tw_pack::restore::whole(&backup, &cur.text, last.as_ref());
         if !core_keeps_prefs() {
             whole.client_prefs = local.client_prefs.clone();
         }
@@ -780,13 +828,7 @@ async fn put_prefs(
     if let Some(p) = &req.prefs
         && p.to_string().len() > tw_api::CLIENT_PREFS_MAX
     {
-        return Err(fail(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            msg!(
-                "backup.prefs_too_large", limit = tw_api::CLIENT_PREFS_MAX / 1024 =>
-                "The client preferences are larger than {limit} KiB."
-            ),
-        ));
+        return Err(prefs_too_large());
     }
     let path = s.config_path().to_path_buf();
     if tw_pack::disk::read_prefs(&path) == req.prefs {
@@ -813,7 +855,7 @@ async fn pin_keys(
 ) -> Result<Json<()>, Fail> {
     let names: BTreeSet<String> = req.names.into_iter().collect();
     s.cfg
-        .set_pinned_keys(names)
+        .set_pinned_keys(&req.source, names)
         .map_err(|e| io_fail(&tw_pack::disk::pinned_path(s.config_path()), e))?;
     Ok(Json(()))
 }

@@ -226,6 +226,66 @@ pub fn device_of(pack: &Pack) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 启动时：插件文件和配置里批准的哈希都对不上的（脚本和底稿都不是那一份 —— 写插件文件和写
+/// 配置之间断了电），从最近的备份里找回哈希对得上的那一份写回去。返回修好的插件 id。
+///
+/// **底稿对得上的不动**：那是用户在磁盘上改了、还没批准的文件，不是断在半路
+pub fn heal_plugins(config_path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text) else {
+        return Vec::new();
+    };
+    let entries: Vec<(String, String)> = doc
+        .get(tw_config::plugins::DIR)
+        .and_then(serde_yaml_ng::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let id = p.get("id")?.as_str()?.to_string();
+            let sha = p.get("sha256")?.as_str()?.to_string();
+            tw_config::plugins::valid_id(&id).then_some((id, sha))
+        })
+        .collect();
+    let hash = crate::model::sha256_hex;
+    let mut healed = Vec::new();
+    let mut backups: Option<Vec<Pack>> = None;
+    for (id, sha) in entries {
+        let files = disk::read_plugin(config_path, &id);
+        let fine = files.as_ref().is_some_and(|f| {
+            hash(&f.script) == sha || f.approved.as_ref().is_some_and(|a| hash(a) == sha)
+        });
+        if fine {
+            continue;
+        }
+        let packs = backups.get_or_insert_with(|| {
+            list(config_path)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .filter_map(|b| open(b).ok())
+                .collect()
+        });
+        let found = packs.iter().find_map(|p| {
+            let f = p.plugins.get(&id)?;
+            [Some(&f.script), f.approved.as_ref()]
+                .into_iter()
+                .flatten()
+                .find(|b| hash(b) == sha)
+                .cloned()
+        });
+        let Some(bytes) = found else { continue };
+        let dir = disk::dir_of(config_path);
+        let ok = disk::write_private(&tw_config::plugins::file_path(&dir, &id), &bytes).is_ok()
+            && disk::write_private(&tw_config::plugins::approved_path(&dir, &id), &bytes).is_ok();
+        if ok {
+            healed.push(id);
+        }
+    }
+    healed
+}
+
 /// 超出 [`KEEP`] 的老版本删掉，以前的修改记录（`*.yaml`）也删掉
 fn prune(config_path: &Path) -> Result<(), BackupError> {
     let all = list(config_path)?;
@@ -408,6 +468,51 @@ mod tests {
         assert_eq!(device_of(&back).as_deref(), Some("MacBook Air"));
         assert_eq!(back.config_yaml, open(&b).unwrap().config_yaml);
         assert_eq!(list(&p).unwrap().len(), 1, "不多出一版");
+    }
+
+    /// 写插件文件和写配置之间断了电：配置还是旧的，文件已经是新的。启动时从备份里找回旧的；
+    /// 用户自己改了、还没批准的文件（底稿对得上）不动
+    #[test]
+    fn plugin_files_cut_off_halfway_are_put_back_from_a_backup() {
+        let (_d, p) = setup();
+        let files = |s: &str, approved: Option<&str>| crate::PluginFiles {
+            script: s.as_bytes().to_vec(),
+            approved: approved.map(|a| a.as_bytes().to_vec()),
+        };
+        let sha = crate::model::sha256_hex(b"v1");
+        let text = format!(
+            "{}plugins:\n  - id: a\n    file: plugins/a.js\n    sha256: {sha}\n  - id: b\n    file: plugins/b.js\n    sha256: {sha}\n",
+            cfg(1)
+        );
+        std::fs::write(&p, &text).unwrap();
+        disk::write_plugins(
+            &p,
+            &Default::default(),
+            &[
+                ("a".to_string(), files("v1", Some("v1"))),
+                ("b".to_string(), files("v1", Some("v1"))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        record(&p, &text, Origin::Ui).unwrap().unwrap();
+        // a：两份都换成了新的（断在半路）；b：用户改了脚本，底稿还是批准的那份
+        disk::write_plugins(
+            &p,
+            &Default::default(),
+            &[
+                ("a".to_string(), files("v2", Some("v2"))),
+                ("b".to_string(), files("edited", Some("v1"))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(heal_plugins(&p), ["a"]);
+        assert_eq!(disk::read_plugin(&p, "a").unwrap().script, b"v1");
+        assert_eq!(disk::read_plugin(&p, "b").unwrap().script, b"edited");
+        assert!(heal_plugins(&p).is_empty());
     }
 
     #[test]

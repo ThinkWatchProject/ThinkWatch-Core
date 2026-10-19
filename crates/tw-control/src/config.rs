@@ -28,7 +28,7 @@ pub struct ConfigManager {
     /// 每换入一份配置响一次（[`Self::applied`]）。默认插件那一路等着它
     applied: tokio::sync::Notify,
     /// 固定密钥：本机接管的客户端在用的网关密钥，桌面端报上来（`PUT /pinned-keys`）
-    pinned: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    pinned: std::sync::Mutex<std::collections::BTreeMap<String, tw_pack::disk::PinnedSource>>,
     /// 同步位置上的备份版本。没开同步是 None
     remote: std::sync::RwLock<Option<Arc<dyn crate::backups::RemoteBackups>>>,
     /// 这份配置的同步服务，第一次用到时建（见 `crate::sync::service`）
@@ -119,7 +119,7 @@ impl ConfigManager {
         gateway.set_config_dir(crate::plugins::dir_of(&path));
         // 配置包、备份按「代码」「数据」分开比较插件，要插件那一套来拆
         crate::backups::install_codec();
-        let pinned = tw_pack::disk::read_pinned(&path);
+        let pinned = tw_pack::disk::read_pinned_sources(&path);
         Self {
             path,
             gateway,
@@ -372,6 +372,14 @@ impl ConfigManager {
     /// 启动时：磁盘上此刻的样子和最新的备份版本不一样就留一版（第一次运行、升级之后、core
     /// 没在跑时命令行改过）。来源记成外部改动 —— 说不清是谁改的
     pub fn record_startup(&self) {
+        // 写插件文件和写配置之间断过电：插件文件先从备份里找回来
+        let healed = tw_pack::backup::heal_plugins(&self.path);
+        if !healed.is_empty() {
+            tracing::warn!(
+                plugins = ?healed,
+                "plugin files that did not match the configuration were put back from a backup"
+            );
+        }
         if let Ok(cur) = self.current() {
             self.backup(tw_pack::backup::record(
                 &self.path,
@@ -381,19 +389,25 @@ impl ConfigManager {
         }
     }
 
-    /// 本机接管的客户端在用的网关密钥（固定密钥）。恢复、导入、同步不删它们
+    /// 本机接管的客户端在用的网关密钥（固定密钥）：各个来源报上来的并集，30 天没更新的来源
+    /// 不算。恢复、导入、同步不删它们
     pub fn pinned_keys(&self) -> std::collections::BTreeSet<String> {
-        self.pinned.lock().map(|g| g.clone()).unwrap_or_default()
+        self.pinned
+            .lock()
+            .map(|g| tw_pack::disk::pinned_union(&g, now_ms()))
+            .unwrap_or_default()
     }
 
-    /// 换掉固定密钥，存进数据目录（`pinned-keys.json`），重启之后还在
+    /// 一个来源（一个 Lite）报上来它的固定密钥：换掉它上次报的，存进数据目录
+    /// （`pinned-keys.json`），重启之后还在
     pub fn set_pinned_keys(
         &self,
+        source: &str,
         names: std::collections::BTreeSet<String>,
     ) -> std::io::Result<()> {
-        tw_pack::disk::write_pinned(&self.path, &names)?;
+        let all = tw_pack::disk::write_pinned(&self.path, source, &names)?;
         if let Ok(mut g) = self.pinned.lock() {
-            *g = names;
+            *g = all;
         }
         Ok(())
     }

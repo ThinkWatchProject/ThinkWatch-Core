@@ -344,6 +344,9 @@ slug_enum! {
     pub enum KeptReason {
         /// 本机接管的客户端正在用这把网关密钥：不删
         KeyInUse = "key_in_use",
+        /// 恢复之后留下的项目还引用着它（留着的密钥绑的路由、没选的路由用的上游……）：删了配置
+        /// 就不成立，所以留着
+        Referenced = "referenced",
     }
 }
 
@@ -380,9 +383,15 @@ pub struct ClientPrefs {
 /// Lite 的通用偏好最大多少字节（写成 JSON 之后）
 pub const CLIENT_PREFS_MAX: usize = 64 * 1024;
 
-/// `PUT /pinned-keys`：本机接管的客户端正在用的网关密钥。恢复、导入、同步不删它们。
+/// `PUT /pinned-keys`：这一个 Lite 接管的客户端正在用的网关密钥。恢复、导入、同步不删它们。
+///
+/// **按来源记**：几个 Lite 连着同一个 core（远程模式）时各报各的，core 取并集；一个来源报的
+/// 换掉它自己上次报的。30 天没更新的来源不再算
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PinnedKeys {
+    /// 这个 Lite 的标识，各实例固定的一个随机串。不给是空串（当作同一个来源）
+    #[serde(default)]
+    pub source: String,
     pub names: Vec<String>,
 }

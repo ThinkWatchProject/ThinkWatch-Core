@@ -163,6 +163,80 @@ pub fn strip_secrets(snap: &mut Snapshot) {
     }
 }
 
+/// 不带密钥的包里的一项，**空着的密钥换成本机同一项里的**：上游的密钥、请求头的值（按名字）、
+/// AWS 访问密钥、OAuth 的客户端密钥，代理的密码，网关密钥的值。比较和覆盖都照这个样子：除了
+/// 密钥都一样的就是「相同」，覆盖不会把本机的密钥抹成空的
+pub fn fill_secrets(id: &ItemId, item: &mut model::Item, mine: &model::Item) {
+    let empty = |v: Option<&Json>| v.and_then(Json::as_str) == Some("");
+    let take = |at: Option<&mut Json>, from: Option<&Json>| {
+        if let (Some(v), Some(f)) = (at, from)
+            && v.as_str() == Some("")
+            && f.as_str().is_some_and(|s| !s.is_empty())
+        {
+            *v = f.clone();
+        }
+    };
+    match id.kind {
+        ItemKind::Provider => {
+            let (Some(conn), Some(local)) =
+                (item.units.get_mut(unit::CONN), mine.units.get(unit::CONN))
+            else {
+                return;
+            };
+            take(conn.get_mut("key"), local.get("key"));
+            if let Some(Json::Array(headers)) = conn.get_mut("headers") {
+                let theirs = local.get("headers").and_then(Json::as_array);
+                for h in headers {
+                    if !empty(h.get(1)) {
+                        continue;
+                    }
+                    let name = h
+                        .get(0)
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let found = theirs.and_then(|hs| {
+                        hs.iter().find(|x| {
+                            x.get(0)
+                                .and_then(Json::as_str)
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+                        })
+                    });
+                    take(h.get_mut(1), found.and_then(|x| x.get(1)));
+                }
+            }
+            for k in ["access_key_id", "secret_access_key", "session_token"] {
+                take(
+                    conn.get_mut("aws").and_then(|a| a.get_mut(k)),
+                    local.get("aws").and_then(|a| a.get(k)),
+                );
+            }
+            take(
+                conn.get_mut("oauth")
+                    .and_then(|o| o.get_mut("client_secret")),
+                local.get("oauth").and_then(|o| o.get("client_secret")),
+            );
+        }
+        ItemKind::Proxy => {
+            let local = mine.units.get(unit::ALL).and_then(|a| a.get("auth"));
+            take(
+                item.units
+                    .get_mut(unit::ALL)
+                    .and_then(|a| a.get_mut("auth"))
+                    .and_then(|a| a.get_mut("pass")),
+                local.and_then(|a| a.get("pass")),
+            );
+        }
+        ItemKind::Key => {
+            take(
+                item.units.get_mut(unit::ALL).and_then(|a| a.get_mut("key")),
+                mine.units.get(unit::ALL).and_then(|a| a.get("key")),
+            );
+        }
+        _ => {}
+    }
+}
+
 /// 一项里有没有被去掉的密钥（空字符串）
 pub fn missing_secret(id: &ItemId, item: &model::Item) -> bool {
     let empty = |v: Option<&Json>| v.and_then(Json::as_str) == Some("");

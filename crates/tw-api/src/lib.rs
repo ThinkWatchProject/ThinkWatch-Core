@@ -971,7 +971,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 新增、相同、冲突、错误）和 `POST /config/import`（[`ImportRequest`]：逐项导入、覆盖、改名
 /// 导入或跳过）。Lite 的通用偏好由 core 存：`GET` / `PUT /client-prefs`（[`ClientPrefs`]，
 /// 不解析，最大 64 KiB），变了发 [`Event::ClientPrefsChanged`]。`PUT /pinned-keys`
-/// （[`PinnedKeys`]）报告接管的客户端在用哪几把密钥。导入覆盖、恢复改了或删了网关密钥时发
+/// （[`PinnedKeys`]：`source` 是这个 Lite 的标识，几个 Lite 各报各的、core 取并集，30 天没更新
+/// 的来源不算）报告接管的客户端在用哪几把密钥。恢复时留下的项目还引用着的不删
+/// （[`KeptReason`] 的 `referenced`），所选项目引用的、本机已没有的一起恢复；不带密钥的包导入时
+/// 比较和覆盖都沿用本机的密钥。导入覆盖、恢复改了或删了网关密钥时发
 /// [`Event::GatewayKeysChanged`]。[`ConfigOrigin`] 删了 `rollback`，多了 `sync`、`import`、
 /// `restore`、`repair`（一键修复以前记成 `ui`）。备份相关的端点在安全模式下照样可用。配置包的
 /// 码是 `pack.*`，导入的是 `import.*`，备份与恢复的是 `backup.*`。停用着的上游可以缺凭据
