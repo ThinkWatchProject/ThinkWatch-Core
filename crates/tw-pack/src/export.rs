@@ -167,11 +167,11 @@ pub fn strip_secrets(snap: &mut Snapshot) {
 /// AWS 访问密钥、OAuth 的客户端密钥，代理的密码，网关密钥的值。比较和覆盖都照这个样子：除了
 /// 密钥都一样的就是「相同」，覆盖不会把本机的密钥抹成空的。
 ///
-/// **只在目的地不变时**（[`same_destination`]）：包里的上游换了主机、端口、AWS 区域或 OAuth
-/// 令牌端点，代理换了地址，本机的密钥就不跟过去 —— 否则一份不带密钥的包改个地址，覆盖之后
-/// 本机的密钥就发给了包里写的那个地方
-pub fn fill_secrets(id: &ItemId, item: &mut model::Item, mine: &model::Item) {
-    if !same_destination(id, item, mine) {
+/// **只在目的地不变时**（[`same_destination`]）：包里的上游换了主机、端口、AWS 区域、OAuth
+/// 令牌端点或者走的出站代理，代理换了地址，本机的密钥就不跟过去 —— 否则一份不带密钥的包改个
+/// 地址，覆盖之后本机的密钥就发给了包里写的那个地方
+pub fn fill_secrets(id: &ItemId, item: &mut model::Item, mine: &model::Item, sides: Sides<'_>) {
+    if !same_destination(id, item, mine, sides) {
         return;
     }
     let empty = |v: Option<&Json>| v.and_then(Json::as_str) == Some("");
@@ -244,16 +244,24 @@ pub fn fill_secrets(id: &ItemId, item: &mut model::Item, mine: &model::Item) {
     }
 }
 
-/// 两份同名的项目，密钥是发去同一个地方的吗：上游的协议、主机、端口一样，AWS 区域一样，
-/// OAuth 的令牌端点一样；代理的类型和地址一样。网关密钥是发给这台网关自己的，总是
-pub fn same_destination(id: &ItemId, theirs: &model::Item, mine: &model::Item) -> bool {
-    let at = |it: &model::Item, u: &str, path: &[&str]| -> Option<Json> {
-        let mut cur = it.units.get(u)?;
-        for p in path {
-            cur = cur.get(*p)?;
-        }
-        Some(cur.clone())
-    };
+/// 比较目的地时两边的全部项目：上游走的出站代理按名字在这里找。
+#[derive(Debug, Clone, Copy)]
+pub struct Sides<'a> {
+    /// 包里的（导入时可能已经改过名）。包里没有的代理按本机的找：导入之后用的就是本机那个
+    pub theirs: &'a Snapshot,
+    /// 本机的
+    pub mine: &'a Snapshot,
+}
+
+/// 两份同名的项目，密钥是发去同一个地方的吗：上游的协议、主机、端口一样（[`destination`]），
+/// AWS 区域一样，OAuth 的令牌端点一样，走的出站代理一样（直连、系统代理，或者类型和地址一样
+/// 的代理）；代理的类型和地址一样。网关密钥是发给这台网关自己的，总是
+pub fn same_destination(
+    id: &ItemId,
+    theirs: &model::Item,
+    mine: &model::Item,
+    sides: Sides<'_>,
+) -> bool {
     match id.kind {
         ItemKind::Provider => {
             let url = |it: &model::Item| {
@@ -265,44 +273,57 @@ pub fn same_destination(id: &ItemId, theirs: &model::Item, mine: &model::Item) -
                     == at(mine, unit::CONN, &["aws", "region"])
                 && at(theirs, unit::CONN, &["oauth", "endpoint"])
                     == at(mine, unit::CONN, &["oauth", "endpoint"])
+                && route_of(theirs, &[sides.theirs, sides.mine]).is_some()
+                && route_of(theirs, &[sides.theirs, sides.mine]) == route_of(mine, &[sides.mine])
         }
-        ItemKind::Proxy => {
-            let addr = |it: &model::Item| {
-                at(it, unit::ALL, &["addr"])
-                    .and_then(|v| v.as_str().map(|a| a.trim().to_ascii_lowercase()))
-            };
-            addr(theirs).is_some()
-                && addr(theirs) == addr(mine)
-                && at(theirs, unit::ALL, &["type"]) == at(mine, unit::ALL, &["type"])
-        }
+        ItemKind::Proxy => proxy_at(theirs).is_some() && proxy_at(theirs) == proxy_at(mine),
         _ => true,
     }
 }
 
-/// 一个地址发去哪儿：协议、主机（小写）、端口（没写时按协议的缺省）。读不懂是 None
+fn at(it: &model::Item, u: &str, path: &[&str]) -> Option<Json> {
+    let mut cur = it.units.get(u)?;
+    for p in path {
+        cur = cur.get(*p)?;
+    }
+    Some(cur.clone())
+}
+
+/// 一个代理连去哪儿：类型和地址（地址去掉空白、小写）
+fn proxy_at(it: &model::Item) -> Option<(String, String)> {
+    let kind = at(it, unit::ALL, &["type"])?.as_str()?.to_string();
+    let addr = at(it, unit::ALL, &["addr"])?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    Some((kind, addr))
+}
+
+/// 一个上游发出去走哪条路：直连、系统代理，或者一个出站代理的类型和地址（按名字依次在
+/// `snaps` 里找）。找不到那个代理是 None
+fn route_of(it: &model::Item, snaps: &[&Snapshot]) -> Option<(String, String)> {
+    let name = at(it, unit::CONN, &["proxy"])
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| tw_config::DIRECT.to_string());
+    if name == tw_config::DIRECT || name == tw_config::SYSTEM {
+        return Some((name, String::new()));
+    }
+    let id = ItemId::new(ItemKind::Proxy, name);
+    snaps
+        .iter()
+        .find_map(|s| s.items.get(&id))
+        .and_then(proxy_at)
+}
+
+/// 一个地址发去哪儿：协议、主机、端口（没写时按协议的缺省）。**和 reqwest 用同一个解析器**
+/// （`url`，WHATWG 的规矩）：主机是规范化之后的（小写、国际化域名转成 punycode、IPv6 和 IPv4
+/// 写成标准形式），反斜杠和网关发请求时一样当成路径的分隔。末尾的点不去掉：单个名字加不加点
+/// 解析到的可能不是同一台。读不懂是 None
 pub fn destination(url: &str) -> Option<(String, String, u16)> {
-    let (scheme, rest) = url.trim().split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let hostport = authority.rsplit('@').next()?;
-    let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
-        let (h, after) = v6.split_once(']')?;
-        (h.to_string(), after.strip_prefix(':'))
-    } else {
-        match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), Some(p)),
-            None => (hostport.to_string(), None),
-        }
-    };
-    let port = match port {
-        Some(p) => p.parse().ok()?,
-        None => match scheme.as_str() {
-            "https" => 443,
-            "http" => 80,
-            _ => return None,
-        },
-    };
-    (!host.is_empty()).then(|| (scheme, host.to_ascii_lowercase(), port))
+    let u = url::Url::parse(url.trim()).ok()?;
+    let host = u.host_str()?.to_string();
+    let port = u.port_or_known_default()?;
+    Some((u.scheme().to_string(), host, port))
 }
 
 /// 一项里有没有被去掉的密钥（空字符串）
@@ -362,26 +383,44 @@ fn civil(days: u64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// 和 reqwest 读法一样：反斜杠是路径的分隔，主机规范化，缺省端口补上
     #[test]
     fn a_destination_is_scheme_host_and_port() {
         let d = |u| destination(u);
+        let relay = Some(("https".to_string(), "relay.example".to_string(), 443));
+        assert_eq!(d("https://Relay.EXAMPLE/v1"), relay);
+        assert_eq!(d("https://relay.example:443/x"), relay);
+        assert_eq!(d(" https://relay.example "), relay);
+        assert_ne!(d("https://relay.example:8443"), relay);
+        assert_ne!(d("http://relay.example"), relay);
+        assert_eq!(d("http://relay.example:80"), d("http://relay.example"));
+        // 反斜杠：连的是前面那一段，不是 @ 后面的
         assert_eq!(
-            d("https://Relay.example/v1"),
-            Some(("https".into(), "relay.example".into(), 443))
+            d("https://evil.example\\@relay.example/v1"),
+            Some(("https".into(), "evil.example".into(), 443))
+        );
+        // 主机前的用户名和密码不算进主机
+        assert_eq!(d("https://user:pw@relay.example/v1"), relay);
+        // 末尾的点是另一个名字
+        assert_ne!(d("https://relay.example./v1"), relay);
+        // 国际化域名：写成 Unicode 和 punycode 是同一个
+        assert_eq!(
+            d("https://bücher.example"),
+            d("https://xn--bcher-kva.example")
         );
         assert_eq!(
-            d("https://relay.example:443/x"),
-            d("https://relay.example/y")
+            d("https://BÜCHER.example").unwrap().1,
+            "xn--bcher-kva.example"
         );
-        assert_ne!(d("https://relay.example:8443"), d("https://relay.example"));
-        assert_ne!(d("http://relay.example"), d("https://relay.example"));
+        // IPv6、IPv4 写成标准形式
         assert_eq!(
-            d("http://user:pw@[::1]:8080/p"),
-            Some(("http".into(), "::1".into(), 8080))
+            d("http://[0:0::1]:8080/p"),
+            Some(("http".into(), "[::1]".into(), 8080))
         );
+        assert_eq!(d("http://0x7f.1/"), d("http://127.0.0.1"));
         assert_eq!(d("not a url"), None);
+        assert_eq!(d("https://"), None);
     }
-
     #[test]
     fn the_file_name_carries_the_date() {
         assert_eq!(file_name(0), "ThinkWatch-1970-01-01.twconfig");

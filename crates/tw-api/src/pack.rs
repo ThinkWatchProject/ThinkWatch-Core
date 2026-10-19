@@ -226,6 +226,10 @@ pub struct ImportRow {
     pub differs: Vec<String>,
     /// 改名导入时的缺省名字（`公司中转 (2)`）。冲突的、有名字的项目才有
     pub suggested_name: Option<String>,
+    /// 改名导入时这一项会带的标记（`flags` 说的是导入、覆盖）。改名导入的是另一个项目，不沿用
+    /// 本机的密钥和登录：不带密钥的包里，改名导入的上游缺着密钥、停用着进来（`missing_key`），
+    /// ChatGPT 账号要重新登录（`needs_login`）。有 `suggested_name` 的行才有，别的行是空的
+    pub rename_flags: Vec<ImportFlag>,
     pub error: Option<Msg>,
     /// 它引用的、包里也有的项目。**被跳过的项目被谁引用着，谁就导入不了**（除非引用的那一项
     /// 是改名导入）：界面按它把那几行标成错误

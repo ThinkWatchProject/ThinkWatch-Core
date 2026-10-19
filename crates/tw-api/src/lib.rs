@@ -976,8 +976,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 超出上限是 `backup.pinned.*`）报告接管的客户端在用哪几把密钥。恢复时留下的项目还引用着的、
 /// 同步设置走的出站代理不删（[`KeptReason`] 的 `referenced`），所选项目引用的、本机已没有的一起
 /// 恢复；恢复同步位置上的版本时本机不同步的上游不列成删除。不带密钥的包导入时比较和覆盖都沿用
-/// 本机的密钥，**只在目的地不变时**（协议、主机、端口、AWS 区域、OAuth 令牌端点、代理地址
-/// 一样）；改名导入的不沿用，缺着的标 `missing_key`（代理的密码也算）。导入覆盖、恢复改了或删了网关密钥时发
+/// 本机的密钥，**只在目的地不变时**（协议、主机、端口按 URL 库规范化后一样，AWS 区域、OAuth
+/// 令牌端点、所走的出站代理、代理地址一样）；改名导入的不沿用，缺着的标 `missing_key`（代理的
+/// 密码也算），[`ImportRow`] 的 `rename_flags` 说改名导入时会带的标记。上游地址里有反斜杠、
+/// 主机前写了用户名或密码的不收（`config.base_url_backslash`、`config.base_url_userinfo`）。导入覆盖、恢复改了或删了网关密钥时发
 /// [`Event::GatewayKeysChanged`]。[`ConfigOrigin`] 删了 `rollback`，多了 `sync`、`import`、
 /// `restore`、`repair`（一键修复以前记成 `ui`）。备份相关的端点在安全模式下照样可用。配置包的
 /// 码是 `pack.*`，导入的是 `import.*`，备份与恢复的是 `backup.*`。停用着的上游可以缺凭据

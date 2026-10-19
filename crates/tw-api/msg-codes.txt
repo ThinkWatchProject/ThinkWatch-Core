@@ -26,6 +26,8 @@ config.aws_profile.unsupported
 config.bad_allow_from
 config.bad_base_url
 config.bad_remote_allow_from
+config.base_url_backslash
+config.base_url_userinfo
 config.blank_models_only
 config.control_key_invalid
 config.control_key_missing

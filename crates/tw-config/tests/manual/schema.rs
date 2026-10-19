@@ -587,8 +587,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`.",
-                        "接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。",
+                        "Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. No backslashes, and no user name or password before the host (credentials go in `key` or `headers`).",
+                        "接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。地址中不能有反斜杠，主机前不能写用户名或密码（凭据写在 `key` 或 `headers` 中）。",
                     ),
                 ),
                 row(

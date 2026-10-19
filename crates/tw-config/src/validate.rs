@@ -28,6 +28,14 @@ pub enum ValidationError {
     DuplicateClientKey(String, String, String),
     #[error("{}", self.msg())]
     BadBaseUrl { name: String, url: String },
+    /// 地址里有反斜杠：URL 库把它当成路径的分隔（`https://a\\@b/` 连的是 a），人读起来
+    /// 像是 b —— 两种读法对不上的地址一律不收
+    #[error("{}", self.msg())]
+    BaseUrlBackslash { name: String, url: String },
+    /// 地址的主机前面写了用户名或密码（`https://user:pass@host`）：凭据写在 `key` 或
+    /// `headers` 里。消息里不带地址：那一段就是密码
+    #[error("{}", self.msg())]
+    BaseUrlUserinfo { name: String },
     #[error("{}", self.msg())]
     EmptyKey { name: String },
     #[error("{}", self.msg())]
@@ -207,6 +215,16 @@ impl ValidationError {
             BadBaseUrl { name, url } => msg!(
                 "config.bad_base_url", upstream = name, url = url =>
                 "the endpoint of upstream `{upstream}` is neither http nor https: {url}"
+            ),
+            BaseUrlBackslash { name, url } => msg!(
+                "config.base_url_backslash", upstream = name, url = url =>
+                "the endpoint of upstream `{upstream}` contains a backslash: {url}. Write the \
+                 address with forward slashes only"
+            ),
+            BaseUrlUserinfo { name } => msg!(
+                "config.base_url_userinfo", upstream = name =>
+                "the endpoint of upstream `{upstream}` has a user name or password before the \
+                 host. Put the credential in `key` or `headers` instead"
             ),
             EmptyKey { name } => msg!(
                 "config.empty_key", key = name =>
@@ -483,6 +501,19 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             return Err(ValidationError::BadBaseUrl {
                 name: p.name.clone(),
                 url: p.base_url.clone(),
+            });
+        }
+        if p.base_url.contains('\\') {
+            return Err(ValidationError::BaseUrlBackslash {
+                name: p.name.clone(),
+                url: p.base_url.clone(),
+            });
+        }
+        if let Ok(u) = url::Url::parse(p.base_url.trim())
+            && (!u.username().is_empty() || u.password().is_some())
+        {
+            return Err(ValidationError::BaseUrlUserinfo {
+                name: p.name.clone(),
             });
         }
         p.check_credential()
@@ -1222,6 +1253,46 @@ mod tests {
         ));
     }
 
+    /// 两种读法对不上的地址不收：反斜杠（URL 库当成路径分隔，人读成主机前的一段）、主机前
+    /// 的用户名和密码
+    #[test]
+    fn a_base_url_that_reads_two_ways_is_refused() {
+        for url in [
+            "https://evil.example\\@relay.example/v1",
+            "https://relay.example\\v1",
+        ] {
+            let e = validate(&cfg(vec![c("d", "tw-1")], vec![p("r", url)])).unwrap_err();
+            assert!(
+                matches!(e, ValidationError::BaseUrlBackslash { .. }),
+                "{url}: {e}"
+            );
+            assert_eq!(e.msg().code, "config.base_url_backslash");
+        }
+        for url in [
+            "https://user:pass@relay.example/v1",
+            "https://user@relay.example",
+            "http://:secret@10.0.0.1:3000",
+        ] {
+            let e = validate(&cfg(vec![c("d", "tw-1")], vec![p("r", url)])).unwrap_err();
+            assert!(
+                matches!(e, ValidationError::BaseUrlUserinfo { .. }),
+                "{url}: {e}"
+            );
+            assert!(
+                !e.to_string().contains("user:pass") && !e.to_string().contains("secret"),
+                "{e}"
+            );
+        }
+        // `@` 在路径里没关系
+        assert!(
+            validate(&cfg(
+                vec![c("d", "tw-1")],
+                vec![p("r", "https://relay.example/v1/@team")]
+            ))
+            .is_ok()
+        );
+    }
+
     #[test]
     fn names_that_start_with_two_underscores_are_reserved() {
         // 「全部上游」在配置里叫 `__all__`。一个同名的上游或策略组会让
@@ -1863,6 +1934,11 @@ mod msg_codes {
                 name: "a".into(),
                 url: "ftp://x".into(),
             },
+            BaseUrlBackslash {
+                name: "a".into(),
+                url: "https://a\\@b".into(),
+            },
+            BaseUrlUserinfo { name: "a".into() },
             EmptyKey { name: "k".into() },
             ZeroConcurrency { name: "k".into() },
             ProviderConcurrency {

@@ -513,3 +513,159 @@ fn a_partial_preview_is_what_the_restore_writes() {
     let out = tw_pack::restore::apply_opts(&now, &then, &opts).unwrap();
     assert_eq!(out.rows, rows);
 }
+
+/// 一个两种读法对不上的地址：`https://evil.example\@relay.example/v1`，人读成 relay.example，
+/// 网关用的 URL 库连的是 evil.example。比较目的地照网关的读法；配置本来就不收这样的地址
+#[test]
+fn an_address_that_reads_two_ways_does_not_take_the_key_along() {
+    let tricky = "https://evil.example\\@relay.example/v1";
+    assert_eq!(
+        tw_pack::export::destination(tricky).map(|d| d.1),
+        Some("evil.example".to_string())
+    );
+    let l = local();
+    let relay = ItemId::new(ItemKind::Provider, "relay");
+    for (url, code) in [
+        (tricky, "config.base_url_backslash"),
+        ("https://u:p@relay.example/v1", "config.base_url_userinfo"),
+    ] {
+        let mut incoming = export(&l, false, PackOrigin::Export);
+        incoming.config_yaml = format!(
+            "version: 1\nproviders:\n  - name: relay\n    base_url: '{url}'\n    key: ''\n    proxy: px\n"
+        );
+        let rows = tw_pack::import::preview(&l, &incoming, &ctx()).unwrap();
+        let row = rows.iter().find(|r| r.item == relay).unwrap();
+        assert_eq!(row.status, Status::Error, "{url}");
+        assert_eq!(row.error.as_ref().unwrap().code, code, "{url}");
+        assert!(
+            tw_pack::import::apply(&l, &incoming, &[decide(&relay, Action::Overwrite)], &ctx())
+                .is_err()
+        );
+    }
+}
+
+/// 地址不变、换了出站代理：走的是另一条路，本机的密钥不跟过去。走的代理类型和地址一样
+/// （哪怕换了个名字）照样沿用
+#[test]
+fn a_new_outbound_proxy_does_not_take_the_key_along() {
+    let here = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-local\nproxies:\n  - name: px\n    type: http\n    addr: 10.0.0.1:8080\nproviders:\n  - name: lan\n    base_url: http://192.168.1.10:3000/v1\n    key: sk-lan-secret\n    proxy: px\n"
+    ));
+    let lan = ItemId::new(ItemKind::Provider, "lan");
+    let with = |proxies: &str, proxy: &str| {
+        let mut p = export(&here, false, PackOrigin::Export);
+        p.config_yaml = format!(
+            "version: 1\n{proxies}providers:\n  - name: lan\n    base_url: http://192.168.1.10:3000/v1\n    key: ''\n    proxy: {proxy}\n"
+        );
+        p
+    };
+    let key_after = |incoming: &Pack| {
+        let rows = tw_pack::import::preview(&here, incoming, &ctx()).unwrap();
+        let decisions: Vec<Decision> = rows
+            .iter()
+            .map(|r| {
+                decide(
+                    &r.item,
+                    if r.status == Status::New {
+                        Action::Import
+                    } else {
+                        Action::Overwrite
+                    },
+                )
+            })
+            .collect();
+        let out = tw_pack::import::apply(&here, incoming, &decisions, &ctx()).unwrap();
+        let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+        let p = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "lan")
+            .unwrap()
+            .clone();
+        let flags = rows.iter().find(|r| r.item == lan).unwrap().flags.clone();
+        (p.key.map(|k| k.raw().to_string()), p.disabled, flags)
+    };
+    let gone = (Some(String::new()), true, vec![Flag::MissingKey]);
+    // 包里新带一个代理
+    let evil = "proxies:\n  - name: evilpx\n    type: http\n    addr: proxy.evil.example:8080\n";
+    assert_eq!(key_after(&with(evil, "evilpx")), gone);
+    // 同名的代理换了地址
+    let moved = "proxies:\n  - name: px\n    type: http\n    addr: proxy.evil.example:8080\n";
+    assert_eq!(key_after(&with(moved, "px")), gone);
+    // 改成直连、系统代理
+    assert_eq!(key_after(&with("", "direct")), gone);
+    assert_eq!(key_after(&with("", "system")), gone);
+    // 同一个代理（包里没带它，用的是本机的）；换了名字、类型和地址一样的
+    let kept = (Some("sk-lan-secret".to_string()), false, Vec::<Flag>::new());
+    assert_eq!(key_after(&with("", "px")), kept);
+    let renamed = "proxies:\n  - name: px2\n    type: http\n    addr: 10.0.0.1:8080\n";
+    assert_eq!(key_after(&with(renamed, "px2")), kept);
+}
+
+/// 改名导入：预览如实说改名之后缺密钥、停用（`rename_flags`），写下去也是这样
+#[test]
+fn the_preview_says_what_a_rename_brings() {
+    let l = local();
+    let mut incoming = export(&l, false, PackOrigin::Export);
+    incoming.config_yaml = "version: 1\nproxies:\n  - name: px\n    type: http\n    addr: 10.0.0.1:8080\n    auth: { user: u, pass: '' }\nproviders:\n  - name: relay\n    base_url: https://relay.example\n    key: ''\n    proxy: px\n    headers:\n      X-Token: ''\n    max_concurrent: 2\n".into();
+    let rows = tw_pack::import::preview(&l, &incoming, &ctx()).unwrap();
+    let row = |kind, name: &str| {
+        rows.iter()
+            .find(|r| r.item == ItemId::new(kind, name))
+            .unwrap()
+    };
+    let relay = row(ItemKind::Provider, "relay");
+    assert_eq!(relay.status, Status::Conflict);
+    assert!(relay.flags.is_empty(), "{:?}", relay.flags);
+    assert_eq!(relay.rename_flags, [Flag::MissingKey]);
+    // 相同的那一项没有改名可选
+    let px = row(ItemKind::Proxy, "px");
+    assert_eq!(px.status, Status::Same);
+    assert!(px.rename_flags.is_empty());
+    let out = tw_pack::import::apply(
+        &l,
+        &incoming,
+        &[decide(&relay.item, Action::Rename("relay (2)".into()))],
+        &ctx(),
+    )
+    .unwrap();
+    let cfg = tw_config::try_parse(&out.pack.config_yaml).unwrap();
+    let p = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == "relay (2)")
+        .unwrap();
+    assert_eq!(p.key.as_ref().map(|k| k.raw()), Some(""));
+    assert!(p.disabled);
+}
+
+/// 安全模式下整份恢复同步位置上的版本：本机不同步的上游（和指向它的路由、绑着那条路由的
+/// 密钥）那一版里本来就没有，从最近一个读得成的本机版本里取回来
+#[test]
+fn a_whole_restore_of_a_synced_version_keeps_what_this_machine_does_not_sync() {
+    let here = pack(&format!(
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\nclients:\n  - name: default\n    key: tw-a\n  - name: local-cli\n    key: tw-l\n    route: local\nproxies:\n  - name: corp\n    type: socks5h\n    addr: 127.0.0.1:7890\nproviders:\n  - name: a\n    base_url: https://a.example\n    key: sk-a\n  - name: ollama\n    base_url: http://127.0.0.1:11434\nroutes:\n  - name: local\n    rules:\n      - name: all\n        to: ollama\n{SYNC}  exclude: [ollama]\n"
+    ));
+    tw_config::try_parse(&here.config_yaml).unwrap_or_else(|e| panic!("{e}\n{}", here.config_yaml));
+    let mut synced = pack(
+        "version: 1\nclients:\n  - name: default\n    key: tw-a\nproviders:\n  - name: a\n    base_url: https://a2.example\n    key: sk-a\n",
+    );
+    synced.manifest.origin = PackOrigin::Sync;
+    // 现在这份读不成 YAML：本机那几节和不同步的上游都从最近一个本机版本里取
+    let not_yaml = "listen: [\n  :::\n";
+    let out = tw_pack::restore::whole(&synced, not_yaml, Some(&here));
+    let cfg = tw_config::try_parse(&out.config_yaml)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.config_yaml));
+    let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["a", "ollama"]);
+    assert_eq!(cfg.providers[0].base_url, "https://a2.example");
+    assert!(cfg.routes.iter().any(|r| r.name == "local"));
+    assert!(cfg.clients.iter().any(|c| c.name == "local-cli"));
+    assert_eq!(cfg.sync.unwrap().exclude, ["ollama"]);
+    // 读得成 YAML、读不成一份配置：一样
+    let broken = format!("{}not_a_field: 1\n", here.config_yaml);
+    let out = tw_pack::restore::whole(&synced, &broken, Some(&here));
+    let cfg = tw_config::try_parse(&out.config_yaml)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.config_yaml));
+    assert!(cfg.providers.iter().any(|p| p.name == "ollama"));
+}

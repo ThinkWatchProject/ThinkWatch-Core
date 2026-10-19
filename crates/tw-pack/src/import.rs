@@ -55,6 +55,9 @@ pub struct Row {
     /// 不同的合并单位
     pub differs: Vec<String>,
     pub suggested_name: Option<String>,
+    /// 改名导入时这一项带的标记（`flags` 说的是导入、覆盖）：改名导入的是另一个项目，**不沿用
+    /// 本机的密钥和登录**，不带密钥的包里缺着的就缺着、上游停用。有 `suggested_name` 的行才有
+    pub rename_flags: Vec<Flag>,
     pub error: Option<Msg>,
     /// 它引用的、包里也有的项目
     pub refs: Vec<ItemId>,
@@ -187,9 +190,14 @@ fn with_local_secrets(l: &Snapshot, mut i: Snapshot, incoming: &Pack) -> Snapsho
     if incoming.manifest.secrets {
         return i;
     }
+    let theirs = i.clone();
+    let sides = export::Sides {
+        theirs: &theirs,
+        mine: l,
+    };
     for (id, item) in i.items.iter_mut() {
         if let Some(mine) = l.items.get(id) {
-            export::fill_secrets(id, item, mine);
+            export::fill_secrets(id, item, mine, sides);
         }
     }
     i
@@ -212,7 +220,8 @@ pub fn preview_with(
     codec: &dyn PluginCodec,
 ) -> Result<Vec<Row>, ImportError> {
     let l = model::snapshot_with(local, codec)?;
-    let i = with_local_secrets(&l, model::snapshot_with(incoming, codec)?, incoming);
+    let raw = model::snapshot_with(incoming, codec)?;
+    let i = with_local_secrets(&l, raw.clone(), incoming);
     let both = union(&l, &i);
     let mut rows = Vec::new();
     for (id, item) in &i.items {
@@ -227,6 +236,7 @@ pub fn preview_with(
             flags: flags(id, item, incoming, &l),
             differs: Vec::new(),
             suggested_name: None,
+            rename_flags: Vec::new(),
             error: None,
             refs: both.items[id]
                 .refs
@@ -243,6 +253,8 @@ pub fn preview_with(
                 row.differs = differing(&mine.units, &item.units);
                 if !global {
                     row.suggested_name = Some(free_name(&both, id.kind, &suggest_base(id)));
+                    // 改名导入时本机没有同名的那一项可沿用：照包里原样（没填回本机的密钥）算
+                    row.rename_flags = flags(id, &raw.items[id], incoming, &Snapshot::default());
                 }
             }
         }
@@ -562,7 +574,15 @@ pub fn apply_with(
             && !matches!(d.action, Action::Rename(_))
             && let Some(mine) = l.items.get(&id)
         {
-            export::fill_secrets(&id, &mut item, mine);
+            export::fill_secrets(
+                &id,
+                &mut item,
+                mine,
+                export::Sides {
+                    theirs: &i,
+                    mine: &l,
+                },
+            );
         }
         let item = &item;
         match &d.action {

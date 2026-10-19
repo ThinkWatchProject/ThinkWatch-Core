@@ -287,11 +287,19 @@ pub fn import(
                 continue;
             }
             Status::New => {
-                println!("  new       {what}");
+                println!("  new       {what}{}", flag_note(&r.item, &r.flags));
                 Action::Import
             }
             Status::Conflict => {
-                println!("  differs   {what} ({})", r.differs.join(", "));
+                println!(
+                    "  differs   {what} ({}){}",
+                    r.differs.join(", "),
+                    flag_note(&r.item, &r.flags)
+                );
+                let renamed = flag_note(&r.item, &r.rename_flags);
+                if !r.global && !renamed.is_empty() {
+                    println!("            under another name{renamed}");
+                }
                 let choice = match on_conflict {
                     Some(c) => c,
                     None if dry_run => continue,
@@ -311,7 +319,10 @@ pub fn import(
                 };
                 match (choice, &r.suggested_name) {
                     (OnConflict::Overwrite, _) => Action::Overwrite,
-                    (OnConflict::Rename, Some(n)) => Action::Rename(n.clone()),
+                    (OnConflict::Rename, Some(n)) => {
+                        println!("    → as `{n}`{renamed}");
+                        Action::Rename(n.clone())
+                    }
                     _ => Action::Skip,
                 }
             }
@@ -334,6 +345,35 @@ pub fn import(
     );
     eprintln!("(a running core picks this up within a second)");
     Ok(())
+}
+
+/// 一行导入带的标记说成一句：缺密钥、要登录的上游停用着进来，空的网关密钥换一个新值
+fn flag_note(id: &ItemId, flags: &[tw_pack::import::Flag]) -> String {
+    use tw_pack::import::Flag;
+    let mut parts: Vec<&str> = Vec::new();
+    if flags.contains(&Flag::MissingKey) {
+        parts.push(match id.kind {
+            ItemKind::Key => "a new key value is generated",
+            ItemKind::Proxy => "its password is missing",
+            _ => "its key is missing",
+        });
+    }
+    if flags.contains(&Flag::NeedsLogin) {
+        parts.push("it needs signing in");
+    }
+    if id.kind == ItemKind::Provider
+        && (flags.contains(&Flag::MissingKey) || flags.contains(&Flag::NeedsLogin))
+    {
+        parts.push("it comes in disabled");
+    }
+    if flags.contains(&Flag::PluginDisabled) {
+        parts.push("it comes in turned off");
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join("; "))
+    }
 }
 
 // ─────────────────────────────────────────────────────────── backup

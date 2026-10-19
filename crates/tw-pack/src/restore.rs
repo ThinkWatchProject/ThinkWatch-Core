@@ -486,6 +486,18 @@ pub fn whole(backup: &Pack, current_text: &str, last_local: Option<&Pack>) -> Pa
     };
     let source = doc(current_text).or_else(|| last_local.and_then(|p| doc(&p.config_yaml)));
     let mut text = backup.config_yaml.clone();
+    // 那一版是同步位置上的（没有本机那几节）：本机不同步的上游本来就不在里面
+    let from_sync = backup.manifest.origin == crate::PackOrigin::Sync
+        || doc(&backup.config_yaml)
+            .is_some_and(|d| model::LOCAL_SECTIONS.iter().all(|k| d.get(*k).is_none()));
+    if from_sync {
+        let current = Pack {
+            config_yaml: current_text.to_string(),
+            ..backup.clone()
+        };
+        let from: Vec<&Pack> = std::iter::once(&current).chain(last_local).collect();
+        text = bring_not_synced(&text, &from);
+    }
     // 两处都取不到（原文坏到读不成 YAML、也没有本机备份）：留着那一版自己的
     for section in source.iter().flat_map(|_| model::LOCAL_SECTIONS) {
         let v = source.as_ref().and_then(|d| d.get(*section)).cloned();
@@ -538,6 +550,107 @@ pub fn whole(backup: &Pack, current_text: &str, last_local: Option<&Pack>) -> Pa
         config_yaml: text,
         ..backup.clone()
     }
+}
+
+/// 本机不同步的上游（`sync.exclude`），连同直接或间接引用它们的项目（路由、策略组、别名、
+/// 网关密钥）。和同步那一路的算法一样
+fn not_synced(names: &BTreeSet<String>, snap: &Snapshot) -> BTreeSet<ItemId> {
+    let mut out: BTreeSet<ItemId> = names
+        .iter()
+        .map(|n| ItemId::new(ItemKind::Provider, n.clone()))
+        .collect();
+    loop {
+        let before = out.len();
+        for (id, it) in &snap.items {
+            if !id.kind.is_order() && it.refs.iter().any(|r| out.contains(r)) {
+                out.insert(id.clone());
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
+/// 整份恢复同步位置上的一个版本：本机不同步的上游和随之不同步的项目，那一版里没有的从 `from`
+/// 里第一份读得成一份配置的（现在的原文，或者最近一个读得成的本机版本）原样取来，连同它们的
+/// 登录，接在各段的末尾。插件不取：它的文件和批准不在配置里
+fn bring_not_synced(text: &str, from: &[&Pack]) -> String {
+    use tw_config::edit::{self, Section};
+    const CLIENTS: Section = Section {
+        path: &["clients"],
+        what: "gateway key",
+        key: "name",
+    };
+    let Some((src, snap, raw)) = from.iter().find_map(|p| {
+        Some((
+            tw_config::try_parse(&p.config_yaml).ok()?,
+            model::snapshot(p).ok()?,
+            edit::parse(&p.config_yaml).ok()?,
+        ))
+    }) else {
+        return text.to_string();
+    };
+    let names: BTreeSet<String> = src
+        .sync
+        .as_ref()
+        .map(|s| s.exclude.iter().cloned().collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    // 先上游，再引用它们的
+    let mut ids: Vec<ItemId> = not_synced(&names, &snap)
+        .into_iter()
+        .filter(|id| snap.items.contains_key(id))
+        .collect();
+    ids.sort_by_key(|id| match id.kind {
+        ItemKind::Provider => 0,
+        ItemKind::Group => 1,
+        ItemKind::Route => 2,
+        ItemKind::Alias => 3,
+        _ => 4,
+    });
+    for id in ids {
+        let Ok(now) = edit::parse(&out) else { break };
+        let section = match id.kind {
+            ItemKind::Provider => edit::PROVIDERS,
+            ItemKind::Group => edit::GROUPS,
+            ItemKind::Route => edit::ROUTES,
+            ItemKind::Key => CLIENTS,
+            ItemKind::Alias => {
+                let there = now
+                    .get("aliases")
+                    .and_then(|a| a.get(id.name.as_str()))
+                    .is_some();
+                if !there
+                    && let Some(a) = src.aliases.find(&id.name)
+                    && let Ok(t) = edit::upsert_alias(&out, None, a)
+                {
+                    out = t;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        if section.index_of(&now, &id.name).is_some() {
+            continue;
+        }
+        let entry = section.index_of(&raw, &id.name).and_then(|i| {
+            let mut cur = &raw;
+            for k in section.path {
+                cur = cur.get(*k)?;
+            }
+            cur.get(i)?.as_mapping().cloned()
+        });
+        if let Some(m) = entry
+            && let Ok(t) = edit::upsert(&out, section, None, &m)
+        {
+            out = t;
+        }
+    }
+    out
 }
 
 /// YAML 坏到按路径找不到时，退一步在原文里找 `key: <64 个十六进制字符>` 那一行
