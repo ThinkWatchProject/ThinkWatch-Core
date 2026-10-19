@@ -514,13 +514,41 @@ async fn encryption_can_be_turned_on_off_and_its_passphrase_changed() {
     assert!(t.eb.unlock("a brand new passphrase").await.unwrap());
     t.eb.round().await.unwrap();
 
-    // A 关闭加密：B 跟着变成不加密
+    // A 关闭加密：keyring 留着、改写成「已关闭」（有口令的人关的），版本不再加密；B 跟着变成
+    // 不加密
     t.ea.disable_encryption("a brand new passphrase")
         .await
         .unwrap();
-    assert!(!t.loc.path().join("keyring").exists());
+    let kr = std::fs::read(t.loc.path().join("keyring")).unwrap();
+    assert!(tw_sync::keyring::marked_off(&kr));
+    assert!(
+        tw_sync::keyring::Keyring::open(&kr, "a brand new passphrase")
+            .unwrap()
+            .off()
+    );
+    for v in versions(t.loc.path()) {
+        let bytes = std::fs::read(t.loc.path().join("versions").join(&v)).unwrap();
+        assert!(!tw_pack::is_encrypted(&bytes), "加密过的版本删了：{v}");
+    }
     let r = t.eb.round().await.unwrap();
     assert!(!r.encrypted, "同步位置不加密了，B 照着改设置");
+    t.b.edit(|s| s.replace("sk-after-encryption", "sk-after-off"));
+    assert!(t.eb.round().await.unwrap().uploaded.is_some());
+    t.ea.round().await.unwrap();
+    assert_eq!(
+        t.a.provider("relay").unwrap().key.unwrap().raw(),
+        "sk-after-off"
+    );
+
+    // 再开回来：B 用同一个口令接着同步
+    t.ea.enable_encryption("a brand new passphrase")
+        .await
+        .unwrap();
+    assert!(!tw_sync::keyring::marked_off(
+        &std::fs::read(t.loc.path().join("keyring")).unwrap()
+    ));
+    let r = t.eb.round().await.unwrap();
+    assert!(r.encrypted, "B 记着口令，解得开新的 keyring");
 }
 
 /// 两台设备同时开启加密同步：keyring 只建得成一份，后写的那台转去加入
@@ -659,19 +687,48 @@ async fn a_key_in_use_here_is_not_deleted_by_another_device() {
     );
 }
 
-/// 另一台设备停止同步并删除了同步数据：这台设备发现同步位置空了
+/// 另一台设备停止同步并删除了同步数据：这台设备几轮、一段时间之后确认同步位置空了，由人
+/// 决定（重新上传本机配置），同步设置和口令都不动
 #[tokio::test]
 async fn a_purged_location_is_noticed() {
     let mut t = bed(true).await;
     t.ea.stop(true).await.unwrap();
     assert!(versions(t.loc.path()).is_empty());
     assert!(!t.loc.path().join("keyring").exists());
+    for _ in 0..3 {
+        let r = t.eb.round().await;
+        assert!(
+            matches!(r, Err(RoundError::LooksEmpty)),
+            "一轮读到空的不下结论：{:?}",
+            r.map(|r| r.uploaded)
+        );
+    }
+    // 过了十分钟（改本机记着的时刻）
+    let mut st = t.eb.local().state();
+    st.empty_since_ms = st.empty_since_ms.map(|t| t - 11 * 60 * 1000);
+    t.eb.local().save_state(&st).unwrap();
     let r = t.eb.round().await;
     assert!(
         matches!(r, Err(RoundError::Emptied)),
         "{:?}",
         r.map(|r| r.uploaded)
     );
+    assert!(t.eb.local().base().is_some(), "本机的同步状态不删");
+    // 重新上传本机配置：keyring 放回这台记着的那一份，版本以本机配置上传
+    t.b.edit(|s| add_provider(s, "kept", "https://kept.example", "sk-kept"));
+    let r = t.eb.republish().await.unwrap();
+    assert!(r.encrypted);
+    assert!(t.loc.path().join("keyring").exists());
+    assert_eq!(versions(t.loc.path()).len(), 1);
+    // A 重新加入，拿到 B 的配置
+    let mut ea = Engine::new(
+        folder(t.loc.path()),
+        t.a.clone(),
+        t.a.dir.path(),
+        settings(A_ID, "Mac mini", true, t.loc.path()),
+    );
+    ea.join(None).await.unwrap();
+    assert!(t.a.provider("kept").is_some());
 }
 
 /// 同一套流程走 WebDAV 和 S3（进程内的假服务）

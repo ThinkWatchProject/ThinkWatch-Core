@@ -88,6 +88,46 @@ pub trait Store: Send + Sync {
         path: &str,
         bytes: &[u8],
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// 清掉这台设备以前留下的临时文件（写到一半断了的）。`tag` 是设备标识的前 8 位。没有临时
+    /// 文件可言的存储什么都不做
+    fn sweep(&self, tag: &str) -> impl Future<Output = ()> + Send {
+        let _ = tag;
+        async {}
+    }
+}
+
+/// 从同步位置读一个文件最多多少字节：配置包的上限，加上加密和余量。**边读边数**，超过就
+/// 不读了 —— 对同步位置有写权限的人能放一个很大的文件进来
+pub const MAX_FILE: usize = tw_pack::MAX_BYTES + 1024 * 1024;
+
+/// 一个目录列表（PROPFIND、ListObjectsV2）的答复最多多少字节
+pub const MAX_LISTING: usize = 8 * 1024 * 1024;
+
+/// 太大了
+pub(crate) fn too_large(what: &str, max: usize) -> StoreError {
+    StoreError::Other(msg!(
+        "sync.store.too_large", what = what, limit = max / (1024 * 1024) =>
+        "{what} at the sync location is larger than {limit} MiB, so it was not read"
+    ))
+}
+
+/// 读一个 HTTP 答复的正文，**边读边数**：超过 `max` 就停
+pub(crate) async fn read_limited(
+    mut r: reqwest::Response,
+    max: usize,
+    what: &str,
+) -> Result<Vec<u8>, StoreError> {
+    if r.content_length().is_some_and(|n| n as usize > max) {
+        return Err(too_large(what, max));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = r.chunk().await.map_err(|e| http_error(&e))? {
+        if out.len() + chunk.len() > max {
+            return Err(too_large(what, max));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// 按配置选出来的那一种。
@@ -170,12 +210,31 @@ impl Store for AnyStore {
     async fn create_exclusive(&self, path: &str, bytes: &[u8]) -> Result<bool, StoreError> {
         each!(self, s => s.create_exclusive(path, bytes).await)
     }
+    async fn sweep(&self, tag: &str) {
+        each!(self, s => s.sweep(tag).await)
+    }
 }
 
-/// 临时文件名：点开头（列目录时跳过），带随机串（两个进程不撞）
+/// 临时文件名：点开头（列目录时跳过），带随机串（两个进程不撞），以最终的名字结尾（版本和
+/// 设备记录的名字里有设备标识，清理时认得出哪些是自己的）
 pub(crate) fn temp_name(final_name: &str) -> String {
     let r: u64 = rand::random();
-    format!(".tmp-{r:016x}-{final_name}")
+    format!("{TEMP_PREFIX}{r:016x}-{final_name}")
+}
+
+pub(crate) const TEMP_PREFIX: &str = ".tmp-";
+
+/// 一个临时文件是不是这台设备留下的：最终的名字是它的版本、它的设备记录，或者 keyring
+pub(crate) fn own_temp(name: &str, tag: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some((_, final_name)) = rest.split_once('-') else {
+        return false;
+    };
+    final_name == tag
+        || final_name == crate::layout::KEYRING
+        || crate::layout::VersionName::parse(final_name).is_some_and(|v| v.device == tag)
 }
 
 /// 一个路径拆成目录和文件名。只有一层目录
@@ -229,6 +288,21 @@ pub(crate) fn http_status(status: reqwest::StatusCode, what: &str) -> StoreError
 }
 
 /// 请求没发出去或者没收到答复
+/// 发一个请求。**连接池里那条空闲连接刚被服务端关掉**（Apache 默认空闲 5 秒就关，发出去
+/// 就收到「连接在答复之前关了」）时换一条连接再发一次：请求根本没到服务端那里。超时、连不上
+/// 不重发
+pub(crate) async fn send(r: reqwest::RequestBuilder) -> Result<reqwest::Response, StoreError> {
+    let again = r.try_clone();
+    match r.send().await {
+        Ok(resp) => Ok(resp),
+        Err(e) if e.is_request() && !e.is_timeout() && !e.is_connect() => match again {
+            Some(r) => r.send().await.map_err(|e| http_error(&e)),
+            None => Err(http_error(&e)),
+        },
+        Err(e) => Err(http_error(&e)),
+    }
+}
+
 pub(crate) fn http_error(e: &reqwest::Error) -> StoreError {
     let mut detail = e.to_string();
     let mut cur = std::error::Error::source(e);
@@ -267,6 +341,16 @@ mod tests {
         ] {
             assert!(check_path(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_temporary_file_is_recognised_as_this_devices() {
+        let t = temp_name("0000000003-aaaaaaaa.twconfig");
+        assert!(own_temp(&t, "aaaaaaaa"));
+        assert!(!own_temp(&t, "bbbbbbbb"));
+        assert!(own_temp(&temp_name("aaaaaaaa"), "aaaaaaaa"));
+        assert!(own_temp(&temp_name("keyring"), "aaaaaaaa"));
+        assert!(!own_temp("notes.txt", "aaaaaaaa"));
     }
 
     #[test]

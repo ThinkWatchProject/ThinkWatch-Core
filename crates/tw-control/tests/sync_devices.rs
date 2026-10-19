@@ -432,11 +432,32 @@ async fn turning_sync_off_keeps_the_configuration_and_purging_empties_the_locati
     assert!(!a.config().providers.is_empty(), "本机保留当前配置");
     assert!(!a.dir.path().join("sync").exists(), "本机的同步状态删掉了");
     assert!(!loc.path().join("keyring").exists());
-    // B 发现同步位置空了：停下，说一声
+    // B：读到空的先不下结论；连着几轮、过了一段时间才是「同步位置空了」，同步设置不动，由人
+    // 选重新上传或者停止
+    for _ in 0..3 {
+        let v = b.ok("POST", "/sync/now", Value::Null).await;
+        assert_eq!(v["error"]["code"], "sync.looks_empty", "{v}");
+        assert_ne!(v["state"], "emptied");
+    }
+    let local = tw_sync::local::Local::new(b.dir.path());
+    let mut st = local.state();
+    st.empty_since_ms = st.empty_since_ms.map(|t| t - 11 * 60 * 1000);
+    local.save_state(&st).unwrap();
     let v = b.ok("POST", "/sync/now", Value::Null).await;
-    assert_eq!(v["state"], "off", "{v}");
-    assert_eq!(v["error"]["code"], "sync.emptied");
-    assert!(b.config().sync.is_none());
+    assert_eq!(v["state"], "emptied", "{v}");
+    assert_eq!(v["error"]["code"], "sync.location_empty");
+    assert!(b.config().sync.is_some(), "同步设置不动");
+    // 重新上传本机配置：keyring 放回 B 记着的那一份，版本以 B 的配置上传
+    let v = b.ok("POST", "/sync/republish", Value::Null).await;
+    assert_eq!(v["state"], "idle", "{v}");
+    assert!(v["error"].is_null(), "{v}");
+    assert!(loc.path().join("keyring").exists());
+    assert_eq!(
+        std::fs::read_dir(loc.path().join("versions"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
 /// 调度：本机改了配置，10 秒合并之后上传；另一台的文件夹监听一收到就合并

@@ -230,6 +230,12 @@ pub enum SyncError {
     BlankExclude,
     #[error("{}", self.msg())]
     MultiLine { field: &'static str },
+    /// S3 前缀里有 `..`、`.` 这样的段，或者以 `/` 开头
+    #[error("{}", self.msg())]
+    Prefix { prefix: String },
+    /// `http://` 的内网地址经出站代理：同步位置的密码会明文交给代理
+    #[error("{}", self.msg())]
+    PlainHttpProxy { proxy: String },
 }
 
 impl SyncError {
@@ -277,6 +283,16 @@ impl SyncError {
             SyncError::MultiLine { field } => msg!(
                 "sync.config.multiline", field = field =>
                 "sync.{field} has to be on one line"
+            ),
+            SyncError::Prefix { prefix } => msg!(
+                "sync.config.prefix", prefix = prefix =>
+                "{prefix} is not a folder inside the bucket: no leading /, and no . or .. parts"
+            ),
+            SyncError::PlainHttpProxy { proxy } => msg!(
+                "sync.config.plain_http_proxy", proxy = proxy =>
+                "an http:// sync location on the local network cannot go through proxy \
+                 `{proxy}`: its password would reach the proxy in the clear. Use direct, or an \
+                 https:// address"
             ),
         }
     }
@@ -366,6 +382,11 @@ impl Target {
                 if prefix.contains(['\n', '\r']) {
                     return Err(SyncError::MultiLine { field: "prefix" });
                 }
+                if !prefix_ok(prefix) {
+                    return Err(SyncError::Prefix {
+                        prefix: prefix.clone(),
+                    });
+                }
                 if !address_ok(endpoint) {
                     return Err(SyncError::Address {
                         field: "endpoint",
@@ -383,9 +404,36 @@ impl Target {
     }
 }
 
-/// 代理名对得上吗：`direct`、`system`，或者 `proxies` 里有的那一个
+/// S3 前缀：桶里的一个文件夹。不以 `/` 开头，没有 `.`、`..` 段和反斜杠（结尾的 `/` 无所谓）
+fn prefix_ok(p: &str) -> bool {
+    let p = p.trim();
+    !p.starts_with('/')
+        && !p.contains('\\')
+        && p.trim_end_matches('/')
+            .split('/')
+            .filter(|s| !p.is_empty() || !s.is_empty())
+            .all(|seg| p.is_empty() || (!seg.is_empty() && seg != "." && seg != ".."))
+}
+
+/// 地址是不是 `http://`（只给内网的那种）
+fn plain_http(t: &Target) -> bool {
+    let url = match t {
+        Target::Webdav { url, .. } => url,
+        Target::S3 { endpoint, .. } => endpoint,
+        Target::Folder { .. } => return false,
+    };
+    url.trim().to_ascii_lowercase().starts_with("http://")
+}
+
+/// 代理名对得上吗：`direct`、`system`，或者 `proxies` 里有的那一个。`http://` 的内网地址
+/// 只能直连
 pub fn check_proxy(target: &Target, proxies: &[crate::Proxy]) -> Result<(), SyncError> {
     let p = target.proxy();
+    if p != DIRECT && plain_http(target) {
+        return Err(SyncError::PlainHttpProxy {
+            proxy: p.to_string(),
+        });
+    }
     if p == DIRECT || p == crate::SYSTEM || proxies.iter().any(|x| x.name == p) {
         return Ok(());
     }
@@ -611,6 +659,34 @@ mod tests {
         assert_eq!(s.check(), Err(SyncError::DeviceId));
         assert!(device_id_ok(&generate_device_id()));
         assert_ne!(generate_device_id(), generate_device_id());
+    }
+
+    #[test]
+    fn an_s3_prefix_stays_inside_the_bucket() {
+        for ok in ["", "me", "team/tw", "team/tw/"] {
+            assert!(prefix_ok(ok), "{ok:?}");
+        }
+        for bad in ["/abs", "a/../b", "..", "./x", "a//b", "a\\b"] {
+            assert!(!prefix_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_http_location_never_goes_through_a_proxy() {
+        let mut t = webdav("http://192.168.1.2:5005/dav").target;
+        check_proxy(&t, &[]).unwrap();
+        if let Target::Webdav { proxy, .. } = &mut t {
+            *proxy = "system".into();
+        }
+        assert!(matches!(
+            check_proxy(&t, &[]),
+            Err(SyncError::PlainHttpProxy { .. })
+        ));
+        let mut https = webdav("https://dav.example.com/").target;
+        if let Target::Webdav { proxy, .. } = &mut https {
+            *proxy = "system".into();
+        }
+        check_proxy(&https, &[]).unwrap();
     }
 
     #[test]

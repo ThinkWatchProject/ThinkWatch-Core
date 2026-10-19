@@ -94,11 +94,21 @@ pub fn device_path(device_id: &str) -> String {
     format!("{DEVICES}/{}", device_tag(device_id))
 }
 
+/// `devices/` 里的这个名字是不是一份设备记录（设备标识的前 8 位）。别的是用户自己放的
+pub fn is_device_file(name: &str) -> bool {
+    name.len() == tw_config::sync::DEVICE_ID_PREFIX
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// 同步位置上的一个版本：名字，以及它说自己依据的上一版本（读出来之后才知道）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
     pub name: VersionName,
     pub parents: Vec<VersionName>,
+    /// 更早的祖先（版本自己记着的）
+    pub history: Vec<VersionName>,
 }
 
 /// 上传新版本之后要删掉哪些。
@@ -122,6 +132,27 @@ pub fn to_delete(listed: &[Listed]) -> Vec<VersionName> {
     let mut keep: BTreeSet<VersionName> = heads.iter().map(|l| l.name.clone()).collect();
     for l in &heads {
         keep.extend(l.parents.iter().cloned());
+    }
+    // 不止一个头：它们共同的祖先也留着，连同从它到每个头之间的版本 —— 下一台设备合并它们要
+    // 用它当基准，删了就只能两方比较
+    if heads.len() > 1 {
+        let lineage = |l: &Listed| -> BTreeSet<VersionName> {
+            l.history
+                .iter()
+                .chain(&l.parents)
+                .cloned()
+                .chain([l.name.clone()])
+                .collect()
+        };
+        let sets: Vec<BTreeSet<VersionName>> = heads.iter().map(|l| lineage(l)).collect();
+        let common = sets.iter().skip(1).fold(sets[0].clone(), |acc, s| {
+            acc.intersection(s).cloned().collect()
+        });
+        if let Some(ca) = common.iter().max() {
+            for s in &sets {
+                keep.extend(s.iter().filter(|n| n.seq >= ca.seq).cloned());
+            }
+        }
     }
     // 不知道上一版本是谁（读不出来）时，至少留住序号紧挨着的那一层
     if listed
@@ -158,6 +189,7 @@ mod tests {
         Listed {
             name: v(seq, dev),
             parents: parents.iter().map(|(s, d)| v(*s, d)).collect(),
+            history: Vec::new(),
         }
     }
 
@@ -229,6 +261,23 @@ mod tests {
             l(5, "bbbbbbbb", &[(4, "aaaaaaaa")]),
         ];
         assert!(to_delete(&listed).is_empty(), "{:?}", to_delete(&listed));
+    }
+
+    /// 两个头的共同祖先比它们的上一版本还早：它和中间的版本都留着
+    #[test]
+    fn the_common_ancestor_of_two_heads_is_kept() {
+        let mut late = l(3, "bbbbbbbb", &[(2, "aaaaaaaa")]);
+        late.history = vec![v(1, "aaaaaaaa")];
+        let mut top = l(4, "aaaaaaaa", &[(3, "aaaaaaaa")]);
+        top.history = vec![v(1, "aaaaaaaa"), v(2, "aaaaaaaa")];
+        let listed = [
+            l(1, "aaaaaaaa", &[]),
+            l(2, "aaaaaaaa", &[(1, "aaaaaaaa")]),
+            l(3, "aaaaaaaa", &[(2, "aaaaaaaa")]),
+            top,
+            late,
+        ];
+        assert_eq!(to_delete(&listed), [v(1, "aaaaaaaa")]);
     }
 
     #[test]

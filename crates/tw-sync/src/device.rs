@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::keyring::Keyring;
 
+/// 一份设备记录最大多少字节：几百字节的 JSON，再大的不是我们写的
+pub const MAX_BYTES: usize = 64 * 1024;
+
 /// 设备记录多久没更新就从同步位置上移除
 pub const STALE_AFTER_MS: u64 = 180 * 24 * 3600 * 1000;
 
@@ -35,8 +38,15 @@ impl DeviceRecord {
         }
     }
 
-    /// 读回来。解不开、读不懂的是 `None`（别的设备刚改了加密设置、还没传完、被人改坏了）
-    pub fn open(bytes: &[u8], keyring: Option<&Keyring>) -> Option<Self> {
+    /// 读回来。解不开、读不懂的是 `None`（别的设备刚改了加密设置、还没传完、被人改坏了）。
+    /// `sealed_only`：同步位置加着密 —— **不加密的记录一律不认**，那是没有口令的人放进来的
+    pub fn open(bytes: &[u8], keyring: Option<&Keyring>, sealed_only: bool) -> Option<Self> {
+        if bytes.len() > MAX_BYTES {
+            return None;
+        }
+        if sealed_only && !crate::keyring::is_age(bytes) {
+            return None;
+        }
         let json = if crate::keyring::is_age(bytes) {
             keyring?.decrypt(bytes)?
         } else {
@@ -68,20 +78,28 @@ mod tests {
     #[test]
     fn a_record_reads_back_plain_or_sealed() {
         let r = rec();
-        assert_eq!(DeviceRecord::open(&r.seal(None), None), Some(r.clone()));
-        let k = Keyring::generate();
+        assert_eq!(
+            DeviceRecord::open(&r.seal(None), None, false),
+            Some(r.clone())
+        );
+        // 加着密的同步位置：明文的记录不认
+        assert_eq!(
+            DeviceRecord::open(&r.seal(None), Some(&Keyring::generate(0)), true),
+            None
+        );
+        let k = Keyring::generate(0);
         let sealed = r.seal(Some(&k));
         assert!(
             !String::from_utf8_lossy(&sealed).contains("张三"),
             "加密时名字不能是明文"
         );
-        assert_eq!(DeviceRecord::open(&sealed, Some(&k)), Some(r.clone()));
-        assert_eq!(DeviceRecord::open(&sealed, None), None);
+        assert_eq!(DeviceRecord::open(&sealed, Some(&k), true), Some(r.clone()));
+        assert_eq!(DeviceRecord::open(&sealed, None, false), None);
         assert_eq!(
-            DeviceRecord::open(&sealed, Some(&Keyring::generate())),
+            DeviceRecord::open(&sealed, Some(&Keyring::generate(0)), true),
             None
         );
-        assert_eq!(DeviceRecord::open(b"{not json", None), None);
+        assert_eq!(DeviceRecord::open(b"{not json", None, false), None);
     }
 
     #[test]

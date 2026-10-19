@@ -17,7 +17,9 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Method;
 use tw_types::msg;
 
-use super::{Entry, Store, StoreError, check_path, http_error, http_status};
+use super::{
+    Entry, MAX_FILE, MAX_LISTING, Store, StoreError, check_path, http_status, read_limited,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -179,12 +181,15 @@ impl S3 {
         if !body.is_empty() {
             r = r.body(body.to_vec());
         }
-        r.send().await.map_err(|e| http_error(&e))
+        super::send(r).await
     }
 
     /// S3 错误答复里的 `<Code>`
     async fn error_code(r: reqwest::Response) -> String {
-        let body = r.text().await.unwrap_or_default();
+        let body = read_limited(r, 64 * 1024, "the error")
+            .await
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default();
         super::xml::parse(&body, "Error")
             .and_then(|(rs, top)| {
                 rs.first()
@@ -280,7 +285,8 @@ impl Store for S3 {
             if !r.status().is_success() {
                 return Err(http_status(r.status(), "ListObjectsV2"));
             }
-            let body = r.text().await.map_err(|e| http_error(&e))?;
+            let body = read_limited(r, MAX_LISTING, "the listing").await?;
+            let body = String::from_utf8_lossy(&body).to_string();
             let Some((records, top)) = super::xml::parse(&body, "Contents") else {
                 return Err(StoreError::Other(msg!(
                     "sync.s3.bad_listing" =>
@@ -318,9 +324,7 @@ impl Store for S3 {
         let r = self.send(Method::GET, &url, &[], b"").await?;
         match r.status().as_u16() {
             404 => Ok(None),
-            s if (200..300).contains(&s) => {
-                Ok(Some(r.bytes().await.map_err(|e| http_error(&e))?.to_vec()))
-            }
+            s if (200..300).contains(&s) => Ok(Some(read_limited(r, MAX_FILE, path).await?)),
             _ => Err(http_status(r.status(), "GET")),
         }
     }

@@ -60,6 +60,7 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::SyncEncryption, encryption)
         .at(ep::SyncUnlock, unlock)
         .at(ep::SyncDisable, disable)
+        .at(ep::SyncRepublish, republish)
 }
 
 fn now_ms() -> u64 {
@@ -212,6 +213,9 @@ impl Host for CoreHost {
 fn http(cfg: &tw_config::Config, proxy: &str) -> Result<reqwest::Client, Msg> {
     let mut b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        // 一轮里的请求是接连发的；两轮之间的空闲连接不留：很多服务端几秒就关掉空闲连接，
+        // 留着的下一轮一发就断（发请求那一处另有一次重发）
+        .pool_idle_timeout(Duration::from_secs(4))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(tw_gateway::user_agent());
     match proxy {
@@ -444,8 +448,11 @@ fn round_fail(e: &RoundError) -> Fail {
         RoundError::Store(StoreError::AuthFailed(_)) => StatusCode::FORBIDDEN,
         RoundError::Store(_) => StatusCode::BAD_GATEWAY,
         RoundError::Locked(_) => StatusCode::BAD_REQUEST,
-        RoundError::TooNew { .. } | RoundError::Stale | RoundError::Emptied => StatusCode::CONFLICT,
-        RoundError::NotArrived => StatusCode::SERVICE_UNAVAILABLE,
+        RoundError::TooNew { .. }
+        | RoundError::Stale
+        | RoundError::Emptied
+        | RoundError::KeyringMissing(_) => StatusCode::CONFLICT,
+        RoundError::NotArrived | RoundError::LooksEmpty => StatusCode::SERVICE_UNAVAILABLE,
         RoundError::Local(_) => StatusCode::BAD_REQUEST,
     };
     fail(code, e.msg())
@@ -605,6 +612,7 @@ impl Sync {
             conflicts: 0,
             excluded: Vec::new(),
             excluded_cascade: Vec::new(),
+            skipped: 0,
         };
         let Some(mgr) = self.mgr() else { return off };
         let cfg = mgr.gateway().config();
@@ -626,6 +634,11 @@ impl Sync {
             .as_ref()
             .map(|r| r.conflicts.len() as u32)
             .or(prev.as_ref().map(|p| p.conflicts))
+            .unwrap_or(0);
+        let skipped = report
+            .as_ref()
+            .map(|r| r.skipped)
+            .or(prev.as_ref().map(|p| p.skipped))
             .unwrap_or(0);
         let devices = match &report {
             Some(r) => r
@@ -680,6 +693,7 @@ impl Sync {
             conflicts,
             excluded: sync.exclude.clone(),
             excluded_cascade: cascade,
+            skipped,
         }
     }
 
@@ -723,9 +737,10 @@ impl Sync {
                 return Ok(v);
             }
             Err(m) => {
+                // 照设置建不起来（出站代理没了、地址不合规矩）：改设置，不是拒绝访问
                 let v = tw_api::SyncView {
                     error: Some(m.clone()),
-                    ..self.compute_view(None, Some(tw_api::SyncState::AuthFailed))
+                    ..self.compute_view(None, Some(tw_api::SyncState::Misconfigured))
                 };
                 self.publish(v.clone());
                 return Err(fail(StatusCode::BAD_REQUEST, m));
@@ -771,11 +786,13 @@ impl Sync {
                         at_ms: now_ms(),
                     });
                 }
-                // 别的设备关掉了加密：这台跟着改设置
-                let follow = (encrypted != r.config.encrypt && !encrypted).then(|| {
+                // 别的设备关掉了加密（keyring 写着已关闭，口令解得开）、或者又开了（口令还是
+                // 这台记着的那个）：这台跟着改设置。**口令留着**：靠它认出以后的 keyring
+                let follow = (encrypted != r.config.encrypt
+                    && (!encrypted || r.config.passphrase.is_some()))
+                .then(|| {
                     let mut s = r.config.clone();
-                    s.encrypt = false;
-                    s.passphrase = None;
+                    s.encrypt = encrypted;
                     s
                 });
                 Ok((report, follow))
@@ -795,27 +812,16 @@ impl Sync {
                 drop(guard);
                 self.view()
             }
-            Err(RoundError::Emptied) => {
-                // 别的设备停止同步并删除了同步数据：这台也停下，说一声
-                r.engine.local().clear();
-                drop(guard);
-                if let Some(mgr) = self.mgr() {
-                    let _ = write_section(&mgr, None, Origin::Sync).await;
-                }
-                *self.run.lock().await = None;
-                self.register_backups(false);
-                tw_api::SyncView {
-                    error: Some(RoundError::Emptied.msg()),
-                    ..self.compute_view(None, Some(tw_api::SyncState::Off))
-                }
-            }
             Err(e) => {
+                // 同步位置空了、keyring 不见了也一样：记下来、等人处理，**同步设置不动**
                 self.record_failure(r, &e);
                 let st = r.engine.local().state();
                 let state = match &e {
                     RoundError::Store(StoreError::AuthFailed(_)) => tw_api::SyncState::AuthFailed,
                     RoundError::Locked(_) => tw_api::SyncState::Locked,
                     RoundError::TooNew { .. } => tw_api::SyncState::TooNew,
+                    RoundError::Emptied => tw_api::SyncState::Emptied,
+                    RoundError::KeyringMissing(_) => tw_api::SyncState::KeyringMissing,
                     _ => {
                         let since = st.failing_since_ms.unwrap_or_else(now_ms);
                         if now_ms().saturating_sub(since) >= UNREACHABLE_AFTER_MS {
@@ -904,6 +910,14 @@ impl Sync {
                         tw_sync::record::Reason::KeyInUse => tw_api::SyncConflictReason::KeyInUse,
                         tw_sync::record::Reason::Invalid => tw_api::SyncConflictReason::Invalid,
                     }),
+                    options: engine::options(c)
+                        .into_iter()
+                        .map(|t| match t {
+                            Take::Local => tw_api::SyncTake::Local,
+                            Take::Remote => tw_api::SyncTake::Remote,
+                            Take::Both => tw_api::SyncTake::Both,
+                        })
+                        .collect(),
                 }
             })
             .collect()
@@ -1563,9 +1577,10 @@ async fn encryption(
             r.engine.enable_encryption(&p).await
         }
         tw_api::SyncEncryptionAction::Disable => {
+            // 口令留着：同步位置上的 keyring 写着「已关闭」，靠它认出来
             let p = req.passphrase.clone().unwrap_or_default();
             next.encrypt = false;
-            next.passphrase = None;
+            next.passphrase = Some(p.clone()).filter(|p| !p.is_empty());
             r.engine.disable_encryption(&p).await
         }
         tw_api::SyncEncryptionAction::Change => {
@@ -1602,16 +1617,32 @@ async fn unlock(
         .await
         .map_err(|e| round_fail(&e))?;
     let mut next = r.config.clone();
-    if encrypted {
-        next.encrypt = true;
-        next.passphrase = Some(req.passphrase.clone());
-    }
+    next.encrypt = encrypted;
+    next.passphrase = Some(req.passphrase.clone());
     r.config = next.clone();
     r.engine.set_settings(settings_of(&s.config(), &next));
     drop(guard);
     write_section(&s.cfg, Some(&next), Origin::Ui)
         .await
         .map_err(apply_fail)?;
+    sync.round(&[]).await.map(Json)
+}
+
+/// 同步位置空了、keyring 不见了之后，由人选的「重新上传本机配置」
+async fn republish(State(s): State<ControlState>) -> Result<Json<tw_api::SyncView>, Fail> {
+    let sync = service(&s);
+    let mut guard = sync.run.lock().await;
+    let r = match sync.ensure(&mut guard) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(sync_off()),
+        Err(m) => return Err(fail(StatusCode::BAD_REQUEST, m)),
+    };
+    let res = r.engine.republish().await;
+    drop(guard);
+    if let Err(e) = res {
+        return Err(round_fail(&e));
+    }
+    sync.failures.store(0, Ordering::Relaxed);
     sync.round(&[]).await.map(Json)
 }
 

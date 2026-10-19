@@ -1105,7 +1105,9 @@ export const manifest = {
 
 多台设备（这台 Mac、一台笔记本、一台运行远程 core 的服务器）可以通过自选的同步位置保持同一份配置：由云盘在设备之间传送的文件夹、WebDAV 服务器或 S3 兼容存储。每次改动都按对象与其他设备自上次同步以来的改动合并；只有两台设备把同一对象的同一部分改成不同内容时才构成冲突，冲突在每台设备上显示，任一设备处理之后随之清除。开启同步、加入已有的同步和处理冲突在应用里进行（设置 → 同步与备份），服务器上用 `twcore sync enable`；本节记录的是结果。
 
-同步的内容即配置包带的内容：上游、出站代理、网关密钥、别名、分组、路由、价目表、安全规则、插件和全局设置，包括密钥。`listen`、`retention` 和 `sync` 本身留在本机，ChatGPT 账号的登录也一样。
+同步的内容即配置包带的内容：上游、出站代理、网关密钥、别名、分组、路由、价目表、安全规则、插件和全局设置，包括密钥。`listen`、`retention` 和 `sync` 本身留在本机，ChatGPT 账号的登录、OAuth 的令牌也一样。别的设备上登录着的上游在这台设备上停用着，在这台登录之后才启用；这不会让它在别的设备上停用。
+
+开着加密时，不加密的版本一概不读。keyring 不见了、被换成更早的那一份，都不会关掉加密：应用会问要不要放回这台设备记着的那一份。同步位置读起来是空的时，要再看几次才提示，停不停止同步由你决定。
 
 <!-- generated: table sync -->
 <a id="cfg-sync"></a>
@@ -1115,7 +1117,7 @@ export const manifest = {
 | `device_id` | 字符串 | **必填** | 开启同步时生成。同步位置上的文件名里出现的是它的前 8 个字符。 |
 | `device_name` | 字符串 | **必填** | 在每台参与同步的设备的设备列表里显示的名字。 |
 | `encrypt` | 布尔 | `true` | 以同步口令加密存到同步位置的内容。同一同步位置上的所有设备采用同一设置；在应用里更改，应用会重新上传最新版本。 |
-| `passphrase` | 字符串 | — | 同步口令，`encrypt` 开着时必填。和本文件里的其他密钥一样以明文保存。 |
+| `passphrase` | 字符串 | — | 同步口令，`encrypt` 开着时必填；关闭加密之后也留着：同步位置上写着「已关闭」的 keyring 要用它核对。和本文件里的其他密钥一样以明文保存。 |
 | `exclude` | 字符串列表 | `[]` | 不同步的上游，按名字：不上传，也不被其他设备的同名上游覆盖。引用它们的路由、别名、分组随之不同步。 |
 | `target` | 对象，见 [`sync.target`](#cfg-sync-target) | **必填** | 同步位置。`keyring`、`versions/`、`devices/` 直接放在它里面。 |
 <!-- /generated -->
@@ -1147,7 +1149,7 @@ export const manifest = {
 | `url` | 字符串 | **必填** | 文件夹的 WebDAV 地址。`https://`，校验证书；`http://` 只用于本机和局域网。 |
 | `user` | 字符串 | `''` | 用户名。 |
 | `pass` | 字符串 | `''` | 密码，或者服务为 WebDAV 签发的应用密码。 |
-| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。 |
+| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。本机、内网的 `http://` 地址只能是 `direct`。 |
 <!-- /generated -->
 
 <!-- generated: table sync.target (s3) -->
@@ -1159,10 +1161,10 @@ export const manifest = {
 | `endpoint` | 字符串 | **必填** | S3 端点。主机以 `amazonaws.com`、`aliyuncs.com`、`myqcloud.com` 结尾的，存储桶名放进域名；其余端点（Cloudflare R2、MinIO、IP 地址）放进路径。`http://` 只用于本机和局域网。 |
 | `region` | 字符串 | **必填** | 签名用的区域；Cloudflare R2 填 `auto`。 |
 | `bucket` | 字符串 | **必填** | 存储桶，建议设为私有。 |
-| `prefix` | 字符串 | `''` | 存储桶里的一个前缀（文件夹）。 |
+| `prefix` | 字符串 | `''` | 存储桶里的一个前缀（文件夹）。不能有 `..`，不以 `/` 开头。 |
 | `access_key_id` | 字符串 | **必填** | Access Key ID。 |
 | `secret_access_key` | 字符串 | **必填** | Secret Access Key。 |
-| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。 |
+| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。本机、内网的 `http://` 地址只能是 `direct`。 |
 <!-- /generated -->
 
 ```yaml

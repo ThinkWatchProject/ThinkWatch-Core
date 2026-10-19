@@ -13,7 +13,10 @@ use std::time::Duration;
 use reqwest::{Method, StatusCode};
 use tw_types::msg;
 
-use super::{Entry, Store, StoreError, check_path, http_error, http_status, split, temp_name};
+use super::{
+    Entry, MAX_FILE, MAX_LISTING, Store, StoreError, TEMP_PREFIX, check_path, http_status,
+    own_temp, read_limited, split, temp_name,
+};
 
 /// 一个请求最多等多久。版本最大 16 MiB，慢的网盘也够了
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -95,7 +98,7 @@ impl WebDav {
     }
 
     async fn send(&self, r: reqwest::RequestBuilder) -> Result<reqwest::Response, StoreError> {
-        r.send().await.map_err(|e| http_error(&e))
+        super::send(r).await
     }
 
     /// 建目录。已经有了（405）不算错；上一级没有（409）先建上一级（同步位置的根）
@@ -201,8 +204,9 @@ fn last_segment(href: &str) -> String {
 const PROPFIND: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/></d:prop></d:propfind>"#;
 
-impl Store for WebDav {
-    async fn list(&self, dir: &str) -> Result<Vec<Entry>, StoreError> {
+impl WebDav {
+    /// 列一个目录，**连点开头的一起**（清临时文件要看到它们）。目录不在是 `Ok(None)`
+    async fn list_raw(&self, dir: &str) -> Result<Option<Vec<Entry>>, StoreError> {
         let url = self.dir(dir)?;
         let own = url.path().trim_end_matches('/').to_string();
         let r = self
@@ -215,10 +219,11 @@ impl Store for WebDav {
             .await?;
         match r.status().as_u16() {
             207 | 200 => {}
-            404 => return Ok(Vec::new()),
+            404 => return Ok(None),
             _ => return Err(http_status(r.status(), "PROPFIND")),
         }
-        let body = r.text().await.map_err(|e| http_error(&e))?;
+        let body = read_limited(r, MAX_LISTING, "the directory listing").await?;
+        let body = String::from_utf8_lossy(&body);
         let Some((records, _)) = super::xml::parse(&body, "response") else {
             return Err(StoreError::Other(msg!(
                 "sync.webdav.bad_listing" =>
@@ -236,7 +241,7 @@ impl Store for WebDav {
                 continue;
             }
             let name = last_segment(href);
-            if name.is_empty() || name.starts_with('.') {
+            if name.is_empty() {
                 continue;
             }
             out.push(Entry {
@@ -248,16 +253,77 @@ impl Store for WebDav {
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        Ok(Some(out))
+    }
+
+    async fn list_raw_root(&self) -> Result<Option<Vec<Entry>>, StoreError> {
+        self.list_raw("").await
+    }
+
+    /// 同步位置的根在不在。**目录列不出来（404）不等于是空的**：根本身不在时那是地址写错了、
+    /// 或者服务器上的文件夹被挪走了，不能当成同步数据被清空了
+    async fn root_exists(&self) -> Result<bool, StoreError> {
+        let r = self
+            .send(
+                self.req(method("PROPFIND"), self.base.clone())
+                    .header("depth", "0")
+                    .header("content-type", "application/xml; charset=utf-8")
+                    .body(PROPFIND),
+            )
+            .await?;
+        match r.status().as_u16() {
+            207 | 200 => Ok(true),
+            404 => Ok(false),
+            _ => Err(http_status(r.status(), "PROPFIND")),
+        }
+    }
+}
+
+impl Store for WebDav {
+    async fn list(&self, dir: &str) -> Result<Vec<Entry>, StoreError> {
+        match self.list_raw(dir).await? {
+            Some(all) => Ok(all
+                .into_iter()
+                .filter(|e| !e.name.starts_with('.'))
+                .collect()),
+            None if self.root_exists().await? => Ok(Vec::new()),
+            None => Err(StoreError::Unreachable(msg!(
+                "sync.webdav.root_missing", url = self.base.as_str() =>
+                "the WebDAV folder {url} is not there"
+            ))),
+        }
+    }
+
+    /// 这台设备写到一半断了留下的临时文件（`PUT` 了、没来得及 `MOVE`）。只在开始同步时清一次，
+    /// 那时这台设备没有在写的
+    async fn sweep(&self, tag: &str) {
+        for dir in ["", crate::layout::VERSIONS, crate::layout::DEVICES] {
+            let listed = if dir.is_empty() {
+                self.list_raw_root().await
+            } else {
+                self.list_raw(dir).await
+            };
+            let Ok(Some(all)) = listed else { continue };
+            for e in all {
+                if e.name.starts_with(TEMP_PREFIX) && own_temp(&e.name, tag) {
+                    let path = if dir.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{dir}/{}", e.name)
+                    };
+                    if let Ok(u) = self.file(&path) {
+                        let _ = self.send(self.req(Method::DELETE, u)).await;
+                    }
+                }
+            }
+        }
     }
 
     async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let r = self.send(self.req(Method::GET, self.file(path)?)).await?;
         match r.status().as_u16() {
             404 | 410 => Ok(None),
-            s if (200..300).contains(&s) => {
-                Ok(Some(r.bytes().await.map_err(|e| http_error(&e))?.to_vec()))
-            }
+            s if (200..300).contains(&s) => Ok(Some(read_limited(r, MAX_FILE, path).await?)),
             _ => Err(http_status(r.status(), "GET")),
         }
     }

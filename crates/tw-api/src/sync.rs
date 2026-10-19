@@ -72,6 +72,17 @@ slug_enum! {
         TooNew = "too_new",
         /// 安全模式：不自动同步
         Paused = "paused",
+        /// 同步位置上的 keyring 不见了、被换成了更早的、一直读不出来。**不会自己关掉加密**：
+        /// 由人选「重新上传本机配置」（`POST /sync/republish`：放回这台设备记着的 keyring）或者
+        /// 停止同步。原因在 `error`
+        KeyringMissing = "keyring_missing",
+        /// 同步位置空了（连着几轮、过了一段时间都是空的）：其他设备删除了同步数据，或者它已经
+        /// 不是原来那个位置。同步设置不动，由人选「重新上传本机配置」（`POST /sync/republish`）
+        /// 或者停止同步
+        Emptied = "emptied",
+        /// 同步设置用不了（比如出站代理被删了、不加密的 `http://` 地址设了代理）：改设置。
+        /// 原因在 `error`
+        Misconfigured = "misconfigured",
     }
 }
 
@@ -122,6 +133,9 @@ pub struct SyncView {
     pub excluded: Vec<String>,
     /// 随之不同步的项目：引用了不同步的上游的路由、别名、分组
     pub excluded_cascade: Vec<ItemRef>,
+    /// 同步位置上跳过了的文件：坏了的、不是这把密钥加密的、加密的位置上没加密的、等了
+    /// 30 分钟还没传完的。不是 0 时界面提一句
+    pub skipped: u32,
 }
 
 /// `POST /sync/test`、`POST /sync/enable/preview`：连上去看看。
@@ -256,9 +270,14 @@ pub struct SyncConflict {
     pub remote: SyncConflictSide,
     /// 两边不同的地方，逐个单位：点对象名时显示的差异
     pub diff: Vec<SyncConflictDiff>,
-    /// 能不能「两者都保留」：两边都还有这个对象，而且它有名字
+    /// 能不能「两者都保留」：两边都还有这个对象，而且它有名字（和 `options` 里有没有 `both`
+    /// 是一回事）
     pub both_allowed: bool,
     pub reason: Option<SyncConflictReason>,
+    /// 这处冲突能选哪几种处理，界面只给这几个按钮：`local` 总在；`remote` 在合并结果过不了
+    /// 校验（`invalid`）时没有；`both` 同 `both_allowed`。网关密钥的「两者都保留」新增的那一把
+    /// 是一个新的值
+    pub options: Vec<SyncTake>,
 }
 
 slug_enum! {

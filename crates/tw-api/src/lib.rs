@@ -990,7 +990,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `PUT /sync/settings`（[`SyncSettingsSave`]）、`POST /sync/now`、`GET` / `POST /sync/conflicts`
 /// （[`SyncConflict`]、[`SyncResolve`]：采用本机、另一边或两者都保留）、`POST /sync/encryption`
 /// （[`SyncEncryption`]：开启、关闭、更改口令）、`POST /sync/unlock`（[`SyncUnlock`]）、
-/// `POST /sync/disable`（[`SyncDisable`]）。状态变了发 [`Event::SyncStatus`]；应用别的设备的
+/// `POST /sync/disable`（[`SyncDisable`]）、`POST /sync/republish`（同步位置空了、keyring 不见了
+/// 之后由人选的「重新上传本机配置」，→ [`SyncView`]）。[`SyncState`] 里要人处理的有
+/// `keyring_missing`、`emptied`、`misconfigured`，[`SyncView`] 的 `skipped` 是同步位置上跳过了的
+/// 文件数，[`SyncConflict`] 的 `options` 是能选的处理。状态变了发 [`Event::SyncStatus`]；应用别的设备的
 /// 版本时配置的来源是 `sync`，改了网关密钥时发 `GatewayKeysChanged`。[`ProviderView`] 多了
 /// `sync_excluded`（不同步的上游）和 `sync_url_changed`（地址经同步变更，改之前的地址）。
 /// 同步的码是 `sync.*`。安全模式下不自动同步（`paused`）

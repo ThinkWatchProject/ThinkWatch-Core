@@ -102,6 +102,19 @@ fn print_view(v: &tw_api::SyncView) {
     if !v.excluded.is_empty() {
         println!("not synced: {}", v.excluded.join(", "));
     }
+    if v.skipped > 0 {
+        println!(
+            "skipped: {} file(s) at the sync location could not be read",
+            v.skipped
+        );
+    }
+    match v.state {
+        tw_api::SyncState::Emptied | tw_api::SyncState::KeyringMissing => println!(
+            "to go on: `twcore sync republish` uploads this device's configuration again, \
+             `twcore sync disable` stops syncing"
+        ),
+        _ => {}
+    }
     for d in &v.devices {
         let mut notes = Vec::new();
         if d.this {
@@ -139,11 +152,18 @@ pub fn now(config: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 同步位置空了、keyring 不见了之后：以本机配置重新上传（keyring 放回本机记着的那一份）
+pub fn republish(config: &Path) -> Result<()> {
+    let v: tw_api::SyncView = send(config, "POST", "/sync/republish", None)?;
+    print_view(&v);
+    Ok(())
+}
+
 pub fn disable(config: &Path, purge: bool) -> Result<()> {
     if purge
         && !yes(
             "Delete every version, device record and the keyring at the sync location? Other \
-             devices stop syncing",
+             devices are told the location is empty",
             false,
         )?
     {
