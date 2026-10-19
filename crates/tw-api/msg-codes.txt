@@ -512,6 +512,7 @@ pack.need_key
 pack.need_passphrase
 pack.no_such_item
 pack.not_base64
+pack.not_encrypted
 pack.passphrase_short
 pack.schema_too_new
 pack.too_large
