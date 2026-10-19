@@ -625,3 +625,166 @@ async fn an_older_pack_is_previewed_repaired_and_a_newer_one_is_too_new() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["code"], "pack.too_new");
 }
+
+/// 导入的请求体放宽到装得下一个最大的包；别的端点照旧
+#[tokio::test]
+async fn a_large_pack_reaches_the_import_and_other_bodies_keep_the_default_limit() {
+    let b = bed(&mine());
+    // 3 MiB 的 base64：超过默认的 2 MiB，远不到配置包的上限
+    let big = "A".repeat(3 * 1024 * 1024);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/config/import/preview",
+        serde_json::json!({ "data_b64": big }),
+    )
+    .await;
+    assert_ne!(st, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["code"], "pack.corrupt", "{v}");
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/client-prefs",
+        serde_json::json!({ "prefs": { "big": big } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// 固定密钥按来源记：两个 Lite 各报各的，取并集；一个来源再报一次换掉它自己的
+#[tokio::test]
+async fn pinned_keys_are_kept_per_source() {
+    let b = bed(&mine());
+    for (source, names) in [("lite-a", vec!["default"]), ("lite-b", vec!["claude-code"])] {
+        let (st, v) = call(
+            &b.app,
+            "PUT",
+            "/pinned-keys",
+            serde_json::json!({ "source": source, "names": names }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let all: Vec<String> = b.state.cfg.pinned_keys().into_iter().collect();
+    assert_eq!(all, ["claude-code", "default"]);
+    call(
+        &b.app,
+        "PUT",
+        "/pinned-keys",
+        serde_json::json!({ "source": "lite-a", "names": [] }),
+    )
+    .await;
+    let all: Vec<String> = b.state.cfg.pinned_keys().into_iter().collect();
+    assert_eq!(all, ["claude-code"]);
+}
+
+/// 导入的包里带着超大的通用偏好：和 `PUT /client-prefs` 一样挡下
+#[tokio::test]
+async fn oversized_preferences_in_a_pack_are_refused() {
+    let dst = bed(&mine());
+    let mut m = tw_pack::Manifest::new(tw_pack::PackKind::Full, tw_pack::PackOrigin::Export);
+    m.secrets = true;
+    let p = tw_pack::Pack {
+        manifest: m,
+        config_yaml: "version: 1\n".into(),
+        plugins: Default::default(),
+        client_prefs: Some(serde_json::json!({ "big": "x".repeat(tw_api::CLIENT_PREFS_MAX + 1) })),
+    };
+    let data = base64::engine::general_purpose::STANDARD
+        .encode(tw_pack::write(&p, tw_pack::Seal::None).unwrap());
+    let (_, preview) = call(
+        &dst.app,
+        "POST",
+        "/config/import/preview",
+        serde_json::json!({ "data_b64": data }),
+    )
+    .await;
+    let (st, v) = call(
+        &dst.app,
+        "POST",
+        "/config/import",
+        serde_json::json!({
+            "data_b64": data,
+            "base_version": preview["base_version"],
+            "decisions": [{ "item": { "kind": "client_prefs", "name": "" }, "action": "import" }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["code"], "backup.prefs_too_large");
+    assert!(tw_pack::disk::read_prefs(&dst.path()).is_none());
+}
+
+/// 同步位置上的版本：里面没有本机那几节
+struct OneRemote(tw_pack::Pack);
+
+impl tw_control::backups::RemoteBackups for OneRemote {
+    fn list(
+        &self,
+    ) -> tw_control::backups::BoxFuture<'_, Vec<tw_control::backups::RemoteVersionInfo>> {
+        let v = tw_control::backups::RemoteVersionInfo {
+            content_id: self.0.content_id(),
+            at_ms: 1,
+            device_name: "MacBook Air".into(),
+            core_version: tw_pack::CORE_VERSION.into(),
+            counts: self.0.manifest.counts,
+        };
+        Box::pin(async move { vec![v] })
+    }
+    fn fetch<'a>(
+        &'a self,
+        _content_id: &'a str,
+    ) -> tw_control::backups::BoxFuture<'a, Result<tw_pack::Pack, tw_types::Msg>> {
+        let p = self.0.clone();
+        Box::pin(async move { Ok(p) })
+    }
+}
+
+/// 安全模式下整份恢复同步位置上的一个版本：钥匙、监听是现在这份原文里的，写得进去
+#[tokio::test]
+async fn in_safe_mode_a_synced_version_comes_back_whole() {
+    let src = bed(&theirs());
+    let file = export_all(&src, true).await;
+    let synced = tw_pack::read(
+        &base64::engine::general_purpose::STANDARD
+            .decode(file["data_b64"].as_str().unwrap())
+            .unwrap(),
+        tw_pack::Unseal::None,
+    )
+    .unwrap();
+    assert!(!synced.config_yaml.contains("listen"));
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("config.yaml");
+    let broken = format!("{}not_a_field: 1\n", mine());
+    std::fs::write(&p, &broken).unwrap();
+    let (cfg, r) = tw_config::stand_in(&broken).unwrap();
+    let gw = tw_gateway::AppState::new(cfg).unwrap();
+    let bus = gw.bus.clone();
+    let mgr = Arc::new(ConfigManager::new(p.clone(), gw.clone(), bus).standing_in(&r));
+    mgr.set_remote_backups(Some(Arc::new(OneRemote(synced.clone()))));
+    let app = tw_control::router(state_for(p.clone(), mgr, gw));
+    let (st, list) = call(&app, "GET", "/backups", serde_json::json!(null)).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    let id = list[0]["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("sync-"), "{list}");
+    let (st, preview) = call(
+        &app,
+        "POST",
+        "/backups/preview",
+        serde_json::json!({ "id": id }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/backups/restore",
+        serde_json::json!({ "id": id, "base_version": preview["base_version"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let text = std::fs::read_to_string(&p).unwrap();
+    let cfg = tw_config::try_parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    assert_eq!(cfg.listen.control.key.as_deref(), Some(KEY));
+    assert!(cfg.providers.iter().any(|p| p.name == "relay"));
+}

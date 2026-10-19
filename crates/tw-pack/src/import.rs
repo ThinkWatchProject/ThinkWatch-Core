@@ -182,6 +182,19 @@ fn skipped_ref(id: &ItemId, target: &ItemId) -> Msg {
     )
 }
 
+/// 不带密钥的包：本机也有的那几项，空着的密钥换成本机的（[`export::fill_secrets`]）
+fn with_local_secrets(l: &Snapshot, mut i: Snapshot, incoming: &Pack) -> Snapshot {
+    if incoming.manifest.secrets {
+        return i;
+    }
+    for (id, item) in i.items.iter_mut() {
+        if let Some(mine) = l.items.get(id) {
+            export::fill_secrets(id, item, mine);
+        }
+    }
+    i
+}
+
 /// 全局设置和通用偏好：冲突只能覆盖或跳过
 fn is_global(kind: ItemKind) -> bool {
     matches!(kind, ItemKind::Global | ItemKind::ClientPrefs)
@@ -199,7 +212,7 @@ pub fn preview_with(
     codec: &dyn PluginCodec,
 ) -> Result<Vec<Row>, ImportError> {
     let l = model::snapshot_with(local, codec)?;
-    let i = model::snapshot_with(incoming, codec)?;
+    let i = with_local_secrets(&l, model::snapshot_with(incoming, codec)?, incoming);
     let both = union(&l, &i);
     let mut rows = Vec::new();
     for (id, item) in &i.items {
@@ -488,7 +501,7 @@ pub fn apply_with(
     codec: &dyn PluginCodec,
 ) -> Result<Applied, ImportError> {
     let l = model::snapshot_with(local, codec)?;
-    let mut i = model::snapshot_with(incoming, codec)?;
+    let mut i = with_local_secrets(&l, model::snapshot_with(incoming, codec)?, incoming);
     let rows = preview_with(local, incoming, ctx, codec)?;
     let errors: BTreeMap<&ItemId, &Msg> = rows
         .iter()
@@ -552,7 +565,14 @@ pub fn apply_with(
             }
             Action::Import | Action::Overwrite | Action::Rename(_) => {}
         }
-        let item = prepared(&id, item, incoming, &l, ctx);
+        let mut item = prepared(&id, item, incoming, &l, ctx);
+        // 改名导入的网关密钥是另一把：值重新生成。照搬的话它和本机原来那把同值，配置不成立
+        if id.kind == ItemKind::Key
+            && matches!(d.action, Action::Rename(_))
+            && let Some(Json::Object(all)) = item.units.get_mut(unit::ALL)
+        {
+            all.insert("key".into(), Json::String((ctx.new_key)()));
+        }
         target.items.insert(id.clone(), item);
         taken.push(id);
     }

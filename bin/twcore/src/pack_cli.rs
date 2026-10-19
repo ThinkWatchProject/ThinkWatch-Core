@@ -381,7 +381,10 @@ pub fn restore(path: &Path, id: &str, dry_run: bool) -> Result<()> {
     let pinned = tw_pack::disk::read_pinned(path);
     let after = if tw_pack::model::snapshot(&local).is_err() {
         println!("the configuration here does not load; the whole version comes back");
-        tw_pack::restore::whole(&backup, &cur.text)
+        let last = tw_pack::backup::list(path)
+            .ok()
+            .and_then(|all| all.last().and_then(|b| tw_pack::backup::open(b).ok()));
+        tw_pack::restore::whole(&backup, &cur.text, last.as_ref())
     } else {
         let rows = tw_pack::restore::preview(&local, &backup, &pinned, true).map_err(model)?;
         if rows.is_empty() {
@@ -396,6 +399,7 @@ pub fn restore(path: &Path, id: &str, dry_run: bool) -> Result<()> {
             };
             let kept = match r.kept {
                 Some(Kept::KeyInUse) => " (kept: a client set up on this machine uses it)",
+                Some(Kept::Referenced) => " (kept: something that stays refers to it)",
                 None => "",
             };
             println!("  {change}  {}{kept}", describe(&r.item));
