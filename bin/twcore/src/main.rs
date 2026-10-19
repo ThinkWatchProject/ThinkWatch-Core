@@ -11,7 +11,9 @@ use clap::{Parser, Subcommand};
 
 mod call;
 mod lockfile;
+mod pack_cli;
 mod proc;
+mod sync_cmd;
 mod upgrade;
 
 use lockfile::{LockFile, LockOutcome};
@@ -103,6 +105,47 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Export the configuration as a configuration pack (.twconfig)
+    Export {
+        /// Export only these upstreams (comma-separated), with what they refer to
+        #[arg(long, value_delimiter = ',')]
+        providers: Vec<String>,
+        /// Leave the keys out: upstream keys, header values, AWS keys, proxy passwords and
+        /// gateway keys are left empty
+        #[arg(long)]
+        no_secrets: bool,
+        /// Encrypt the file with a passphrase, asked for or taken from TWCORE_PASSPHRASE
+        #[arg(long)]
+        encrypt: bool,
+        /// The file to write
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Import a configuration pack: what is not here is added, and what differs is chosen item
+    /// by item
+    Import {
+        /// The configuration pack (.twconfig)
+        file: PathBuf,
+        /// Show what would happen and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// What to do with every item that differs from the one here; asked item by item
+        /// without it
+        #[arg(long, value_enum)]
+        on_conflict: Option<pack_cli::OnConflict>,
+    },
+    /// The last versions of the configuration, and restoring one
+    Backup {
+        #[command(subcommand)]
+        what: BackupCmd,
+    },
+    /// Show or change multi-device sync. Talks to the running core
+    //
+    // 给没有界面的服务器（远程 core）用：和界面走同一套控制面端点
+    Sync {
+        #[command(subcommand)]
+        what: SyncCmd,
+    },
     /// Replace this twcore with another release from GitHub; the configuration is left alone
     //
     // 只给单独装的 twcore 用（服务器上）。桌面应用包里的那份由应用更新，见 upgrade.rs
@@ -117,6 +160,25 @@ enum Command {
         #[arg(long)]
         version: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SyncCmd {
+    /// Print the sync state, the location and the devices
+    Status,
+    /// Sync once now
+    Now,
+    /// Turn sync on; asks for the location and the passphrase
+    Enable,
+    /// Turn sync off; this device keeps its configuration
+    Disable {
+        /// Also delete every version, device record and the keyring at the sync location
+        #[arg(long)]
+        purge: bool,
+    },
+    /// After the sync location was emptied or lost its keyring: upload this device's
+    /// configuration again (and put back the keyring this device keeps)
+    Republish,
 }
 
 #[derive(Subcommand)]
@@ -141,6 +203,21 @@ enum RemoteCmd {
 }
 
 #[derive(Subcommand)]
+enum BackupCmd {
+    /// List the versions, newest first
+    List,
+    /// Go back to a version. Settings that belong to this machine, ChatGPT sign-ins and the
+    /// gateway keys clients set up here use are kept
+    Restore {
+        /// The id from `twcore backup list`
+        id: String,
+        /// Show what would change and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCmd {
     /// Print the configuration as it is, with its version
     Show,
@@ -159,10 +236,6 @@ enum ConfigCmd {
         #[arg(long, conflicts_with_all = ["int", "bool_value"])]
         null: bool,
     },
-    /// List the versions in the history
-    History,
-    /// Roll back to a version
-    Rollback { version: String },
 }
 
 fn main() -> Result<()> {
@@ -182,6 +255,8 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let path = cli.config.clone().unwrap_or_else(tw_config::default_path);
+    // 配置包、备份按「代码」「数据」分开比较插件：拆法要插件那一套
+    tw_control::backups::install_codec();
 
     match cli.command {
         Command::Init { force } => cmd_init(&path, force),
@@ -191,12 +266,34 @@ fn main() -> Result<()> {
         Command::Config { what } => cmd_config(&path, what),
         Command::ControlKey { rotate } => cmd_control_key(&path, rotate),
         Command::Remote { what } => cmd_remote(&path, what.unwrap_or(RemoteCmd::Show)),
+        Command::Export {
+            providers,
+            no_secrets,
+            encrypt,
+            out,
+        } => pack_cli::export(&path, providers, no_secrets, encrypt, out),
+        Command::Import {
+            file,
+            dry_run,
+            on_conflict,
+        } => pack_cli::import(&path, &file, dry_run, on_conflict),
+        Command::Backup { what } => match what {
+            BackupCmd::List => pack_cli::list(&path),
+            BackupCmd::Restore { id, dry_run } => pack_cli::restore(&path, &id, dry_run),
+        },
         Command::Call {
             path: endpoint,
             method,
             data,
             out,
         } => call::run(&path, &endpoint, &method, data, out),
+        Command::Sync { what } => match what {
+            SyncCmd::Status => sync_cmd::status(&path),
+            SyncCmd::Now => sync_cmd::now(&path),
+            SyncCmd::Enable => sync_cmd::enable(&path),
+            SyncCmd::Disable { purge } => sync_cmd::disable(&path, purge),
+            SyncCmd::Republish => sync_cmd::republish(&path),
+        },
         Command::Upgrade {
             check,
             restart,
@@ -212,7 +309,7 @@ fn main() -> Result<()> {
 /// 改配置。
 ///
 /// **不连控制面，直接操作文件。**理由是这个命令必须在 core 没跑的时候
-/// 也能用 —— 「配置写坏了导致 core 起不来」正是最需要 `config rollback`
+/// 也能用 —— 「配置写坏了导致 core 起不来」正是最需要 `backup restore`
 /// 的时刻，而那时控制面根本不存在。
 ///
 /// 代价是 core 正在跑时，改动要等它的文件监听发现（几百毫秒）。那条路
@@ -223,40 +320,6 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
             let c = tw_config::store::read(path)?;
             println!("{}", c.text);
             eprintln!("── {} · {}", c.path.display(), c.version());
-            Ok(())
-        }
-        ConfigCmd::History => {
-            let all = tw_config::history::list(path)?;
-            if all.is_empty() {
-                println!("No versions yet; the first change to the configuration makes one.");
-                return Ok(());
-            }
-            let now = tw_config::store::read(path).map(|c| c.version()).ok();
-            // 新的在前 —— 要找的几乎总是最近那几版
-            for v in all.iter().rev() {
-                let mark = if Some(&v.version) == now.as_ref() {
-                    "← current"
-                } else {
-                    "      "
-                };
-                println!(
-                    "{mark}  {}  {:<10}  {} bytes  {}",
-                    v.version,
-                    v.origin.label(),
-                    v.bytes,
-                    fmt_time(v.at_ms)
-                );
-            }
-            println!();
-            println!(
-                "To roll back: twcore config rollback <version> (the first few characters are enough)"
-            );
-            Ok(())
-        }
-        ConfigCmd::Rollback { version } => {
-            let text = tw_config::history::rollback(path, &version)?;
-            println!("rolled back to {}", tw_config::store::version_of(&text));
-            eprintln!("(a running core picks this up within a second)");
             Ok(())
         }
         ConfigCmd::Set {
@@ -293,10 +356,11 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
             let next = tw_yaml::set(&cur.text, &steps, &scalar)?;
             // **先校验再写。**写完才发现读不回来，那份坏配置已经在盘上了。
             tw_config::try_parse(&next).map_err(|r| anyhow::anyhow!("{r}"))?;
-            // 改之前那一版进历史，这样这条命令也能被 rollback 撤销
-            let _ = tw_config::history::snapshot(path, &cur.text, tw_config::history::Origin::Cli);
+            // 前后各留一个备份版本，这样这条命令也能被 `twcore backup restore` 撤销
+            let _ =
+                tw_pack::backup::record_before(path, &cur.text, tw_config::history::Origin::Cli);
             tw_config::store::write_if_unchanged(path, &cur.fingerprint, &next)?;
-            let _ = tw_config::history::snapshot(path, &next, tw_config::history::Origin::Cli);
+            let _ = tw_pack::backup::record(path, &next, tw_config::history::Origin::Cli);
             println!(
                 "changed; the new version is {}",
                 tw_config::store::version_of(&next)
@@ -884,6 +948,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             Some(r) => manager.standing_in(r),
             None => manager,
         });
+        // 磁盘上此刻的样子和最新的备份版本不一样就留一版：第一次运行、升级之后、core 没在跑时
+        // 命令行改过。配置读不进来时也留：一键修复之前的那一份在备份里
+        manager.record_startup();
         // 默认插件（随 core 发的那几个）：没给过的装上（停用着），没动过的换成新版。
         // 启动时在控制面起来之前走一遍，界面第一次取插件就看得到它们；之后每换入一份
         // 配置再走一遍。**不挡启动**：哪个没办成只记一行、说一声。安全模式不走 ——
@@ -931,6 +998,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 这是一种（另一种是上面的默认插件）—— 理由是服务器换发新 refresh
         // token 的那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
+        // 多设备同步：启动时一轮，之后按本机改动、定时、文件夹变化、唤醒。安全模式下不自动同步
+        let sync = tw_control::sync::start(&control, safe);
         // 定期刷新默认价目表（`pricing.auto_update`，默认开）
         tw_control::pricing::spawn(control.clone());
 
@@ -999,6 +1068,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             }
             _ = shutdown_requested(&shutdown) => {
                 tracing::info!("got a shutdown signal");
+                // 还没上传的本机改动，退出前上传（等不了太久：没传成的下次启动时传）
+                sync.flush().await;
                 Ok(())
             }
         }

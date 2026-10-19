@@ -373,27 +373,31 @@ async fn the_key_cannot_be_changed_or_removed_through_the_control_plane() {
 
 /// 历史里没有钥匙；回滚回去，钥匙是现在这一把。
 #[tokio::test]
-async fn a_rollback_through_the_control_plane_keeps_the_key() {
+async fn a_restore_through_the_control_plane_keeps_the_key() {
     let b = bed();
     let app = b.app();
     let path = b.dir.path().join("config.yaml");
-    let v0 = tw_config::store::version_of(&b.file());
     b.state
         .cfg
         .write(&yaml(KEY).replace("tw-aaaa", "tw-bbbb"), None, Origin::Ui)
         .await
         .unwrap();
-    for v in tw_config::history::list(&path).unwrap() {
-        let t = tw_config::history::read(&v).unwrap();
-        assert!(!t.contains(KEY), "历史里有钥匙：{t}");
+    let all = tw_pack::backup::list(&path).unwrap();
+    for v in &all {
+        let t = tw_pack::backup::open(v).unwrap().config_yaml;
+        assert!(!t.contains(KEY), "备份里有钥匙：{t}");
     }
+    let first = &all[0];
+    let base = tw_config::store::version_of(&b.file());
     let (st, body) = call(
         &app,
         "POST",
-        "/config/rollback",
-        serde_json::json!({ "version": v0 }),
+        "/backups/restore",
+        serde_json::json!({ "id": first.id, "base_version": base }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    assert_eq!(b.file(), yaml(KEY));
+    let now = b.file();
+    assert!(now.contains(KEY), "{now}");
+    assert!(now.contains("tw-aaaa"), "{now}");
 }

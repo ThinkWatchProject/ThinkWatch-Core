@@ -1,0 +1,47 @@
+[package]
+name = "tw-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Multi-device configuration sync: folder, WebDAV and S3 locations, the keyring, version naming and the three-way merge"
+
+[dependencies]
+# `sync` 一节的形状、地址规则
+tw-config = { workspace = true }
+tw-types = { workspace = true }
+# 通用偏好的上限
+tw-api = { workspace = true }
+# 配置包的格式与加密、把一份配置拆成项目与合并单位
+tw-pack = { workspace = true }
+# S3 的 SigV4 和 Bedrock 用的是同一份
+tw-bedrock = { workspace = true }
+# 文件夹位置：版本一到就合并，不等定时检查
+tw-watch = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+age = { workspace = true }
+quick-xml = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+percent-encoding = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+# 假的 WebDAV、假的 S3：和 core 别处的测试一样手写在 axum 上
+axum = { workspace = true }
+tempfile = "3"
+# 假 WebDAV 核对 Basic 认证
+base64 = { workspace = true }
+# 两台设备的测试直接读写配置
+tw-config = { workspace = true }
+serde_yaml_ng = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

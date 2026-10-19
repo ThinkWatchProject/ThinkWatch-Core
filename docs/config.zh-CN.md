@@ -13,7 +13,7 @@ ThinkWatch Core 只读一个文件：`config.yaml`。本文逐项说明其中每
 | macOS、Linux | `~/.thinkwatch/config.yaml` |
 | Windows | `%APPDATA%\ThinkWatch\config.yaml` |
 
-`THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、配置历史（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
+`THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、配置的备份（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
 
 这两项权限就是这份文件在本机上的全部保护：挡得住其他用户，挡不住以同一用户身份运行的程序。这样的程序能读到文件里的每一把密钥，也能用其中的控制通道密钥经控制通道修改配置。出站脱敏不改变这一点：它保护的是请求带出本机的内容，不是磁盘上的文件。显示配置时给控制通道密钥打码，是为了让经控制通道的写入改不了它（见 [`listen.control`](#cfg-listen-control)），而不是对本机程序隐藏它；上游密钥和网关密钥按原样显示。
 
@@ -65,19 +65,25 @@ providers:
 
 两方同时修改时（应用和手工编辑），后写入的一方因版本不一致被拒绝，不会覆盖先写入的内容。
 
-### 历史与回滚
+### 备份、导出与导入
 
-每个生效过的版本都保存在配置文件旁边的 `history/` 目录中，并记录来源（应用、命令行、外部编辑、回滚、凭据轮换）。保留最近 50 个版本。
+配置每改动一次，配置文件旁边的 `history/` 目录中就留下一个版本：一个配置包（`.twconfig`），连同插件和应用的通用偏好，并记录来源（应用、命令行、外部编辑、导入、恢复、同步）。保留最近 10 个版本；凭据轮换不生成版本。版本中的控制面密钥一律打码。
 
 ```sh
 twcore check                      # 只校验配置，不启动任何服务
 twcore config show                # 打印当前配置及其版本
-twcore config history             # 列出历史版本，最新的在前
-twcore config rollback 3f9a2c     # 回滚到某个版本（写前几位即可）
+twcore backup list                # 列出备份版本，最新的在前
+twcore backup restore 1792315800000 --dry-run   # 恢复会改动什么
+twcore backup restore 1792315800000             # 恢复到某个版本
+twcore export -o all.twconfig     # 把全部配置导出为配置包
+twcore export --providers relay --no-secrets --encrypt -o relay.twconfig
+twcore import all.twconfig --dry-run            # 导入会做什么
 twcore config set /listen/gateway/port 8790 --int
 ```
 
-这些命令直接操作文件，因此 core 没有运行时也能使用，而那往往正是最需要回滚的时候。正在运行的 core 会像对待其他保存一样接收这些改动。
+恢复时保留本机设置（监听、控制面密钥、保留期限、同步设置）、ChatGPT 的登录，以及本机已接管的客户端正在使用的网关密钥。导入时加入本机没有的项目，与本机不同的项目逐项选择处理方式（`--on-conflict` 一次指定全部）。配置包不含本机设置与 ChatGPT 登录；未指定 `--no-secrets` 时其中以明文保存密钥，除非指定 `--encrypt`（口令在终端输入，或取自环境变量 `TWCORE_PASSPHRASE`）。以不含密钥的配置包覆盖本机项目时，只有目的地不变（协议、主机与端口，AWS 区域，OAuth 令牌端点，所走的出站代理，代理的地址）才沿用本机的密钥；目的地变了的、改名导入的上游以停用状态导入，填入密钥后再启用。
+
+这些命令直接操作文件，因此 core 没有运行时也能使用，而那往往正是最需要恢复的时候；配置完全无法读取时，恢复把整个版本写回，控制面密钥保持现在的值。正在运行的 core 会像对待其他保存一样接收这些改动。
 
 `twcore config set <路径> <值>` 修改文件中已经写出的一个值。路径中的列表项按其 `name` 定位（`/providers/anthropic/base_url`）；数字表示下标（`/routes/0/rules/1/to`）。值默认按字符串写入，`--int`、`--bool`、`--null` 另作指定。写入前先校验结果。要添加文件中还没有的字段，请直接编辑文件。
 
@@ -112,6 +118,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `default_route` | 字符串 | — | 未指定路由的密钥走哪条路由。不写：名为 `default` 的路由；没有这条路由时走内置的故障转移。 |
 | `default_key` | 字符串 | — | 没有专用密钥的客户端使用哪一把。不写：名为 `default` 的那把，没有则取第一把。这把密钥不能停用。 |
 | `plugins` | 对象列表，见 [`plugins[]`](#cfg-plugins) | `[]` | 脚本插件，按运行的顺序。由应用安装，每个插件的代码和设置是本文件旁边的一个文件。 |
+| `sync` | 对象，见 [`sync`](#cfg-sync) | — | 多设备同步。属于本机设置：配置包和其他设备不会带走它，恢复备份时保留当前值。不写：不同步。 |
 <!-- /generated -->
 
 ### `listen`
@@ -164,7 +171,7 @@ listen:
 | `remote` | 对象，见 [`listen.control.remote`](#cfg-listen-control-remote) | — | 供另一台机器上的桌面应用连接的网络端口。它是本地通道之外额外开的，不取代本地通道。 |
 <!-- /generated -->
 
-`key` 缺失时，由 `twcore serve` 在控制通道开始监听之前写入；`twcore init` 生成的配置也带有它。凡是显示配置或写入配置历史的地方，这个字段一律打码；把打码值原样存回时保留原值。密钥缺失或格式不对（不是 64 个十六进制字符）时整份配置无效，因此无法把它换成一把容易猜到的短密钥。
+`key` 缺失时，由 `twcore serve` 在控制通道开始监听之前写入；`twcore init` 生成的配置也带有它。凡是显示配置或写入备份的地方，这个字段一律打码；把打码值原样存回时保留原值。密钥缺失或格式不对（不是 64 个十六进制字符）时整份配置无效，因此无法把它换成一把容易猜到的短密钥。
 
 ```sh
 twcore control-key            # 显示密钥，用于粘贴到桌面应用
@@ -287,7 +294,7 @@ clients:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 上游的名字，不能重复，也不能和策略组同名。以 `__` 开头的名字保留给内置项。 |
-| `base_url` | 字符串 | **必填** | 接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。 |
+| `base_url` | 字符串 | **必填** | 接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。地址中不能有反斜杠，主机前不能写用户名或密码（凭据写在 `key` 或 `headers` 中）。 |
 | `key` | 字符串，可写 `${VAR}` | — | API 密钥，放进协议规定的请求头：`x-api-key`（Anthropic）、`Authorization: Bearer`（OpenAI，以及 Bedrock API Key）、`x-goog-api-key`（Gemini）。上游不需要密钥、或凭据写在 `headers` 里时不写。不能和 `oauth`、`aws` 同时写。 |
 | `headers` | 请求头名 → 值的映射 | `{}` | 额外的请求头，按书写顺序发送；值可以用 `${VAR}`，配置了 `oauth` 时可以用 `{{access_token}}`。最多 32 个。HTTP 或网关管理的请求头（`host`、`content-length`、`connection` 等）不能设置。 |
 | `oauth` | 对象，见 [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth 凭据：用 refresh token 换取 access token。与 `key` 二选一。 |
@@ -1092,6 +1099,88 @@ export const manifest = {
     note: { type: "string", label: "Note", value: "用中文回答。" },
   },
 };
+```
+
+### `sync`
+
+多台设备（这台 Mac、一台笔记本、一台运行远程 core 的服务器）可以通过自选的同步位置保持同一份配置：由云盘在设备之间传送的文件夹、WebDAV 服务器或 S3 兼容存储。每次改动都按对象与其他设备自上次同步以来的改动合并；只有两台设备把同一对象的同一部分改成不同内容时才构成冲突，冲突在每台设备上显示，任一设备处理之后随之清除。开启同步、加入已有的同步和处理冲突在应用里进行（设置 → 同步与备份），服务器上用 `twcore sync enable`；本节记录的是结果。
+
+同步的内容即配置包带的内容：上游、出站代理、网关密钥、别名、分组、路由、价目表、安全规则、插件和全局设置，包括密钥。`listen`、`retention` 和 `sync` 本身留在本机，ChatGPT 账号的登录、OAuth 的令牌也一样。别的设备上登录着的上游在这台设备上停用着，在这台登录之后才启用；这不会让它在别的设备上停用。
+
+已有配置的设备加入时逐项合并，不一样的项目逐项选择；默认网关密钥例外：每个安装都会生成一把，加入的设备采用同步数据的值，本机已接管的客户端随之更新。
+
+开着加密时，不加密的版本一概不读。keyring 不见了、被换成更早的那一份，都不会关掉加密：应用会问要不要放回这台设备记着的那一份。同步位置读起来是空的时，要再看几次才提示，停不停止同步由你决定。
+
+<!-- generated: table sync -->
+<a id="cfg-sync"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `device_id` | 字符串 | **必填** | 开启同步时生成。同步位置上的文件名里出现的是它的前 8 个字符。 |
+| `device_name` | 字符串 | **必填** | 在每台参与同步的设备的设备列表里显示的名字。 |
+| `encrypt` | 布尔 | `true` | 以同步口令加密存到同步位置的内容。同一同步位置上的所有设备采用同一设置；在应用里更改，应用会重新上传最新版本。 |
+| `passphrase` | 字符串 | — | 同步口令，`encrypt` 开着时必填；关闭加密之后也留着：同步位置上写着「已关闭」的 keyring 要用它核对。和本文件里的其他密钥一样以明文保存。 |
+| `exclude` | 字符串列表 | `[]` | 不同步的上游，按名字：不上传，也不被其他设备的同名上游覆盖。引用它们的路由、别名、分组随之不同步。 |
+| `target` | 对象，见 [`sync.target`](#cfg-sync-target) | **必填** | 同步位置。`keyring`、`versions/`、`devices/` 直接放在它里面。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target -->
+<a id="cfg-sync-target"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | `folder` \| `webdav` \| `s3` | **必填** | 同步位置的种类；其余字段随之不同，见下面三张表。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target (folder) -->
+<a id="cfg-sync-target-folder"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | 字符串 | **必填** | `folder` |
+| `path` | 字符串 | **必填** | core 所在机器上的绝对路径：由 iCloud Drive、Dropbox、OneDrive、Syncthing 或 NAS 共享在设备之间传送的文件夹。 |
+| `proxy` | 字符串 | `direct` | 文件夹用不到。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target (webdav) -->
+<a id="cfg-sync-target-webdav"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | 字符串 | **必填** | `webdav` |
+| `url` | 字符串 | **必填** | 文件夹的 WebDAV 地址。`https://`，校验证书；`http://` 只用于本机和局域网。 |
+| `user` | 字符串 | `''` | 用户名。 |
+| `pass` | 字符串 | `''` | 密码，或者服务为 WebDAV 签发的应用密码。 |
+| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。本机、内网的 `http://` 地址只能是 `direct`。 |
+<!-- /generated -->
+
+<!-- generated: table sync.target (s3) -->
+<a id="cfg-sync-target-s3"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | 字符串 | **必填** | `s3` |
+| `endpoint` | 字符串 | **必填** | S3 端点。主机以 `amazonaws.com`、`aliyuncs.com`、`myqcloud.com` 结尾的，存储桶名放进域名；其余端点（Cloudflare R2、MinIO、IP 地址）放进路径。`http://` 只用于本机和局域网。 |
+| `region` | 字符串 | **必填** | 签名用的区域；Cloudflare R2 填 `auto`。 |
+| `bucket` | 字符串 | **必填** | 存储桶，建议设为私有。 |
+| `prefix` | 字符串 | `''` | 存储桶里的一个前缀（文件夹）。不能有 `..`，不以 `/` 开头。 |
+| `access_key_id` | 字符串 | **必填** | Access Key ID。 |
+| `secret_access_key` | 字符串 | **必填** | Secret Access Key。 |
+| `proxy` | 字符串 | `direct` | 访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。本机、内网的 `http://` 地址只能是 `direct`。 |
+<!-- /generated -->
+
+```yaml
+sync:
+  device_id: 3f9a2c1e-0b1d-4e2f-9a3b-5c6d7e8f9a0b
+  device_name: Mac mini
+  encrypt: true
+  passphrase: "correct horse battery staple"
+  exclude: [本机 Ollama]
+  target:
+    type: webdav
+    url: https://dav.example.com/dav/ThinkWatch
+    user: name@example.com
+    pass: "应用密码"
 ```
 
 ## 环境变量

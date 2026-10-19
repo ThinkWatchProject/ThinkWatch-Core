@@ -3,6 +3,13 @@
 # A second column marks codes a UI does not translate:
 #   passthrough  the sentence is only placeholders (system or upstream text); show `text`
 #   test         only produced by tests; never reaches a UI
+backup.io
+backup.not_found
+backup.pinned.name_too_long
+backup.pinned.source_too_long
+backup.pinned.too_many
+backup.prefs_too_large
+backup.write_failed
 config.alias_blank_model
 config.alias_chained
 config.alias_duplicate
@@ -19,6 +26,8 @@ config.aws_profile.unsupported
 config.bad_allow_from
 config.bad_base_url
 config.bad_remote_allow_from
+config.base_url_backslash
+config.base_url_userinfo
 config.blank_models_only
 config.control_key_invalid
 config.control_key_missing
@@ -137,8 +146,8 @@ control.chatgpt_login.expired
 control.chatgpt_login.no_code
 control.chatgpt_login.page_error
 control.client_unknown
-control.config_not_repairable
 control.config_stale
+control.config_unrepairable
 control.control_key_locked
 control.default_key_cannot_delete
 control.default_key_cannot_disable
@@ -174,7 +183,6 @@ control.name_taken_not_zai
 control.name_whitespace
 control.no_keys
 control.no_such_endpoint
-control.no_such_version
 control.not_a_chatgpt_account
 control.patch.no_entry
 control.patch.not_an_entry
@@ -432,6 +440,15 @@ gw.ws.proxy_unsupported
 gw.ws.send_failed
 gw.ws.upstream_broke
 gw.ws.upstream_closed
+import.exists
+import.key_value_taken
+import.missing_reference
+import.name_taken
+import.no_aws_profile
+import.not_in_pack
+import.plugin_mismatch
+import.plugin_missing
+import.skipped_reference
 l1.config.bad_url
 l1.config.no_host
 l1.config.proxy_addr_form
@@ -492,6 +509,23 @@ l3.not_streamed
 l3.refused
 l3.sign_failed
 l3.stream_failed
+pack.bad_entry
+pack.corrupt
+pack.item_shape
+pack.missing_entry
+pack.need_key
+pack.need_passphrase
+pack.no_such_item
+pack.not_base64
+pack.not_encrypted
+pack.passphrase_short
+pack.schema_too_new
+pack.too_large
+pack.too_much_work
+pack.too_new
+pack.verify_failed
+pack.wrong_key
+pack.wrong_passphrase
 pricing.sheet.bad_multiplier
 pricing.sheet.bad_price
 pricing.sheet.duplicate_name
@@ -515,11 +549,72 @@ security.unknown_action
 security.unknown_custom_rule
 security.unknown_guard
 security.unknown_rule
+sync.already_on
+sync.both_name_taken
+sync.both_not_allowed
+sync.config.address
+sync.config.blank
+sync.config.blank_exclude
+sync.config.bucket
+sync.config.device_id
+sync.config.device_name
+sync.config.folder_relative
+sync.config.multiline
+sync.config.passphrase_missing
+sync.config.plain_http_proxy
+sync.config.prefix
+sync.config.unknown_proxy
+sync.folder.denied
+sync.folder.io
+sync.folder.missing
+sync.folder.task
+sync.http_client
+sync.join_undecided
+sync.keyring_corrupt
+sync.keyring_missing
+sync.keyring_rolled_back
+sync.keyring_too_new
+sync.local
+sync.local.io
+sync.location_empty
+sync.location_taken
+sync.locked_new
+sync.looks_empty
+sync.merge_invalid
+sync.not_arrived
+sync.not_encrypted
+sync.off
+sync.passphrase_changed
+sync.passphrase_short
+sync.passphrase_wrong
+sync.place_changed
+sync.prefs_too_large
+sync.proxy_unusable
+sync.s3.bad_listing
+sync.s3.sign
+sync.shutting_down
+sync.stale
+sync.store.bad_path
+sync.store.denied
+sync.store.exists
+sync.store.server_error
+sync.store.too_large
+sync.store.unexpected
+sync.store.unreachable
+sync.take_not_allowed
+sync.too_new
+sync.too_new_unknown
+sync.version_gone
+sync.webdav.bad_listing
+sync.webdav.bad_url
+sync.webdav.root_missing
+sync.write_section
 t.auth test
 t.boom test
 t.broke test
 t.limited test
 t.plugin_threw test
+t.prefs test
 t.upstream test
 t.x test
 yaml.anchor_or_alias

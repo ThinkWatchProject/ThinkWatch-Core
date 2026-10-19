@@ -524,7 +524,7 @@ for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=36000
 done
 
 for ep in /status /overview /summary /history /latency /latency/provider /latency/client /storage /quota /security \
-          /security/events /sessions /diagnostics /config /config/history /models /in-flight /live \
+          /security/events /sessions /diagnostics /config /config/items /backups /client-prefs /models /in-flight /live \
           /upstreams/health /plugins; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"

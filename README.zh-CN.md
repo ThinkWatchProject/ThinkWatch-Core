@@ -93,6 +93,7 @@ twcore control-key --rotate     # 更换密钥；用旧密钥建立的连接随�
 | `tw-observe` | 事件总线 |
 | `tw-gateway` | 数据面：一个请求的完整生命周期 |
 | `tw-plugin` | 脚本插件的沙箱：编成 WebAssembly 的 QuickJS，由 Wasmtime 运行 |
+| `tw-pack` | 配置包（`.twconfig`）：格式、加密、本机备份，以及导入与同步共同比较的项目模型 |
 | `tw-control` | 控制面服务 |
 
 ThinkWatch 企业版只依赖前四个 crate，这四个 crate 也只相互依赖；CI 会针对它们的每一次改动检查企业版能否编译。ThinkWatch Lite 把 `tw-api`、`tw-types`、`tw-yaml`、`tw-guard`、`tw-watch` 和 `tw-link` 固定在某个 Release 的 tag 上，并打包同一 Release 的 `twcore`。接管 AI 客户端和扫描其配置在 Lite 中完成，作用于应用所在的机器；`twcore` 只为每个客户端签发专用的网关密钥。二进制的源码位于 `bin/twcore`。只有 `tw-gateway` 和 `twcore` 可以依赖 `tw-plugin`——它是唯一一个构建时除了 Rust 还需要别的工具的 crate（见下文），因此用这些 crate 构建 Lite 或企业版时都不需要。

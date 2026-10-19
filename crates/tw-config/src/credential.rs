@@ -541,9 +541,16 @@ impl Provider {
     }
 
     /// 凭据写法对不对。**不联网，不读环境变量** —— 那是转发时的事。
+    ///
+    /// **停用着的上游可以缺凭据**：密钥、OAuth、AWS 访问密钥空着，ChatGPT 账号还没登录。
+    /// 导入一个不带密钥的配置包、别的设备传来一家 ChatGPT 账号上游时就是这样 —— 上游先
+    /// 停用着进来，填上密钥（登录）之后才启用得了。写法上的毛病（请求头写错、两种凭据
+    /// 都写了）照样不收
     pub fn check_credential(&self) -> Result<(), CredentialError> {
+        let waiting = self.disabled;
         if let Some(k) = &self.key
             && k.is_blank()
+            && !waiting
         {
             return Err(CredentialError::EmptyKey);
         }
@@ -552,7 +559,7 @@ impl Provider {
             if self.key.is_some() {
                 return Err(CredentialError::KeyAndOauth);
             }
-            if o.refresh.trim().is_empty() || o.endpoint.trim().is_empty() {
+            if (o.refresh.trim().is_empty() && !waiting) || o.endpoint.trim().is_empty() {
                 return Err(CredentialError::EmptyOauth);
             }
             // **订阅账号的令牌不接。**Anthropic 规定 Claude 订阅的 OAuth 令牌不得由
@@ -574,7 +581,8 @@ impl Provider {
         }
         // **Codex 后端只认登录拿到的凭据**，API 密钥发过去只会是一个 401
         let chatgpt = self.effective_protocol() == Some(Protocol::Chatgpt);
-        if chatgpt && crate::chatgpt::is_backend(&self.base_url) && self.oauth.is_none() {
+        if chatgpt && crate::chatgpt::is_backend(&self.base_url) && self.oauth.is_none() && !waiting
+        {
             return Err(CredentialError::ChatgptWithoutLogin);
         }
         // 接 ChatGPT 账号的前提是如实说明请求来自 ThinkWatch：转发客户端的身份就是冒充它
@@ -657,9 +665,10 @@ impl Provider {
                 Some(_) => {}
                 None => {
                     let blank = |s: &Option<Secret>| s.as_ref().is_none_or(Secret::is_blank);
-                    if blank(&aws.access_key_id)
-                        || blank(&aws.secret_access_key)
-                        || aws.session_token.as_ref().is_some_and(Secret::is_blank)
+                    if !self.disabled
+                        && (blank(&aws.access_key_id)
+                            || blank(&aws.secret_access_key)
+                            || aws.session_token.as_ref().is_some_and(Secret::is_blank))
                     {
                         return Err(CredentialError::AwsEmpty);
                     }
@@ -962,6 +971,27 @@ mod tests {
         let mut lookalike = p("name: l\nbase_url: https://notanthropic.com/api.anthropic.com\n");
         lookalike.oauth = Some(oauth());
         lookalike.check_credential().unwrap();
+    }
+
+    /// 停用着的上游可以缺凭据（导入时没带密钥、别的设备上登录的 ChatGPT 账号）；启用就不行。
+    /// 写法上的毛病照样不收
+    #[test]
+    fn a_disabled_upstream_may_wait_for_its_credential() {
+        for yaml in [
+            "name: k\nbase_url: https://relay.example\nkey: ''\n",
+            "name: c\nbase_url: https://chatgpt.com/backend-api/codex\n",
+            "name: o\nbase_url: https://relay.example\noauth: { refresh: '', endpoint: https://t.example }\n",
+            "name: b\nbase_url: https://bedrock-runtime.us-east-1.amazonaws.com\naws: { access_key_id: '', secret_access_key: '' }\n",
+        ] {
+            assert!(p(yaml).check_credential().is_err(), "{yaml}");
+            let off = p(&format!("{yaml}disabled: true\n"));
+            off.check_credential()
+                .unwrap_or_else(|e| panic!("{yaml}: {e}"));
+        }
+        let both = p(
+            "name: x\nbase_url: https://relay.example\nkey: ''\noauth: { refresh: r, endpoint: https://t.example }\ndisabled: true\n",
+        );
+        assert_eq!(both.check_credential(), Err(CredentialError::KeyAndOauth));
     }
 
     #[test]

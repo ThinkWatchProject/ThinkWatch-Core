@@ -27,6 +27,12 @@ pub struct ConfigManager {
     rejected: std::sync::Mutex<Option<tw_api::ConfigRejection>>,
     /// 每换入一份配置响一次（[`Self::applied`]）。默认插件那一路等着它
     applied: tokio::sync::Notify,
+    /// 固定密钥：本机接管的客户端在用的网关密钥，桌面端报上来（`PUT /pinned-keys`）
+    pinned: std::sync::Mutex<std::collections::BTreeMap<String, tw_pack::disk::PinnedSource>>,
+    /// 同步位置上的备份版本。没开同步是 None
+    remote: std::sync::RwLock<Option<Arc<dyn crate::backups::RemoteBackups>>>,
+    /// 这份配置的同步服务，第一次用到时建（见 `crate::sync::service`）
+    sync: std::sync::OnceLock<Arc<crate::sync::Sync>>,
 }
 
 /// 一次配置改动没成的原因。
@@ -111,6 +117,9 @@ impl ConfigManager {
         let seen = store::read(&path).ok().map(|l| l.fingerprint);
         // 插件文件的路径相对配置文件所在的目录：**知道配置在哪儿的是这里**，告诉网关一声
         gateway.set_config_dir(crate::plugins::dir_of(&path));
+        // 配置包、备份按「代码」「数据」分开比较插件，要插件那一套来拆
+        crate::backups::install_codec();
+        let pinned = tw_pack::disk::read_pinned_sources(&path);
         Self {
             path,
             gateway,
@@ -118,6 +127,9 @@ impl ConfigManager {
             seen: Mutex::new(seen),
             rejected: std::sync::Mutex::new(None),
             applied: tokio::sync::Notify::new(),
+            pinned: std::sync::Mutex::new(pinned),
+            remote: std::sync::RwLock::new(None),
+            sync: std::sync::OnceLock::new(),
         }
     }
 
@@ -138,6 +150,16 @@ impl ConfigManager {
             });
         }
         self
+    }
+
+    /// 同步服务放在这里（`crate::sync::service`）
+    pub(crate) fn sync_slot(&self) -> &std::sync::OnceLock<Arc<crate::sync::Sync>> {
+        &self.sync
+    }
+
+    /// 事件总线
+    pub fn bus(&self) -> &tw_observe::EventBus {
+        &self.bus
     }
 
     /// 数据面。管理面里要碰插件文件、编插件的那几处从这里拿
@@ -243,7 +265,7 @@ impl ConfigManager {
         // 之后的效果是「每个存在过的版本各一条」，最新那条就是现在跑
         // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。
         self.set_rejected(None);
-        let _ = tw_config::history::snapshot(&self.path, text, origin);
+        self.backup(tw_pack::backup::record(&self.path, text, origin));
         let version = store::version_of(text);
         tracing::info!(%version, origin = origin.slug(), "the configuration is in effect");
         self.applied.notify_one();
@@ -299,9 +321,11 @@ impl ConfigManager {
         {
             return Err(ApplyError::RemoteControlLocked);
         }
-        // 改之前那一版进历史。**这一步在写盘之前** —— 写完再存的话，
+        // 改之前那一版留一个备份版本。**这一步在写盘之前** —— 写完再存的话，
         // 中间崩一次就永远丢了那一版，而那恰恰是最需要它的时刻。
-        let _ = tw_config::history::snapshot(&self.path, &cur.text, origin);
+        self.backup(tw_pack::backup::record_before(
+            &self.path, &cur.text, origin,
+        ));
         // 写盘之前再确认一次磁盘还是我们读到的那份 —— 绝不静默覆盖手改
         let fp = store::write_if_unchanged(&self.path, &cur.fingerprint, new_text)?;
         // **先记指纹再换入。**顺序反了的话，文件事件可能在记指纹之前就
@@ -338,34 +362,72 @@ impl ConfigManager {
         self.write(&text, Some(&cur.version()), origin).await
     }
 
-    /// 回到某一版。
-    pub async fn rollback(&self, version: &str) -> Result<String, ApplyError> {
-        let text = self.rollback_text(version)?;
-        let cur = self.current().ok();
-        // 回滚也走同一条写入路径，所以它同样会：校验、存历史、防回环。
-        self.write(
-            &text,
-            cur.as_ref().map(|c| c.version()).as_deref(),
-            Origin::Rollback,
-        )
-        .await
+    /// 留备份版本没成：记一行，不挡这次写入 —— 配置本身已经写下去了
+    fn backup(&self, r: Result<Option<tw_pack::backup::Backup>, tw_pack::backup::BackupError>) {
+        if let Err(e) = r {
+            tracing::warn!("a backup version could not be kept: {e}");
+        }
     }
 
-    /// 回滚要写回去的那一版原文。**不写**：控制面先看过它（插件那一节，见
-    /// `plugins::guard_raw_write`）再写
-    pub fn rollback_text(&self, version: &str) -> Result<String, ApplyError> {
-        let all = tw_config::history::list(&self.path)?;
-        let target = all
-            .iter()
-            .rev()
-            .find(|v| v.version == version || v.version.ends_with(version))
-            .ok_or_else(|| {
-                ApplyError::BadPath(msg!(
-                    "control.no_such_version", version = version =>
-                    "the version history has no {version}"
-                ))
-            })?;
-        Ok(tw_config::history::read(target)?)
+    /// 启动时：磁盘上此刻的样子和最新的备份版本不一样就留一版（第一次运行、升级之后、core
+    /// 没在跑时命令行改过）。来源记成外部改动 —— 说不清是谁改的
+    pub fn record_startup(&self) {
+        // 写插件文件和写配置之间断过电：插件文件先从备份里找回来
+        let healed = tw_pack::backup::heal_plugins(&self.path);
+        if !healed.is_empty() {
+            tracing::warn!(
+                plugins = ?healed,
+                "plugin files that did not match the configuration were put back from a backup"
+            );
+            // 网关已经照找回来之前的文件读过插件（对不上的停用了）：照找回来的重读一遍
+            self.gateway.reload_plugins();
+        }
+        if let Ok(cur) = self.current() {
+            self.backup(tw_pack::backup::record(
+                &self.path,
+                &cur.text,
+                Origin::External,
+            ));
+        }
+    }
+
+    /// 本机接管的客户端在用的网关密钥（固定密钥）：各个来源报上来的并集。恢复、导入、同步
+    /// 不删它们
+    pub fn pinned_keys(&self) -> std::collections::BTreeSet<String> {
+        self.pinned
+            .lock()
+            .map(|g| tw_pack::disk::pinned_union(&g))
+            .unwrap_or_default()
+    }
+
+    /// 一个来源（一个 Lite）报上来它的固定密钥：换掉它上次报的，存进数据目录
+    /// （`pinned-keys.json`），重启之后还在。**读、改、写都在锁里**：两个 Lite 同时报，
+    /// 谁也不会盖掉谁的
+    pub fn set_pinned_keys(
+        &self,
+        source: &str,
+        names: std::collections::BTreeSet<String>,
+    ) -> Result<(), PinnedError> {
+        let mut g = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = tw_pack::disk::with_pinned(&g, source, &names, now_ms())
+            .map_err(PinnedError::TooLarge)?;
+        tw_pack::disk::write_pinned_sources(&self.path, &next).map_err(PinnedError::Io)?;
+        *g = next;
+        Ok(())
+    }
+
+    /// 同步位置上的版本（开着同步时由同步那一路装上，关掉时换成 None）
+    pub fn set_remote_backups(&self, r: Option<Arc<dyn crate::backups::RemoteBackups>>) {
+        if let Ok(mut g) = self.remote.write() {
+            *g = r;
+        }
+    }
+
+    pub fn remote_backups(&self) -> Option<Arc<dyn crate::backups::RemoteBackups>> {
+        self.remote.read().ok().and_then(|g| g.clone())
     }
 
     /// 记下一个不是我们写的指纹。**首次运行生成配置之后要调它** ——
@@ -584,6 +646,14 @@ impl ConfigManager {
 
 fn bad_path(e: tw_yaml::PatchError) -> ApplyError {
     ApplyError::BadPath(e.msg())
+}
+
+/// 存固定密钥没成。
+#[derive(Debug)]
+pub enum PinnedError {
+    /// 报上来的超出了上限（[`tw_pack::disk::PINNED_SOURCE_MAX`] 这几个）
+    TooLarge(tw_pack::disk::PinnedTooLarge),
+    Io(std::io::Error),
 }
 
 #[cfg(test)]

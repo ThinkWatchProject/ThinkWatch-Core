@@ -7,7 +7,7 @@
 //! 说明写给手写配置文件的人：这个字段管什么、不写是什么意思、写错了会怎样。
 //! 两种语言各写一遍，**不是互译的字面对照**，各自按各自的习惯说。
 
-use super::{Def, Kind, Lang, Row, Section, T2};
+use super::{Def, Kind, Lang, Row, Section, T2, Ty};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
@@ -86,6 +86,49 @@ fn balance_bys() -> Vec<&'static str> {
 fn limit_pers() -> Vec<&'static str> {
     super::fields::<LimitPer>()
 }
+
+/// 同步位置三种写法各自的字段。`target` 是按 `type` 分的枚举，问 serde 要字段的办法问不出
+/// 枚举每一种的字段，所以借它的报错：写一个不存在的字段，serde 说出这一种认得的全部字段
+fn target_fields(kind: &str) -> Vec<&'static str> {
+    let e = serde_yaml_ng::from_str::<tw_config::sync::Target>(&format!(
+        "type: {kind}\n__probe__: 1\n"
+    ))
+    .expect_err("an unknown field is refused")
+    .to_string();
+    let expected = e
+        .split("expected")
+        .nth(1)
+        .unwrap_or_else(|| panic!("serde did not list the fields: {e}"));
+    let mut out: Vec<&'static str> = vec!["type"];
+    out.extend(
+        expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|f| &*Box::leak(f.to_string().into_boxed_str())),
+    );
+    out
+}
+fn folder_fields() -> Vec<&'static str> {
+    target_fields("folder")
+}
+fn webdav_fields() -> Vec<&'static str> {
+    target_fields("webdav")
+}
+fn s3_fields() -> Vec<&'static str> {
+    target_fields("s3")
+}
+fn target_type() -> Vec<&'static str> {
+    vec!["type"]
+}
+fn target_types() -> Vec<&'static str> {
+    vec!["folder", "webdav", "s3"]
+}
+
+const PROXY_DOC: T2 = t(
+    "Where requests to the sync location go out: `direct`, `system` (the system proxy), or the name of a proxy under `proxies`. An `http://` address on this machine or the local network has to be `direct`.",
+    "访问同步位置的请求从哪里出去：`direct`（直连）、`system`（跟随系统代理），或者 `proxies` 里一个代理的名字。本机、内网的 `http://` 地址只能是 `direct`。",
+);
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
 const MODE_DOC: T2 = t(
@@ -261,6 +304,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Script plugins, in the order they run. The app installs them; each one's code and settings are a file next to this one.",
                         "脚本插件，按运行的顺序。由应用安装，每个插件的代码和设置是本文件旁边的一个文件。",
+                    ),
+                ),
+                row(
+                    "sync",
+                    Kind::Obj("sync"),
+                    Def::Unset,
+                    t(
+                        "Multi-device sync. A local setting: configuration packs and other devices never carry it, and restoring a backup keeps the current one. Unset: sync is off.",
+                        "多设备同步。属于本机设置：配置包和其他设备不会带走它，恢复备份时保留当前值。不写：不同步。",
                     ),
                 ),
             ],
@@ -535,8 +587,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`.",
-                        "接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。",
+                        "Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. No backslashes, and no user name or password before the host (credentials go in `key` or `headers`).",
+                        "接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。地址中不能有反斜杠，主机前不能写用户名或密码（凭据写在 `key` 或 `headers` 中）。",
                     ),
                 ),
                 row(
@@ -1827,6 +1879,210 @@ pub fn sections() -> Vec<Section> {
                         "是否运行这个插件。`false`：插件保留，不参与任何请求。",
                     ),
                 ),
+            ],
+        },
+        // ── sync ──────────────────────────────────────────────
+        Section {
+            path: "sync",
+            ty: checked!(
+                tw_config::sync::Sync,
+                "{device_id: 3f9a2c1e-0b1d-4e2f-9a3b-5c6d7e8f9a0b, device_name: Mac mini, target: {type: folder, path: /sync}}"
+            ),
+            rows: vec![
+                row(
+                    "device_id",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "Generated when sync is turned on. File names at the sync location show its first 8 characters.",
+                        "开启同步时生成。同步位置上的文件名里出现的是它的前 8 个字符。",
+                    ),
+                ),
+                row(
+                    "device_name",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "Shown in the device list of every device that syncs here.",
+                        "在每台参与同步的设备的设备列表里显示的名字。",
+                    ),
+                ),
+                row(
+                    "encrypt",
+                    Kind::Bool,
+                    Def::Is("true"),
+                    t(
+                        "Encrypt what goes to the sync location with the sync passphrase. Every device at one location uses the same setting; change it in the app, which re-uploads the latest version.",
+                        "以同步口令加密存到同步位置的内容。同一同步位置上的所有设备采用同一设置；在应用里更改，应用会重新上传最新版本。",
+                    ),
+                ),
+                row(
+                    "passphrase",
+                    Kind::Str,
+                    Def::Unset,
+                    t(
+                        "The sync passphrase; required when `encrypt` is on, and kept after encryption is turned off: the keyring that says it is off is checked with it. Kept here in the clear, like the other keys in this file.",
+                        "同步口令，`encrypt` 开着时必填；关闭加密之后也留着：同步位置上写着「已关闭」的 keyring 要用它核对。和本文件里的其他密钥一样以明文保存。",
+                    ),
+                ),
+                row(
+                    "exclude",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Upstreams, by name, that are not synced: they are not uploaded and another device's upstream of the same name does not replace them. Routes, aliases and groups that refer to them are not synced either.",
+                        "不同步的上游，按名字：不上传，也不被其他设备的同名上游覆盖。引用它们的路由、别名、分组随之不同步。",
+                    ),
+                ),
+                row(
+                    "target",
+                    Kind::Obj("sync.target"),
+                    Def::Required,
+                    t(
+                        "The sync location. The keyring, `versions/` and `devices/` live directly in it.",
+                        "同步位置。`keyring`、`versions/`、`devices/` 直接放在它里面。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "sync.target",
+            ty: Ty::Code {
+                fields: target_type,
+                same: super::same_as_omitted::<tw_config::sync::Target>,
+                parses_without: super::parses_without::<tw_config::sync::Target>,
+                minimal: "{type: folder}",
+            },
+            rows: vec![row(
+                "type",
+                Kind::Enum(target_types),
+                Def::Required,
+                t(
+                    "Which kind of location; the other fields depend on it, see the three tables below.",
+                    "同步位置的种类；其余字段随之不同，见下面三张表。",
+                ),
+            )],
+        },
+        Section {
+            path: "sync.target (folder)",
+            ty: Ty::Code {
+                fields: folder_fields,
+                same: super::same_as_omitted::<tw_config::sync::Target>,
+                parses_without: super::parses_without::<tw_config::sync::Target>,
+                minimal: "{type: folder, path: /sync}",
+            },
+            rows: vec![
+                row("type", Kind::Str, Def::Required, t("`folder`", "`folder`")),
+                row(
+                    "path",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "An absolute path on the machine core runs on: a folder that iCloud Drive, Dropbox, OneDrive, Syncthing or a NAS share carries between devices.",
+                        "core 所在机器上的绝对路径：由 iCloud Drive、Dropbox、OneDrive、Syncthing 或 NAS 共享在设备之间传送的文件夹。",
+                    ),
+                ),
+                row(
+                    "proxy",
+                    Kind::Str,
+                    Def::Is("direct"),
+                    t("Not used for a folder.", "文件夹用不到。"),
+                ),
+            ],
+        },
+        Section {
+            path: "sync.target (webdav)",
+            ty: Ty::Code {
+                fields: webdav_fields,
+                same: super::same_as_omitted::<tw_config::sync::Target>,
+                parses_without: super::parses_without::<tw_config::sync::Target>,
+                minimal: "{type: webdav, url: 'https://dav.example.com/ThinkWatch'}",
+            },
+            rows: vec![
+                row("type", Kind::Str, Def::Required, t("`webdav`", "`webdav`")),
+                row(
+                    "url",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The WebDAV address of the folder. `https://`, with the certificate checked; `http://` only for this machine and the local network.",
+                        "文件夹的 WebDAV 地址。`https://`，校验证书；`http://` 只用于本机和局域网。",
+                    ),
+                ),
+                row(
+                    "user",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t("User name.", "用户名。"),
+                ),
+                row(
+                    "pass",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t(
+                        "Password, or the app password the service issues for WebDAV.",
+                        "密码，或者服务为 WebDAV 签发的应用密码。",
+                    ),
+                ),
+                row("proxy", Kind::Str, Def::Is("direct"), PROXY_DOC),
+            ],
+        },
+        Section {
+            path: "sync.target (s3)",
+            ty: Ty::Code {
+                fields: s3_fields,
+                same: super::same_as_omitted::<tw_config::sync::Target>,
+                parses_without: super::parses_without::<tw_config::sync::Target>,
+                minimal: "{type: s3, endpoint: 'https://s3.us-east-1.amazonaws.com', region: us-east-1, bucket: tw-sync, access_key_id: AK, secret_access_key: SK}",
+            },
+            rows: vec![
+                row("type", Kind::Str, Def::Required, t("`s3`", "`s3`")),
+                row(
+                    "endpoint",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The S3 endpoint. Hosts ending in `amazonaws.com`, `aliyuncs.com` or `myqcloud.com` put the bucket in the host name; every other endpoint (Cloudflare R2, MinIO, an address) puts it in the path. `http://` only for this machine and the local network.",
+                        "S3 端点。主机以 `amazonaws.com`、`aliyuncs.com`、`myqcloud.com` 结尾的，存储桶名放进域名；其余端点（Cloudflare R2、MinIO、IP 地址）放进路径。`http://` 只用于本机和局域网。",
+                    ),
+                ),
+                row(
+                    "region",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The signing region; `auto` for Cloudflare R2.",
+                        "签名用的区域；Cloudflare R2 填 `auto`。",
+                    ),
+                ),
+                row(
+                    "bucket",
+                    Kind::Str,
+                    Def::Required,
+                    t("The bucket. Keep it private.", "存储桶，建议设为私有。"),
+                ),
+                row(
+                    "prefix",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t(
+                        "A folder inside the bucket. No `..` parts, and not starting with `/`.",
+                        "存储桶里的一个前缀（文件夹）。不能有 `..`，不以 `/` 开头。",
+                    ),
+                ),
+                row(
+                    "access_key_id",
+                    Kind::Str,
+                    Def::Required,
+                    t("Access key ID.", "Access Key ID。"),
+                ),
+                row(
+                    "secret_access_key",
+                    Kind::Str,
+                    Def::Required,
+                    t("Secret access key.", "Secret Access Key。"),
+                ),
+                row("proxy", Kind::Str, Def::Is("direct"), PROXY_DOC),
             ],
         },
     ]
