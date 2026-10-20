@@ -185,7 +185,8 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
     assert_eq!(f["failures_to_pause"], 3, "{body}");
     assert_eq!(f["pause_secs"], 60);
     assert_eq!(f["idle_timeout_secs"], 300);
-    assert_eq!(f["slot_wait_secs"], 30);
+    assert_eq!(f["wait_secs"], 120);
+    assert!(f.get("slot_wait_secs").is_none(), "{body}");
     assert!(f.get("stream_start_wait_secs").is_none(), "{body}");
     assert!(f.get("next_on_slow_start").is_none(), "{body}");
 
@@ -224,12 +225,12 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
         "PATCH",
         "/config",
         serde_json::json!({
-            "ops": [{ "op": "replace", "path": "/failover/slot_wait_secs", "value": 0 }],
+            "ops": [{ "op": "replace", "path": "/failover/wait_secs", "value": 0 }],
         }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    assert_eq!(b.parsed().failover.slot_wait_secs, 0);
+    assert_eq!(b.parsed().failover.wait_secs, 0);
 }
 
 /// 无响应超时：概览给出真在用的数，改了就生效；删掉的两项写不进去

@@ -348,12 +348,14 @@ fn to_client(
     })
 }
 
-/// 界面上的一条上限 → 配置里的写法。费用在界面上是微分，配置里写美元
-fn limit(l: &tw_api::KeyLimitInput) -> tw_config::KeyLimit {
+/// 界面上的一条上限 → 配置里的写法。费用在界面上是微分，配置里写美元。`every` 是 1 的不写
+/// （那是默认）；别的照写，范围由校验说。密钥的、上游的都用它
+pub(crate) fn limit(l: &tw_api::KeyLimitInput) -> tw_config::KeyLimit {
     let max = l.max.min(i64::MAX as u64) as i64;
     let is = |m: tw_api::LimitMeasure| l.measure == m;
     tw_config::KeyLimit {
         per: l.per.into(),
+        every: (l.every != 1).then_some(l.every),
         requests: is(tw_api::LimitMeasure::Requests).then_some(max),
         tokens: is(tw_api::LimitMeasure::Tokens).then_some(max),
         cost: is(tw_api::LimitMeasure::Cost).then(|| max as f64 / 1_000_000.0),

@@ -141,31 +141,39 @@ fn used_up_reset(headers: &HeaderMap, now_ms: u64) -> Option<Option<u64>> {
     Some(full.iter().filter_map(|w| w.resets_at_ms).max())
 }
 
-/// `Retry-After`：秒数，或者一个 HTTP 日期。
+/// 按秒说的「多久之后再来」短于这个的当没说（`Retry-After: 0`、`"retryDelay": "0s"`）：照它
+/// 暂停等于不暂停，被限流的请求当场又发、又被限流，一直空转到等待期限（见 [`crate::throttle`]）
+pub const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// `Retry-After`：秒数，或者一个 HTTP 日期。不到一秒（[`MIN_RETRY_AFTER`]）的当没说
 pub fn retry_after(headers: &HeaderMap, now_ms: u64) -> Option<Duration> {
     let v = headers
         .get(http::header::RETRY_AFTER)?
         .to_str()
         .ok()?
         .trim();
-    if let Ok(secs) = v.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    let at = chrono::DateTime::parse_from_rfc2822(v)
-        .ok()?
-        .timestamp_millis();
-    let left = u64::try_from(at).ok()?.checked_sub(now_ms)?;
-    Some(Duration::from_millis(left))
+    let left = match v.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => {
+            let at = chrono::DateTime::parse_from_rfc2822(v)
+                .ok()?
+                .timestamp_millis();
+            Duration::from_millis(u64::try_from(at).ok()?.checked_sub(now_ms)?)
+        }
+    };
+    (left >= MIN_RETRY_AFTER).then_some(left)
 }
 
-/// Gemini 把「多久之后再来」写在正文里：`"retryDelay": "33s"`。
-fn retry_delay_in_body(body: &[u8]) -> Option<Duration> {
+/// Gemini 把「多久之后再来」写在正文里：`"retryDelay": "33s"`。不到一秒的当没说；大得离谱的
+/// 照最长的算（交给调用方封顶），**不能让换算 panic**
+pub fn retry_delay_in_body(body: &[u8]) -> Option<Duration> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let details = v.pointer("/error/details")?.as_array()?;
     details.iter().find_map(|d| {
         let s = d.get("retryDelay")?.as_str()?;
         let secs: f64 = s.strip_suffix('s')?.parse().ok()?;
-        (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+        (secs.is_finite() && secs >= MIN_RETRY_AFTER.as_secs_f64())
+            .then(|| Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX))
     })
 }
 
@@ -345,6 +353,29 @@ mod tests {
             verdict(500, "余额不足"),
             Verdict::Failed(Cause::NoBalance),
             "有的中转把没钱了报成 500"
+        );
+    }
+
+    #[test]
+    fn a_retry_after_under_a_second_counts_as_unsaid_and_an_absurd_one_does_not_panic() {
+        // 照 0 秒暂停等于不暂停：当没说，按退避算
+        let h = headers(&[("retry-after", "0")]);
+        assert_eq!(retry_after(&h, NOW), None);
+        let past = chrono::DateTime::from_timestamp_millis((NOW - 5_000) as i64)
+            .unwrap()
+            .to_rfc2822();
+        assert_eq!(retry_after(&headers(&[("retry-after", &past)]), NOW), None);
+        let body = |d: &str| format!(r#"{{"error":{{"details":[{{"retryDelay":"{d}"}}]}}}}"#);
+        assert_eq!(retry_delay_in_body(body("0s").as_bytes()), None);
+        assert_eq!(retry_delay_in_body(body("0.5s").as_bytes()), None);
+        assert_eq!(
+            retry_delay_in_body(body("1.5s").as_bytes()),
+            Some(Duration::from_millis(1500))
+        );
+        // 大得离谱的照最长的算，由调用方封顶
+        assert_eq!(
+            retry_delay_in_body(body("1e300s").as_bytes()),
+            Some(Duration::MAX)
         );
     }
 

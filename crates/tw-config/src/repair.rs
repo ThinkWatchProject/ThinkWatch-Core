@@ -279,6 +279,26 @@ mod tests {
         assert_eq!(repair(&only).unwrap().text, GOOD);
     }
 
+    /// `slot_wait_secs` 改名成了 `wait_secs`（不只等空位了，也等限流暂停、用量上限）：写着旧名的
+    /// 老配置读不进来，一键修复删掉它。**旧值不搬过去**：等待照新的默认值走
+    #[test]
+    fn the_renamed_slot_wait_is_offered_for_deletion_without_carrying_its_value() {
+        let bad = format!("{GOOD}failover:\n  pause_secs: 90\n  slot_wait_secs: 45\n");
+        let r = repair(&bad).expect("该修得了");
+        let got: Vec<_> = r
+            .fixes
+            .iter()
+            .map(|f| (f.kind, f.field.as_str(), f.value.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(FixKind::UnknownField, "failover.slot_wait_secs", Some("45"))]
+        );
+        assert_eq!(r.text, format!("{GOOD}failover:\n  pause_secs: 90\n"));
+        let cfg = try_parse(&r.text).unwrap();
+        assert_eq!(cfg.failover.wait_secs, 120);
+    }
+
     #[test]
     fn a_misspelled_field_in_a_list_item_is_removed() {
         let bad = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\n    colour: red\n";

@@ -1,10 +1,14 @@
-//! 一把网关密钥的用量上限：每分钟、每小时、每天、每周、每月最多多少个请求、多少 token、
-//! 花多少钱。
+//! 用量上限：每 N 分钟、每 N 小时、每天、每周、每月最多多少个请求、多少 token、花多少钱。
 //!
-//! **上限挂在密钥上**，不挂在上游上：要管住的是「这台机器上的这个脚本」，不是「这家
-//! 上游」。一把密钥可以有好几条，**每一条都要过**。
+//! **同一种写法挂在两处**，管的是两件事：
 //!
-//! 怎么数、怎么等、到了怎么拒，在 `tw_gateway::key_limits`；这里只有写法。
+//! - 网关密钥上（`clients[].limits`）：管住「这台机器上的这个脚本」。到了就拒绝这把密钥的
+//!   请求，见 `tw_gateway::key_limits`。
+//! - 上游上（`providers[].limits`）：照着那家上游自己的限额写（中转站、订阅套餐常有「每
+//!   5 小时多少次」）。到了就不往那家发，换下一家或者等它空出来，见
+//!   `tw_gateway::upstream_limits`。
+//!
+//! 一处可以有好几条，**每一条都要过**。这里只有写法。
 
 use serde::{Deserialize, Serialize};
 
@@ -32,11 +36,22 @@ impl LimitPer {
         }
     }
 
-    /// 滚动的那两种：窗口多长，毫秒。自然周期是 None
+    /// 滚动的那两种：一个单位多长，毫秒。自然周期是 None。一条上限的窗口还要乘上它的
+    /// `every`，见 [`KeyLimit::window_ms`]
     pub fn rolling_ms(&self) -> Option<i64> {
         match self {
             LimitPer::Minute => Some(60_000),
             LimitPer::Hour => Some(3_600_000),
+            _ => None,
+        }
+    }
+
+    /// `every` 最多写多少：一小时以内的分钟、一天以内的小时。再长就是写天。自然周期不能写
+    /// `every`，是 None
+    pub fn every_max(&self) -> Option<u32> {
+        match self {
+            LimitPer::Minute => Some(60),
+            LimitPer::Hour => Some(24),
             _ => None,
         }
     }
@@ -60,15 +75,23 @@ impl LimitMeasure {
     }
 }
 
-/// 一条上限：`{ per: day, cost: 5 }`。**一条只写一种量**（请求数、token、费用三选一），
-/// 校验时查。
+/// 一条上限：`{ per: day, cost: 5 }`、`{ per: hour, every: 5, requests: 300 }`。**一条只写
+/// 一种量**（请求数、token、费用三选一），校验时查。
 ///
 /// 三种量写成三个可选字段而不是 `{ measure: cost, max: 5 }`：手写的人读
 /// `requests: 30` 不用再对一遍哪个数是什么单位。
+///
+/// 名字里的 Key 是它先有的那一处；挂在上游上的是同一个类型（[`UsageLimit`]），写法、校验
+/// 一样
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyLimit {
     pub per: LimitPer,
+    /// 滚动窗口是几个单位：`per: hour, every: 5` 是最近 5 小时。**只有 `minute`（1 到 60）、
+    /// `hour`（1 到 24）能写**，不写是 1。天、周、月是自然的，没有「每 3 天」：三天从哪天
+    /// 算起说不清
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<u32>,
     /// 请求数。**写成有符号的**：写了负数时报的是「要大于 0」，不是一句解析器的话
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requests: Option<i64>,
@@ -84,7 +107,27 @@ pub struct KeyLimit {
     pub cache_reads: bool,
 }
 
+/// 挂在上游上的用量上限：和密钥的是同一种写法，换个名字读起来清楚
+pub type UsageLimit = KeyLimit;
+
 impl KeyLimit {
+    /// 滚动窗口是几个单位。不写是 1；自然周期一律是 1
+    pub fn every_or_one(&self) -> u32 {
+        match self.per.rolling_ms() {
+            Some(_) => self.every.unwrap_or(1),
+            None => 1,
+        }
+    }
+
+    /// 滚动窗口多长，毫秒：一个单位乘上 `every`。自然周期是 None。
+    ///
+    /// **数滚动窗口的地方一律用它**，不用 [`LimitPer::rolling_ms`]：那只是一个单位
+    pub fn window_ms(&self) -> Option<i64> {
+        self.per
+            .rolling_ms()
+            .map(|w| w.saturating_mul(i64::from(self.every_or_one().max(1))))
+    }
+
     /// 写了的那几种量。校验要求恰好一种
     pub fn measures(&self) -> Vec<LimitMeasure> {
         let mut out = Vec::new();
@@ -117,9 +160,11 @@ impl KeyLimit {
         }
     }
 
-    /// 两条算不算同一条：同一段时间、同一种量、缓存读算不算进去也一样
+    /// 两条算不算同一条：同一段时间（`every` 也一样）、同一种量、缓存读算不算进去也一样。
+    /// 每 1 小时和每 5 小时是两条：管的是两件事
     pub fn same_as(&self, other: &KeyLimit) -> bool {
         self.per == other.per
+            && self.every_or_one() == other.every_or_one()
             && self.measure() == other.measure()
             && self.cache_reads == other.cache_reads
     }
@@ -176,6 +221,7 @@ mod tests {
         // 默认值不写回去
         let out = serde_yaml_ng::to_string(&KeyLimit {
             per: LimitPer::Hour,
+            every: None,
             requests: Some(3),
             tokens: None,
             cost: None,
@@ -183,6 +229,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out.trim(), "per: hour\nrequests: 3");
+    }
+
+    #[test]
+    fn every_multiplies_the_rolling_window() {
+        let l: KeyLimit = serde_yaml_ng::from_str("{per: hour, every: 5, requests: 300}").unwrap();
+        assert_eq!(l.every, Some(5));
+        assert_eq!(l.window_ms(), Some(5 * 3_600_000));
+        let l: KeyLimit = serde_yaml_ng::from_str("{per: minute, requests: 30}").unwrap();
+        assert_eq!((l.every_or_one(), l.window_ms()), (1, Some(60_000)));
+        // 自然周期没有窗口；写了 every 的由校验拒，这里不当真
+        let l: KeyLimit = serde_yaml_ng::from_str("{per: day, every: 3, requests: 1}").unwrap();
+        assert_eq!((l.every_or_one(), l.window_ms()), (1, None));
+        // 每 1 小时和每 5 小时是两条；写明的 1 和不写是同一条
+        let one: KeyLimit = serde_yaml_ng::from_str("{per: hour, requests: 3}").unwrap();
+        let five: KeyLimit = serde_yaml_ng::from_str("{per: hour, every: 5, requests: 9}").unwrap();
+        let also_one: KeyLimit =
+            serde_yaml_ng::from_str("{per: hour, every: 1, requests: 9}").unwrap();
+        assert!(!one.same_as(&five));
+        assert!(one.same_as(&also_one));
+        // 不写不写回去，写了照写
+        assert!(!serde_yaml_ng::to_string(&one).unwrap().contains("every"));
+        assert!(
+            serde_yaml_ng::to_string(&five)
+                .unwrap()
+                .contains("every: 5")
+        );
     }
 
     #[test]

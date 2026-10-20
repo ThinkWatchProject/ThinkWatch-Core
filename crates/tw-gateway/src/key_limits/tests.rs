@@ -255,7 +255,7 @@ async fn a_rolling_minute_waits_for_its_next_slot_or_refuses() {
     assert_eq!(b.limits.clock.now_ms(), t0 + 60_000, "等到第一个滑出窗口");
 }
 
-/// 等待期限是整个请求的那一个（见 [`slot_wait`]），调用方给的是那一刻，不是从此刻起再给
+/// 等待期限是整个请求的那一个（见 [`request_wait`]），调用方给的是那一刻，不是从此刻起再给
 /// 一整段：期限之前空不出来的就拒
 #[tokio::test(start_paused = true)]
 async fn a_rolling_wait_ends_at_the_requests_own_deadline() {
@@ -297,6 +297,72 @@ async fn tokens_in_a_rolling_hour_count_when_they_are_settled() {
     assert_eq!(r.used, 1100);
     assert_eq!(r.retry_after_ms, 3_600_000);
     assert_eq!(r.msg().code, "gw.key_limit.tokens_rolling");
+}
+
+/// `every`：窗口是几个单位那么长。每 5 分钟 2 个请求，第一个要到 5 分钟时才滑出去
+#[tokio::test(start_paused = true)]
+async fn every_makes_the_rolling_window_that_many_units_long() {
+    let b = bed(
+        "2026-10-05T10:00:00+08:00",
+        "[{per: minute, every: 5, requests: 2}]",
+    );
+    let t0 = b.now();
+    b.run(1, Ask::default()).await.unwrap();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    b.run(2, Ask::default()).await.unwrap();
+    // 一分钟之后第一个还在窗口里：每分钟的话它已经滑出去了
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let r = b.try_admit(Ask::default()).await.unwrap_err();
+    assert_eq!(r.retry_after_ms, 180_000, "第一个在 5 分钟时滑出去");
+    let m = r.msg();
+    assert_eq!(m.code, "gw.key_limit.requests_every");
+    assert_eq!(m.arg("every"), "5");
+    assert_eq!(
+        m.text,
+        "Gateway key `k` has reached its limit of 2 requests every 5 minutes: 2 in the last 5 \
+         minutes. Try again in 180 s."
+    );
+    let v = b.limits.view("k", &b.set);
+    assert_eq!((v[0].every, v[0].used, v[0].reached), (5, 2, true));
+    // 等得到就等：到第一个滑出去为止
+    let hold = b
+        .limits
+        .admit("k", &b.set, Ask::default(), Duration::from_secs(200))
+        .await
+        .unwrap();
+    drop(hold);
+    assert_eq!(b.now(), t0 + 300_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_on_tokens_and_cost_names_its_window_too() {
+    let b = bed(
+        "2026-10-05T10:00:00+08:00",
+        "[{per: hour, every: 3, tokens: 100}, {per: hour, every: 2, cost: 1}]",
+    );
+    b.run(1, ask(0, 0)).await.unwrap();
+    b.done(1, row(60, 60, 0, 2_000_000));
+    let r = b.try_admit(Ask::default()).await.unwrap_err();
+    // 两条都满了：报等得久的那条
+    assert_eq!(r.retry_after_ms, 3 * 3_600_000);
+    assert_eq!(r.msg().code, "gw.key_limit.tokens_every");
+    // 两小时之后费用那条滑出去了，token 那条还满着
+    tokio::time::advance(Duration::from_secs(2 * 3600)).await;
+    let r = b.try_admit(Ask::default()).await.unwrap_err();
+    assert_eq!(r.retry_after_ms, 3_600_000);
+    let b = bed(
+        "2026-10-05T10:00:00+08:00",
+        "[{per: hour, every: 2, cost: 1}]",
+    );
+    b.run(1, ask(0, 0)).await.unwrap();
+    b.done(1, row(1, 1, 0, 1_500_000));
+    let m = b.try_admit(Ask::default()).await.unwrap_err().msg();
+    assert_eq!(m.code, "gw.key_limit.cost_every");
+    assert_eq!(
+        m.text,
+        "Gateway key `k` has reached its limit of $1.00 every 2 hours: $1.50 spent in the last 2 \
+         hours. Try again in 7200 s."
+    );
 }
 
 // ───────────────────────────────────────────────── 预留与结算
@@ -676,4 +742,5 @@ async fn the_view_says_how_much_is_left_and_when_it_resets() {
         (v[1].used, v[1].reached, v[1].resets_at_ms),
         (1, true, None)
     );
+    assert_eq!((v[0].every, v[1].every), (1, 1));
 }

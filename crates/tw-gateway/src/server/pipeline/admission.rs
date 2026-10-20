@@ -9,7 +9,7 @@
 //!    说清多久之后再来。过了就把这个请求记上，按输入估一个数占着，等存储层记下它那一行时
 //!    换成实数。
 //!
-//! **等待期限一个请求只有一个**：过了并发上限那一刻起算 `failover.slot_wait_secs`，这里等
+//! **等待期限一个请求只有一个**：过了并发上限那一刻起算 `failover.wait_secs`，这里等
 //! 滚动窗口的空位、之后等上游的空位（见 `hop`）都算在里面 —— 两段各给一份的话，一个请求能
 //! 等两倍那么久。并发上限那一段不算：它等前面的请求结束，不拒绝，等多久由客户端决定（见
 //! [`crate::limits`]）。
@@ -59,7 +59,7 @@ pub(super) async fn admit(
     }
     let pass = state.gate.acquire(&req.client_name, max_concurrent).await;
     // 等待期限从这里起算：之后的两段等待共用它
-    let wait_until = tokio::time::Instant::now() + crate::key_limits::slot_wait(&rt.config);
+    let wait_until = tokio::time::Instant::now() + crate::key_limits::request_wait(&rt.config);
     let ask = if limits.is_empty() {
         Ask::default()
     } else {

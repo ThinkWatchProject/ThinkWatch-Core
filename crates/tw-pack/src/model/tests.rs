@@ -49,6 +49,10 @@ providers:
     pricing: 中转
     models: [m1]
     max_concurrent: 4
+    limits:
+      - per: hour
+        every: 5
+        requests: 100
   - name: chatgpt
     base_url: https://chatgpt.com/backend-api/codex
     oauth:
@@ -206,7 +210,11 @@ fn an_upstream_splits_into_four_units_by_what_its_fields_are_about() {
     );
     assert_eq!(relay.units["models"], json!({"models": ["m1"]}));
     assert_eq!(relay.units["billing"], json!({"pricing": "中转"}));
-    assert_eq!(relay.units["other"], json!({"max_concurrent": 4}));
+    // 用量上限跟着上游走（分享、导出、同步都带着），和并发上限在同一个单位里
+    assert_eq!(
+        relay.units["other"],
+        json!({"max_concurrent": 4, "limits": [{"per": "hour", "every": 5, "requests": 100}]})
+    );
     // 写明的默认值（proxy: direct）和没写一样；请求头按写的顺序
     let official = &s.items[&id(ItemKind::Provider, "官方")];
     assert_eq!(

@@ -286,7 +286,7 @@ pub(super) async fn ws_upgrade(
                 &client_name,
                 limits,
                 Default::default(),
-                crate::key_limits::slot_wait(&rt.config),
+                crate::key_limits::request_wait(&rt.config),
             )
             .await
         {

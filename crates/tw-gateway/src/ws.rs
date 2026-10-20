@@ -847,8 +847,9 @@ pub(crate) async fn proxy(
         }
     };
     // 这一家接没接下这条连接，和 HTTP 那条路一跳的成败记在同一笔账上（见 `crate::health`）：
-    // 连不上、回了 5xx 是失败，凭据被拒、限流按原因停用，请求本身的问题算这一家答上了。每一轮
-    // 一行的连接接下了不记 —— 它的每一轮各记各的（见 `turn`）
+    // 连不上、回了 5xx 是失败，凭据被拒按原因停用，请求本身的问题算这一家答上了；回 429 的不是
+    // 失败，这一家暂停（见 `crate::throttle`）。每一轮一行的连接接下了不记 —— 它的每一轮各记
+    // 各的（见 `turn`）
     let change = match &connected {
         Ok(_) if turns.is_some() => None,
         Ok(_) => state.health.record_success(name),
@@ -860,6 +861,10 @@ pub(crate) async fn proxy(
             &[],
             crate::server::now_ms(),
         ) {
+            crate::failure::Verdict::Failed(crate::failure::Cause::RateLimited { retry_after }) => {
+                state.throttles.limited(name, hop_started, retry_after);
+                None
+            }
             crate::failure::Verdict::Failed(cause) => state.health.record_cause(name, cause),
             crate::failure::Verdict::ClientError => state.health.record_success(name),
         },

@@ -193,6 +193,37 @@ slug_enum! {
 }
 
 slug_enum! {
+    /// 一家上游为什么暂时发不出去（[`Throttle::kind`]）。
+    pub enum ThrottleKind {
+        /// 上游回了 429（不是额度用完）：这家暂停着，到 `until_ms` 为止。请求排队等它
+        RateLimited = "rate_limited",
+        /// 这家一条分钟、小时的用量上限（[`ProviderView::limits`]）满了：最近的用量滑出窗口
+        /// 之后又能发，`until_ms` 是算出来的那一刻。请求排队等它
+        WindowFull = "window_full",
+        /// 这家一条天、周、月的用量上限用完了：到下一期开始（`until_ms`）之前跳过它，不等
+        PeriodUsedUp = "period_used_up",
+    }
+}
+
+/// 一家上游暂时发不出去的状态（[`ProviderView::throttle`]、[`Event::ThrottleChanged`]）。
+///
+/// **不是失败**：上游没坏，不进熔断的账，也不算进成功率。几种同时成立时给 `until_ms` 最晚的
+/// 那一种 —— 到那一刻之前它都发不出去。只在内存里：core 重启之后限流的暂停没有了，滚动窗口
+/// 从空的开始，天、周、月照请求记录算回来。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Throttle {
+    pub kind: ThrottleKind,
+    /// 什么时候又能发（Unix 毫秒）。限流是暂停结束的时刻，`window_full` 是算出来的那一刻，
+    /// `period_used_up` 是下一期开始的时刻
+    pub until_ms: u64,
+    /// 是哪一条用量上限：[`ProviderView::limits`] 里的下标。`window_full` / `period_used_up`
+    /// 才有，限流没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+slug_enum! {
     /// 熔断器的状态变成了什么。
     pub enum BreakerState {
         /// 熔断中，不进候选链
@@ -492,6 +523,15 @@ slug_enum! {
         /// 它的并发数满了（`max_concurrent`）：这一跳没有发出去，换了下一家。只在尝试链里
         /// 出现（[`AttemptView::skipped`]）
         Busy = "busy",
+        /// 它回过 429，正暂停着（[`ThrottleKind::RateLimited`]）：这一跳没有发出去，换了下一家。
+        /// 只在尝试链里出现
+        Throttled = "throttled",
+        /// 它一条分钟、小时的用量上限满了（[`ThrottleKind::WindowFull`]）：这一跳没有发出去，换了
+        /// 下一家。只在尝试链里出现
+        WindowFull = "window_full",
+        /// 它一条天、周、月的用量上限用完了（[`ThrottleKind::PeriodUsedUp`]）：跳过，不等。只在
+        /// 尝试链里出现
+        PeriodUsedUp = "period_used_up",
     }
 }
 
@@ -1004,7 +1044,24 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 版本时配置的来源是 `sync`，改了网关密钥时发 `GatewayKeysChanged`。[`ProviderView`] 多了
 /// `sync_excluded`（不同步的上游）和 `sync_url_changed`（地址经同步变更，改之前的地址）。
 /// 同步的码是 `sync.*`。安全模式下不自动同步（`paused`）
-pub const CONTROL_API_VERSION: u32 = 50;
+///
+/// **51 起上游被限流时请求排队，上游有了用量上限**：[`FailoverView`] 的 `slot_wait_secs` 改名
+/// `wait_secs`（一个请求合计最多等多久，默认 120、最多 600；等空位、等限流暂停、等用量窗口都
+/// 算在里面）。[`ProviderView`] 多了 `throttle`（[`Throttle`]：`kind` 是 [`ThrottleKind`] 的
+/// `rate_limited` / `window_full` / `period_used_up`，`until_ms` 是又能发的时刻，`limit` 是
+/// 满了的那一条在 `limits` 里的下标；几样都有时报恢复得最晚的那一样；能发时没有）和 `limits`
+/// （[`KeyLimitView`] 的列表，和密钥的一样带着此刻用了多少）；[`ProviderInput`] 多了 `limits`
+/// （[`KeyLimitInput`]，整份替换）。[`KeyLimitView`]、[`KeyLimitInput`] 多了 `every`（滚动窗口
+/// 是几个 `per`：分钟 1 到 60、小时 1 到 24，天、周、月是 1）。新事件
+/// [`Event::ThrottleChanged`]（一家上游开始、结束、换了暂时发不出去的样子，`throttle` 为空是
+/// 又能发了；不进通知）、[`Event::RequestQueued`]（一个请求开始排队：在等哪几家、最多等到
+/// 什么时候）和 [`Event::RequestDequeued`]（它不排队了：等到了、被中止了、等不到了），后两条也在
+/// `InFlightRequest::events` 里。[`ServeSkip`] 多了 `throttled`、`window_full`、`period_used_up`，[`AttemptView`] 多了 `pause_ms`（这一跳被限流，这家因此暂停了多久）；
+/// 带着 `pause_ms` 的、回了 429 的一跳不算进上游的用量上限（[`AttemptView::counts_for_upstream`]）。
+/// 新码：`config.key_limit_every*`、`config.upstream_limit_*`、`gw.key_limit.*_every`、
+/// `gw.upstream.paused`、`gw.upstream.window_full`、`gw.upstream.period_used_up`、`gw.wait.*`。
+/// 照 50 写的界面读不到 `wait_secs`，保存密钥的上限时没有 `every` 会被拒
+pub const CONTROL_API_VERSION: u32 = 51;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1294,6 +1351,26 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered_model: Option<String>,
     },
+    /// 这个请求开始排队了：它能去的上游此刻都发不出去（满着、限流暂停着、用量上限满了），
+    /// 它在等其中先能发的那一家。留在一家的对话等那一家时也发。
+    ///
+    /// **一次排队发一条**，不排了发一条 [`Event::RequestDequeued`]：一个请求可以排好几次（发出去
+    /// 又被限流了，回来接着等）。在 [`InFlightRequest::events`] 里，半路才来听的一方照样看得出它
+    /// 在排队。
+    RequestQueued {
+        id: u64,
+        /// 在等哪几家，按候选的顺序
+        upstreams: Vec<String>,
+        /// 最多等到什么时候（Unix 毫秒）：这个请求的等待期限（`failover.wait_secs`）
+        until_ms: u64,
+        at_ms: u64,
+    },
+    /// 这个请求不排队了：等到了一家、要发出去了，被手动中止了，或者等不到了。和它之前的那条
+    /// [`Event::RequestQueued`] 成对；路由事件要等整条尝试链走完才发，界面靠这一条知道它不在
+    /// 排队了。也在 [`InFlightRequest::events`] 里。
+    ///
+    /// 客户端在排队时走了的不发：紧跟着的结局（取消）就是它的结束
+    RequestDequeued { id: u64, at_ms: u64 },
     /// 路由决定完了，尝试链也走完了。
     ///
     /// **单独一个事件，因为成功和失败两条路都要发它。**挂在
@@ -1532,6 +1609,18 @@ pub enum Event {
         provider: String,
         /// `open` = 熔断中，不进候选链；`closed` = 可以用
         state: BreakerState,
+        at_ms: u64,
+    },
+    /// 某家上游暂时发不出去了（限流暂停、用量上限满了或用完了）、换了一种、又能发了。
+    ///
+    /// 和 [`ProviderView::throttle`] 说的是同一件事：一个是现状，一个是变化。**不挂在请求上**，
+    /// 号是新取的。它自己会好：界面显示它，不发通知。
+    ThrottleChanged {
+        id: u64,
+        provider: String,
+        /// 现在的样子。又能发了是空
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        throttle: Option<Throttle>,
         at_ms: u64,
     },
     /// 某家上游的模型清单开始获取了，或者获取完了（列出来了、没列出来、
@@ -1814,14 +1903,21 @@ pub struct AttemptView {
     /// 出来的（请求解不开）没有。别的结果都没有：接下请求的那一跳的用量在结局里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AttemptUsage>,
-    /// 这一跳等了多少毫秒才轮到一个空位：这家设了 `max_concurrent` 而它满着。不算在 `ms`
-    /// 里。没等的没有
+    /// 这一跳等了多少毫秒才轮到：这家满着（`max_concurrent`）、限流暂停着、分钟或小时的用量
+    /// 上限满了。不算在 `ms` 里。没等的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_ms: Option<u64>,
-    /// 这一跳为什么没发出去：`busy`（这家满着，换了下一家；等过它的话 `queued_ms` 是等了
-    /// 多久）。这时 `outcome` 是 `error`，`error` 是同一件事的那句话。发出去了的没有
+    /// 这一跳为什么没发出去：`busy`（这家满着）、`throttled`（限流暂停着）、`window_full`（分钟、
+    /// 小时的用量上限满了），换了下一家或者等着它，等过它的话 `queued_ms` 是等了多久；
+    /// `period_used_up`（天、周、月的用量上限用完了），跳过。这时 `outcome` 是 `error`，`error`
+    /// 是同一件事的那句话。发出去了的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<ServeSkip>,
+    /// 这一跳收到了 429（或者上游在回答的第一段内容之前报了限流），这家因此暂停了多少毫秒（见
+    /// [`ThrottleKind::RateLimited`]）。请求接着换下一家或者等这家，客户端察觉不到。有它的一跳
+    /// 不算进这家的用量上限（[`Self::counts_for_upstream`]）。别的结果没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_ms: Option<u64>,
     /// 这一跳走的代理：这家上游配置的代理名（跟随系统的是 `system`），直连是 None。没发出去
     /// 的一跳（满着、被拒、转换不了……）是它要走的那个 —— 连不上的那一跳，问题可能就出在
     /// 这个代理上。WebSocket 只连直连的上游，一律是 None
@@ -1867,7 +1963,37 @@ impl AttemptView {
     }
 }
 
+impl AttemptView {
+    /// 这一跳算进这家上游的用量上限（见 `tw_gateway::upstream_limits`）：发到了上游
+    /// （[`Self::sent`]），上游没回 429，也没在回答开头报限流（[`Self::pause_ms`]）。被限流的
+    /// 那一跳上游没接，请求另找一家或者等它，不该把这家的上限用掉。**网关在内存里也是这么数的**：
+    /// 这几跳发出时占的当场还回去，和重启后从记录里加回来的是同一个数
+    pub fn counts_for_upstream(&self) -> bool {
+        self.sent() && self.status != Some(429) && self.pause_ms.is_none()
+    }
+}
+
 impl RoutingView {
+    /// 算进上游用量上限的那几跳各是哪一家，按先后（[`AttemptView::counts_for_upstream`]）。
+    /// 同一家可以出现几次：每一跳算一个请求
+    pub fn upstream_hops(&self) -> Vec<String> {
+        self.attempts
+            .iter()
+            .filter(|a| a.counts_for_upstream())
+            .map(|a| a.provider.clone())
+            .collect()
+    }
+
+    /// 这个请求的 token、费用算在哪一家的用量上限上：链的最后一跳，它算进上限的话
+    /// （[`AttemptView::counts_for_upstream`]）。这一行的用量就是它的：转移在第一次成功时就
+    /// 停，前面那几跳没有用量
+    pub fn served_by(&self) -> Option<&str> {
+        self.attempts
+            .last()
+            .filter(|a| a.counts_for_upstream())
+            .map(|a| a.provider.as_str())
+    }
+
     /// 这个请求可能发到了上游：尝试链上有一跳发出去了（[`AttemptView::sent`]）。**尝试链是空的
     /// 时看它怎么收场**（`failed`）：失败的是网关在发往哪一家之前就拒了（规则、内容过滤、
     /// 用量上限）；没失败的（客户端走了）是还没等到路由事件 —— 那时请求可能正在上游那里，
@@ -2026,6 +2152,9 @@ impl Event {
             | Event::ContentMatched { id, .. }
             | Event::RequestPriced { id, .. }
             | Event::HealthChanged { id, .. }
+            | Event::ThrottleChanged { id, .. }
+            | Event::RequestQueued { id, .. }
+            | Event::RequestDequeued { id, .. }
             | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
             | Event::AuthChanged { id, .. }
@@ -2295,9 +2424,9 @@ pub struct FailoverView {
     /// 上游多少秒没有内容就不再等它（无响应超时）：从请求发出去起算，每来一段内容重新
     /// 计时。客户端还什么都没收到时换下一家，已经收到一部分的报错收尾
     pub idle_timeout_secs: u64,
-    /// 一个请求合计最多等多少秒：等密钥的分钟、小时上限空出名额，和等满着（`max_concurrent`）
-    /// 的上游空出位置，共用这一段。0 是不等
-    pub slot_wait_secs: u64,
+    /// 一个请求合计最多等多少秒：等密钥的分钟、小时上限空出名额，和等暂时发不出去的上游（满着、
+    /// 限流暂停着、用量上限满了），共用这一段。0 是不等
+    pub wait_secs: u64,
 }
 
 /// 每项防护各在哪一档：`off` / `observe` / `enforce`。
@@ -2374,6 +2503,10 @@ pub struct ProviderView {
     pub disabled: bool,
     /// `ok` / `open`（熔断中）
     pub health: Health,
+    /// 这家暂时发不出去：限流暂停着、用量上限满了或用完了（见 [`Throttle`]）。能发是空。变化报
+    /// [`Event::ThrottleChanged`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle: Option<Throttle>,
     /// 上游拒绝了凭据：最近一次得到答复的请求回的是这个状态码（401 / 403）。
     /// 没被拒是空的，被拒之后有请求成功了也是空的。
     ///
@@ -2394,6 +2527,8 @@ pub struct ProviderView {
     /// 同时最多发给这家几个请求。不限是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 用量上限，按配置里的顺序，各带此刻用了多少（发出去还没结束的按估算算）。没设的是空的
+    pub limits: Vec<KeyLimitView>,
     /// 配置里的 `balance:`，原样：编辑对话框保存时交回去（[`ProviderInput::balance`]）
     pub balance_setting: BalanceSetting,
     /// 最近一次读到的余额。**是空的：这家没有余额可读**（关掉了、账号上游和 Bedrock、
@@ -2697,11 +2832,14 @@ slug_enum! {
     }
 }
 
-/// 一条用量上限，和它此刻用了多少。
+/// 一条用量上限，和它此刻用了多少。密钥的（[`ClientView::limits`]）和上游的
+/// （[`ProviderView::limits`]）都是它。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyLimitView {
     pub per: LimitPer,
+    /// 滚动窗口是几个 `per`：`hour` 的 5 是最近 5 小时。没写的是 1；天、周、月一律是 1
+    pub every: u32,
     pub measure: LimitMeasure,
     /// 上限：请求数、token 数，费用是微分
     pub max: u64,
@@ -2718,11 +2856,13 @@ pub struct KeyLimitView {
     pub reached: bool,
 }
 
-/// 新建、保存密钥时的一条用量上限。
+/// 新建、保存密钥（和上游）时的一条用量上限。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyLimitInput {
     pub per: LimitPer,
+    /// 滚动窗口是几个 `per`：`minute` 1 到 60、`hour` 1 到 24。天、周、月交 1
+    pub every: u32,
     pub measure: LimitMeasure,
     /// 上限：请求数、token 数，费用是微分。要大于 0
     pub max: u64,
@@ -3354,6 +3494,9 @@ pub struct ProviderInput {
     /// 同时最多发给这家几个请求，1 到 1000。不给就是不限
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 用量上限，整份替换。不给 = 一条都没有
+    #[serde(default)]
+    pub limits: Vec<KeyLimitInput>,
     /// 停用
     #[serde(default)]
     pub disabled: bool,
@@ -6688,8 +6831,39 @@ mod tests {
             usage: None,
             queued_ms: None,
             skipped: None,
+            pause_ms: None,
             proxy: None,
         }
+    }
+
+    /// 算进上游用量上限的那几跳：发到了、没被限流。回了 429 的、在回答开头报了限流的
+    /// （带着 `pause_ms`）上游没接，不算 —— 网关在内存里也是这么数的
+    #[test]
+    fn a_rate_limited_hop_does_not_count_toward_the_upstreams_limit() {
+        use AttemptOutcome::*;
+        let served = attempt(Served, Some(200), None);
+        assert!(served.counts_for_upstream());
+        let mut paused = attempt(Status, Some(429), None);
+        paused.pause_ms = Some(5_000);
+        assert!(!paused.counts_for_upstream());
+        // 额度用完的 429 不暂停，也不算
+        assert!(!attempt(Status, Some(429), None).counts_for_upstream());
+        let mut opening = attempt(Error, None, Some("gw.upstream.stream_opening_error"));
+        assert!(opening.counts_for_upstream());
+        opening.pause_ms = Some(5_000);
+        assert!(!opening.counts_for_upstream());
+        let mut turn = attempt(Served, Some(200), None);
+        turn.pause_ms = Some(5_000);
+        assert!(!turn.counts_for_upstream());
+
+        let mut b = served.clone();
+        b.provider = "b".into();
+        let routing = RoutingView {
+            attempts: vec![paused, opening, b],
+            ..Default::default()
+        };
+        assert_eq!(routing.upstream_hops(), vec!["b".to_string()]);
+        assert_eq!(routing.served_by(), Some("b"));
     }
 
     /// 发到了上游的一跳：上游回了话，或者发出去之后才失败。没发出去的（满着、被拒、连不上）

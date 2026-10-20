@@ -526,8 +526,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(limit_pers),
                     Def::Required,
                     t(
-                        "The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st.",
-                        "按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。",
+                        "The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes, or `every` of them); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st.",
+                        "按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟，或者 `every` 个这样的单位）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。",
+                    ),
+                ),
+                row(
+                    "every",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "How many minutes or hours the rolling window spans: `{per: hour, every: 5}` is the last 5 hours. From 1 to 60 for `minute`, from 1 to 24 for `hour`; `day`, `week` and `month` do not take it. Unset: 1.",
+                        "滚动窗口有几分钟、几小时：`{per: hour, every: 5}` 是最近 5 小时。`minute` 取 1 到 60，`hour` 取 1 到 24；`day`、`week`、`month` 不能写。不写：1。",
                     ),
                 ),
                 row(
@@ -713,8 +722,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Int,
                     Def::Unset,
                     t(
-                        "Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit.",
-                        "同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。",
+                        "Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.wait_secs`. Unset: no limit.",
+                        "同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.wait_secs`。不写：不限。",
+                    ),
+                ),
+                row(
+                    "limits",
+                    Kind::Objs("providers[].limits[]"),
+                    Def::Unset,
+                    t(
+                        "Usage limits of this upstream, written like its own quota: requests, tokens or cost every few minutes or hours, per day, week or month. Every one has to have room before a request is sent to it. When a rolling window is full, requests go to the next upstream or wait for room; when a day, week or month is used up, requests go to the next upstream until the next one starts. Unset: no limit.",
+                        "这家上游的用量上限，照着它自己的限额写：每几分钟、每几小时、每天、每周或每月的请求数、token 数或费用。每一条都有余量才往这家发。滚动窗口满了，请求换下一家或者等它空出来；天、周、月用满了，到下一期之前请求换下一家。不写：不限。",
                     ),
                 ),
                 row(
@@ -785,6 +803,66 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Whether the model takes images as input. The model list carries it, as `input_modalities`. Unset: the price table's; the list leaves it out when the price table does not say.",
                         "这个模型收不收图。模型列表里以 `input_modalities` 给出。不写：取价目表的；价目表也没写时，列表里不给这一项。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "providers[].limits[]",
+            ty: checked!(UsageLimit, "{per: day}"),
+            rows: vec![
+                row(
+                    "per",
+                    Kind::Enum(limit_pers),
+                    Def::Required,
+                    t(
+                        "The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes, or `every` of them); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st.",
+                        "按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟，或者 `every` 个这样的单位）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。",
+                    ),
+                ),
+                row(
+                    "every",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "How many minutes or hours the rolling window spans: `{per: hour, every: 5}` is the last 5 hours. From 1 to 60 for `minute`, from 1 to 24 for `hour`; `day`, `week` and `month` do not take it. Unset: 1.",
+                        "滚动窗口有几分钟、几小时：`{per: hour, every: 5}` 是最近 5 小时。`minute` 取 1 到 60，`hour` 取 1 到 24；`day`、`week`、`month` 不能写。不写：1。",
+                    ),
+                ),
+                row(
+                    "requests",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "At most this many requests sent to this upstream. Each attempt that reaches it counts, unless it answers 429; token counts do not count.",
+                        "最多往这家发这么多个请求。每一次发到了这家的尝试都算，它回 429 的不算；数 token 的请求不算。",
+                    ),
+                ),
+                row(
+                    "tokens",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "At most this many tokens in the answers of this upstream: uncached input, cache writes and output.",
+                        "这家回答的请求最多用这么多 token：未命中缓存的输入、写入缓存的和输出。",
+                    ),
+                ),
+                row(
+                    "cost",
+                    Kind::Num,
+                    Def::Unset,
+                    t(
+                        "At most this much, in US dollars, as recorded for the requests this upstream answers; at least 0.01. Models without a price count as 0, and so does everything with `billing: free`.",
+                        "这家回答的请求最多花这么多美元，按每个请求记下的费用算；至少 0.01。没有价格的模型算 0，`billing: free` 时全都算 0。",
+                    ),
+                ),
+                row(
+                    "cache_reads",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Count cache reads too. Only for a `tokens` limit.",
+                        "把读取缓存的 token 也算进去。只有 `tokens` 上限能写。",
                     ),
                 ),
             ],
@@ -1483,8 +1561,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Int,
                     Def::Is("3600"),
                     t(
-                        "A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason.",
-                        "被限流的上游按它给的 `Retry-After` 停用，最多这么多秒。没有 `Retry-After` 的按没有说明原因的失败计。",
+                        "Longest pause, in seconds, after an upstream answers 429 (rate limited). The pause lasts as long as the upstream says (`retry-after-ms`, `Retry-After`, or a delay in the error body); when it says nothing, it backs off by the upstream's consecutive 429s: 5, 10, 20 and 40 seconds, then 60 seconds each time. A pause is not a failure: requests wait for the upstream within `wait_secs`, and the circuit breaker does not count it.",
+                        "上游回 429（限流）后暂停这家的最长秒数。上游给出了等待时间的（`retry-after-ms`、`Retry-After` 或错误正文里的等待时间）按它给的暂停；没有给出的，按这家连续被限流的次数退避：5、10、20、40 秒，之后每次 60 秒。暂停不算失败：请求在 `wait_secs` 之内等这家恢复，熔断也不计入。",
                     ),
                 ),
                 row(
@@ -1497,12 +1575,12 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
-                    "slot_wait_secs",
+                    "wait_secs",
                     Kind::Int,
-                    Def::Is("30"),
+                    Def::Is("120"),
                     t(
-                        "Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for a free slot on upstreams at their `max_concurrent`. A key limit that does not free up in time refuses the request; without an upstream slot in time it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300.",
-                        "一个请求合计最多等的秒数，从过了密钥自己的 `max_concurrent` 时算起：等密钥的 `minute`、`hour` 上限空出名额，和等并发数满了（`max_concurrent`）的上游空出位置，都算在里面。密钥的上限到时空不出来就拒绝；等不到上游的空位就换下一家，候选全满时回 429。`0`：不等。取值 0 到 300。",
+                        "Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for an upstream that cannot take it yet — at its `max_concurrent`, paused after answering 429, or at one of its `minute` or `hour` usage limits. A key limit that does not free up in time refuses the request. An upstream that cannot take it is skipped for the next one, and when none is left the request waits for the first to become available; a conversation that stays on an upstream waits for it. When nothing became available in time, the client gets 429 with `Retry-After`. `0`: never wait. From 0 to 600.",
+                        "一个请求合计最多等的秒数，从过了密钥自己的 `max_concurrent` 时算起：等密钥的 `minute`、`hour` 上限空出名额，和等暂时不能发的上游 —— 并发数满了（`max_concurrent`）、回了 429 正在暂停、到了这家 `minute` 或 `hour` 的用量上限 —— 都算在里面。密钥的上限到时空不出来就拒绝。上游暂时不能发的先换下一家，没有下一家了就等最先恢复的那一家；留在某一家的对话等这一家。到时都没有恢复，客户端收到带 `Retry-After` 的 429。`0`：不等。取值 0 到 600。",
                     ),
                 ),
             ],
