@@ -456,15 +456,37 @@ async fn turning_sync_off_keeps_the_configuration_and_purging_empties_the_locati
     );
 }
 
+/// 这台设备最近一次同步成功的时刻（`last_synced_ms`）。还没成功过是 0
+async fn synced_at(d: &Dev) -> u64 {
+    d.ok("GET", "/sync", Value::Null).await["last_synced_ms"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
 /// 调度：本机改了配置，10 秒合并之后上传；另一台的文件夹监听一收到就合并
 #[tokio::test]
 async fn a_local_change_is_uploaded_after_it_settles_and_the_folder_watcher_picks_it_up() {
     let loc = tempfile::tempdir().unwrap();
     let (a, b) = pair(loc.path()).await;
+    let before = [synced_at(&a).await, synced_at(&b).await];
     tw_control::sync::start(&a.state, false);
     tw_control::sync::start(&b.state, false);
-    // 启动那一轮先跑完
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 启动那一轮先跑完。**不按固定的时长等**：机器慢的时候那一轮还没走完，下面第一处改动
+    // 就被它顺手传上去了，看起来像是没等稳定期
+    let started = std::time::Instant::now();
+    loop {
+        let (sa, sb) = (synced_at(&a).await, synced_at(&b).await);
+        let busy = a.ok("GET", "/sync", Value::Null).await["state"] == "syncing"
+            || b.ok("GET", "/sync", Value::Null).await["state"] == "syncing";
+        if sa > before[0] && sb > before[1] && !busy {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "启动那一轮 20 秒没跑完"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     a.edit(|t| add_provider(t, "first", "https://first.example", "sk-1"))
         .await;
     a.edit(|t| add_provider(t, "second", "https://second.example", "sk-2"))
