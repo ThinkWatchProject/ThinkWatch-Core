@@ -1175,14 +1175,21 @@ failover:
 
 An upstream that answers 429 (rate limited) is not set aside but paused:
 for as long as it says (`retry-after-ms`, `Retry-After`, or a delay in the
-error body), and otherwise for 5, 10, 20 and 40 seconds, then 60 seconds each
-time, by its consecutive 429s; any other answer starts the count again. The
+error body; under one second, or under one millisecond for `retry-after-ms`,
+counts as not said), and otherwise for 5, 10, 20 and 40 seconds, then 60
+seconds each time, by its consecutive 429s; any other answer starts the count
+again. The
 pause is at most `rate_limit_max_pause_secs`, and the circuit breaker and
 `load-balance` do not count it as a failure. The request that got the 429
 moves to the next candidate, or waits for the pause to end; the client sees
-nothing of it. When the pause ends, one request goes first, and the others
-follow once the upstream has accepted it. A pause lasts until twcore restarts
-at most.
+nothing of it. A streamed answer that reports a rate limit before any content
+counts as a 429 too; only on a request's last candidate that has not been rate
+limited in the last five minutes does the client get that error (the upstream
+is paused all the same). When the pause ends, one request goes first, and the
+others follow once the upstream has accepted it (for a streamed answer, once
+its content starts), or at once if that request gets no answer, times out or
+finds the upstream's quota used up. A pause lasts until twcore restarts at
+most.
 
 A request waits for upstreams that cannot take it yet for at most `wait_secs`
 in all: an upstream at its `max_concurrent`, one paused after a 429, and one

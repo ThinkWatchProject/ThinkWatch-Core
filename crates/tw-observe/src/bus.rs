@@ -100,8 +100,9 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::SecretsFound { .. }
         | E::ContentMatched { .. }
         | E::ToolCallFlagged { .. }
-        // 在排队：半路才来的一方要看得出它在等哪几家
-        | E::RequestQueued { .. } => true,
+        // 在排队：半路才来的一方要看得出它在等哪几家，和它是不是已经不排了
+        | E::RequestQueued { .. }
+        | E::RequestDequeued { .. } => true,
         // 开始和三种结局由 `track_at` 自己管
         E::RequestStarted { .. }
         | E::RequestFinished { .. }

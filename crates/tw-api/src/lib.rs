@@ -1054,9 +1054,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （[`KeyLimitInput`]，整份替换）。[`KeyLimitView`]、[`KeyLimitInput`] 多了 `every`（滚动窗口
 /// 是几个 `per`：分钟 1 到 60、小时 1 到 24，天、周、月是 1）。新事件
 /// [`Event::ThrottleChanged`]（一家上游开始、结束、换了暂时发不出去的样子，`throttle` 为空是
-/// 又能发了；不进通知）和 [`Event::RequestQueued`]（一个请求开始排队：在等哪几家、最多等到
-/// 什么时候；也在 `InFlightRequest::events` 里）。[`ServeSkip`] 多了 `throttled`、`window_full`、
-/// `period_used_up`，[`AttemptView`] 多了 `pause_ms`（这一跳被限流，这家因此暂停了多久）；
+/// 又能发了；不进通知）、[`Event::RequestQueued`]（一个请求开始排队：在等哪几家、最多等到
+/// 什么时候）和 [`Event::RequestDequeued`]（它不排队了：等到了、被中止了、等不到了），后两条也在
+/// `InFlightRequest::events` 里。[`ServeSkip`] 多了 `throttled`、`window_full`、`period_used_up`，[`AttemptView`] 多了 `pause_ms`（这一跳被限流，这家因此暂停了多久）；
 /// 带着 `pause_ms` 的、回了 429 的一跳不算进上游的用量上限（[`AttemptView::counts_for_upstream`]）。
 /// 新码：`config.key_limit_every*`、`config.upstream_limit_*`、`gw.key_limit.*_every`、
 /// `gw.upstream.paused`、`gw.upstream.window_full`、`gw.upstream.period_used_up`、`gw.wait.*`。
@@ -1354,8 +1354,9 @@ pub enum Event {
     /// 这个请求开始排队了：它能去的上游此刻都发不出去（满着、限流暂停着、用量上限满了），
     /// 它在等其中先能发的那一家。留在一家的对话等那一家时也发。
     ///
-    /// **一次排队发一条**，排到了、等不到了都不另发：之后的 `RequestRouted` 或者结局就是它的
-    /// 结束。在 [`InFlightRequest::events`] 里，半路才来听的一方照样看得出它在排队。
+    /// **一次排队发一条**，不排了发一条 [`Event::RequestDequeued`]：一个请求可以排好几次（发出去
+    /// 又被限流了，回来接着等）。在 [`InFlightRequest::events`] 里，半路才来听的一方照样看得出它
+    /// 在排队。
     RequestQueued {
         id: u64,
         /// 在等哪几家，按候选的顺序
@@ -1364,6 +1365,12 @@ pub enum Event {
         until_ms: u64,
         at_ms: u64,
     },
+    /// 这个请求不排队了：等到了一家、要发出去了，被手动中止了，或者等不到了。和它之前的那条
+    /// [`Event::RequestQueued`] 成对；路由事件要等整条尝试链走完才发，界面靠这一条知道它不在
+    /// 排队了。也在 [`InFlightRequest::events`] 里。
+    ///
+    /// 客户端在排队时走了的不发：紧跟着的结局（取消）就是它的结束
+    RequestDequeued { id: u64, at_ms: u64 },
     /// 路由决定完了，尝试链也走完了。
     ///
     /// **单独一个事件，因为成功和失败两条路都要发它。**挂在
@@ -2147,6 +2154,7 @@ impl Event {
             | Event::HealthChanged { id, .. }
             | Event::ThrottleChanged { id, .. }
             | Event::RequestQueued { id, .. }
+            | Event::RequestDequeued { id, .. }
             | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
             | Event::AuthChanged { id, .. }

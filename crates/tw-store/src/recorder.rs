@@ -696,6 +696,7 @@ impl Recorder {
             | Event::ThrottleChanged { .. }
             // 一个请求开始排队：它等了多久在尝试链（`queued_ms`）里，这一条不用落库
             | Event::RequestQueued { .. }
+            | Event::RequestDequeued { .. }
             | Event::ModelsChanged { .. }
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }

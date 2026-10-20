@@ -1838,6 +1838,85 @@ async fn a_turn_rate_limited_before_any_content_does_not_count_toward_the_upstre
     assert_eq!(used(), 1);
 }
 
+/// 暂停结束后探路的那一轮：上游先回了 `response.created`，接着在内容之前报限流。**头一帧不说明
+/// 这一家好了**：排在后面的那一轮不能在 `response.created` 到的那一刻就跟着发，要等这一家再次
+/// 暂停完
+#[tokio::test]
+async fn a_probing_turn_limited_after_response_created_keeps_the_next_turn_waiting() {
+    let times: Arc<Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let t = times.clone();
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| {
+            let times = t.clone();
+            async move {
+                ws.on_upgrade(move |mut sock| async move {
+                    while let Some(Ok(m)) = sock.recv().await {
+                        if !matches!(m, Message::Text(_)) {
+                            continue;
+                        }
+                        let n = {
+                            let mut t = times.lock().unwrap();
+                            t.push(std::time::Instant::now());
+                            t.len()
+                        };
+                        let id = format!("resp_{n}");
+                        // 头一个（探路的）：开头当场到，300 毫秒后报限流
+                        let frames = if n == 1 {
+                            vec![(0, created(&id)), (300, error("rate_limit_exceeded"))]
+                        } else {
+                            vec![(0, created(&id)), (0, delta()), (0, completed(&id))]
+                        };
+                        for (wait, f) in frames {
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
+                            if sock
+                                .send(Message::Text(f.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                })
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let (gw, _rx, state) = turns_gateway(
+        up,
+        // 退避截成 1 秒：测试不用干等
+        |c| c.failover.rate_limit_max_pause_secs = 1,
+        None,
+    )
+    .await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .throttles
+        .limited("up", now, Some(Duration::from_millis(300)));
+    let (mut a, mut b) = (connect(gw).await, connect(gw).await);
+    a.send(create("one")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    b.send(create("two")).await.unwrap();
+    assert_eq!(until_end(&mut a).await.last().unwrap()["type"], "error");
+    assert_eq!(
+        until_end(&mut b).await.last().unwrap()["type"],
+        "response.completed"
+    );
+    let times = times.lock().unwrap().clone();
+    assert_eq!(times.len(), 2);
+    assert!(
+        times[1] - times[0] >= Duration::from_millis(1_000),
+        "探路的那一轮在 response.created 之后被限流了，后面的却跟着发了：{:?}",
+        times[1] - times[0]
+    );
+}
+
 /// 一轮回到一半上游就收了连接：帧里写着 `CLOSE` 的，回了开头之后发关闭帧；写着 `DROP` 的，
 /// 回了开头之后直接断开（没有关闭帧）；写着 `HOLD` 的，回了开头之后一直不说完。别的照常答完
 async fn closing() -> SocketAddr {

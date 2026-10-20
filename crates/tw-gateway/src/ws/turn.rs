@@ -333,10 +333,6 @@ impl Turn {
         // **在报路由事件之前**：这一轮在内容之前就被限流了的，尝试链上那一跳要带着暂停多久
         self.pause_on(fault);
         if !self.responded {
-            // 头一帧不是限流的错误：这一家没在限流（探路的过了，连续限流的次数归零）
-            if !limited {
-                self.state.throttles.answered(&self.provider, self.sent_ms);
-            }
             self.responded = true;
             self.routed();
             self.state.bus.emit(tw_api::Event::RequestHeaders {
@@ -354,16 +350,34 @@ impl Turn {
         if self.judged {
             return;
         }
+        // 这一家在不在限流（见 `crate::throttle`）也在这里说，**不在头一帧**：`response.created`
+        // 之后接着报限流的上游，头一帧不说明它好了 —— 和 HTTP 那条路压着开头的一跳一样
         if self.ending.as_ref().is_some_and(Ending::has_content) {
-            // 内容到了：这一家答上了。之后流里再报错也不改 —— HTTP 那条路的一跳也是开头
-            // 一过就记成功
+            // 内容到了：这一家答上了，没在限流（探路的过了，连续限流的次数归零）。之后流里再报错
+            // 也不改 —— HTTP 那条路的一跳也是开头一过就记成功
+            self.state.throttles.answered(&self.provider, self.sent_ms);
             self.judge(|h, p| h.record_success(p));
         } else if super::ends_turn(kind) {
-            // 一段内容都没有就收了尾。限流不是失败（上面暂停过了），不记
+            // 一段内容都没有就收了尾。限流不是失败（上面暂停过了），不记；额度用完、没钱了等不到，
+            // 探路的不再探，交给熔断
             match fault {
                 Some(_) if limited => self.judged = true,
-                Some(cause) => self.judge(|h, p| h.record_cause(p, cause)),
-                None => self.judge(|h, p| h.record_success(p)),
+                Some(cause) => {
+                    if matches!(
+                        cause,
+                        crate::failure::Cause::QuotaUsedUp { .. }
+                            | crate::failure::Cause::NoBalance
+                    ) {
+                        self.state.throttles.released(&self.provider, self.sent_ms);
+                    } else {
+                        self.state.throttles.answered(&self.provider, self.sent_ms);
+                    }
+                    self.judge(|h, p| h.record_cause(p, cause))
+                }
+                None => {
+                    self.state.throttles.answered(&self.provider, self.sent_ms);
+                    self.judge(|h, p| h.record_success(p))
+                }
             }
         }
     }
@@ -407,6 +421,15 @@ impl Turn {
         crate::server::note_health(&self.state.bus, health, &self.provider, change);
     }
 
+    /// 发出去了的这一轮在这一家的用量上限上算一个请求：占着的交给这一轮的号，等存储层结算。
+    /// **在报结局之前**：存储层先收到结局、先结算的话，这一份没交给号、没人认领，要在内存里多占
+    /// 一阵（见 [`crate::upstream_limits`]）
+    fn bind_usage(&mut self) {
+        if let Some(h) = self.usage.take() {
+            h.bind(self.id);
+        }
+    }
+
     fn routed(&mut self) {
         let Some(r) = self.route.take() else { return };
         let mut attempt = r.attempt;
@@ -420,6 +443,7 @@ impl Turn {
     /// 那句（见 [`Ending::streaming`]）
     fn finish(mut self) {
         self.routed();
+        self.bind_usage();
         let Some(e) = self.ending.take() else { return };
         match self.cut.take() {
             Some(why) => e.failed(tw_api::FailureSource::Denied, why),
@@ -432,8 +456,13 @@ impl Turn {
     pub(crate) fn fail(mut self, source: tw_api::FailureSource, why: Msg) {
         if source == tw_api::FailureSource::Upstream {
             self.judge(|h, p| h.record_failure(p));
+            // 没有结论：探路的不再探，交给熔断（见 `crate::throttle::Throttles::released`）
+            if !self.ending.as_ref().is_some_and(Ending::has_content) {
+                self.state.throttles.released(&self.provider, self.sent_ms);
+            }
         }
         self.routed();
+        self.bind_usage();
         if let Some(e) = self.ending.take() {
             e.failed(source, why);
         }
@@ -451,9 +480,16 @@ impl Turn {
         if source == tw_api::FailureSource::Upstream {
             self.judge(|h, p| h.record_failure(p));
         }
-        // 没发出去：用量上限上占着的还回去
+        // 没发出去：用量上限上占着的还回去，探路的名额也是
         if let Some(h) = self.usage.take() {
             h.release();
+        }
+        if let Some(p) = self.probe.take() {
+            p.withdraw();
+        }
+        // 写不过去是上游断了：没有结论，探路的不再探，交给熔断
+        if source == tw_api::FailureSource::Upstream {
+            self.state.throttles.released(&self.provider, self.sent_ms);
         }
         if let Some(r) = self.route.take() {
             self.state.bus.emit(routed(
@@ -474,10 +510,9 @@ impl Drop for Turn {
     /// 这一行没有尝试链。结局随后由它自己的 Drop 报成取消
     fn drop(&mut self) {
         self.routed();
-        // 发出去了的这一轮（答完了、失败了、连接断了）：在这一家的用量上限上算一个请求
-        if let Some(h) = self.usage.take() {
-            h.bind(self.id);
-        }
+        // 发出去了的这一轮（连接断了）：在这一家的用量上限上算一个请求。结局（取消）由它自己的
+        // Drop 随后报，交给号在那之前
+        self.bind_usage();
     }
 }
 
@@ -646,12 +681,19 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
                     until_ms: deadline_ms,
                     at_ms: crate::server::now_ms(),
                 });
-                ready = crate::throttle::first_ready(state, &mut waiter, &one, wait_until).await;
+                ready =
+                    Some(crate::throttle::first_ready(state, &mut waiter, &one, wait_until).await);
+                state.bus.emit(tw_api::Event::RequestDequeued {
+                    id,
+                    at_ms: crate::server::now_ms(),
+                });
                 waited = Some(hop_started.elapsed().as_millis() as u64);
             }
             match ready {
-                Some((_, ready)) => (ready.slot, ready.probe, waited),
-                None => {
+                Some(crate::throttle::Outcome::Ready(_, ready)) => {
+                    (ready.slot, ready.probe, waited)
+                }
+                _ => {
                     let now = crate::server::now_ms();
                     // 此刻它是哪一样：等的时候可能换了
                     let stuck = match (stuck, state.throttles.peek(&line.provider, limits)) {

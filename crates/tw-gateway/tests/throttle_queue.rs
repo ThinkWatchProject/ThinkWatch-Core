@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use futures::StreamExt;
 use tw_api::{AttemptOutcome, AttemptView, Event, ServeSkip, Stay, ThrottleKind};
 
 /// 假上游的一次答复
@@ -20,6 +21,8 @@ struct Reply {
     body: String,
     /// 响应头之前等多久
     delay_ms: u64,
+    /// 流式的回答：响应头之后一段一段地给，每一段之前等多久。有的话 `body` 不用
+    chunks: Vec<(u64, String)>,
 }
 
 /// 照常答的那一种：读了 5000 token 的缓存（这段对话跨轮值得留下）
@@ -29,6 +32,7 @@ fn ok() -> Reply {
         headers: Vec::new(),
         body: r#"{"type":"message","role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":5000,"output_tokens":1}}"#.into(),
         delay_ms: 0,
+        chunks: Vec::new(),
     }
 }
 
@@ -39,6 +43,68 @@ fn limited(headers: &[(&'static str, &str)]) -> Reply {
         headers: headers.iter().map(|(k, v)| (*k, v.to_string())).collect(),
         body: r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}"#.into(),
         delay_ms: 0,
+        chunks: Vec::new(),
+    }
+}
+
+/// Anthropic 流式回答里的一个事件
+fn event(name: &str, data: &str) -> String {
+    format!("event: {name}\ndata: {data}\n\n")
+}
+
+fn message_start() -> String {
+    event(
+        "message_start",
+        r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+    )
+}
+
+/// 流式地照常答：开头、一段内容「ok」、收尾
+fn streamed() -> Reply {
+    let chunks = [
+        message_start(),
+        event(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ),
+        event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+        ),
+        event(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        event(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+        ),
+        event("message_stop", r#"{"type":"message_stop"}"#),
+    ];
+    Reply {
+        status: 200,
+        headers: Vec::new(),
+        body: String::new(),
+        delay_ms: 0,
+        chunks: chunks.into_iter().map(|c| (0, c)).collect(),
+    }
+}
+
+/// 响应头是 200、流也开了，开头之后 `after_ms` 在流里报限流（一段内容都还没有），说 1 秒之后
+/// 再来
+fn limited_in_the_stream(after_ms: u64) -> Reply {
+    Reply {
+        chunks: vec![
+            (0, message_start()),
+            (
+                after_ms,
+                event(
+                    "error",
+                    r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down","details":[{"retryDelay":"1s"}]}}"#,
+                ),
+            ),
+        ],
+        ..streamed()
     }
 }
 
@@ -68,13 +134,26 @@ async fn upstream(script: Vec<Reply>, then: Reply) -> Up {
             h.lock().unwrap().push(Instant::now());
             let r = script.lock().unwrap().pop_front().unwrap_or(then);
             tokio::time::sleep(Duration::from_millis(r.delay_ms)).await;
-            let mut b = axum::response::Response::builder()
-                .status(r.status)
-                .header("content-type", "application/json");
+            let streams = !r.chunks.is_empty();
+            let mut b = axum::response::Response::builder().status(r.status).header(
+                "content-type",
+                if streams {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            );
             for (k, v) in &r.headers {
                 b = b.header(*k, v.as_str());
             }
-            b.body(axum::body::Body::from(r.body)).unwrap()
+            if !streams {
+                return b.body(axum::body::Body::from(r.body)).unwrap();
+            }
+            let chunks = futures::stream::iter(r.chunks).then(|(ms, c)| async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from(c))
+            });
+            b.body(axum::body::Body::from_stream(chunks)).unwrap()
         }
     }));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -201,6 +280,20 @@ fn ask(
     r
 }
 
+/// 一个流式的请求
+fn ask_stream(gw: SocketAddr, model: &str) -> reqwest::RequestBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("anthropic-version", "2023-06-01")
+        .body(format!(
+            r#"{{"model":"{model}","max_tokens":16,"stream":true,"messages":[{{"role":"user","content":"{model}"}}]}}"#
+        ))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -286,6 +379,19 @@ async fn a_lone_upstream_that_rate_limits_is_waited_for_and_then_answers() {
         .filter(|e| matches!(e, Event::RequestQueued { id: i, .. } if *i == id))
         .count();
     assert_eq!(queued, 1, "一次排队报一条");
+    // 不排了也报一条：在路由事件之前（路由事件要等整条尝试链走完）
+    let at = |f: &dyn Fn(&Event) -> bool| evs.iter().position(f);
+    let queued = at(&|e| matches!(e, Event::RequestQueued { id: i, .. } if *i == id)).unwrap();
+    let dequeued =
+        at(&|e| matches!(e, Event::RequestDequeued { id: i, .. } if *i == id)).expect("没报不排了");
+    let routed = at(&|e| matches!(e, Event::RequestRouted { id: i, .. } if *i == id)).unwrap();
+    assert!(queued < dequeued && dequeued < routed, "{evs:#?}");
+    assert_eq!(
+        evs.iter()
+            .filter(|e| matches!(e, Event::RequestDequeued { id: i, .. } if *i == id))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -440,6 +546,12 @@ async fn aborting_a_queued_request_takes_it_out_of_the_queue() {
         .await;
     assert_eq!(source.slug(), "aborted");
     assert_eq!(up.hits(), 0);
+    // 被中止也是不排了
+    assert!(
+        log.all()
+            .iter()
+            .any(|e| matches!(e, Event::RequestDequeued { id: i, .. } if *i == id))
+    );
     // 它不在队里了：暂停结束后下一个请求当场就发（它要是还排在队头，后面的要一直等它）
     tokio::time::sleep(Duration::from_millis(800)).await;
     let t = Instant::now();
@@ -629,4 +741,121 @@ async fn a_request_waits_for_a_probe_in_flight_even_when_its_deadline_is_within_
         t.elapsed()
     );
     assert_eq!(first.await.unwrap().unwrap().status(), 200);
+}
+
+/// 回答压着开头的时候，响应头是 200 不说明这一家好了：探路的拿到 200、流里接着报限流，**它的
+/// 结论是又被限流**。排在后面的不能在响应头到的那一刻就一拥而上，退避也不归零
+#[tokio::test]
+async fn a_probe_whose_stream_reports_a_rate_limit_after_a_200_head_does_not_open_the_queue() {
+    let up = upstream(
+        vec![
+            limited(&[("retry-after-ms", "300")]),
+            // 探路的：响应头当场到，限流 300 毫秒之后才在流里报
+            limited_in_the_stream(300),
+        ],
+        streamed(),
+    )
+    .await;
+    let (gw, _state, log) = serve(config(&[&up], 10)).await;
+    let first = tokio::spawn(ask_stream(gw, "一").send());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let more: Vec<_> = ["二", "三"]
+        .into_iter()
+        .map(|m| tokio::spawn(ask_stream(gw, m).send()))
+        .collect();
+    for r in std::iter::once(first).chain(more) {
+        let r = r.await.unwrap().unwrap();
+        assert_eq!(r.status(), 200);
+        let text = r.text().await.unwrap();
+        assert!(text.contains("text_delta"), "{text}");
+        assert!(
+            !text.contains("rate_limit_error"),
+            "客户端看到了限流：{text}"
+        );
+    }
+    let times = up.times();
+    assert_eq!(times.len(), 5, "429、探路的、再探一次、后面两个");
+    for later in &times[2..] {
+        assert!(
+            *later - times[1] >= Duration::from_millis(1_200),
+            "探路的在流里又被限流了，后面的却跟着发了：{:?}",
+            *later - times[1]
+        );
+    }
+    let (chain, _) = log.routed("一").await;
+    assert_eq!(chain.len(), 3, "{chain:#?}");
+    assert!(
+        chain[1]
+            .pause_ms
+            .is_some_and(|ms| (900..=1_000).contains(&ms)),
+        "{chain:#?}"
+    );
+    assert_eq!(chain[2].outcome, AttemptOutcome::Served);
+}
+
+/// 只有一家、它刚限流过：流的开头（内容之前）又报了限流，和回 429 一样暂停、排队、再发，
+/// **客户端察觉不到**。一直好好的最后一家不压开头（客户端当场拿到响应头），见 `hop`
+#[tokio::test]
+async fn a_rate_limit_inside_the_stream_before_any_content_is_invisible_on_the_last_upstream() {
+    let up = upstream(
+        vec![
+            limited(&[("retry-after-ms", "300")]),
+            ok(),
+            limited_in_the_stream(0),
+        ],
+        streamed(),
+    )
+    .await;
+    let (gw, _state, log) = serve(config(&[&up], 10)).await;
+    // 先被限流一次（等过之后照常答了）：这一家最近限流过
+    assert_eq!(ask(gw, "零", None, 1).send().await.unwrap().status(), 200);
+    let r = ask_stream(gw, "一").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(text.contains("text_delta"), "{text}");
+    assert!(
+        !text.contains("rate_limit_error"),
+        "客户端看到了限流：{text}"
+    );
+    let times = up.times();
+    assert_eq!(times.len(), 4);
+    assert!(times[3] - times[2] >= Duration::from_millis(950));
+    let (chain, _) = log.routed("一").await;
+    assert_eq!(chain.len(), 2, "{chain:#?}");
+    assert_eq!(chain[0].outcome, AttemptOutcome::Error);
+    assert!(
+        chain[0]
+            .pause_ms
+            .is_some_and(|ms| (900..=1_000).contains(&ms)),
+        "{chain:#?}"
+    );
+    assert_eq!(chain[1].outcome, AttemptOutcome::Served);
+    assert!(chain[1].queued_ms.is_some_and(|ms| ms >= 900), "{chain:#?}");
+}
+
+/// 探路的拿到的 429 是额度用完了（等不到）：它没有「好了没有」的结论，**排在后面的不用干等完
+/// 宽限期**，照常发，这一家怎么样由熔断说了算
+#[tokio::test]
+async fn a_probe_answered_with_a_used_up_quota_lets_the_queue_go_at_once() {
+    let used_up = Reply {
+        body: r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have reached your usage limit for this plan"}}"#.into(),
+        delay_ms: 400,
+        ..limited(&[])
+    };
+    let up = upstream(vec![limited(&[("retry-after-ms", "300")]), used_up], ok()).await;
+    let (gw, _state, _log) = serve(config(&[&up], 20)).await;
+    let first = tokio::spawn(ask(gw, "一", None, 1).send());
+    // 探路的发出去了、还没有结论：这时来的排在后面等它
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let t = Instant::now();
+    let r = ask(gw, "二", None, 1).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "额度用完的探路之后还干等了宽限期：{:?}",
+        t.elapsed()
+    );
+    // 探路的那个请求自己收到的是额度用完
+    assert_eq!(first.await.unwrap().unwrap().status(), 429);
+    assert_eq!(up.hits(), 3);
 }

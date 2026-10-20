@@ -453,3 +453,49 @@ async fn a_reservation_is_given_back_when_the_hop_is_refused_or_never_sent() {
     assert_eq!(used(&state, "甲", 1), 0);
     assert_eq!(used(&state, "乙", 0), 1);
 }
+
+/// 一个请求在等分钟的窗口空出来，等的时候这一家今天的也用完了：**不再干等到期限**，当场回
+/// 「这一期用完了」的 429，到重置之前别重试
+#[tokio::test]
+async fn a_request_waiting_for_a_window_stops_at_once_when_the_day_is_used_up_meanwhile() {
+    let up = upstream(Vec::new(), ok()).await;
+    let clock = Ahead::new();
+    let limits = "[{per: minute, requests: 1}, {per: day, requests: 2}]";
+    let (gw, state, log) = serve(config(&[(up.addr, limits)], 120), clock.clone()).await;
+    assert_eq!(ask(gw, "第一个").await.status(), 200);
+    // 这一分钟的窗口再过 30 秒空出来：这个请求等得到，排队
+    clock.jump(30_000);
+    let t = Instant::now();
+    let second = tokio::spawn(async move { ask(gw, "第二个").await });
+    let id = log.id("第二个").await;
+    log.until("排队", |evs| {
+        evs.iter()
+            .any(|e| matches!(e, Event::RequestQueued { id: i, .. } if *i == id))
+            .then_some(())
+    })
+    .await;
+    // 别处又发了一个：今天的两个用完了
+    let cfg = state.config();
+    let p = cfg.providers.iter().find(|p| p.name == "甲").unwrap();
+    let _hold =
+        state
+            .upstream_limits
+            .reserve("甲", &p.limits, &tw_gateway::key_limits::Ask::default());
+    let r = second.await.unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "该当场说用完了，却等了 {:?}",
+        t.elapsed()
+    );
+    assert_eq!(r.status(), 429);
+    assert_eq!(head(&r, "x-should-retry").as_deref(), Some("false"));
+    assert_eq!(head(&r, "retry-after-ms"), None);
+    assert_eq!(log.failed_code("第二个").await, "gw.wait.used_up");
+    assert_eq!(up.hits(), 1);
+    assert!(
+        log.all()
+            .iter()
+            .any(|e| matches!(e, Event::RequestDequeued { id: i, .. } if *i == id)),
+        "没报不排了"
+    );
+}

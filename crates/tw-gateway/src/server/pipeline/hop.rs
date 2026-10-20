@@ -49,7 +49,8 @@ pub(super) struct Served<'a> {
     pub(super) slot: crate::slots::Slot,
     /// 这一跳发出去的那一刻。这一家的快慢样本从这里算起（见 [`crate::latency`]）
     pub(super) sent_at: std::time::Instant,
-    /// 这一家答没答上还不知道：最后一家的开头不压，成败的账等回程看到第一段内容才记（见
+    /// 这一家答没答上还不知道：最后一家的开头没压（整包的、等不起的），或者压着时到点了还没有
+    /// 内容、在开头报了限流以外的错，原样交了出去。成败的账等回程看到第一段内容才记（见
     /// `relay`）。没有内容就超时了记失败，和压着开头时一样
     pub(super) unconfirmed: bool,
 }
@@ -210,15 +211,31 @@ pub(super) async fn try_upstreams<'a>(
                     ready = crate::throttle::first_ready(state, &mut waiter, &names, until) => ready,
                     // 等的时候被手动中止：一个字节都还没发出去，尝试链上不多一跳
                     _ = req.abort.wait() => {
+                        dequeued(state, id);
                         halt = Some(GatewayError::aborted());
                         break;
                     }
                 };
+                dequeued(state, id);
                 match ready {
-                    Some((k, ready)) => (waiting.remove(k).0, Some((ready, t.elapsed()))),
-                    None => {
+                    crate::throttle::Outcome::Ready(k, ready) => {
+                        (waiting.remove(k).0, Some((ready, t.elapsed())))
+                    }
+                    crate::throttle::Outcome::Late => {
                         stalled = true;
                         break;
+                    }
+                    // 等着的都不用等了：这一期用完了的记下来（429 里说到它们），停用了的交给熔断
+                    // （尝试链上已经有跳过它们的那一行）
+                    crate::throttle::Outcome::Gone => {
+                        for (n, _) in std::mem::take(&mut waiting) {
+                            if let crate::throttle::Peek::UsedUp { until_ms, .. } =
+                                state.throttles.peek(n, usage_limits_of(rt, n))
+                            {
+                                spent.push((n, until_ms));
+                            }
+                        }
+                        continue;
                     }
                 }
             }
@@ -425,15 +442,29 @@ pub(super) async fn try_upstreams<'a>(
                                 biased;
                                 ready = crate::throttle::first_ready(state, &mut waiter, &one, until) => ready,
                                 _ = req.abort.wait() => {
+                                    dequeued(state, id);
                                     halt = Some(GatewayError::aborted());
                                     break;
                                 }
                             };
+                            dequeued(state, id);
                             waited = Some(t.elapsed().as_millis() as u64);
                             hop_started = std::time::Instant::now();
-                            if let Some((_, ready)) = ready {
+                            if let crate::throttle::Outcome::Ready(_, ready) = ready {
                                 queued = waited.map(|ms| (chain.len(), ms));
                                 (ready.slot, ready.probe)
+                            } else if let crate::throttle::Peek::UsedUp { until_ms, .. } =
+                                state.throttles.peek(&provider.name, limits)
+                            {
+                                // 等的时候这一期用完了：跳过，不再等它
+                                chain.push(crate::server::hop_used_up(
+                                    &provider.name,
+                                    model,
+                                    until_ms,
+                                    hop_started,
+                                ));
+                                spent.push((name, until_ms));
+                                continue;
                             } else {
                                 chain.push(skipped_hop(
                                     state,
@@ -713,18 +744,18 @@ pub(super) async fn try_upstreams<'a>(
         };
         let sent = match waited {
             Waited::Done(sent) => {
-                // 上游的响应头（重发过的是最后那一遍的）
+                // 上游的响应头（重发过的是最后那一遍的）。这一家在不在限流（见 `crate::throttle`）
+                // 等看清了这个答复再说：压着开头的回答，流的开头还可能报限流
                 if let Ok(r) = &sent {
                     tap.answered(r);
-                    // 不是 429 的答复：这一家没在限流（探路的过了，连续限流的次数归零）
-                    if r.status() != 429 {
-                        state.throttles.answered(&provider.name, sent_ms);
-                    }
                 }
                 sent
             }
-            // 被手动中止：这一跳到此为止，不再换下一家。不停用、不算失败
+            // 被手动中止：这一跳到此为止，不再换下一家。不停用、不算失败；探路的名额还回去
             Waited::Aborted => {
+                if let Some(p) = probe.take() {
+                    p.withdraw();
+                }
                 chain.push(super::idle::aborted_hop(
                     &provider.name,
                     model.clone(),
@@ -737,6 +768,7 @@ pub(super) async fn try_upstreams<'a>(
             // 响应头都没等到：放弃这一家，换下一家；没有下一家了，交出去的就是这个超时
             Waited::Quiet => {
                 reached = true;
+                state.throttles.released(&provider.name, sent_ms);
                 last_err = Some(gave_up(
                     state,
                     started,
@@ -760,6 +792,7 @@ pub(super) async fn try_upstreams<'a>(
                 // 同格式的上游没实现数 token（不少中转只做了生成回答）：网关自己估。
                 // **在判断换不换之前**：404 平时是「这家没有这个模型」，要换下一家
                 if counting && crate::count::unsupported(status) {
+                    state.throttles.answered(&provider.name, sent_ms);
                     note_health(
                         &state.bus,
                         &state.health,
@@ -782,6 +815,9 @@ pub(super) async fn try_upstreams<'a>(
                     state.note_glm_429_body(id, provider, &head);
                 }
                 let verdict = crate::failure::classify(status, &headers, &head, now_ms());
+                if !matches!(verdict, Verdict::Failed(Cause::RateLimited { .. })) {
+                    to_throttle(state, &provider.name, sent_ms, verdict);
+                }
                 // **最后一家的 4xx 交给客户端**：没有下一家可换了，上游自己的原话
                 // （「invalid x-api-key」）比我们转述的一句「回了 401」有用得多。
                 // 5xx 和 429 照旧报我们的话，带着尝试链
@@ -813,9 +849,10 @@ pub(super) async fn try_upstreams<'a>(
                             estimated = Some(provider);
                             break;
                         }
-                        // 探路的又被限流了：它回到这一家的队头，后面的照旧排在它后面
+                        // 探路的又被限流了：它下一次等的时候回到这一家的队头，后面的照旧排在它
+                        // 后面。**先去试别的候选时不占着**（见 `throttle::Waiter::keep_place`）
                         if probe.is_some() {
-                            waiter.join_front(&provider.name);
+                            waiter.keep_place(&provider.name);
                         }
                         waiting.push((name, Wait::Throttled));
                         continue;
@@ -914,14 +951,30 @@ pub(super) async fn try_upstreams<'a>(
                 }
             }
             Ok(r) => {
-                // 回答的开头：**第一段内容到之前**上游在流里报的错照样换下一家，一直没有内容
-                // 也换（见 `opening`）。最后一家不压 —— 没有下一家可换，压着只会让客户端晚
-                // 一点看到同样的东西；它不出声由回程按无响应超时收尾（见 `relay`）
+                // 回答的开头：**第一段内容到之前**上游在流里报的错照样换下一家（报的是限流就排队
+                // 等它，和回 429 一样），一直没有内容也换（见 `opening`）。
+                //
+                // 最后一家只在这一家可能在限流时压（探路的、最近被限流过的，见
+                // `throttle::Throttles::wary`），而且只压流式的、这个请求又还等得起的：流的开头报的
+                // 限流要暂停这一家、排队等它恢复，客户端察觉不到（不压的话那个错误直接交给了客户端）。
+                // 别的时候不压：没有下一家可换，客户端该当场拿到响应头和开头的事件；整包的回答不在
+                // 正文里报限流，等不起的也排不了队。不压的由回程按无响应超时收尾（见 `relay`）
                 let hold = hold_of(req, reading, provider, &out, &r);
-                // 最后一家不压开头：它答没答上（成败的账）要等回程看到第一段内容才知道
-                let unconfirmed = last && hold.is_some();
-                let r = match hold.filter(|_| !last) {
-                    None => r,
+                let held = hold.as_ref().is_some_and(|h| {
+                    !last
+                        || (matches!(h, Hold::Stream(..))
+                            && tokio::time::Instant::now() < until
+                            && state.throttles.wary(&provider.name))
+                });
+                // 不压开头的最后一家：它答没答上（成败的账）要等回程看到第一段内容才知道
+                let mut unconfirmed = last && hold.is_some() && !held;
+                let r = match hold.filter(|_| held) {
+                    None => {
+                        // 不压开头：响应头就是它的答复，这一家没在限流（探路的过了，连续限流的次数
+                        // 归零）
+                        state.throttles.answered(&provider.name, sent_ms);
+                        r
+                    }
                     Some(hold) => {
                         let status = r.status().as_u16();
                         let watching = async move {
@@ -940,6 +993,9 @@ pub(super) async fn try_upstreams<'a>(
                         };
                         match opened {
                             None => {
+                                if let Some(p) = probe.take() {
+                                    p.withdraw();
+                                }
                                 chain.push(super::idle::aborted_hop(
                                     &provider.name,
                                     model.clone(),
@@ -949,30 +1005,43 @@ pub(super) async fn try_upstreams<'a>(
                                 halt = Some(GatewayError::aborted());
                                 break;
                             }
-                            Some(super::opening::Opening::Go(r)) => r,
-                            // 到点了还没有内容：放弃这一家。**响应跟着这一轮循环丢掉**，和上游的连接
-                            // 随之断开，它不再接着生成
+                            // 内容来了：**这时**才是这一家的答复。响应头是 200、流里接着报限流的
+                            // 上游，响应头不说明它好了
+                            Some(super::opening::Opening::Go(r)) => {
+                                state.throttles.answered(&provider.name, sent_ms);
+                                r
+                            }
+                            // 到点了还没有内容：这一跳没有结论
                             Some(super::opening::Opening::Slow { response, usage }) => {
-                                let status = response.status().as_u16();
-                                drop(response);
-                                reached = true;
-                                // 上游回了话，说明代理是通的
-                                state.note_proxy_ok(&provider.proxy);
-                                last_err = Some(gave_up(
-                                    state,
-                                    started,
-                                    reading,
-                                    Abandoned {
-                                        provider,
-                                        model: model.clone(),
-                                        status: Some(status),
-                                        usage,
-                                        quiet,
-                                        hop_started,
-                                    },
-                                    &mut chain,
-                                ));
-                                continue;
+                                state.throttles.released(&provider.name, sent_ms);
+                                if last {
+                                    // 最后一家：和不压开头时一样交给回程，由它按无响应超时收尾
+                                    unconfirmed = true;
+                                    response
+                                } else {
+                                    // 放弃这一家。**响应跟着这一轮循环丢掉**，和上游的连接随之
+                                    // 断开，它不再接着生成
+                                    let status = response.status().as_u16();
+                                    drop(response);
+                                    reached = true;
+                                    // 上游回了话，说明代理是通的
+                                    state.note_proxy_ok(&provider.proxy);
+                                    last_err = Some(gave_up(
+                                        state,
+                                        started,
+                                        reading,
+                                        Abandoned {
+                                            provider,
+                                            model: model.clone(),
+                                            status: Some(status),
+                                            usage,
+                                            quiet,
+                                            hop_started,
+                                        },
+                                        &mut chain,
+                                    ));
+                                    continue;
+                                }
                             }
                             Some(super::opening::Opening::Failed {
                                 status,
@@ -984,7 +1053,15 @@ pub(super) async fn try_upstreams<'a>(
                             }) => {
                                 let verdict =
                                     crate::failure::classify(status, &headers, &body, now_ms());
-                                if verdict == Verdict::ClientError {
+                                let limited =
+                                    matches!(verdict, Verdict::Failed(Cause::RateLimited { .. }));
+                                if !limited {
+                                    to_throttle(state, &provider.name, sent_ms, verdict);
+                                }
+                                if verdict == Verdict::ClientError || (last && !limited) {
+                                    // 请求本身的问题，或者最后一家报了限流以外的错：原样交出去，和
+                                    // 不压开头时一样（后者的成败由回程记）
+                                    unconfirmed |= verdict != Verdict::ClientError;
                                     response
                                 } else {
                                     // 换下一家：这一跳的回答就是上游在开头报的那个错
@@ -1021,7 +1098,7 @@ pub(super) async fn try_upstreams<'a>(
                                             a.pause_ms = Some(pause.as_millis() as u64);
                                             chain.push(a);
                                             if probe.is_some() {
-                                                waiter.join_front(&provider.name);
+                                                waiter.keep_place(&provider.name);
                                             }
                                             waiting.push((name, Wait::Throttled));
                                         }
@@ -1049,6 +1126,7 @@ pub(super) async fn try_upstreams<'a>(
                             }
                             Some(super::opening::Opening::Broken(err)) => {
                                 reached = true;
+                                state.throttles.released(&provider.name, sent_ms);
                                 note_health(
                                     &state.bus,
                                     &state.health,
@@ -1109,18 +1187,24 @@ pub(super) async fn try_upstreams<'a>(
                     SendError::Http(e) if e.is_connect() => {
                         usage_hold.release();
                         reached = true;
+                        // 没有结论：探路的不再探，交给熔断（见 `crate::throttle`）
+                        state.throttles.released(&provider.name, sent_ms);
                         state.check_proxy(&provider.proxy);
                         forward::map_reqwest_error(e)
                     }
                     SendError::Http(e) => {
                         reached = true;
+                        state.throttles.released(&provider.name, sent_ms);
                         // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                         state.check_proxy(&provider.proxy);
                         forward::map_reqwest_error(e)
                     }
-                    // 签不了名：没发出去
+                    // 签不了名：没发出去，探路的名额还回去
                     SendError::Sign(e) => {
                         usage_hold.release();
+                        if let Some(p) = probe.take() {
+                            p.withdraw();
+                        }
                         GatewayError::config(msg!(
                             "gw.upstream.sign_failed",
                             upstream = provider.name.clone(), detail = e.0 =>
@@ -1433,6 +1517,25 @@ fn queued_up(
         until_ms: deadline_ms,
         at_ms: now_ms(),
     });
+}
+
+/// 这个请求不排队了（见 [`tw_api::Event::RequestDequeued`]）：等到了要发出去、被中止了、等不到了
+fn dequeued(state: &AppState, id: u64) {
+    state.bus.emit(tw_api::Event::RequestDequeued {
+        id,
+        at_ms: now_ms(),
+    });
+}
+
+/// 一跳有了不是限流的结论，告诉 [`crate::throttle`]：额度用完、没钱了是等不到 —— 不再探路，交给
+/// 熔断（[`crate::throttle::Throttles::released`]）；别的是这一家的答复，它没在限流
+fn to_throttle(state: &AppState, name: &str, sent_ms: u64, verdict: Verdict) {
+    match verdict {
+        Verdict::Failed(Cause::QuotaUsedUp { .. } | Cause::NoBalance) => {
+            state.throttles.released(name, sent_ms)
+        }
+        _ => state.throttles.answered(name, sent_ms),
+    }
 }
 
 /// 这一跳在这一家的用量上限上占多少：输入 token 的估算（解不开的请求没有估算，占 0），和设了

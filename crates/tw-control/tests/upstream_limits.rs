@@ -44,6 +44,7 @@ fn ms(s: &str) -> i64 {
 
 struct Bed {
     _dir: tempfile::TempDir,
+    gw: tw_gateway::AppState,
     app: axum::Router,
     rec: Arc<tokio::sync::Mutex<tw_store::Recorder>>,
     path: std::path::PathBuf,
@@ -82,6 +83,7 @@ fn bed(db: Option<tw_store::Db>) -> Bed {
         zai: Default::default(),
     };
     Bed {
+        gw,
         app: tw_control::router(state),
         _dir: d,
         rec,
@@ -293,10 +295,19 @@ async fn saving_an_upstream_writes_its_limits_and_a_rename_keeps_what_it_used() 
         (&serde_json::json!(30), &serde_json::json!(2_500_000))
     );
 
-    // 「中转」用掉一个请求，然后改名、换上限：用量跟着走
+    // 「中转」用掉一个请求、刚回了 429 暂停着，然后改名、换上限：用量和暂停都跟着走
     for e in request(1, ms(NOON), vec![attempt("中转", 200)], 10) {
         b.rec.lock().await.on_event(&e);
     }
+    let paused = b.gw.throttles.limited(
+        "中转",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        Some(std::time::Duration::from_secs(60)),
+    );
+    assert_eq!(paused.as_secs(), 60);
     let (st, v) = call(
         &b.app,
         "PUT",
@@ -315,6 +326,17 @@ async fn saving_an_upstream_writes_its_limits_and_a_rename_keeps_what_it_used() 
     let u = upstream(&b, "中转二").await;
     assert_eq!(u["limits"][0]["used"], 1);
     assert_eq!(u["limits"][0]["reached"], true);
+    assert!(matches!(
+        b.gw.throttles.peek("中转二", &[]),
+        tw_gateway::throttle::Peek::Wait {
+            kind: tw_api::ThrottleKind::RateLimited,
+            ..
+        }
+    ));
+    assert_eq!(
+        b.gw.throttles.peek("中转", &[]),
+        tw_gateway::throttle::Peek::Open
+    );
     assert_eq!(config(&b).providers[0].limits.len(), 1);
 
     // 写错了：校验的那句话，码是上游自己的
