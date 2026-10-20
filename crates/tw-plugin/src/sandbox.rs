@@ -50,7 +50,7 @@ pub(crate) struct HostState {
     max_log_line: usize,
     log_overflow: bool,
     /// 这一段执行的起点（线程 CPU 时间）和预算
-    start: Duration,
+    start: cpu::Mark,
     budget: Duration,
     cpu_hit: bool,
 }
@@ -96,7 +96,7 @@ impl ResourceLimiter for HostState {
 
 impl HostState {
     fn exceeded(&self) -> bool {
-        cpu::now().saturating_sub(self.start) >= self.budget
+        self.start.elapsed() >= self.budget
     }
 }
 
@@ -235,7 +235,7 @@ impl Sandbox {
         memory_cap: usize,
         budget: Duration,
     ) -> Result<Sandbox, RunError> {
-        let start = cpu::now();
+        let start = cpu::Mark::now();
         let mut store = Store::new(
             pre.module().engine(),
             HostState {
@@ -283,7 +283,7 @@ impl Sandbox {
     /// 下一段执行的 CPU 预算从现在算起
     pub(crate) fn arm(&mut self, budget: Duration) {
         let s = self.store.data_mut();
-        s.start = cpu::now();
+        s.start = cpu::Mark::now();
         s.budget = budget;
         s.cpu_hit = false;
         self.store.set_epoch_deadline(1);
@@ -291,7 +291,7 @@ impl Sandbox {
 
     /// 这一段执行（上次 `arm` 或建实例以来）用掉的 CPU 时间
     pub(crate) fn elapsed(&self) -> Duration {
-        cpu::now().saturating_sub(self.store.data().start)
+        self.store.data().start.elapsed()
     }
 
     pub(crate) fn take_logs(&mut self) -> Vec<LogLine> {

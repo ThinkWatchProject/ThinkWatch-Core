@@ -29,6 +29,10 @@ rand = { workspace = true }
 # 量线程的 CPU 时间（CLOCK_THREAD_CPUTIME_ID）
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# 量线程的 CPU 时间（GetThreadTimes）
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [build-dependencies]
 # 构建时的编译器：Cranelift 把快照编成目标平台的机器码；all-arch 让交叉编译
 # （比如在 x64 上编 aarch64 的 Windows）也能编

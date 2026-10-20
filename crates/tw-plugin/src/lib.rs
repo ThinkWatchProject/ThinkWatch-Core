@@ -608,14 +608,14 @@ impl Plugin {
         let view_json = to_json(&view);
         let ctx_json = to_json(&ctx);
         let _running = self.inner.rt.ticker.enter();
-        let start = cpu::now();
+        let start = cpu::Mark::now();
         let (mut sb, mut logs) = match self.setup(limits.request_memory) {
             Ok(x) => x,
             Err((e, logs)) => {
                 return Invocation {
                     result: Err(e),
                     logs,
-                    cpu: cpu::now().saturating_sub(start),
+                    cpu: start.elapsed(),
                 };
             }
         };
