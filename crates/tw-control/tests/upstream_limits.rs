@@ -301,10 +301,7 @@ async fn saving_an_upstream_writes_its_limits_and_a_rename_keeps_what_it_used() 
     }
     let paused = b.gw.throttles.limited(
         "中转",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
+        std::time::Instant::now(),
         Some(std::time::Duration::from_secs(60)),
     );
     assert_eq!(paused.as_secs(), 60);

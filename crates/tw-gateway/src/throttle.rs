@@ -27,15 +27,16 @@
 //! 客户端走了、请求被手动中止了：当场离开队，什么都不占。
 //!
 //! **只在内存里**：跨配置重载存活，重启就没了 —— 重启之后第一个请求照常发，上游还在限流的话
-//! 再回一个 429，这里重新暂停。暂停多久按单调时钟算：系统时间被往回拨，暂停不跟着变长。
+//! 再回一个 429，这里重新暂停。暂停多久按单调时钟和墙上的时钟里走得多的那个算：系统时间被往回拨，
+//! 暂停不跟着变长；合上盖子睡过去的时间算进暂停（单调时钟那时不走）。
 //!
 //! 状态变了（开始暂停、暂停结束、用量上限满了或空出来）报 [`tw_api::Event::ThrottleChanged`]，
 //! 界面显示它；它自己会好，不发通知。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::HeaderMap;
 use tokio::sync::watch;
@@ -63,8 +64,13 @@ const BACKOFF_SECS: [u64; 5] = [5, 10, 20, 40, 60];
 /// 一家最近一次被限流之后这么久之内，它还「可能在限流」（[`Throttles::wary`]）
 const WARY_FOR: Duration = Duration::from_secs(300);
 
-/// 墙上的时钟和单调时钟的差，变了这么多才换（见 [`Throttles::offset`]）
-const OFFSET_SLACK_MS: i64 = 1_000;
+/// 两个时钟走的差，到了这么多才当是系统时间被拨过（见 [`Span::end_ms`]）；两个时钟换算出来的
+/// 时刻差不到这么多的当是同一刻（见 [`Throttles::limit_state`]）。先后读两个时钟，差会抖一两毫秒
+const SLACK_MS: u64 = 1_000;
+
+/// 等一个时刻到来时，最多睡这么久就起来再看一眼。**tokio 的定时器按单调时钟走**，合上盖子睡着的
+/// 时候它不走：醒来时暂停按墙上的时钟早就结束了，定时器却还要睡完剩下的
+const NAP: Duration = Duration::from_secs(1);
 
 /// 一家上游的用量上限写在哪儿（`providers[].limits`，见 [`crate::upstream_limits`]）
 pub fn usage_limits(p: &tw_config::Provider) -> &[KeyLimit] {
@@ -127,25 +133,82 @@ pub enum Peek {
     },
 }
 
-/// 一个时钟，毫秒
-type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+/// 墙上的时钟，Unix 毫秒
+type Wall = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// 单调时钟
+type Mono = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// 同一刻，在两个时钟上
+#[derive(Debug, Clone, Copy)]
+struct Moment {
+    mono: Instant,
+    wall: u64,
+}
+
+impl Moment {
+    /// 从这一刻到 `now` 过了多久：**两个时钟里走得多的那个**。合上盖子睡着的时候单调时钟不走
+    /// （macOS、Linux 都是），墙上的照走 —— 睡着的时间要算进去；系统时间被往回拨，墙上的倒退、
+    /// 单调的照走 —— 拨回去也拉不长
+    fn since(&self, now: Moment) -> Duration {
+        now.mono
+            .saturating_duration_since(self.mono)
+            .max(Duration::from_millis(now.wall.saturating_sub(self.wall)))
+    }
+}
+
+/// 从某一刻起的一段时间：限流暂停、探路的宽限。**两个时钟哪个先走完就结束**（见
+/// [`Moment::since`]）
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    from: Moment,
+    len: Duration,
+}
+
+impl Span {
+    /// 还剩多久。结束了是 0
+    fn left(&self, now: Moment) -> Duration {
+        self.len.saturating_sub(self.from.since(now))
+    }
+
+    fn over(&self, now: Moment) -> bool {
+        self.left(now).is_zero()
+    }
+
+    /// 结束的那一刻，墙上的（报出去的 `until_ms`）。系统时间被往回拨过 —— 墙上的比单调的少走了
+    /// [`SLACK_MS`] 以上 —— 起点在墙上跟着拨回去：报出去的时刻按拨过的算，还要等多久不变，之后
+    /// 再报还是这一刻。**不按两个时钟的差现算**：先后读两个时钟，差会抖，报出去的时刻跟着抖的话，
+    /// 同一个暂停会报好几次（[`Throttles::refresh`] 比的是报过的样子）
+    fn end_ms(&mut self, now: Moment) -> u64 {
+        let mono = now
+            .mono
+            .saturating_duration_since(self.from.mono)
+            .as_millis() as i64;
+        let wall = now.wall as i64 - self.from.wall as i64;
+        if wall.saturating_add(SLACK_MS as i64) < mono {
+            self.from.wall = now.wall.saturating_sub(mono as u64);
+        }
+        self.from.wall.saturating_add(self.len.as_millis() as u64)
+    }
+}
 
 /// 每家上游的暂停、排队和探路。**跨重载存活**，按上游的名字记。
 ///
-/// 两个时钟：**暂停多久、宽限多久按单调的算**（`mono`）—— 系统时间往回拨了一小时，暂停不该
-/// 跟着长出一小时。报出去的时刻（`until_ms`、事件的 `at_ms`）、请求的等待期限、上游说的 HTTP
-/// 日期是墙上的（`wall`，Unix 毫秒），进出时按两个时钟的差换算（[`Self::to_wall`]）
+/// 两个时钟（见 [`Moment`]）：暂停、宽限、「最近被限流过」**按两个里走得多的那个算**，合上盖子
+/// 睡过去的时间算进去，系统时间往回拨也拉不长。报出去的时刻（`until_ms`、事件的 `at_ms`）、请求
+/// 的等待期限、上游说的 HTTP 日期是墙上的（Unix 毫秒）；一跳是什么时候发出去的看单调的
 pub struct Throttles {
     ups: Mutex<HashMap<String, Up>>,
     limits: Arc<crate::upstream_limits::UpstreamLimits>,
     bus: tw_observe::EventBus,
     settings: Mutex<Settings>,
-    wall: Clock,
-    mono: Clock,
-    /// 墙上的时钟减单调时钟（见 [`Self::offset`]）
-    offset: AtomicI64,
+    wall: Wall,
+    mono: Mono,
     /// 排队的、探路的各自的号
     next: AtomicU64,
+    /// 看着用量上限的那些后台任务（[`Self::configure`]），一家一个。**配置换了就全换掉**：
+    /// 删掉、改了名的那一家，它的任务不会再被叫醒
+    watchers: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 #[derive(Default)]
@@ -153,23 +216,21 @@ struct Settings {
     max_pause: Duration,
     /// 每家的用量上限：报状态、等窗口空出来时要看
     limits: HashMap<String, Vec<KeyLimit>>,
-    /// 配置换了几次：看着用量上限的那些后台任务，配置换了就收工
-    generation: u64,
 }
 
-/// 一家上游记着的。时刻都在单调时钟上。
+/// 一家上游记着的。
 struct Up {
-    /// 暂停到这一刻。没暂停过是 0
-    until: u64,
+    /// 暂停着的话，从哪一刻起、多久
+    pause: Option<Span>,
     /// 最近一次收到 429 的时刻。**在它之前发出去的请求的答复不算数**：一阵同时被限流的请求
     /// 只算一次，暂停之前发出去的一个长回答到了响应头，也不说明这家好了
-    limited_at: Option<u64>,
+    limited_at: Option<Moment>,
     /// 连续被限流的次数（退避按它算）。拿到别的答复就归零
     strikes: u32,
     /// 暂停结束了、还没有结论：只放一个过去探路
     probing: bool,
     /// 探路的那一个：它的号，和发出去的时刻（还没发出去是 None）
-    probe: Option<(u64, Option<u64>)>,
+    probe: Option<(u64, Option<Moment>)>,
     /// 排着队的，先来的在前
     queue: VecDeque<u64>,
     /// 队是为什么排起来的：后来的、不在队里的请求看到的就是这个
@@ -183,7 +244,7 @@ struct Up {
 impl Up {
     fn new() -> Self {
         Self {
-            until: 0,
+            pause: None,
             limited_at: None,
             strikes: 0,
             probing: false,
@@ -199,11 +260,16 @@ impl Up {
         self.tx.send_modify(|v| *v = v.wrapping_add(1));
     }
 
+    /// 此刻还在暂停着的话，那一段
+    fn paused(&mut self, now: Moment) -> Option<&mut Span> {
+        self.pause.as_mut().filter(|p| !p.over(now))
+    }
+
     /// 探路的发出去 [`PROBE_GRACE`] 还没有结论：当这一家好了
-    fn settle_probe(&mut self, now: u64) {
+    fn settle_probe(&mut self, now: Moment) {
         if self.probing
             && let Some((_, Some(sent))) = self.probe
-            && sent + PROBE_GRACE.as_millis() as u64 <= now
+            && grace(sent).over(now)
         {
             self.probing = false;
             self.probe = None;
@@ -223,37 +289,40 @@ impl Up {
     }
 }
 
+/// `sent` 发出去的探路的那一个的宽限
+fn grace(sent: Moment) -> Span {
+    Span {
+        from: sent,
+        len: PROBE_GRACE,
+    }
+}
+
+/// 拿着这张探路名额的那一家。**认号不认名字**：拿到名额之后这一家可能改了名（[`Throttles::rename`]），
+/// 名额跟着走，[`Probe`] 手上的还是旧名字
+fn holding(map: &mut HashMap<String, Up>, ticket: u64) -> Option<(&String, &mut Up)> {
+    map.iter_mut()
+        .find(|(_, up)| matches!(up.probe, Some((t, _)) if t == ticket))
+}
+
 impl Throttles {
     pub fn new(
         bus: tw_observe::EventBus,
         limits: Arc<crate::upstream_limits::UpstreamLimits>,
     ) -> Self {
-        let base = std::time::Instant::now();
         Self::with_clocks(
             bus,
             limits,
             Arc::new(crate::server::now_ms),
-            Arc::new(move || base.elapsed().as_millis() as u64),
+            Arc::new(Instant::now),
         )
-    }
-
-    /// 测试用：两个时钟是同一个
-    #[cfg(test)]
-    fn with_clock(
-        bus: tw_observe::EventBus,
-        limits: Arc<crate::upstream_limits::UpstreamLimits>,
-        clock: Clock,
-    ) -> Self {
-        Self::with_clocks(bus, limits, clock.clone(), clock)
     }
 
     fn with_clocks(
         bus: tw_observe::EventBus,
         limits: Arc<crate::upstream_limits::UpstreamLimits>,
-        wall: Clock,
-        mono: Clock,
+        wall: Wall,
+        mono: Mono,
     ) -> Self {
-        let offset = wall() as i64 - mono() as i64;
         Self {
             ups: Mutex::new(HashMap::new()),
             limits,
@@ -266,8 +335,8 @@ impl Throttles {
             }),
             wall,
             mono,
-            offset: AtomicI64::new(offset),
             next: AtomicU64::new(1),
+            watchers: Mutex::new(Vec::new()),
         }
     }
 
@@ -285,39 +354,19 @@ impl Throttles {
         (self.wall)()
     }
 
-    /// 此刻，单调时钟
-    fn mono(&self) -> u64 {
-        (self.mono)()
-    }
-
-    /// 墙上的时钟减单调时钟。**差得不到一秒的不换**：两个时钟先后读，差会抖一两毫秒，报出去的
-    /// 时刻跟着抖的话，同一个暂停会报好几次（[`Self::refresh`] 比的是报过的样子）。系统时间被拨了
-    /// 才换：之后报出去的时刻按拨过的算，还要等多久不变
-    fn offset(&self) -> i64 {
-        let fresh = self.now() as i64 - self.mono() as i64;
-        let held = self.offset.load(Ordering::Relaxed);
-        if (fresh - held).abs() > OFFSET_SLACK_MS {
-            self.offset.store(fresh, Ordering::Relaxed);
-            fresh
-        } else {
-            held
+    /// 此刻，在两个时钟上
+    fn moment(&self) -> Moment {
+        Moment {
+            mono: (self.mono)(),
+            wall: self.now(),
         }
     }
 
-    /// 单调时钟上的 `m` 是墙上的哪一刻
-    fn to_wall(&self, m: u64) -> u64 {
-        (m as i64).saturating_add(self.offset()).max(0) as u64
-    }
-
-    /// 墙上的 `w` 是单调时钟上的哪一刻
-    fn to_mono(&self, w: u64) -> u64 {
-        (w as i64).saturating_sub(self.offset()).max(0) as u64
-    }
-
-    /// 照这份配置换设置：最长暂停多久、每家的用量上限。**暂停着的照旧暂停着**。用量上限有变化的
-    /// 那几家起一个后台任务看着它们，状态变了就报（见 [`Self::refresh`]）
+    /// 照这份配置换设置：最长暂停多久、每家的用量上限。**暂停着的照旧暂停着**。有用量上限的
+    /// 那几家各起一个后台任务看着，状态变了就报（见 [`Self::refresh`]）；上一份配置的那些当场
+    /// 收工 —— 删掉、改了名的那一家的用量不会再变，它的任务不收工就一直挂着，重载一次多一批
     pub fn configure(self: &Arc<Self>, cfg: &tw_config::Config) {
-        let generation = {
+        let names: Vec<String> = {
             let mut s = self.settings();
             s.max_pause = Duration::from_secs(cfg.failover.rate_limit_max_pause_secs);
             s.limits = cfg
@@ -326,70 +375,78 @@ impl Throttles {
                 .filter(|p| !usage_limits(p).is_empty())
                 .map(|p| (p.name.clone(), usage_limits(p).to_vec()))
                 .collect();
-            s.generation += 1;
-            s.generation
+            s.limits.keys().cloned().collect()
         };
-        let names: Vec<String> = self.settings().limits.keys().cloned().collect();
         // 配置换了，用量上限可能删了：报一遍现在的样子
         let known: Vec<String> = self.lock().keys().cloned().collect();
         for n in known.iter().chain(&names) {
             self.refresh(n);
+        }
+        let mut watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        for w in watchers.drain(..) {
+            w.abort();
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
         for name in names {
             let me = Arc::downgrade(self);
-            rt.spawn(async move {
+            let task = rt.spawn(async move {
                 loop {
-                    let Some(t) = me.upgrade() else { return };
-                    if t.settings().generation != generation {
-                        return;
-                    }
-                    let until = t.view(&name).map(|v| v.until_ms);
+                    // **等的时候不攥着它**：它没了（网关关了）任务跟着收工，见 `Drop`
+                    let (limits, nap) = {
+                        let Some(t) = me.upgrade() else { return };
+                        let nap = t.view(&name).map(|v| t.nap(v.until_ms));
+                        (t.limits.clone(), nap)
+                    };
                     let wake = async {
-                        match until {
-                            Some(at) => tokio::time::sleep(t.left(at)).await,
+                        match nap {
+                            Some(d) => tokio::time::sleep(d).await,
                             None => std::future::pending().await,
                         }
                     };
                     tokio::select! {
-                        _ = t.limits.changed(&name) => {}
+                        _ = limits.changed(&name) => {}
                         _ = wake => {}
                     }
-                    if t.settings().generation != generation {
-                        return;
-                    }
+                    let Some(t) = me.upgrade() else { return };
                     t.refresh(&name);
                     t.bump(&name);
                 }
             });
+            watchers.push(task.abort_handle());
         }
     }
 
-    /// 离墙上的 `at_ms` 还有多久。已经过了的是 0
-    fn left(&self, at_ms: u64) -> Duration {
-        Duration::from_millis(at_ms.saturating_sub(self.now()))
+    /// 等墙上的 `at_ms` 到来，这一次睡多久：离它还有多久，最多 [`NAP`]。已经过了的是 0
+    fn nap(&self, at_ms: u64) -> Duration {
+        Duration::from_millis(at_ms.saturating_sub(self.now())).min(NAP)
     }
 
     /// 这一家的用量上限此刻的样子（[`crate::upstream_limits::UpstreamLimits::state`]），时刻换成
     /// 这里的时钟：用量上限按它自己的时钟算（测试会拨它），暂停、等待期限、`Retry-After` 都按
-    /// 这里的。**换的是还要多久**，两个时钟一样时什么都不变
+    /// 这里的。两个时钟各读一次；**差不到 [`SLACK_MS`] 的当是同一个**，时刻原样交回 —— 不然先后
+    /// 读的两个时钟差一毫秒，报出去的时刻就差一毫秒，同一个样子报好几次
     fn limit_state(&self, name: &str, limits: &[KeyLimit]) -> LimitState {
-        let mine = |until_ms: u64| {
-            let left = (until_ms as i64)
-                .saturating_sub(self.limits.now_ms())
-                .max(0) as u64;
-            self.now().saturating_add(left)
+        let theirs = self.limits.now_ms();
+        let mine = self.now() as i64;
+        let same = mine.abs_diff(theirs) <= SLACK_MS;
+        let convert = |until_ms: u64| {
+            if same {
+                until_ms
+            } else {
+                let left = (until_ms as i64).saturating_sub(theirs).max(0);
+                mine.saturating_add(left).max(0) as u64
+            }
         };
         match self.limits.state(name, limits) {
             LimitState::Free => LimitState::Free,
             LimitState::WindowFull { until_ms, limit } => LimitState::WindowFull {
-                until_ms: mine(until_ms),
+                until_ms: convert(until_ms),
                 limit,
             },
             LimitState::PeriodUsedUp { until_ms, limit } => LimitState::PeriodUsedUp {
-                until_ms: mine(until_ms),
+                until_ms: convert(until_ms),
                 limit,
             },
         }
@@ -425,7 +482,6 @@ impl Throttles {
         match self.check(name, limits, waiter, true) {
             (Peek::Open, ticket) => Gate::Go(ticket.map(|ticket| Probe {
                 throttles: self.clone(),
-                name: name.to_string(),
                 ticket,
                 sent: false,
             })),
@@ -453,7 +509,7 @@ impl Throttles {
             LimitState::WindowFull { until_ms, limit: _ } => Some(until_ms),
             LimitState::Free => None,
         };
-        let now = self.mono();
+        let now = self.moment();
         let mut map = self.lock();
         let Some(up) = map.get_mut(name) else {
             return match window {
@@ -468,8 +524,8 @@ impl Throttles {
             };
         };
         up.settle_probe(now);
-        if up.until > now {
-            let until = self.to_wall(up.until).max(window.unwrap_or(0));
+        if let Some(pause) = up.paused(now) {
+            let until = pause.end_ms(now).max(window.unwrap_or(0));
             return (
                 Peek::Wait {
                     kind: ThrottleKind::RateLimited,
@@ -518,7 +574,7 @@ impl Throttles {
                 None => (
                     Peek::Wait {
                         kind: ThrottleKind::RateLimited,
-                        until_ms: Some(self.now()),
+                        until_ms: Some(now.wall),
                     },
                     None,
                 ),
@@ -532,13 +588,9 @@ impl Throttles {
     /// 限流要排队等它恢复，不交给客户端。一直好好的上游不压 —— 客户端照常当场拿到响应头和
     /// 开头的那几个事件
     pub fn wary(&self, name: &str) -> bool {
-        let now = self.mono();
+        let now = self.moment();
         self.lock().get(name).is_some_and(|up| {
-            up.probing
-                || up.strikes > 0
-                || up
-                    .limited_at
-                    .is_some_and(|t| now.saturating_sub(t) < WARY_FOR.as_millis() as u64)
+            up.probing || up.strikes > 0 || up.limited_at.is_some_and(|t| t.since(now) < WARY_FOR)
         })
     }
 
@@ -556,54 +608,57 @@ impl Throttles {
         }
     }
 
-    /// 发给这一家的、`sent_at_ms`（墙上的）发出去的一跳被限流了（回了 429，或者在流的开头报了限流；
-    /// 额度用完不算）：暂停这一家。`hint` 是上游说的暂停多久（[`pause_hint`]），没说、说了等于没说
+    /// 发给这一家的、`sent` 发出去的一跳被限流了（回了 429，或者在流的开头报了限流；额度用完
+    /// 不算）：暂停这一家。`hint` 是上游说的暂停多久（[`pause_hint`]），没说、说了等于没说
     /// （不到 [`MIN_HINT`]）按退避（[`backoff`]）。**已经暂停着的延到两个里晚的那个**。交回从此刻起
     /// 还要暂停多久
     pub fn limited(
         self: &Arc<Self>,
         name: &str,
-        sent_at_ms: u64,
+        sent: Instant,
         hint: Option<Duration>,
     ) -> Duration {
-        let now = self.mono();
-        let sent = self.to_mono(sent_at_ms);
+        let now = self.moment();
         let max = self.settings().max_pause;
         let hint = hint.filter(|d| *d >= MIN_HINT);
-        let until = {
+        let pause = {
             let mut map = self.lock();
             let up = map.entry(name.to_string()).or_insert_with(Up::new);
             // 上一次 429 之后才发出去的又被限流了，才是连续的又一次。同一阵里被限流的那几个只算
             // 一次
-            if up.limited_at.is_none_or(|t| sent > t) {
+            if up.limited_at.is_none_or(|t| sent > t.mono) {
                 up.strikes = up.strikes.saturating_add(1);
             }
-            let pause = hint.unwrap_or_else(|| backoff(up.strikes)).min(max);
-            up.until = up.until.max(now.saturating_add(pause.as_millis() as u64));
+            let len = hint.unwrap_or_else(|| backoff(up.strikes)).min(max);
+            let fresh = Span { from: now, len };
+            let pause = match up.pause {
+                Some(p) if p.left(now) >= len => p,
+                _ => fresh,
+            };
+            up.pause = Some(pause);
             up.limited_at = Some(now);
             // 探路的被拒了，或者别人在探路时被拒了：暂停结束后重新探
             up.probing = true;
             up.probe = None;
             up.bump();
-            up.until
+            pause
         };
         self.refresh(name);
         // 暂停结束那一刻也是一次变化，没有哪个请求会触发它
-        self.at(name, self.to_wall(until));
-        Duration::from_millis(until.saturating_sub(now))
+        self.at(name, pause);
+        pause.left(now)
     }
 
-    /// 发给这一家的、`sent_at_ms`（墙上的）发出去的一跳有了不是限流的答复：连续限流的次数归零；
-    /// 在探路的话，这一家好了，排着的照并发和用量上限放。**最近一次 429 之前发出去的不算**。
+    /// 发给这一家的、`sent` 发出去的一跳有了不是限流的答复：连续限流的次数归零；在探路的话，
+    /// 这一家好了，排着的照并发和用量上限放。**最近一次 429 之前发出去的不算**。
     ///
     /// 答复是什么时候算的看调用方：压着开头的回答（见 `hop`、`ws::turn`）要等到第一段内容 ——
     /// 响应头是 200、流里接着报限流的上游，响应头不说明它好了
-    pub fn answered(&self, name: &str, sent_at_ms: u64) {
-        let sent = self.to_mono(sent_at_ms);
+    pub fn answered(&self, name: &str, sent: Instant) {
         let changed = {
             let mut map = self.lock();
             let Some(up) = map.get_mut(name) else { return };
-            if up.limited_at.is_some_and(|t| sent <= t) {
+            if up.limited_at.is_some_and(|t| sent <= t.mono) {
                 return;
             }
             up.strikes = 0;
@@ -620,17 +675,16 @@ impl Throttles {
         }
     }
 
-    /// 发给这一家的、`sent_at_ms`（墙上的）发出去的一跳**没有结论**：连不上、发出去之后断了、到
-    /// 无响应超时还没有内容，或者回的 429 是额度用完、没钱了（等不到，见 [`crate::health`]）。
-    /// 在探路的话不再探：排着的照常放，这一家怎么样交给熔断 —— 不然后面的要干等完宽限期，再
-    /// 一拥而上，打到一家熔断刚停用的上游上（排着的看得见它停用了，见 [`first_ready`]）。连续
-    /// 限流的次数不动：这不是一个不是限流的答复。最近一次 429 之前发出去的不算
-    pub fn released(&self, name: &str, sent_at_ms: u64) {
-        let sent = self.to_mono(sent_at_ms);
+    /// 发给这一家的、`sent` 发出去的一跳**没有结论**：连不上、发出去之后断了、到无响应超时还
+    /// 没有内容，或者回的 429 是额度用完、没钱了（等不到，见 [`crate::health`]）。在探路的话不再
+    /// 探：排着的照常放，这一家怎么样交给熔断 —— 不然后面的要干等完宽限期，再一拥而上，打到一家
+    /// 熔断刚停用的上游上（排着的看得见它停用了，见 [`first_ready`]）。连续限流的次数不动：这不是
+    /// 一个不是限流的答复。最近一次 429 之前发出去的不算
+    pub fn released(&self, name: &str, sent: Instant) {
         {
             let mut map = self.lock();
             let Some(up) = map.get_mut(name) else { return };
-            if !up.probing || up.limited_at.is_some_and(|t| sent <= t) {
+            if !up.probing || up.limited_at.is_some_and(|t| sent <= t.mono) {
                 return;
             }
             up.probing = false;
@@ -641,13 +695,14 @@ impl Throttles {
     }
 
     /// 上游改了名（控制面改的）：暂停、退避、排着的队、探路的跟着走，和用量上限的账一样（见
-    /// [`crate::upstream_limits::UpstreamLimits::rename`]）。等旧名字的叫醒：它们手上是改名之前的
-    /// 配置，再看时旧名字下什么都没有，照常发
+    /// [`crate::upstream_limits::UpstreamLimits::rename`]）。探路的名额跟着走也不会丢：[`Probe`]
+    /// 认号不认名字。等旧名字的叫醒：它们手上是改名之前的配置，再看时旧名字下什么都没有，照常发
     pub fn rename(self: &Arc<Self>, from: &str, to: &str) {
         if from == to {
             return;
         }
-        let (until, sent) = {
+        let now = self.moment();
+        let (pause, sent) = {
             let mut map = self.lock();
             let Some(old) = map.remove(from) else { return };
             old.bump();
@@ -656,8 +711,14 @@ impl Throttles {
             if up.queue.is_empty() {
                 up.queue_kind = old.queue_kind;
             }
-            up.until = up.until.max(old.until);
-            up.limited_at = up.limited_at.max(old.limited_at);
+            up.pause = match (up.pause, old.pause) {
+                (Some(a), Some(b)) => Some(if b.left(now) > a.left(now) { b } else { a }),
+                (a, b) => a.or(b),
+            };
+            up.limited_at = match (up.limited_at, old.limited_at) {
+                (Some(a), Some(b)) => Some(if b.mono > a.mono { b } else { a }),
+                (a, b) => a.or(b),
+            };
             up.strikes = up.strikes.max(old.strikes);
             up.probing |= old.probing;
             if up.probe.is_none() {
@@ -669,26 +730,36 @@ impl Throttles {
                 }
             }
             up.bump();
-            (up.until, up.probe.and_then(|(_, sent)| sent))
+            (up.pause, up.probe.and_then(|(_, sent)| sent))
         };
         self.refresh(to);
         // 到点时的那一次变化原来挂在旧名字上
-        if until > self.mono() {
-            self.at(to, self.to_wall(until));
+        if let Some(pause) = pause.filter(|p| !p.over(now)) {
+            self.at(to, pause);
         }
         if let Some(sent) = sent {
-            self.at(to, self.to_wall(sent + PROBE_GRACE.as_millis() as u64));
+            self.at(to, grace(sent));
         }
     }
 
-    /// 到墙上的 `at_ms` 时重报一次这一家的样子、叫醒排队的
-    fn at(self: &Arc<Self>, name: &str, at_ms: u64) {
+    /// `span` 结束时重报一次这一家的样子、叫醒排队的。**睡一会儿起来看一眼**（[`NAP`]）：睡着的
+    /// 时候单调时钟不走，只按它睡，醒来后还要再等完剩下的
+    fn at(self: &Arc<Self>, name: &str, span: Span) {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let (me, name, wait) = (Arc::downgrade(self), name.to_string(), self.left(at_ms));
+        let (me, name) = (Arc::downgrade(self), name.to_string());
         rt.spawn(async move {
-            tokio::time::sleep(wait).await;
+            loop {
+                let left = match me.upgrade() {
+                    Some(t) => span.left(t.moment()),
+                    None => return,
+                };
+                if left.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(left.min(NAP)).await;
+            }
             if let Some(t) = me.upgrade() {
                 t.refresh(&name);
                 t.bump(&name);
@@ -699,15 +770,14 @@ impl Throttles {
     /// 这一家此刻暂时发不出去的样子：限流暂停、滚动窗口满了、这一期用完了。**几样都有时给
     /// 又能发得最晚的那一样**。能发是 None。探路那几秒不算：暂停已经结束了
     pub fn view(&self, name: &str) -> Option<tw_api::Throttle> {
-        let now = self.mono();
+        let now = self.moment();
         let paused = self
             .lock()
-            .get(name)
-            .filter(|up| up.until > now)
-            .map(|up| up.until)
-            .map(|until| tw_api::Throttle {
+            .get_mut(name)
+            .and_then(|up| up.paused(now).map(|p| p.end_ms(now)))
+            .map(|until_ms| tw_api::Throttle {
                 kind: ThrottleKind::RateLimited,
-                until_ms: self.to_wall(until),
+                until_ms,
                 limit: None,
             });
         let limited = match self.limit_state(name, &self.limits_of(name)) {
@@ -800,6 +870,19 @@ impl Throttles {
     }
 }
 
+impl Drop for Throttles {
+    fn drop(&mut self) {
+        for w in self
+            .watchers
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+        {
+            w.abort();
+        }
+    }
+}
+
 /// 一个在排队的请求。在哪几家的队里排着，**丢掉就全部离开**：客户端走了、被手动中止了，
 /// 后面的不用替它等。
 pub struct Waiter {
@@ -861,10 +944,13 @@ impl Drop for Waiter {
 
 /// 暂停结束后放过去探路的那一个。**发出去时说一声**（[`Probe::sent`]）：从那一刻起
 /// [`PROBE_GRACE`] 还没有结论，这一家就算好了。没发出去就丢掉的（没占到位置、被中止了），名额
-/// 还回去，下一个接着探
+/// 还回去，下一个接着探。
+///
+/// **名额认号不认名字**（[`holding`]）：拿到名额、还没发出去的时候这一家改了名，名额跟着新名字
+/// 走，这里说的发出去、还回去照样落在它身上 —— 不然新名字下一直挂着一张没人管的名额，宽限期
+/// 不从它算起，这一家再也放不出一个请求
 pub struct Probe {
     throttles: Arc<Throttles>,
-    name: String,
     ticket: u64,
     sent: bool,
 }
@@ -873,29 +959,25 @@ impl Probe {
     /// 这一跳发出去了
     pub fn sent(&mut self) {
         self.sent = true;
-        let at = {
-            let now = self.throttles.mono();
+        let now = self.throttles.moment();
+        let name = {
             let mut map = self.throttles.lock();
-            let Some(up) = map.get_mut(&self.name) else {
+            let Some((name, up)) = holding(&mut map, self.ticket) else {
                 return;
             };
-            match &mut up.probe {
-                Some((t, sent)) if *t == self.ticket => *sent = Some(now),
-                _ => return,
+            if let Some((_, sent)) = &mut up.probe {
+                *sent = Some(now);
             }
             up.bump();
-            now + PROBE_GRACE.as_millis() as u64
+            name.clone()
         };
-        self.throttles.at(&self.name, self.throttles.to_wall(at));
+        self.throttles.at(&name, grace(now));
     }
 
     /// 发出去了、却不作数：被手动中止了、签不了名。名额还回去，下一个接着探
     pub fn withdraw(mut self) {
         self.sent = true;
-        let mut map = self.throttles.lock();
-        if let Some(up) = map.get_mut(&self.name)
-            && matches!(up.probe, Some((t, _)) if t == self.ticket)
-        {
+        if let Some((_, up)) = holding(&mut self.throttles.lock(), self.ticket) {
             up.probe = None;
             up.bump();
         }
@@ -903,10 +985,9 @@ impl Probe {
 
     /// 名额还有效：拿到之后这一家没有又被限流
     pub fn valid(&self) -> bool {
-        let now = self.throttles.mono();
-        self.throttles.lock().get(&self.name).is_some_and(|up| {
-            up.until <= now && matches!(up.probe, Some((t, _)) if t == self.ticket)
-        })
+        let now = self.throttles.moment();
+        holding(&mut self.throttles.lock(), self.ticket)
+            .is_some_and(|(_, up)| up.paused(now).is_none())
     }
 }
 
@@ -915,9 +996,8 @@ impl Drop for Probe {
         if self.sent {
             return;
         }
-        let mut map = self.throttles.lock();
-        if let Some(up) = map.get_mut(&self.name)
-            && matches!(up.probe, Some((t, None)) if t == self.ticket)
+        if let Some((_, up)) = holding(&mut self.throttles.lock(), self.ticket)
+            && matches!(up.probe, Some((_, None)))
         {
             up.probe = None;
             up.bump();
@@ -1048,7 +1128,7 @@ async fn wait_ready(
         );
         let woken = async {
             match wake {
-                Some(at) => tokio::time::sleep(throttles.left(at)).await,
+                Some(at) => tokio::time::sleep(throttles.nap(at)).await,
                 None => std::future::pending().await,
             }
         };
@@ -1191,19 +1271,71 @@ mod tests {
 
     const T0: u64 = 1_800_000_000_000;
 
-    fn clocked() -> (Arc<Throttles>, Arc<AtomicU64>) {
-        let now = Arc::new(AtomicU64::new(T0));
-        let bus = tw_observe::EventBus::new();
-        let limits = Arc::new(crate::upstream_limits::UpstreamLimits::new(bus.clone()));
-        let t = Arc::new(Throttles::with_clock(bus, limits, {
-            let now = now.clone();
-            Arc::new(move || now.load(Ordering::SeqCst))
-        }));
-        (t, now)
+    /// 单调时钟上的零点在墙上 `T0` 之前这么久：测试里说「`T0` 之前一毫秒发出去的」也说得出
+    const HEAD: u64 = 3_600_000;
+
+    /// 拨得动的两个时钟
+    struct Clocks {
+        wall: Arc<AtomicU64>,
+        /// 单调时钟，从 `base` 起的毫秒
+        mono: Arc<AtomicU64>,
+        base: Instant,
     }
 
-    fn advance(now: &AtomicU64, ms: u64) {
-        now.fetch_add(ms, Ordering::SeqCst);
+    impl Clocks {
+        fn new() -> Self {
+            Self {
+                wall: Arc::new(AtomicU64::new(T0)),
+                mono: Arc::new(AtomicU64::new(HEAD)),
+                base: Instant::now(),
+            }
+        }
+
+        fn throttles(&self) -> Arc<Throttles> {
+            let bus = tw_observe::EventBus::new();
+            let limits = Arc::new(crate::upstream_limits::UpstreamLimits::new(bus.clone()));
+            self.throttles_with(bus, limits)
+        }
+
+        fn throttles_with(
+            &self,
+            bus: tw_observe::EventBus,
+            limits: Arc<crate::upstream_limits::UpstreamLimits>,
+        ) -> Arc<Throttles> {
+            let (wall, mono, base) = (self.wall.clone(), self.mono.clone(), self.base);
+            Arc::new(Throttles::with_clocks(
+                bus,
+                limits,
+                Arc::new(move || wall.load(Ordering::SeqCst)),
+                Arc::new(move || base + Duration::from_millis(mono.load(Ordering::SeqCst))),
+            ))
+        }
+
+        /// 两个时钟一起走
+        fn advance(&self, ms: u64) {
+            self.wall.fetch_add(ms, Ordering::SeqCst);
+            self.mono.fetch_add(ms, Ordering::SeqCst);
+        }
+
+        /// 墙上的此刻
+        fn now(&self) -> u64 {
+            self.wall.load(Ordering::SeqCst)
+        }
+
+        /// 墙上 `ms` 那一刻在单调时钟上是哪一刻（两个时钟一起走、没拨过时）
+        fn at(&self, ms: u64) -> Instant {
+            self.base + Duration::from_millis(ms + HEAD - T0)
+        }
+
+        /// 单调时钟上的此刻
+        fn sent(&self) -> Instant {
+            self.base + Duration::from_millis(self.mono.load(Ordering::SeqCst))
+        }
+    }
+
+    fn clocked() -> (Arc<Throttles>, Clocks) {
+        let c = Clocks::new();
+        (c.throttles(), c)
     }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -1248,52 +1380,53 @@ mod tests {
 
     #[test]
     fn without_a_hint_the_pause_backs_off_and_any_other_answer_starts_over() {
-        let (t, now) = clocked();
+        let (t, c) = clocked();
         let mut got = Vec::new();
         for _ in 0..7 {
             // 每一次都是上一次暂停结束之后才发出去的那一个（探路的）
-            let sent = now.load(Ordering::SeqCst);
-            let d = t.limited("甲", sent, None);
+            c.advance(1);
+            let d = t.limited("甲", c.sent(), None);
             got.push(d.as_secs());
-            advance(&now, d.as_millis() as u64);
+            c.advance(d.as_millis() as u64);
         }
         assert_eq!(got, [5, 10, 20, 40, 60, 60, 60]);
         // 拿到一个不是 429 的答复：从头退避
-        t.answered("甲", now.load(Ordering::SeqCst));
-        let sent = now.load(Ordering::SeqCst);
-        assert_eq!(t.limited("甲", sent, None), Duration::from_secs(5));
+        c.advance(1);
+        t.answered("甲", c.sent());
+        c.advance(1);
+        assert_eq!(t.limited("甲", c.sent(), None), Duration::from_secs(5));
     }
 
     #[test]
     fn a_burst_of_429s_counts_once_and_a_later_one_extends_the_pause() {
-        let (t, now) = clocked();
+        let (t, c) = clocked();
         // 同一阵发出去的五个都被限流：只算一次，暂停 5 秒
         for _ in 0..5 {
-            t.limited("甲", T0, None);
+            t.limited("甲", c.at(T0), None);
         }
         assert!(matches!(
             t.peek("甲", &[]),
             Peek::Wait { kind: ThrottleKind::RateLimited, until_ms: Some(u) } if u == T0 + 5_000
         ));
         // 暂停中又一个说了 30 秒：延到晚的那个
-        advance(&now, 1_000);
-        let d = t.limited("甲", T0, Some(Duration::from_secs(30)));
+        c.advance(1_000);
+        let d = t.limited("甲", c.at(T0), Some(Duration::from_secs(30)));
         assert_eq!(d, Duration::from_secs(30));
         // 说得更短的不往前提
-        let d = t.limited("甲", T0, Some(Duration::from_secs(1)));
+        let d = t.limited("甲", c.at(T0), Some(Duration::from_secs(1)));
         assert_eq!(d, Duration::from_secs(30));
         // 最长暂停按配置封顶
-        let (t, _) = clocked();
-        let d = t.limited("乙", T0, Some(Duration::from_secs(99_999)));
+        let (t, c) = clocked();
+        let d = t.limited("乙", c.at(T0), Some(Duration::from_secs(99_999)));
         assert_eq!(d, Duration::from_secs(3600));
     }
 
     #[test]
     fn after_a_pause_only_one_request_goes_ahead_until_it_is_answered() {
-        let (t, now) = clocked();
-        t.limited("甲", T0, None);
+        let (t, c) = clocked();
+        t.limited("甲", c.at(T0), None);
         assert!(!is_go(&t.gate("甲", &[], None)), "暂停中");
-        advance(&now, 5_000);
+        c.advance(5_000);
         // 暂停结束：头一个去探路
         let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
             panic!("暂停结束了该放一个去探路");
@@ -1307,7 +1440,7 @@ mod tests {
             }
         ));
         probe.sent();
-        let sent = now.load(Ordering::SeqCst);
+        let sent = c.sent();
         // 什么时候有结论说不出：宽限期的结束不是知道的恢复时刻
         assert!(matches!(
             t.peek("甲", &[]),
@@ -1316,7 +1449,7 @@ mod tests {
                 until_ms: None
             }
         ));
-        assert!(t.keeps_conversation("甲", &[], sent + 1_000));
+        assert!(t.keeps_conversation("甲", &[], c.now() + 1_000));
         // 它拿到了响应头，不是 429：放开
         t.answered("甲", sent);
         assert!(matches!(t.gate("甲", &[], None), Gate::Go(None)));
@@ -1325,36 +1458,35 @@ mod tests {
     #[test]
     fn a_probe_that_is_limited_again_pauses_longer_and_one_without_a_verdict_passes_after_the_grace()
      {
-        let (t, now) = clocked();
-        t.limited("甲", T0, None);
-        advance(&now, 5_000);
+        let (t, c) = clocked();
+        t.limited("甲", c.at(T0), None);
+        c.advance(5_000);
         let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
             panic!()
         };
         probe.sent();
-        let sent = now.load(Ordering::SeqCst);
         // 探路的又被限流：退避接着往上走
-        assert_eq!(t.limited("甲", sent, None), Duration::from_secs(10));
+        assert_eq!(t.limited("甲", c.sent(), None), Duration::from_secs(10));
         assert!(!probe.valid());
         drop(probe);
-        advance(&now, 10_000);
+        c.advance(10_000);
         let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
             panic!()
         };
         probe.sent();
         drop(probe);
         // 一直没有结论：10 秒之后当它好了
-        advance(&now, 9_999);
+        c.advance(9_999);
         assert!(!is_go(&t.gate("甲", &[], None)));
-        advance(&now, 1);
+        c.advance(1);
         assert!(matches!(t.gate("甲", &[], None), Gate::Go(None)));
     }
 
     #[test]
     fn a_probe_dropped_before_it_was_sent_lets_the_next_one_go() {
-        let (t, now) = clocked();
-        t.limited("甲", T0, None);
-        advance(&now, 5_000);
+        let (t, c) = clocked();
+        t.limited("甲", c.at(T0), None);
+        c.advance(5_000);
         let Gate::Go(Some(probe)) = t.gate("甲", &[], None) else {
             panic!()
         };
@@ -1365,24 +1497,35 @@ mod tests {
 
     #[test]
     fn an_answer_to_a_request_sent_before_the_429_does_not_end_the_pause() {
-        let (t, now) = clocked();
-        advance(&now, 1_000);
-        t.limited("甲", T0 + 1_000, None);
-        advance(&now, 5_000);
+        let (t, c) = clocked();
+        c.advance(1_000);
+        t.limited("甲", c.at(T0 + 1_000), None);
+        c.advance(5_000);
         // 暂停之前发出去的长回答这时才到响应头：不说明这家好了
-        t.answered("甲", T0);
+        t.answered("甲", c.at(T0));
         assert!(matches!(t.gate("甲", &[], None), Gate::Go(Some(_))));
+        // **按单调时钟比**，不差一毫秒：429 那一刻之后才发出去的，哪怕只晚一点点，也是新的一跳
+        let (t, c) = clocked();
+        t.limited("甲", c.sent(), None);
+        let after = c.sent() + Duration::from_micros(1);
+        c.advance(5_000);
+        let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
+            panic!()
+        };
+        probe.sent();
+        t.answered("甲", after);
+        assert!(matches!(t.gate("甲", &[], None), Gate::Go(None)));
     }
 
     #[test]
     fn the_queue_lets_them_go_in_order_and_a_leaver_makes_room() {
-        let (t, now) = clocked();
-        t.limited("甲", T0, None);
+        let (t, c) = clocked();
+        t.limited("甲", c.at(T0), None);
         let (mut a, mut b) = (t.waiter(), t.waiter());
         a.join("甲", ThrottleKind::RateLimited);
         b.join("甲", ThrottleKind::RateLimited);
         assert_eq!(t.queue("甲"), [a.id, b.id]);
-        advance(&now, 5_000);
+        c.advance(5_000);
         // 后来的、不在队里的不插队
         assert!(matches!(
             t.gate("甲", &[], None),
@@ -1398,25 +1541,24 @@ mod tests {
         };
         a.leave_all();
         probe.sent();
-        let sent = now.load(Ordering::SeqCst);
         // 探路的又被限流：它回到队头
-        t.limited("甲", sent, None);
+        t.limited("甲", c.sent(), None);
         a.join_front("甲");
         assert_eq!(t.queue("甲"), [a.id, b.id]);
         // a 不等了（客户端走了）：b 排到了头
         drop(a);
         assert_eq!(t.queue("甲"), [b.id]);
-        advance(&now, 10_000);
+        c.advance(10_000);
         assert!(matches!(t.gate("甲", &[], Some(b.id)), Gate::Go(Some(_))));
     }
 
     #[tokio::test]
     async fn every_change_is_reported_once() {
-        let (t, now) = clocked();
+        let (t, c) = clocked();
         let mut rx = t.bus.subscribe();
-        t.limited("甲", T0, None);
-        t.limited("甲", T0, None);
-        advance(&now, 5_000);
+        t.limited("甲", c.at(T0), None);
+        t.limited("甲", c.at(T0), None);
+        c.advance(5_000);
         t.refresh("甲");
         t.refresh("甲");
         let mut got = Vec::new();
@@ -1442,6 +1584,102 @@ mod tests {
                 ("甲".to_string(), None),
             ]
         );
+    }
+
+    /// 用量上限的时钟：比墙上的慢 `behind` 毫秒
+    struct Behind {
+        wall: Arc<AtomicU64>,
+        behind: u64,
+    }
+
+    impl crate::key_limits::Clock for Behind {
+        fn now_ms(&self) -> i64 {
+            (self.wall.load(Ordering::SeqCst) - self.behind) as i64
+        }
+        fn period(&self, per: tw_config::LimitPer, at_ms: i64) -> (i64, i64) {
+            crate::key_limits::SystemClock.period(per, at_ms)
+        }
+        fn show(&self, at_ms: i64) -> String {
+            crate::key_limits::SystemClock.show(at_ms)
+        }
+    }
+
+    /// 用量上限的时钟和这里的先后读，差一毫秒：报出去的时刻**不跟着抖**，同一个样子只报一次
+    #[tokio::test]
+    async fn a_full_window_is_reported_once_although_the_two_clocks_are_read_apart() {
+        let c = Clocks::new();
+        let bus = tw_observe::EventBus::new();
+        let limits = Arc::new(crate::upstream_limits::UpstreamLimits::with_clock(
+            bus.clone(),
+            Arc::new(Behind {
+                wall: c.wall.clone(),
+                behind: 1,
+            }),
+        ));
+        let t = c.throttles_with(bus.clone(), limits.clone());
+        let set: Vec<KeyLimit> = serde_yaml_ng::from_str("[{per: minute, requests: 1}]").unwrap();
+        let cfg = tw_config::Config {
+            providers: vec![tw_config::Provider {
+                name: "甲".into(),
+                base_url: "https://a.example".into(),
+                limits: set.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        limits.configure(&cfg);
+        t.configure(&cfg);
+        let mut rx = bus.subscribe();
+        let _hold = limits.reserve("甲", &set, &crate::key_limits::Ask::default());
+        let until = T0 - 1 + 60_000;
+        for _ in 0..3 {
+            assert_eq!(t.view("甲").map(|v| v.until_ms), Some(until));
+            t.refresh("甲");
+            c.advance(1);
+        }
+        let shown: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|ev| match ev {
+                tw_api::Event::ThrottleChanged { throttle, .. } => Some(throttle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+    }
+
+    /// 重载一次不多一批后台任务：上一份配置的那些收工，删掉了用量上限的那一家不留任务
+    #[tokio::test]
+    async fn reloading_does_not_pile_up_watchers() {
+        let (t, _c) = clocked();
+        let with = |limits: &str| tw_config::Config {
+            providers: vec![tw_config::Provider {
+                name: "甲".into(),
+                base_url: "https://a.example".into(),
+                limits: serde_yaml_ng::from_str(limits).unwrap(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let alive = || async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let before = alive().await;
+        for _ in 0..5 {
+            t.configure(&with("[{per: minute, requests: 1}]"));
+        }
+        assert_eq!(alive().await, before + 1);
+        // 用量上限删了（改名、删掉上游也一样）：它的任务不再被叫醒，要当场收工
+        t.configure(&with("[]"));
+        assert_eq!(alive().await, before);
+        // 网关没了，任务跟着收工
+        t.configure(&with("[{per: minute, requests: 1}]"));
+        assert_eq!(alive().await, before + 1);
+        drop(t);
+        assert_eq!(alive().await, before);
     }
 
     #[test]
@@ -1515,17 +1753,18 @@ mod tests {
         let e = refusal(&n(&[("甲", Stuck::WindowFull(Some(T0 - 5)))]), T0);
         assert_eq!(e.retry.unwrap().after_ms, 1);
     }
+
     #[test]
     fn a_hint_that_says_nothing_falls_back_to_the_backoff_and_an_absurd_one_is_capped() {
-        let (t, now) = clocked();
+        let (t, c) = clocked();
         // `retry-after-ms: 0`、不到一毫秒：照它暂停等于不暂停，按退避算
         assert_eq!(
-            t.limited("甲", T0, Some(Duration::ZERO)),
+            t.limited("甲", c.at(T0), Some(Duration::ZERO)),
             Duration::from_secs(5)
         );
-        advance(&now, 5_000);
+        c.advance(5_000);
         assert_eq!(
-            t.limited("甲", T0 + 5_000, Some(Duration::from_micros(400))),
+            t.limited("甲", c.at(T0 + 5_000), Some(Duration::from_micros(400))),
             Duration::from_secs(10)
         );
         let h = headers(&[("retry-after-ms", "0"), ("retry-after", "0")]);
@@ -1536,68 +1775,103 @@ mod tests {
         let h = headers(&[("retry-after-ms", "1e300")]);
         let hint = pause_hint(&h, b"", T0);
         assert!(hint.is_some_and(|d| d > Duration::from_secs(3600)));
-        let (t, _) = clocked();
-        assert_eq!(t.limited("乙", T0, hint), Duration::from_secs(3600));
+        let (t, c) = clocked();
+        assert_eq!(t.limited("乙", c.at(T0), hint), Duration::from_secs(3600));
     }
 
     #[test]
     fn the_pause_runs_on_the_monotonic_clock_when_the_system_time_moves_back() {
-        let wall = Arc::new(AtomicU64::new(T0));
-        let mono = Arc::new(AtomicU64::new(1_000));
-        let bus = tw_observe::EventBus::new();
-        let limits = Arc::new(crate::upstream_limits::UpstreamLimits::new(bus.clone()));
-        let clock = |c: &Arc<AtomicU64>| -> Clock {
-            let c = c.clone();
-            Arc::new(move || c.load(Ordering::SeqCst))
-        };
-        let t = Arc::new(Throttles::with_clocks(
-            bus,
-            limits,
-            clock(&wall),
-            clock(&mono),
-        ));
-        assert_eq!(t.limited("甲", T0, None), Duration::from_secs(5));
+        let (t, c) = clocked();
+        assert_eq!(t.limited("甲", c.sent(), None), Duration::from_secs(5));
         // 系统时间往回拨了一小时：暂停照样只剩 5 秒，报出去的时刻按拨过的算
-        wall.fetch_sub(3_600_000, Ordering::SeqCst);
+        c.wall.fetch_sub(3_600_000, Ordering::SeqCst);
         assert!(matches!(
             t.peek("甲", &[]),
             Peek::Wait { until_ms: Some(u), .. } if u == T0 - 3_600_000 + 5_000
         ));
         assert_eq!(t.view("甲").unwrap().until_ms, T0 - 3_600_000 + 5_000);
-        mono.fetch_add(4_999, Ordering::SeqCst);
+        c.mono.fetch_add(4_999, Ordering::SeqCst);
         assert!(!is_go(&t.gate("甲", &[], None)));
-        mono.fetch_add(1, Ordering::SeqCst);
+        c.mono.fetch_add(1, Ordering::SeqCst);
         let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
             panic!("暂停该结束了");
         };
-        // 探路的宽限也按单调时钟算：系统时间再往回拨，宽限不跟着变长
+        // 探路的宽限也拉不长：系统时间再往回拨，宽限照样 10 秒
         probe.sent();
-        wall.fetch_sub(3_600_000, Ordering::SeqCst);
-        mono.fetch_add(10_000, Ordering::SeqCst);
+        c.wall.fetch_sub(3_600_000, Ordering::SeqCst);
+        c.mono.fetch_add(10_000, Ordering::SeqCst);
+        assert!(matches!(t.gate("甲", &[], None), Gate::Go(None)));
+    }
+
+    /// 合上盖子睡着的时候单调时钟不走、墙上的走：**睡过去的时间算进暂停**，醒来时该结束的已经
+    /// 结束了，不再等完剩下的（最长要等一小时）
+    #[test]
+    fn a_pause_slept_through_is_over_when_the_machine_wakes() {
+        let (t, c) = clocked();
+        assert_eq!(
+            t.limited("甲", c.sent(), Some(Duration::from_secs(600))),
+            Duration::from_secs(600)
+        );
+        // 睡了五分钟：还剩五分钟，报出去的结束时刻不变
+        c.wall.fetch_add(300_000, Ordering::SeqCst);
+        assert!(matches!(
+            t.peek("甲", &[]),
+            Peek::Wait { until_ms: Some(u), .. } if u == T0 + 600_000
+        ));
+        // 醒着又过了五分钟（两个时钟一起走）：结束
+        c.advance(299_999);
+        assert!(!is_go(&t.gate("甲", &[], None)));
+        c.advance(1);
+        assert!(t.view("甲").is_none());
+        let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
+            panic!("暂停该结束了");
+        };
+        // 一下子睡过整个暂停：醒来就结束
+        probe.sent();
+        let sent = c.sent();
+        c.advance(1);
+        assert_eq!(
+            t.limited(
+                "甲",
+                sent + Duration::from_millis(1),
+                Some(Duration::from_secs(3_000))
+            ),
+            Duration::from_secs(3_000)
+        );
+        c.wall.fetch_add(3_000_000, Ordering::SeqCst);
+        assert!(t.view("甲").is_none());
+        let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
+            panic!("睡过了整个暂停，醒来就该结束");
+        };
+        // 探路的宽限也一样：发出去之后睡着了，醒来就过了宽限
+        probe.sent();
+        assert!(!is_go(&t.gate("甲", &[], None)));
+        c.wall.fetch_add(10_000, Ordering::SeqCst);
         assert!(matches!(t.gate("甲", &[], None), Gate::Go(None)));
     }
 
     #[test]
     fn a_probe_without_a_verdict_hands_the_queue_back_without_waiting_for_the_grace() {
-        let (t, now) = clocked();
-        t.limited("甲", T0, None);
-        advance(&now, 5_000);
+        let (t, c) = clocked();
+        t.limited("甲", c.at(T0), None);
+        c.advance(5_000);
         let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
             panic!()
         };
         probe.sent();
-        let sent = now.load(Ordering::SeqCst);
+        let sent = c.sent();
         assert!(!is_go(&t.gate("甲", &[], None)));
         // 暂停之前发出去的那一跳连不上：不是探路的，不算
-        t.released("甲", T0 - 1);
+        t.released("甲", c.at(T0 - 1));
         assert!(!is_go(&t.gate("甲", &[], None)));
         // 探路的连不上（或者回的是额度用完）：不再探，排着的照常放，交给熔断
         t.released("甲", sent);
         assert!(matches!(t.gate("甲", &[], None), Gate::Go(None)));
         // 连续限流的次数没有归零：下一次接着往上退避
-        assert_eq!(t.limited("甲", sent + 1, None), Duration::from_secs(10));
+        c.advance(1);
+        assert_eq!(t.limited("甲", c.sent(), None), Duration::from_secs(10));
         // 被中止的探路：名额还回去，下一个接着探
-        advance(&now, 10_000);
+        c.advance(10_000);
         let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
             panic!()
         };
@@ -1609,23 +1883,23 @@ mod tests {
 
     #[test]
     fn an_upstream_is_wary_while_probing_and_for_a_while_after_a_429() {
-        let (t, now) = clocked();
+        let (t, c) = clocked();
         assert!(!t.wary("甲"), "没被限流过");
-        t.limited("甲", T0, None);
+        t.limited("甲", c.at(T0), None);
         assert!(t.wary("甲"));
-        advance(&now, 5_000);
-        t.answered("甲", T0 + 5_000);
+        c.advance(5_000);
+        t.answered("甲", c.at(T0 + 5_000));
         // 探路的过了、连续的次数归零：最近被限流过，还要当心
         assert!(t.wary("甲"));
-        advance(&now, 295_000);
+        c.advance(295_000);
         assert!(!t.wary("甲"));
     }
 
     #[tokio::test]
     async fn a_renamed_upstream_keeps_its_pause_and_its_queue() {
-        let (t, now) = clocked();
+        let (t, c) = clocked();
         let mut rx = t.bus.subscribe();
-        t.limited("甲", T0, Some(Duration::from_secs(30)));
+        t.limited("甲", c.at(T0), Some(Duration::from_secs(30)));
         let mut a = t.waiter();
         a.join("甲", ThrottleKind::RateLimited);
         let old = t.watch("甲");
@@ -1658,7 +1932,36 @@ mod tests {
         drop(a);
         assert!(t.queue("乙").is_empty());
         // 退避跟着走：暂停结束后再被限流是第二次
-        advance(&now, 30_000);
-        assert_eq!(t.limited("乙", T0 + 30_000, None), Duration::from_secs(10));
+        c.advance(30_000);
+        assert_eq!(
+            t.limited("乙", c.at(T0 + 30_000), None),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// 探路的名额拿到了、还没发出去时改了名：名额跟着新名字走，[`Probe`] 手上的是旧名字也照样
+    /// 落在它身上 —— 发出去从那一刻起算宽限，没发出去就还回去
+    #[test]
+    fn a_probe_ticket_follows_a_rename() {
+        for send in [false, true] {
+            let (t, c) = clocked();
+            t.limited("甲", c.at(T0), None);
+            c.advance(5_000);
+            let Gate::Go(Some(mut probe)) = t.gate("甲", &[], None) else {
+                panic!()
+            };
+            t.rename("甲", "乙");
+            assert!(probe.valid());
+            assert!(!is_go(&t.gate("乙", &[], None)), "探路的还没有结论");
+            if send {
+                probe.sent();
+                drop(probe);
+                c.advance(PROBE_GRACE.as_millis() as u64);
+                assert!(matches!(t.gate("乙", &[], None), Gate::Go(None)));
+            } else {
+                drop(probe);
+                assert!(matches!(t.gate("乙", &[], None), Gate::Go(Some(_))));
+            }
+        }
     }
 }

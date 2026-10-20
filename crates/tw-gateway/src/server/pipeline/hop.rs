@@ -195,8 +195,12 @@ pub(super) async fn try_upstreams<'a>(
             Some(name) => (name, None),
             None if waiting.is_empty() => break,
             None => {
-                // 每一家都要到等待期限之后才能发：不用干等，当场说清多久之后再来
-                if hopeless(state, rt, &waiting, deadline_ms) {
+                // 每一家都要到等待期限之后才能发：不用干等，当场说清多久之后再来。这个请求能等的
+                // 已经等完了（或者配置的是不等）也一样 —— **它没排过队**，不报排队（界面会显示成
+                // 「排队中」）
+                if tokio::time::Instant::now() >= until
+                    || hopeless(state, rt, &waiting, deadline_ms)
+                {
                     stalled = true;
                     break;
                 }
@@ -680,9 +684,8 @@ pub(super) async fn try_upstreams<'a>(
         // `super::idle`）。之前等空位、跑插件的时间都不算
         let sent_at = std::time::Instant::now();
         let quiet_by = quiet.after(sent_at);
-        // 这一家的答复看的是这一刻（见 `crate::throttle`）：最近一次 429 之前发出去的不算数。
+        // 这一家的答复也看这一刻（见 `crate::throttle`）：最近一次 429 之前发出去的不算数。
         // 暂停结束后探路的就是这一跳的话，从这一刻起计它的宽限
-        let sent_ms = now_ms();
         if let Some(p) = probe.as_mut() {
             p.sent();
         }
@@ -768,7 +771,7 @@ pub(super) async fn try_upstreams<'a>(
             // 响应头都没等到：放弃这一家，换下一家；没有下一家了，交出去的就是这个超时
             Waited::Quiet => {
                 reached = true;
-                state.throttles.released(&provider.name, sent_ms);
+                state.throttles.released(&provider.name, sent_at);
                 last_err = Some(gave_up(
                     state,
                     started,
@@ -792,7 +795,7 @@ pub(super) async fn try_upstreams<'a>(
                 // 同格式的上游没实现数 token（不少中转只做了生成回答）：网关自己估。
                 // **在判断换不换之前**：404 平时是「这家没有这个模型」，要换下一家
                 if counting && crate::count::unsupported(status) {
-                    state.throttles.answered(&provider.name, sent_ms);
+                    state.throttles.answered(&provider.name, sent_at);
                     note_health(
                         &state.bus,
                         &state.health,
@@ -816,7 +819,7 @@ pub(super) async fn try_upstreams<'a>(
                 }
                 let verdict = crate::failure::classify(status, &headers, &head, now_ms());
                 if !matches!(verdict, Verdict::Failed(Cause::RateLimited { .. })) {
-                    to_throttle(state, &provider.name, sent_ms, verdict);
+                    to_throttle(state, &provider.name, sent_at, verdict);
                 }
                 // **最后一家的 4xx 交给客户端**：没有下一家可换了，上游自己的原话
                 // （「invalid x-api-key」）比我们转述的一句「回了 401」有用得多。
@@ -832,7 +835,7 @@ pub(super) async fn try_upstreams<'a>(
                         state.note_proxy_ok(&provider.proxy);
                         state.glm_traffic(provider);
                         let hint = crate::throttle::pause_hint(&headers, &head, now_ms());
-                        let pause = state.throttles.limited(&provider.name, sent_ms, hint);
+                        let pause = state.throttles.limited(&provider.name, sent_at, hint);
                         usage_hold.release();
                         let mut a = hop(
                             &provider.name,
@@ -972,7 +975,7 @@ pub(super) async fn try_upstreams<'a>(
                     None => {
                         // 不压开头：响应头就是它的答复，这一家没在限流（探路的过了，连续限流的次数
                         // 归零）
-                        state.throttles.answered(&provider.name, sent_ms);
+                        state.throttles.answered(&provider.name, sent_at);
                         r
                     }
                     Some(hold) => {
@@ -1008,12 +1011,12 @@ pub(super) async fn try_upstreams<'a>(
                             // 内容来了：**这时**才是这一家的答复。响应头是 200、流里接着报限流的
                             // 上游，响应头不说明它好了
                             Some(super::opening::Opening::Go(r)) => {
-                                state.throttles.answered(&provider.name, sent_ms);
+                                state.throttles.answered(&provider.name, sent_at);
                                 r
                             }
                             // 到点了还没有内容：这一跳没有结论
                             Some(super::opening::Opening::Slow { response, usage }) => {
-                                state.throttles.released(&provider.name, sent_ms);
+                                state.throttles.released(&provider.name, sent_at);
                                 if last {
                                     // 最后一家：和不压开头时一样交给回程，由它按无响应超时收尾
                                     unconfirmed = true;
@@ -1056,7 +1059,7 @@ pub(super) async fn try_upstreams<'a>(
                                 let limited =
                                     matches!(verdict, Verdict::Failed(Cause::RateLimited { .. }));
                                 if !limited {
-                                    to_throttle(state, &provider.name, sent_ms, verdict);
+                                    to_throttle(state, &provider.name, sent_at, verdict);
                                 }
                                 if verdict == Verdict::ClientError || (last && !limited) {
                                     // 请求本身的问题，或者最后一家报了限流以外的错：原样交出去，和
@@ -1091,7 +1094,7 @@ pub(super) async fn try_upstreams<'a>(
                                             );
                                             let pause = state.throttles.limited(
                                                 &provider.name,
-                                                sent_ms,
+                                                sent_at,
                                                 hint,
                                             );
                                             usage_hold.release();
@@ -1126,7 +1129,7 @@ pub(super) async fn try_upstreams<'a>(
                             }
                             Some(super::opening::Opening::Broken(err)) => {
                                 reached = true;
-                                state.throttles.released(&provider.name, sent_ms);
+                                state.throttles.released(&provider.name, sent_at);
                                 note_health(
                                     &state.bus,
                                     &state.health,
@@ -1188,13 +1191,13 @@ pub(super) async fn try_upstreams<'a>(
                         usage_hold.release();
                         reached = true;
                         // 没有结论：探路的不再探，交给熔断（见 `crate::throttle`）
-                        state.throttles.released(&provider.name, sent_ms);
+                        state.throttles.released(&provider.name, sent_at);
                         state.check_proxy(&provider.proxy);
                         forward::map_reqwest_error(e)
                     }
                     SendError::Http(e) => {
                         reached = true;
-                        state.throttles.released(&provider.name, sent_ms);
+                        state.throttles.released(&provider.name, sent_at);
                         // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                         state.check_proxy(&provider.proxy);
                         forward::map_reqwest_error(e)
@@ -1529,12 +1532,12 @@ fn dequeued(state: &AppState, id: u64) {
 
 /// 一跳有了不是限流的结论，告诉 [`crate::throttle`]：额度用完、没钱了是等不到 —— 不再探路，交给
 /// 熔断（[`crate::throttle::Throttles::released`]）；别的是这一家的答复，它没在限流
-fn to_throttle(state: &AppState, name: &str, sent_ms: u64, verdict: Verdict) {
+fn to_throttle(state: &AppState, name: &str, sent_at: std::time::Instant, verdict: Verdict) {
     match verdict {
         Verdict::Failed(Cause::QuotaUsedUp { .. } | Cause::NoBalance) => {
-            state.throttles.released(name, sent_ms)
+            state.throttles.released(name, sent_at)
         }
-        _ => state.throttles.answered(name, sent_ms),
+        _ => state.throttles.answered(name, sent_at),
     }
 }
 

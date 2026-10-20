@@ -862,8 +862,7 @@ pub(crate) async fn proxy(
             crate::server::now_ms(),
         ) {
             crate::failure::Verdict::Failed(crate::failure::Cause::RateLimited { retry_after }) => {
-                let now = crate::server::now_ms();
-                state.throttles.limited(name, now, retry_after);
+                state.throttles.limited(name, hop_started, retry_after);
                 None
             }
             crate::failure::Verdict::Failed(cause) => state.health.record_cause(name, cause),

@@ -1542,12 +1542,7 @@ async fn a_turn_waits_for_a_paused_upstream_and_fails_when_the_pause_outlasts_it
     let (up, seen) = responder(None).await;
     let (gw, mut rx, state) = turns_gateway(up, |c| c.failover.wait_secs = 2, None).await;
     let mut c = connect(gw).await;
-    let now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-    };
+    let now = std::time::Instant::now;
     state
         .throttles
         .limited("up", now(), Some(Duration::from_millis(400)));
@@ -1892,13 +1887,11 @@ async fn a_probing_turn_limited_after_response_created_keeps_the_next_turn_waiti
         None,
     )
     .await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .throttles
-        .limited("up", now, Some(Duration::from_millis(300)));
+    state.throttles.limited(
+        "up",
+        std::time::Instant::now(),
+        Some(Duration::from_millis(300)),
+    );
     let (mut a, mut b) = (connect(gw).await, connect(gw).await);
     a.send(create("one")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;

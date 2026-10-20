@@ -186,7 +186,6 @@ pub(super) fn respond(
     // 上游在流里报了限流（答到一半的也算）：这一家暂停（见 `crate::throttle`）。最近一次 429 之后
     // 发出去的才算连续的又一次，按这一跳发出去的那一刻比
     let throttles = state.throttles.clone();
-    let sent_ms = crate::server::now_ms().saturating_sub(sent_at.elapsed().as_millis() as u64);
     // 这个请求结束时记一笔，到了时候重读这一家的余额（见 `crate::balances`）
     let passing = state.balance_passing(&upstream_name);
     let stream = async_stream::stream! {
@@ -344,7 +343,7 @@ pub(super) fn respond(
                 crate::server::now_ms(),
             )
         {
-            throttles.limited(&upstream_name, sent_ms, retry_after);
+            throttles.limited(&upstream_name, sent_at, retry_after);
         }
         // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
         // 东西，分开写就会有一种漏掉

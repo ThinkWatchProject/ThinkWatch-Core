@@ -294,18 +294,13 @@ fn ask_stream(gw: SocketAddr, model: &str) -> reqwest::RequestBuilder {
         ))
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
 /// 直接让一家暂停这么久，像它刚回了一个 429
 fn pause(state: &tw_gateway::AppState, name: &str, ms: u64) {
-    state
-        .throttles
-        .limited(name, now_ms(), Some(Duration::from_millis(ms)));
+    state.throttles.limited(
+        name,
+        std::time::Instant::now(),
+        Some(Duration::from_millis(ms)),
+    );
 }
 
 #[tokio::test]
