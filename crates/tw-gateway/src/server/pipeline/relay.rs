@@ -183,6 +183,10 @@ pub(super) fn respond(
     let mut pulse = crate::pulse::Pulse::new(plan.is_sse.then_some(upstream_dialect));
     let abort = req.abort.clone();
     let (bus, health) = (state.bus.clone(), state.health.clone());
+    // 上游在流里报了限流（答到一半的也算）：这一家暂停（见 `crate::throttle`）。最近一次 429 之后
+    // 发出去的才算连续的又一次，按这一跳发出去的那一刻比
+    let throttles = state.throttles.clone();
+    let sent_ms = crate::server::now_ms().saturating_sub(sent_at.elapsed().as_millis() as u64);
     // 这个请求结束时记一笔，到了时候重读这一家的余额（见 `crate::balances`）
     let passing = state.balance_passing(&upstream_name);
     let stream = async_stream::stream! {
@@ -326,6 +330,21 @@ pub(super) fn respond(
         // 扣下整份 body 和流断在半路，对结局来说是同一件事
         if let Some(err) = denied {
             broke = Some(err.in_dialect(dialect));
+        }
+        // 上游在流里报的错是限流：回答照样以错误收尾（客户端已经收到了东西，换不了），这一家暂停
+        if let Some((code, body)) = ending
+            .upstream_fault()
+            .and_then(|data| super::opening::stream_error(upstream_dialect, data))
+            && let crate::failure::Verdict::Failed(crate::failure::Cause::RateLimited {
+                retry_after,
+            }) = crate::failure::classify(
+                code,
+                &http::HeaderMap::new(),
+                &body,
+                crate::server::now_ms(),
+            )
+        {
+            throttles.limited(&upstream_name, sent_ms, retry_after);
         }
         // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
         // 东西，分开写就会有一种漏掉

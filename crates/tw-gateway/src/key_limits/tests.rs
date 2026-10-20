@@ -255,7 +255,7 @@ async fn a_rolling_minute_waits_for_its_next_slot_or_refuses() {
     assert_eq!(b.limits.clock.now_ms(), t0 + 60_000, "等到第一个滑出窗口");
 }
 
-/// 等待期限是整个请求的那一个（见 [`slot_wait`]），调用方给的是那一刻，不是从此刻起再给
+/// 等待期限是整个请求的那一个（见 [`request_wait`]），调用方给的是那一刻，不是从此刻起再给
 /// 一整段：期限之前空不出来的就拒
 #[tokio::test(start_paused = true)]
 async fn a_rolling_wait_ends_at_the_requests_own_deadline() {

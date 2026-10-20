@@ -139,7 +139,7 @@ routes:
       - name: 全部
         to: 池
 failover:
-  slot_wait_secs: {wait_secs}
+  wait_secs: {wait_secs}
 ",
         a.addr,
         limit(limits.0),

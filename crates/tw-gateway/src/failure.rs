@@ -159,7 +159,7 @@ pub fn retry_after(headers: &HeaderMap, now_ms: u64) -> Option<Duration> {
 }
 
 /// Gemini 把「多久之后再来」写在正文里：`"retryDelay": "33s"`。
-fn retry_delay_in_body(body: &[u8]) -> Option<Duration> {
+pub fn retry_delay_in_body(body: &[u8]) -> Option<Duration> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let details = v.pointer("/error/details")?.as_array()?;
     details.iter().find_map(|d| {

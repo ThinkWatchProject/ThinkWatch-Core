@@ -1585,9 +1585,7 @@ groups:
             ("idle_timeout_secs", |f| {
                 f.idle_timeout_secs = crate::MAX_IDLE_TIMEOUT_SECS + 1
             }),
-            ("slot_wait_secs", |f| {
-                f.slot_wait_secs = crate::MAX_SLOT_WAIT_SECS + 1
-            }),
+            ("wait_secs", |f| f.wait_secs = crate::MAX_WAIT_SECS + 1),
         ];
         for (want, bend) in cases {
             let mut x = base.clone();
@@ -1597,10 +1595,12 @@ groups:
                 other => panic!("{want} 该被拒，实际 {other:?}"),
             }
         }
-        // 等空位写 0 是不等，不是写错
-        let mut x = base.clone();
-        x.failover.slot_wait_secs = 0;
-        assert!(validate(&x).is_ok());
+        // 等待写 0 是不等，不是写错；上限本身也收
+        for secs in [0, crate::MAX_WAIT_SECS] {
+            let mut x = base.clone();
+            x.failover.wait_secs = secs;
+            assert!(validate(&x).is_ok(), "{secs}");
+        }
         // 无响应超时的两头都收
         for secs in [crate::MIN_IDLE_TIMEOUT_SECS, crate::MAX_IDLE_TIMEOUT_SECS] {
             let mut x = base.clone();

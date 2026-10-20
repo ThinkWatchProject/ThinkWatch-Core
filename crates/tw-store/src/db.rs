@@ -3496,6 +3496,7 @@ mod cost_state_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 }],
                 ..Default::default()
@@ -3996,6 +3997,7 @@ mod cost {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 }
             })

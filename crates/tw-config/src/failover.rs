@@ -1,4 +1,4 @@
-//! 故障转移：一家上游失败之后停用多久、多久没有内容就不再等它、上游满着时最多等多久。
+//! 故障转移：一家上游失败之后停用多久、多久没有内容就不再等它、一个请求最多等多久。
 
 use serde::{Deserialize, Serialize};
 
@@ -29,8 +29,9 @@ pub struct Failover {
     /// 上游说额度用完、又没说什么时候重置时，停用多少秒。说了的就停到那一刻
     #[serde(default = "d_quota_pause_secs")]
     pub quota_pause_secs: u64,
-    /// 限流时按上游给的 `Retry-After` 停用，**最多停多少秒**。没给就当作说不出
-    /// 原因的失败
+    /// 上游回 429（限流）之后这一家暂停多久，**最多多少秒**。上游说了多久的（`retry-after-ms`、
+    /// `Retry-After`、正文里的等待时间）按它说的，没说的按这一家连续被限流的次数退避：5、10、
+    /// 20、40 秒，之后每次 60 秒。**暂停不是停用**：请求排队等它，不进熔断的账
     #[serde(default = "d_rate_limit_max_pause_secs")]
     pub rate_limit_max_pause_secs: u64,
     /// 上游多少秒没有内容就不再等它（无响应超时）。从请求发给它的那一刻算起，**每来一段
@@ -43,11 +44,11 @@ pub struct Failover {
     #[serde(default = "d_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
     /// 一个请求最多等多少秒，**整个请求合起来算**：准入时等密钥的分钟、小时上限空出名额，
-    /// 之后上游的并发数满了（`providers[].max_concurrent`）时等空位，共用这一段。留在那一家
-    /// 的对话等它空出来，候选都满了时等先空出来的那一家；等不到的换下一家，或者回 429。
-    /// 0 是不等
-    #[serde(default = "d_slot_wait_secs")]
-    pub slot_wait_secs: u64,
+    /// 之后等上游 —— 并发数满了（`providers[].max_concurrent`）、被限流暂停着、分钟或小时的
+    /// 用量上限满了 —— 共用这一段。留在那一家的对话等它，候选都等不上时等先能发的那一家；
+    /// 等不到的换下一家，或者回 429。0 是不等
+    #[serde(default = "d_wait_secs")]
+    pub wait_secs: u64,
 }
 
 fn d_failures_to_pause() -> u32 {
@@ -71,8 +72,8 @@ fn d_rate_limit_max_pause_secs() -> u64 {
 fn d_idle_timeout_secs() -> u64 {
     300
 }
-fn d_slot_wait_secs() -> u64 {
-    30
+fn d_wait_secs() -> u64 {
+    120
 }
 
 impl Default for Failover {
@@ -85,7 +86,7 @@ impl Default for Failover {
             quota_pause_secs: d_quota_pause_secs(),
             rate_limit_max_pause_secs: d_rate_limit_max_pause_secs(),
             idle_timeout_secs: d_idle_timeout_secs(),
-            slot_wait_secs: d_slot_wait_secs(),
+            wait_secs: d_wait_secs(),
         }
     }
 }
@@ -100,8 +101,9 @@ pub const MIN_IDLE_TIMEOUT_SECS: u64 = 30;
 /// 无响应超时最多写多少秒：一小时。再长就等于不设
 pub const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
 
-/// 等空位最多写多少秒。等的时候客户端一个字节都收不到，再长的话它先超时了
-pub const MAX_SLOT_WAIT_SECS: u64 = 300;
+/// 一个请求最多写等多少秒。流式的回答等过一阵先交出响应头和保活，整包的回答等的时候
+/// 客户端一个字节都收不到 —— 再长的话它先超时了
+pub const MAX_WAIT_SECS: u64 = 600;
 
 impl Failover {
     /// 不在允许范围里的第一项：字段名、写的值、下限、上限。
@@ -139,7 +141,7 @@ impl Failover {
                 MIN_IDLE_TIMEOUT_SECS,
                 MAX_IDLE_TIMEOUT_SECS,
             ),
-            ("slot_wait_secs", self.slot_wait_secs, 0, MAX_SLOT_WAIT_SECS),
+            ("wait_secs", self.wait_secs, 0, MAX_WAIT_SECS),
         ];
         fields
             .into_iter()

@@ -12,7 +12,7 @@
 //!
 //! **怎么拒、怎么等。**天、周、月是自然周期：用满了就拒，到下一期之前重试也没用。分钟、
 //! 小时是滚动窗口：用满了先看下一个空位多久之后空出来，等得到（在这个请求的等待期限之前，
-//! 期限见 [`slot_wait`]）就等，等不到就拒，并说清楚多久之后再来。顺序见 [`crate::server`]
+//! 期限见 [`request_wait`]）就等，等不到就拒，并说清楚多久之后再来。顺序见 [`crate::server`]
 //! 的管线第 3 步：自然周期 → 并发上限 → 滚动窗口。
 //!
 //! **在跑的怎么算。**准入时按输入估一个数占着（预留：输入 token 的估算，和按头一个候选算
@@ -48,13 +48,14 @@ const CALENDAR: [LimitPer; 3] = [LimitPer::Day, LimitPer::Week, LimitPer::Month]
 /// 额度。存储层正常时几毫秒就到
 const GRACE_MS: i64 = 60_000;
 
-/// 一个请求最多等多久：`failover.slot_wait_secs`，0 是不等。
+/// 一个请求最多等多久：`failover.wait_secs`，0 是不等。
 ///
-/// **一个请求合起来算**：等滚动窗口的空位在准入时、发给哪一家之前，等上游空位
-/// （`crate::slots`）在之后的那几跳里，两段共用准入时定下的同一个期限（见
-/// `server::pipeline::admission`）。各给一份的话，两样都碰上的请求能等两倍那么久
-pub fn slot_wait(cfg: &tw_config::Config) -> Duration {
-    Duration::from_secs(cfg.failover.slot_wait_secs)
+/// **一个请求合起来算**：等滚动窗口的空位在准入时、发给哪一家之前，等上游（满着的空位
+/// `crate::slots`、限流暂停和上游的用量上限 `crate::throttle`）在之后的那几跳里，几段共用准入时
+/// 定下的同一个期限（见 `server::pipeline::admission`）。各给一份的话，几样都碰上的请求能等
+/// 好几倍那么久
+pub fn request_wait(cfg: &tw_config::Config) -> Duration {
+    Duration::from_secs(cfg.failover.wait_secs)
 }
 
 /// 这个路径的请求算不算：数 token 的不算（Anthropic 的 `count_tokens`、Gemini 的
@@ -568,7 +569,7 @@ impl KeyLimits {
     }
 
     /// 准入第三步：分钟、小时的上限。用满了先等下一个空位，最多等到 `until`（这个请求的
-    /// 等待期限，见 [`slot_wait`]）；等不到就拒，带着多久之后能再来。**过了就记上**：这个
+    /// 等待期限，见 [`request_wait`]）；等不到就拒，带着多久之后能再来。**过了就记上**：这个
     /// 请求算进滚动窗口，输入的估算占上预留。
     ///
     /// 天、周、月在这里再看一遍：等并发名额、等空位的那一阵，别的请求可能把它用满了。

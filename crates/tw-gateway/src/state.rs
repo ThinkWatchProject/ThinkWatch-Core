@@ -158,6 +158,11 @@ pub struct AppState {
     /// **跨重载存活**，理由和并发闸门一样：改一条路由规则不该让今天花的钱归零，在跑的
     /// 请求的预留也不该变成孤儿。上限本身跟着配置换（[`crate::key_limits::KeyLimits::configure`]）
     pub key_limits: Arc<crate::key_limits::KeyLimits>,
+    /// 每家上游的用量上限（见 [`crate::upstream_limits`]）。**跨重载存活**，理由和 `key_limits` 一样
+    pub upstream_limits: Arc<crate::upstream_limits::UpstreamLimits>,
+    /// 每家上游暂时发不出去的样子：限流暂停、用量上限，和等它们的请求排的队（见
+    /// [`crate::throttle`]）。**跨重载存活**：改一条规则不该让一家正被限流的上游马上又挨一遍
+    pub throttles: Arc<crate::throttle::Throttles>,
     /// 一家上游不在当前运行时里时顶上的 Client（直连，不读系统代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
@@ -303,12 +308,21 @@ impl AppState {
         let bus = tw_observe::EventBus::new();
         let key_limits = Arc::new(crate::key_limits::KeyLimits::new(bus.clone()));
         key_limits.configure(&rt.config);
+        let upstream_limits = Arc::new(crate::upstream_limits::UpstreamLimits::new(bus.clone()));
+        upstream_limits.configure(&rt.config);
+        let throttles = Arc::new(crate::throttle::Throttles::new(
+            bus.clone(),
+            upstream_limits.clone(),
+        ));
+        throttles.configure(&rt.config);
         let state = Self {
             local_time: Arc::new(tw_engine::LocalTime::now),
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Default::default(),
             slots,
             key_limits,
+            upstream_limits,
+            throttles,
             http,
             bus,
             health,
@@ -463,11 +477,21 @@ impl AppState {
             } else {
                 Default::default()
             },
-            // 并发数满着的也不参加这一轮：它们会被当场跳过（见 `crate::slots`）
+            // 并发数满着的也不参加这一轮：它们会被当场跳过（见 `crate::slots`）。限流暂停着的、
+            // 用量上限满了或用完了的一样（见 `crate::throttle`）—— 跳过的不记账，真发出去的那一家记
             busy: if balanced {
                 candidates
                     .iter()
-                    .filter(|p| self.slots.is_full(p))
+                    .filter(|p| {
+                        self.slots.is_full(p) || {
+                            let limits = providers
+                                .iter()
+                                .find(|x| &x.name == *p)
+                                .map(crate::throttle::usage_limits)
+                                .unwrap_or_default();
+                            self.throttles.peek(p, limits) != crate::throttle::Peek::Open
+                        }
+                    })
                     .cloned()
                     .collect()
             } else {
@@ -563,6 +587,8 @@ impl AppState {
         self.health.configure(&next.config.failover);
         self.slots.configure(&next.config.providers);
         self.key_limits.configure(&next.config);
+        self.upstream_limits.configure(&next.config);
+        self.throttles.configure(&next.config);
         self.rt.store(Arc::new(next));
         self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表

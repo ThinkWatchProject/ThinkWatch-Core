@@ -390,6 +390,7 @@ fn routed(hops: &[(&str, Option<&str>)]) -> Option<String> {
             usage: None,
             queued_ms: None,
             skipped: None,
+            pause_ms: None,
             proxy: None,
         })
         .collect();

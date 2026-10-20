@@ -192,18 +192,18 @@ async fn a_refused_request_is_recorded_like_other_refusals() {
     )));
 }
 
-/// 一分钟一个：第二个等不到空位（要等快一分钟，超过 30 秒），拒，并说准多久之后再来，
-/// 可以重试。
+/// 一小时一个：第二个等不到空位（要等快一小时，超过等待期限 `wait_secs` 的 120 秒），拒，并说
+/// 准多久之后再来，可以重试。
 #[tokio::test]
 async fn a_rolling_limit_says_exactly_when_to_retry() {
     let (up, _hits) = upstream().await;
-    let (gw, _rx) = gateway(up, "[{per: minute, requests: 1}]").await;
+    let (gw, _rx) = gateway(up, "[{per: hour, requests: 1}]").await;
     assert_eq!(anthropic(gw, "/v1/messages").await.status(), 200);
     let r = anthropic(gw, "/v1/messages").await;
     assert_eq!(r.status(), 429);
     assert_eq!(head(&r, "x-should-retry").as_deref(), Some("true"));
     let ms: u64 = head(&r, "retry-after-ms").unwrap().parse().unwrap();
-    assert!((50_000..=60_000).contains(&ms), "{ms}");
+    assert!((3_500_000..=3_600_000).contains(&ms), "{ms}");
     let secs: u64 = head(&r, "retry-after").unwrap().parse().unwrap();
     assert_eq!(secs, ms.div_ceil(1000));
     let v: serde_json::Value = r.json().await.unwrap();
@@ -211,7 +211,7 @@ async fn a_rolling_limit_says_exactly_when_to_retry() {
         v["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("1 requests per minute"),
+            .contains("1 requests per hour"),
         "{v}"
     );
 }

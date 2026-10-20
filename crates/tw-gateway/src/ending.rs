@@ -76,6 +76,8 @@ pub struct Ending {
     /// 上游在流里报的错：哪一家、原话。**有它就不是成功** —— 响应头是 200，回答却断在了
     /// 半路
     upstream_error: Option<(String, String)>,
+    /// 上游报错的那一帧的 `data`：回程照它认是不是限流（见 [`Ending::upstream_fault`]）
+    upstream_fault: Option<String>,
     /// 上游回的不是 2xx、原样交给了客户端（见 [`Ending::refused`]）。**有它就不是成功**：
     /// 客户端拿到的是上游的错误，不是回答
     refusal: Option<Refusal>,
@@ -167,12 +169,15 @@ struct Watch {
 }
 
 impl Watch {
-    /// 这些帧里上游报的第一个错
-    fn error_in(&self, frames: Vec<tw_dialect::frame::Frame>) -> Option<(String, String)> {
-        frames
-            .iter()
-            .find_map(|f| tw_dialect::convert::stream_error(self.dialect, f))
-            .map(|message| (self.provider.clone(), message))
+    /// 这些帧里上游报的第一个错：哪一家、原话，和那一帧的 `data`
+    fn error_in(
+        &self,
+        frames: Vec<tw_dialect::frame::Frame>,
+    ) -> Option<((String, String), String)> {
+        frames.iter().find_map(|f| {
+            tw_dialect::convert::stream_error(self.dialect, f)
+                .map(|message| ((self.provider.clone(), message), f.data.clone()))
+        })
     }
 }
 
@@ -315,6 +320,7 @@ impl Ending {
             lap: None,
             watch: None,
             upstream_error: None,
+            upstream_fault: None,
             refusal: None,
             answer: None,
             abort: None,
@@ -377,6 +383,13 @@ impl Ending {
     /// 认）。WebSocket 上 Responses 的一轮靠它判断这一家答上了没有（见 `crate::ws::turn`）
     pub fn has_content(&self) -> bool {
         self.opened.is_some()
+    }
+
+    /// 上游在流里报了错：那一帧的 `data`（上游的格式，[`Ending::streaming`] 时给的）。回程照它
+    /// 认是不是限流 —— 答到一半才报的限流，回答照样以错误收尾，这一家照样暂停（见
+    /// [`crate::throttle`]）
+    pub fn upstream_fault(&self) -> Option<&str> {
+        self.upstream_fault.as_deref()
     }
 
     /// 上游 `provider` 回的不是 2xx，原样交给了客户端（4xx 是请求本身的问题，或者没有
@@ -485,8 +498,9 @@ impl Ending {
             return;
         };
         let frames = w.frames.feed(chunk);
-        if let Some(found) = w.error_in(frames) {
+        if let Some((found, data)) = w.error_in(frames) {
             self.upstream_error = Some(found);
+            self.upstream_fault = Some(data);
             self.watch = None;
         }
     }
@@ -598,7 +612,12 @@ impl Ending {
         // 最后一帧后面不带空行的上游：收尾时再看一眼
         if let Some(mut w) = self.watch.take() {
             let frames = w.frames.flush();
-            self.upstream_error = self.upstream_error.take().or(w.error_in(frames));
+            if self.upstream_error.is_none()
+                && let Some((found, data)) = w.error_in(frames)
+            {
+                self.upstream_error = Some(found);
+                self.upstream_fault = Some(data);
+            }
         }
         if let Some((upstream, message)) = self.upstream_error.take() {
             let message: String = message.chars().take(500).collect();

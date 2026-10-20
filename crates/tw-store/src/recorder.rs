@@ -687,6 +687,10 @@ impl Recorder {
             // 某家上游熔断了 —— 是「现在什么情况」，不是「刚才发生过什么」。
             // 这张表只装后者。
             | Event::HealthChanged { .. }
+            // 一家上游暂时发不出去，同上：是现状
+            | Event::ThrottleChanged { .. }
+            // 一个请求开始排队：它等了多久在尝试链（`queued_ms`）里，这一条不用落库
+            | Event::RequestQueued { .. }
             | Event::ModelsChanged { .. }
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
@@ -978,6 +982,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -990,6 +995,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: Some("机场".into()),
                 },
             ],
@@ -1055,6 +1061,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -1089,6 +1096,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -1101,6 +1109,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
             ],
@@ -1154,6 +1163,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -1282,6 +1292,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -1608,6 +1619,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::Free,
@@ -1650,6 +1662,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::Free,
@@ -1731,6 +1744,7 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing,
@@ -1823,6 +1837,7 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing,
@@ -2269,6 +2284,7 @@ mod security_detail_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -2564,6 +2580,7 @@ mod translation_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 })
                 .collect(),
@@ -3256,6 +3273,7 @@ mod settle_hook_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,

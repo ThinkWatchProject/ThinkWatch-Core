@@ -166,22 +166,22 @@ fn provider(name: &str, up: &Upstream, protocol: Protocol) -> Provider {
 const HOLD: Duration = Duration::from_millis(300);
 const KEEPALIVE_EVERY: Duration = Duration::from_millis(150);
 
-/// 起网关，交回数据面的状态。`slot_wait_secs` 是等空位的期限
+/// 起网关，交回数据面的状态。`wait_secs` 是等空位的期限
 async fn gateway_with(
     providers: Vec<Provider>,
-    slot_wait_secs: u64,
+    wait_secs: u64,
 ) -> (
     SocketAddr,
     tokio::sync::broadcast::Receiver<Event>,
     tw_gateway::AppState,
 ) {
-    gateway_held(providers, slot_wait_secs, Duration::from_secs(10)).await
+    gateway_held(providers, wait_secs, Duration::from_secs(10)).await
 }
 
 /// 起网关，流式回答最多压 `hold` 不给响应头
 async fn gateway_held(
     providers: Vec<Provider>,
-    slot_wait_secs: u64,
+    wait_secs: u64,
     hold: Duration,
 ) -> (
     SocketAddr,
@@ -193,14 +193,14 @@ async fn gateway_held(
         key: "tw-k".into(),
         ..Default::default()
     };
-    gateway_as(client, providers, slot_wait_secs, hold).await
+    gateway_as(client, providers, wait_secs, hold).await
 }
 
 /// 起网关，密钥是 `client`，流式回答最多压 `hold` 不给响应头
 async fn gateway_as(
     client: Client,
     providers: Vec<Provider>,
-    slot_wait_secs: u64,
+    wait_secs: u64,
     hold: Duration,
 ) -> (
     SocketAddr,
@@ -213,7 +213,7 @@ async fn gateway_as(
         providers,
         failover: Failover {
             idle_timeout_secs: 30,
-            slot_wait_secs,
+            wait_secs,
             ..Default::default()
         },
         ..Default::default()

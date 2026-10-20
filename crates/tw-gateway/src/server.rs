@@ -385,6 +385,7 @@ pub(crate) fn hop(
         usage: None,
         queued_ms: None,
         skipped: None,
+        pause_ms: None,
         proxy: None,
     }
 }
@@ -412,6 +413,86 @@ pub(crate) fn hop_busy(
         usage: None,
         queued_ms,
         skipped: Some(tw_api::ServeSkip::Busy),
+        pause_ms: None,
+        proxy: None,
+    }
+}
+
+/// 这家暂时发不出去、没发出去的一跳（见 [`crate::throttle`]）：限流暂停着，或者分钟、小时的用量
+/// 上限满了。`until_ms` 是预计又能发的那一刻（说不出的是 None），`queued_ms`：等过它的话等了多久。
+///
+/// **不是失败**，和满着的一样：不停用、不进熔断的账，这一行只说明请求为什么去了下一家、或者在等它。
+pub(crate) fn hop_waiting(
+    provider: &str,
+    model: Option<String>,
+    kind: tw_api::ThrottleKind,
+    until_ms: Option<u64>,
+    queued_ms: Option<u64>,
+    started: std::time::Instant,
+) -> tw_api::AttemptView {
+    let secs = until_ms
+        .map(|t| t.saturating_sub(now_ms()))
+        .unwrap_or(crate::throttle::PROBE_GRACE.as_millis() as u64)
+        .div_ceil(1000)
+        .max(1);
+    let (error, skipped) = match kind {
+        tw_api::ThrottleKind::WindowFull => (
+            msg!(
+                "gw.upstream.window_full", upstream = provider, secs = secs =>
+                "Upstream `{upstream}` is at one of its per-minute or per-hour usage limits; it has \
+                 room again in about {secs} s."
+            ),
+            tw_api::ServeSkip::WindowFull,
+        ),
+        _ => (
+            msg!(
+                "gw.upstream.paused", upstream = provider, secs = secs =>
+                "Upstream `{upstream}` answered 429 (rate limited) and is paused; it takes requests \
+                 again in about {secs} s."
+            ),
+            tw_api::ServeSkip::Throttled,
+        ),
+    };
+    tw_api::AttemptView {
+        provider: provider.to_string(),
+        model,
+        outcome: tw_api::AttemptOutcome::Error,
+        status: None,
+        error: Some(error),
+        ms: started.elapsed().as_millis() as u64,
+        usage: None,
+        queued_ms,
+        skipped: Some(skipped),
+        pause_ms: None,
+        proxy: None,
+    }
+}
+
+/// 这家一条天、周、月的用量上限用完了、跳过了的一跳。`until_ms` 是它重置的那一刻
+pub(crate) fn hop_used_up(
+    provider: &str,
+    model: Option<String>,
+    until_ms: u64,
+    started: std::time::Instant,
+) -> tw_api::AttemptView {
+    use crate::key_limits::Clock;
+    let resets = crate::key_limits::SystemClock.show(i64::try_from(until_ms).unwrap_or(i64::MAX));
+    tw_api::AttemptView {
+        provider: provider.to_string(),
+        model,
+        outcome: tw_api::AttemptOutcome::Error,
+        status: None,
+        error: Some(msg!(
+            "gw.upstream.period_used_up",
+            upstream = provider, resets = resets, resets_at_ms = until_ms =>
+            "Upstream `{upstream}` has used up one of its usage limits for the current day, week \
+             or month; it resets at {resets}."
+        )),
+        ms: started.elapsed().as_millis() as u64,
+        usage: None,
+        queued_ms: None,
+        skipped: Some(tw_api::ServeSkip::PeriodUsedUp),
+        pause_ms: None,
         proxy: None,
     }
 }
@@ -433,6 +514,7 @@ pub(crate) fn hop_failed(
         usage: None,
         queued_ms: None,
         skipped: None,
+        pause_ms: None,
         proxy: None,
     }
 }

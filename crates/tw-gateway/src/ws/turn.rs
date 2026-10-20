@@ -14,10 +14,11 @@
 //! （见 `server::upgrade`）。
 //!
 //! **上限和并发按轮算，和 HTTP 那条路的一个请求同一套**（[`admit`]）：天、周、月用满了就拒，
-//! 密钥的并发上限等前面的结束，分钟、小时等得到就等；然后占这一家的一个位置
-//! （`max_concurrent`）—— 这条连接只连着这一家，没有下一家可换：满着就等，等不到回
-//! `response.failed`。等分钟、小时的空位和等这一家的位置**共用这一轮的一个期限**，和 HTTP
-//! 那条路一样。被拒的这一轮替它回一个 `response.failed`，连接照常。占着的（密钥的
+//! 密钥的并发上限等前面的结束，分钟、小时等得到就等；然后等这一家能发 —— 这条连接只连着这一家，
+//! 没有下一家可换：满着（`max_concurrent`）、限流暂停着、分钟或小时的用量上限满了就等它（见
+//! [`crate::throttle`]），排在它的队里，等不到、这一期用完了回 `response.failed`。等分钟、小时的
+//! 空位和等这一家**共用这一轮的一个期限**，和 HTTP 那条路一样。上游在这一轮里回了限流的错误，
+//! 这一家暂停，错误照常交给客户端：这一帧已经发出去了，换不了。被拒的这一轮替它回一个 `response.failed`，连接照常。占着的（密钥的
 //! 并发通行证、这一家的位置）从发出去占到这一次回答完、或者连接断了；**闲着的连接什么都
 //! 不占**。
 //!
@@ -38,7 +39,8 @@ use crate::ending::Ending;
 use crate::error::GatewayError;
 use crate::server::Choice;
 use crate::state::AppState;
-use tw_types::{Msg, msg};
+use crate::throttle::Stuck;
+use tw_types::Msg;
 
 /// 一条连接上开始一个请求时都一样的那几项：谁发的、从哪儿来、哪条路径。整条连接一行的
 /// （Realtime 和别的路径）和每一轮一行的（Responses）都由它开始。
@@ -266,6 +268,15 @@ pub(crate) struct Turn {
     /// 密钥的并发通行证和这一家的位置：**跟着这一轮走**，回答完了、连接断了就还
     _pass: crate::limits::Pass,
     _slot: crate::slots::Slot,
+    /// 暂停结束后探路的就是这一轮的话，探路的名额（见 [`crate::throttle::Probe`]）。发出去时说一声
+    probe: Option<crate::throttle::Probe>,
+    /// 这一帧发出去的时刻（Unix 毫秒）：这一家的答复是不是最近一次 429 之后的，看它
+    sent_ms: u64,
+    /// 这一轮在这一家用量上限上占着的（见 [`crate::upstream_limits`]）：发出去了的这一轮**怎么收场
+    /// 都交给这一轮的号**等结算（上游收到了它），被限流了、没发出去的还回去
+    usage: Option<crate::upstream_limits::UpstreamHold>,
+    /// 上游在这一轮里报了限流，这一家已经暂停了。**一轮只暂停一次**
+    paused: bool,
     /// 这一轮结束时记一笔，到了时候重读这一家的余额（见 [`crate::balances`]）
     _passing: crate::balances::Passing,
 }
@@ -277,6 +288,10 @@ impl Turn {
         if let Some(r) = self.route.as_mut() {
             r.attempt.model = model;
             r.since = Instant::now();
+        }
+        self.sent_ms = crate::server::now_ms();
+        if let Some(p) = self.probe.as_mut() {
+            p.sent();
         }
     }
 
@@ -309,7 +324,17 @@ impl Turn {
             self.response = response.map(str::to_string);
         }
         self.errored |= kind == Some("error");
+        // 收尾的这一帧报的错。和 HTTP 那条路开头报错的一跳同一个判据
+        let dialect = tw_dialect::ir::Dialect::Responses;
+        let fault = super::ends_turn(kind)
+            .then(|| crate::server::stream_fault(&self.state, &self.provider, dialect, text))
+            .flatten();
+        let limited = matches!(fault, Some(crate::failure::Cause::RateLimited { .. }));
         if !self.responded {
+            // 头一帧不是限流的错误：这一家没在限流（探路的过了，连续限流的次数归零）
+            if !limited {
+                self.state.throttles.answered(&self.provider, self.sent_ms);
+            }
             self.responded = true;
             self.routed();
             self.state.bus.emit(tw_api::Event::RequestHeaders {
@@ -321,6 +346,7 @@ impl Turn {
                 e.responded(200);
             }
         }
+        self.pause_on(fault);
         if let Some(e) = self.ending.as_mut() {
             e.frame(text);
         }
@@ -332,11 +358,26 @@ impl Turn {
             // 一过就记成功
             self.judge(|h, p| h.record_success(p));
         } else if super::ends_turn(kind) {
-            // 一段内容都没有就收了尾：和 HTTP 那条路开头报错的一跳同一个判据
-            let dialect = tw_dialect::ir::Dialect::Responses;
-            match crate::server::stream_fault(&self.state, &self.provider, dialect, text) {
+            // 一段内容都没有就收了尾。限流不是失败（上面暂停过了），不记
+            match fault {
+                Some(_) if limited => self.judged = true,
                 Some(cause) => self.judge(|h, p| h.record_cause(p, cause)),
                 None => self.judge(|h, p| h.record_success(p)),
+            }
+        }
+    }
+
+    /// 上游在这一轮里报了限流（`fault`）：这一家暂停，这一轮在用量上限上占着的还回去。**错误照常
+    /// 交给客户端**：这一帧已经发出去了。答到一半才报的也暂停
+    fn pause_on(&mut self, fault: Option<crate::failure::Cause>) {
+        if let Some(crate::failure::Cause::RateLimited { retry_after }) = fault
+            && !std::mem::replace(&mut self.paused, true)
+        {
+            self.state
+                .throttles
+                .limited(&self.provider, self.sent_ms, retry_after);
+            if let Some(h) = self.usage.take() {
+                h.release();
             }
         }
     }
@@ -399,6 +440,10 @@ impl Turn {
         if source == tw_api::FailureSource::Upstream {
             self.judge(|h, p| h.record_failure(p));
         }
+        // 没发出去：用量上限上占着的还回去
+        if let Some(h) = self.usage.take() {
+            h.release();
+        }
         if let Some(r) = self.route.take() {
             self.state.bus.emit(routed(
                 self.id,
@@ -418,6 +463,10 @@ impl Drop for Turn {
     /// 这一行没有尝试链。结局随后由它自己的 Drop 报成取消
     fn drop(&mut self) {
         self.routed();
+        // 发出去了的这一轮（答完了、失败了、连接断了）：在这一家的用量上限上算一个请求
+        if let Some(h) = self.usage.take() {
+            h.bind(self.id);
+        }
     }
 }
 
@@ -481,10 +530,11 @@ pub(crate) enum NotAdmitted {
 /// 3. 分钟、小时的上限 —— 下一个空位在这一轮的等待期限之前空出来就等，等不到就拒；过了
 ///    就按输入的估算占着，存储层记下这一行时换成实数；
 /// 4. 开始：发开始事件，内容过滤的结论挂在这一轮上报（拒绝的切断连接）；
-/// 5. 这一家的位置（`max_concurrent`）—— 满着就等，等到同一个期限；这条连接只连着
-///    这一家，等不到就是这一家忙，回 429 那句话。
+/// 5. 这一家能发 —— 满着（`max_concurrent`）、限流暂停着、分钟或小时的用量上限满了就等，
+///    排在它的队里，等到同一个期限（见 [`crate::throttle`]）；这条连接只连着这一家，等不到、
+///    这一期用完了，回 429 那句话（和 HTTP 那条路一家都发不出去时同一句）。
 ///
-/// **等待期限一轮只有一个**：过了密钥的并发上限那一刻起算 `failover.slot_wait_secs`，第 3 步、
+/// **等待期限一轮只有一个**：过了密钥的并发上限那一刻起算 `failover.wait_secs`，第 3 步、
 /// 第 5 步的等待都算在里面，和 HTTP 那条路一样（见 `server::pipeline::admission`）。
 ///
 /// 被上限拒的、等不到位置的**照样留一行**，流量里看得见它为什么没发出去。拿到的通行证和
@@ -506,8 +556,8 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
     }
     let pass = state.gate.acquire(key_name, max_concurrent).await;
     // 等待期限从这里起算：等滚动窗口的空位、等这一家的位置共用它（见
-    // `crate::key_limits::slot_wait`）
-    let wait_until = tokio::time::Instant::now() + crate::key_limits::slot_wait(&rt.config);
+    // `crate::key_limits::request_wait`）
+    let wait_until = tokio::time::Instant::now() + crate::key_limits::request_wait(&rt.config);
     let ask = ask(state, &a, limits);
     let hold = match state
         .key_limits
@@ -542,37 +592,121 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
     }
     let model = Some(a.sent.clone()).filter(|m| !m.is_empty() && *m != a.requested);
     let hop_started = Instant::now();
-    let (slot, queued_ms) = match state.slots.try_take(&line.provider) {
-        Some(slot) => (slot, None),
-        None => {
+    let provider = rt.config.providers.iter().find(|p| p.name == line.provider);
+    let limits = provider
+        .map(crate::throttle::usage_limits)
+        .unwrap_or_default();
+    let deadline_ms = crate::server::now_ms()
+        + wait_until
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis() as u64;
+    let mut waiter = state.throttles.waiter();
+    let at_once = match state
+        .throttles
+        .gate(&line.provider, limits, Some(waiter.id))
+    {
+        crate::throttle::Gate::Go(probe) => match state.slots.try_take(&line.provider) {
+            Some(slot) => Ok((slot, probe)),
+            None => Err(Stuck::Busy),
+        },
+        crate::throttle::Gate::Wait { kind, until_ms } => Err(match kind {
+            tw_api::ThrottleKind::WindowFull => Stuck::WindowFull(until_ms),
+            _ => Stuck::RateLimited(until_ms),
+        }),
+        crate::throttle::Gate::UsedUp { until_ms, .. } => Err(Stuck::UsedUp(until_ms)),
+    };
+    let (slot, probe, queued_ms) = match at_once {
+        Ok((slot, probe)) => (slot, probe, None),
+        Err(stuck) => {
             let mut waited = None;
-            let mut slot = None;
-            // 这一轮能等的已经等完了（或者配置的是不等）：不再等
-            if tokio::time::Instant::now() < wait_until {
-                slot = state.slots.take_by(&line.provider, wait_until).await;
+            let mut ready = None;
+            // 等得到才等：这一期用完了的、说得出什么时候恢复又晚于期限的不等。这一轮能等的已经
+            // 等完了（或者配置的是不等）也不再等
+            let hopeful = match stuck {
+                Stuck::Busy => true,
+                Stuck::RateLimited(t) | Stuck::WindowFull(t) => t.is_none_or(|t| t <= deadline_ms),
+                Stuck::UsedUp(_) => false,
+            };
+            if hopeful && tokio::time::Instant::now() < wait_until {
+                let one = [(line.provider.as_str(), limits)];
+                state.bus.emit(tw_api::Event::RequestQueued {
+                    id,
+                    upstreams: vec![line.provider.clone()],
+                    until_ms: deadline_ms,
+                    at_ms: crate::server::now_ms(),
+                });
+                ready = crate::throttle::first_ready(state, &mut waiter, &one, wait_until).await;
                 waited = Some(hop_started.elapsed().as_millis() as u64);
             }
-            match slot {
-                Some(slot) => (slot, waited),
+            match ready {
+                Some((_, ready)) => (ready.slot, ready.probe, waited),
                 None => {
-                    let limit = state.slots.limit(&line.provider).unwrap_or_default();
-                    let busy =
-                        crate::server::hop_busy(&line.provider, model, limit, waited, hop_started);
+                    let now = crate::server::now_ms();
+                    // 此刻它是哪一样：等的时候可能换了
+                    let stuck = match (stuck, state.throttles.peek(&line.provider, limits)) {
+                        (Stuck::Busy, _) => Stuck::Busy,
+                        (_, crate::throttle::Peek::UsedUp { until_ms, .. }) => {
+                            Stuck::UsedUp(until_ms)
+                        }
+                        (
+                            _,
+                            crate::throttle::Peek::Wait {
+                                kind: tw_api::ThrottleKind::WindowFull,
+                                until_ms,
+                            },
+                        ) => Stuck::WindowFull(until_ms),
+                        (_, crate::throttle::Peek::Wait { until_ms, .. }) => {
+                            Stuck::RateLimited(until_ms)
+                        }
+                        (stuck, crate::throttle::Peek::Open) => stuck,
+                    };
+                    let hop = match stuck {
+                        Stuck::Busy => crate::server::hop_busy(
+                            &line.provider,
+                            model,
+                            state.slots.limit(&line.provider).unwrap_or_default(),
+                            waited,
+                            hop_started,
+                        ),
+                        Stuck::RateLimited(t) => crate::server::hop_waiting(
+                            &line.provider,
+                            model,
+                            tw_api::ThrottleKind::RateLimited,
+                            t,
+                            waited,
+                            hop_started,
+                        ),
+                        Stuck::WindowFull(t) => crate::server::hop_waiting(
+                            &line.provider,
+                            model,
+                            tw_api::ThrottleKind::WindowFull,
+                            t,
+                            waited,
+                            hop_started,
+                        ),
+                        Stuck::UsedUp(t) => {
+                            crate::server::hop_used_up(&line.provider, model, t, hop_started)
+                        }
+                    };
                     state
                         .bus
-                        .emit(routed(id, choice, vec![busy], tw_api::Billing::PerToken));
-                    // 和 HTTP 那条路候选全满时同一句：能服务它的就这一家
-                    let err = GatewayError::busy(msg!(
-                        "gw.busy_all", upstreams = format!("`{}`", line.provider) =>
-                        "Every upstream that can serve this request is at its concurrency limit \
-                         (max_concurrent): {upstreams}. None had a free slot in time; try again shortly."
-                    ));
+                        .emit(routed(id, choice, vec![hop], tw_api::Billing::PerToken));
+                    // 和 HTTP 那条路一家都发不出去时同一句：能服务它的就这一家
+                    let err = crate::throttle::refusal(&[(line.provider.clone(), stuck)], now);
                     ending.failed(err.source.into(), err.detail.clone());
                     return Err(NotAdmitted::Failed(err));
                 }
             }
         }
     };
+    // 这一家的用量上限：请求数此刻记上，token 和费用按这一帧估一个数占着（见
+    // `crate::upstream_limits`）
+    let usage = (!limits.is_empty()).then(|| {
+        let asked = self::ask(state, &a, limits);
+        state
+            .upstream_limits
+            .reserve(&line.provider, limits, &asked)
+    });
     let mut attempt = crate::server::hop(
         &line.provider,
         model,
@@ -600,6 +734,10 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
         cut: None,
         _pass: pass,
         _slot: slot,
+        probe,
+        sent_ms: crate::server::now_ms(),
+        usage,
+        paused: false,
         _passing: state.balance_passing(&line.provider),
     })
 }

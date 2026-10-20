@@ -99,7 +99,9 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::Translated { .. }
         | E::SecretsFound { .. }
         | E::ContentMatched { .. }
-        | E::ToolCallFlagged { .. } => true,
+        | E::ToolCallFlagged { .. }
+        // 在排队：半路才来的一方要看得出它在等哪几家
+        | E::RequestQueued { .. } => true,
         // 开始和三种结局由 `track_at` 自己管
         E::RequestStarted { .. }
         | E::RequestFinished { .. }
@@ -119,6 +121,8 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         // 插件出错是一条通知：它的号是新取的，出错的请求在 `request_id` 里
         | E::PluginFailed { .. }
         | E::HealthChanged { .. }
+        // 一家上游暂时发不出去：说的是那一家现在的样子（`/overview` 答得了）
+        | E::ThrottleChanged { .. }
         | E::ModelsChanged { .. }
         | E::ProxyChanged { .. }
         | E::AuthChanged { .. }
@@ -502,6 +506,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -514,6 +519,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
             ],

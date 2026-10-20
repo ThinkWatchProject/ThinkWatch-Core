@@ -422,6 +422,8 @@ gw.upstream.eventstream_broken
 gw.upstream.forward_failed
 gw.upstream.idle_timeout
 gw.upstream.idle_timeout_mid_stream
+gw.upstream.paused
+gw.upstream.period_used_up
 gw.upstream.rate_limited
 gw.upstream.sign_failed
 gw.upstream.status
@@ -431,6 +433,11 @@ gw.upstream.stream_exception
 gw.upstream.stream_opening_error
 gw.upstream.timeout
 gw.upstream.unreachable
+gw.upstream.window_full
+gw.wait.mixed
+gw.wait.rate_limited
+gw.wait.used_up
+gw.wait.window_full
 gw.ws.alias_unserved
 gw.ws.alias_unserved_rewritten
 gw.ws.bad_header
