@@ -522,6 +522,7 @@ fn provider_view(
             .collect(),
         pricing: p.pricing.clone(),
         max_concurrent: p.max_concurrent,
+        limits: s.gateway.upstream_limits.view(&p.name, &p.limits),
         balance_setting: p.balance.into(),
         balance: s.gateway.balance_of(p),
         signed_in: p.signed_in.map(Into::into),

@@ -164,6 +164,63 @@ pub enum ValidationError {
         days: u64,
         min: u64,
     },
+    /// `every` 超出了这种时间单位能写的范围（分钟 1 到 60、小时 1 到 24）
+    #[error("{}", self.msg())]
+    KeyLimitEvery {
+        key: String,
+        per: &'static str,
+        every: u32,
+        max: u32,
+    },
+    /// 天、周、月写了 `every`：自然周期没有「每 3 天」
+    #[error("{}", self.msg())]
+    KeyLimitEveryCalendar { key: String, per: &'static str },
+    // 上游的用量上限（`providers[].limits`）：和密钥的一条一条对应，码另起一套 —— 句子里
+    // 说的是上游，不是密钥
+    #[error("{}", self.msg())]
+    UpstreamLimitEmpty { upstream: String },
+    #[error("{}", self.msg())]
+    UpstreamLimitTwoMeasures { upstream: String, measures: String },
+    #[error("{}", self.msg())]
+    UpstreamLimitNotPositive {
+        upstream: String,
+        per: &'static str,
+        measure: &'static str,
+        value: String,
+    },
+    #[error("{}", self.msg())]
+    UpstreamLimitDuplicate {
+        upstream: String,
+        per: &'static str,
+        measure: &'static str,
+    },
+    #[error("{}", self.msg())]
+    UpstreamLimitCacheReads {
+        upstream: String,
+        measure: &'static str,
+    },
+    #[error("{}", self.msg())]
+    UpstreamLimitCostTooSmall {
+        upstream: String,
+        per: &'static str,
+        value: String,
+    },
+    #[error("{}", self.msg())]
+    UpstreamLimitRetention {
+        upstream: String,
+        per: &'static str,
+        days: u64,
+        min: u64,
+    },
+    #[error("{}", self.msg())]
+    UpstreamLimitEvery {
+        upstream: String,
+        per: &'static str,
+        every: u32,
+        max: u32,
+    },
+    #[error("{}", self.msg())]
+    UpstreamLimitEveryCalendar { upstream: String, per: &'static str },
     /// `sync` 一节写得不对（[`crate::sync::SyncError`]）
     #[error("{}", self.msg())]
     Sync(crate::sync::SyncError),
@@ -464,6 +521,94 @@ impl ValidationError {
                  After a restart the total for the {per} is added up again from the request \
                  records, so row_days has to be at least {min}"
             ),
+            KeyLimitEvery {
+                key,
+                per,
+                every,
+                max,
+            } => msg!(
+                "config.key_limit_every", key = key, per = per, every = every, max = max =>
+                "a limit per {per} of gateway key `{key}` has every: {every}. With per: {per}, \
+                 every takes 1 to {max}"
+            ),
+            KeyLimitEveryCalendar { key, per } => msg!(
+                "config.key_limit_every_calendar", key = key, per = per =>
+                "a limit per {per} of gateway key `{key}` sets every, which only per: minute and \
+                 per: hour take. A day, a week and a month start again at local midnight"
+            ),
+            UpstreamLimitEmpty { upstream } => msg!(
+                "config.upstream_limit_empty", upstream = upstream =>
+                "a limit of upstream `{upstream}` names nothing to count. Each entry under limits \
+                 takes one of requests, tokens or cost"
+            ),
+            UpstreamLimitTwoMeasures { upstream, measures } => msg!(
+                "config.upstream_limit_two_measures", upstream = upstream, measures = measures =>
+                "a limit of upstream `{upstream}` names {measures} together. Each entry takes one \
+                 of requests, tokens or cost; write one entry for each"
+            ),
+            UpstreamLimitNotPositive {
+                upstream,
+                per,
+                measure,
+                value,
+            } => msg!(
+                "config.upstream_limit_not_positive", upstream = upstream, per = per,
+                measure = measure, value = value =>
+                "the {measure} limit per {per} of upstream `{upstream}` is {value}; it has to be \
+                 more than 0"
+            ),
+            UpstreamLimitDuplicate {
+                upstream,
+                per,
+                measure,
+            } => msg!(
+                "config.upstream_limit_duplicate", upstream = upstream, per = per,
+                measure = measure =>
+                "upstream `{upstream}` has two {measure} limits per {per}. Keep one of them"
+            ),
+            UpstreamLimitCacheReads { upstream, measure } => msg!(
+                "config.upstream_limit_cache_reads", upstream = upstream, measure = measure =>
+                "the {measure} limit of upstream `{upstream}` sets cache_reads, which only a \
+                 tokens limit takes"
+            ),
+            UpstreamLimitCostTooSmall {
+                upstream,
+                per,
+                value,
+            } => msg!(
+                "config.upstream_limit_cost_too_small", upstream = upstream, per = per,
+                value = value =>
+                "the cost limit per {per} of upstream `{upstream}` is {value}; it has to be at \
+                 least 0.01"
+            ),
+            UpstreamLimitRetention {
+                upstream,
+                per,
+                days,
+                min,
+            } => msg!(
+                "config.upstream_limit_retention", upstream = upstream, per = per, days = days,
+                min = min =>
+                "upstream `{upstream}` has a limit per {per}, and retention.row_days is {days}. \
+                 After a restart the total for the {per} is added up again from the request \
+                 records, so row_days has to be at least {min}"
+            ),
+            UpstreamLimitEvery {
+                upstream,
+                per,
+                every,
+                max,
+            } => msg!(
+                "config.upstream_limit_every", upstream = upstream, per = per, every = every,
+                max = max =>
+                "a limit per {per} of upstream `{upstream}` has every: {every}. With per: {per}, \
+                 every takes 1 to {max}"
+            ),
+            UpstreamLimitEveryCalendar { upstream, per } => msg!(
+                "config.upstream_limit_every_calendar", upstream = upstream, per = per =>
+                "a limit per {per} of upstream `{upstream}` sets every, which only per: minute \
+                 and per: hour take. A day, a week and a month start again at local midnight"
+            ),
             Sync(e) => e.msg(),
         }
     }
@@ -546,6 +691,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             }
         }
         check_manual_models(&p.name, &p.models)?;
+        check_upstream_limits(p, cfg.retention.row_days)?;
         for (model, spec) in &p.model_specs {
             check_model_spec(&p.name, model, Some(spec))?;
         }
@@ -736,27 +882,56 @@ fn row_days_needed(per: crate::LimitPer) -> Option<u64> {
 /// 费用上限最小是多少美元：再小的话换成微分是 0（不到一微分），或者小到一个请求就用完
 const COST_MIN: f64 = 0.01;
 
-/// 一把密钥的用量上限写得对不对。
+/// 一条用量上限哪儿写得不对。密钥的和上游的写法、规则一样，报的码各是各的（见
+/// [`check_limits`]、[`check_upstream_limits`]）
+enum LimitFault {
+    Empty,
+    TwoMeasures(String),
+    NotPositive {
+        per: &'static str,
+        measure: &'static str,
+        value: String,
+    },
+    CostTooSmall {
+        per: &'static str,
+        value: String,
+    },
+    CacheReads(&'static str),
+    Duplicate {
+        per: &'static str,
+        measure: &'static str,
+    },
+    Retention {
+        per: &'static str,
+        days: u64,
+        min: u64,
+    },
+    Every {
+        per: &'static str,
+        every: u32,
+        max: u32,
+    },
+    EveryCalendar(&'static str),
+}
+
+/// 一组用量上限写得对不对。
 ///
 /// **每一条恰好数一种量**：一条里写两种，读的人分不清是「都要过」还是「过一个就行」。
 /// 同一段时间、同一种量写两条（缓存读算不算进去也一样）的，两条里总有一条不起作用，
 /// 而用户以为它在起作用。
-fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError> {
-    let key = || c.name.clone();
-    for (i, l) in c.limits.iter().enumerate() {
+fn check_limit_entries(limits: &[crate::KeyLimit], row_days: u64) -> Result<(), LimitFault> {
+    for (i, l) in limits.iter().enumerate() {
         let measures = l.measures();
         let measure = match measures.as_slice() {
-            [] => return Err(ValidationError::KeyLimitEmpty { key: key() }),
+            [] => return Err(LimitFault::Empty),
             [one] => *one,
             many => {
-                return Err(ValidationError::KeyLimitTwoMeasures {
-                    key: key(),
-                    measures: many
-                        .iter()
+                return Err(LimitFault::TwoMeasures(
+                    many.iter()
                         .map(|m| m.word())
                         .collect::<Vec<_>>()
                         .join(" and "),
-                });
+                ));
             }
         };
         // 写了 `.nan`、`.inf` 的费用也在这里挡：前者比什么都不大，后者换不成微分
@@ -771,36 +946,43 @@ fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError>
                 crate::LimitMeasure::Tokens => l.tokens.unwrap_or_default().to_string(),
                 crate::LimitMeasure::Cost => l.cost.unwrap_or_default().to_string(),
             };
-            return Err(ValidationError::KeyLimitNotPositive {
-                key: key(),
+            return Err(LimitFault::NotPositive {
                 per: l.per.word(),
                 measure: measure.word(),
                 value,
             });
         }
         if let Some(x) = l.cost.filter(|x| *x < COST_MIN) {
-            return Err(ValidationError::KeyLimitCostTooSmall {
-                key: key(),
+            return Err(LimitFault::CostTooSmall {
                 per: l.per.word(),
                 value: x.to_string(),
             });
         }
         if l.cache_reads && measure != crate::LimitMeasure::Tokens {
-            return Err(ValidationError::KeyLimitCacheReads {
-                key: key(),
-                measure: measure.word(),
-            });
+            return Err(LimitFault::CacheReads(measure.word()));
         }
-        if c.limits[..i].iter().any(|o| o.same_as(l)) {
-            return Err(ValidationError::KeyLimitDuplicate {
-                key: key(),
+        // 「每 0 分钟」没有意思；「每 90 分钟」写成每 2 小时之外，就是写错了单位
+        if let Some(every) = l.every {
+            match l.per.every_max() {
+                None => return Err(LimitFault::EveryCalendar(l.per.word())),
+                Some(max) if every == 0 || every > max => {
+                    return Err(LimitFault::Every {
+                        per: l.per.word(),
+                        every,
+                        max,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        if limits[..i].iter().any(|o| o.same_as(l)) {
+            return Err(LimitFault::Duplicate {
                 per: l.per.word(),
                 measure: measure.word(),
             });
         }
         if let Some(min) = row_days_needed(l.per).filter(|min| row_days < *min) {
-            return Err(ValidationError::KeyLimitRetention {
-                key: key(),
+            return Err(LimitFault::Retention {
                 per: l.per.word(),
                 days: row_days,
                 min,
@@ -808,6 +990,95 @@ fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError>
         }
     }
     Ok(())
+}
+
+/// 一把密钥的用量上限写得对不对（[`check_limit_entries`]）。
+fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError> {
+    let key = c.name.clone();
+    check_limit_entries(&c.limits, row_days).map_err(|f| match f {
+        LimitFault::Empty => ValidationError::KeyLimitEmpty { key },
+        LimitFault::TwoMeasures(measures) => ValidationError::KeyLimitTwoMeasures { key, measures },
+        LimitFault::NotPositive {
+            per,
+            measure,
+            value,
+        } => ValidationError::KeyLimitNotPositive {
+            key,
+            per,
+            measure,
+            value,
+        },
+        LimitFault::CostTooSmall { per, value } => {
+            ValidationError::KeyLimitCostTooSmall { key, per, value }
+        }
+        LimitFault::CacheReads(measure) => ValidationError::KeyLimitCacheReads { key, measure },
+        LimitFault::Duplicate { per, measure } => {
+            ValidationError::KeyLimitDuplicate { key, per, measure }
+        }
+        LimitFault::Retention { per, days, min } => ValidationError::KeyLimitRetention {
+            key,
+            per,
+            days,
+            min,
+        },
+        LimitFault::Every { per, every, max } => ValidationError::KeyLimitEvery {
+            key,
+            per,
+            every,
+            max,
+        },
+        LimitFault::EveryCalendar(per) => ValidationError::KeyLimitEveryCalendar { key, per },
+    })
+}
+
+/// 一家上游的用量上限写得对不对：和密钥的同一套规则（[`check_limit_entries`]），天、周、月
+/// 一样要请求记录留够那一期 —— 重启之后上游这一期用了多少也是从记录里加回来的。
+fn check_upstream_limits(p: &crate::Provider, row_days: u64) -> Result<(), ValidationError> {
+    let upstream = p.name.clone();
+    check_limit_entries(&p.limits, row_days).map_err(|f| match f {
+        LimitFault::Empty => ValidationError::UpstreamLimitEmpty { upstream },
+        LimitFault::TwoMeasures(measures) => {
+            ValidationError::UpstreamLimitTwoMeasures { upstream, measures }
+        }
+        LimitFault::NotPositive {
+            per,
+            measure,
+            value,
+        } => ValidationError::UpstreamLimitNotPositive {
+            upstream,
+            per,
+            measure,
+            value,
+        },
+        LimitFault::CostTooSmall { per, value } => ValidationError::UpstreamLimitCostTooSmall {
+            upstream,
+            per,
+            value,
+        },
+        LimitFault::CacheReads(measure) => {
+            ValidationError::UpstreamLimitCacheReads { upstream, measure }
+        }
+        LimitFault::Duplicate { per, measure } => ValidationError::UpstreamLimitDuplicate {
+            upstream,
+            per,
+            measure,
+        },
+        LimitFault::Retention { per, days, min } => ValidationError::UpstreamLimitRetention {
+            upstream,
+            per,
+            days,
+            min,
+        },
+        LimitFault::Every { per, every, max } => ValidationError::UpstreamLimitEvery {
+            upstream,
+            per,
+            every,
+            max,
+        },
+        LimitFault::EveryCalendar(per) => {
+            ValidationError::UpstreamLimitEveryCalendar { upstream, per }
+        }
+    })
 }
 
 /// 别名表写得对不对，和整份配置的校验是同一套（界面预览一个别名时也用它）。
@@ -1793,6 +2064,119 @@ groups:
             ("k", "day", "0.005")
         );
         assert!(with("[{per: day, cost: 0.01}]", 90).is_ok());
+        // every：分钟 1 到 60、小时 1 到 24；天、周、月不能写
+        assert!(
+            with(
+                "[{per: minute, every: 60, requests: 3}, {per: hour, every: 24, requests: 3}, \
+                 {per: hour, every: 5, cost: 1}, {per: hour, cost: 1}]",
+                90
+            )
+            .is_ok(),
+            "每 5 小时和每小时是两条"
+        );
+        for bad in [
+            "[{per: minute, every: 0, requests: 3}]",
+            "[{per: minute, every: 61, requests: 3}]",
+            "[{per: hour, every: 25, requests: 3}]",
+        ] {
+            assert_eq!(code(bad), "config.key_limit_every", "{bad}");
+        }
+        let m = with("[{per: minute, every: 90, requests: 3}]", 90).unwrap_err();
+        assert_eq!(
+            (m.arg("key"), m.arg("per"), m.arg("every"), m.arg("max")),
+            ("k", "minute", "90", "60")
+        );
+        for per in ["day", "week", "month"] {
+            let m = with(&format!("[{{per: {per}, every: 1, requests: 3}}]"), 90).unwrap_err();
+            assert_eq!(m.code, "config.key_limit_every_calendar", "{per}");
+            assert_eq!(m.arg("per"), per);
+        }
+        assert_eq!(
+            code("[{per: hour, every: 5, cost: 3}, {per: hour, every: 5, cost: 5}]"),
+            "config.key_limit_duplicate"
+        );
+        assert_eq!(
+            code("[{per: hour, every: 1, cost: 3}, {per: hour, cost: 5}]"),
+            "config.key_limit_duplicate",
+            "写明的 1 和不写是同一条"
+        );
+    }
+
+    /// 上游的用量上限：和密钥的同一套规则，报的是上游自己的码
+    #[test]
+    fn upstream_limits_follow_the_key_rules_with_their_own_codes() {
+        let with = |limits: &str, row_days: u64| {
+            let mut up = p("u", "https://api.example.com");
+            up.limits = serde_yaml_ng::from_str(limits).unwrap();
+            let mut cfg = cfg(vec![c("k", "tw-1")], vec![up]);
+            cfg.retention.row_days = row_days;
+            validate(&cfg).map_err(|e| e.msg())
+        };
+        let code = |limits: &str| with(limits, 90).unwrap_err().code;
+        assert!(
+            with(
+                "[{per: hour, every: 5, requests: 300}, {per: minute, tokens: 100000}, \
+                 {per: day, tokens: 900000, cache_reads: true}, {per: month, cost: 100}]",
+                90
+            )
+            .is_ok()
+        );
+        for (bad, want) in [
+            ("[{per: day}]", "config.upstream_limit_empty"),
+            (
+                "[{per: day, requests: 3, cost: 1}]",
+                "config.upstream_limit_two_measures",
+            ),
+            (
+                "[{per: day, requests: 0}]",
+                "config.upstream_limit_not_positive",
+            ),
+            (
+                "[{per: day, cost: .nan}]",
+                "config.upstream_limit_not_positive",
+            ),
+            (
+                "[{per: day, cost: 0.005}]",
+                "config.upstream_limit_cost_too_small",
+            ),
+            (
+                "[{per: day, requests: 3, cache_reads: true}]",
+                "config.upstream_limit_cache_reads",
+            ),
+            (
+                "[{per: day, cost: 3}, {per: day, cost: 5}]",
+                "config.upstream_limit_duplicate",
+            ),
+            (
+                "[{per: minute, every: 61, requests: 3}]",
+                "config.upstream_limit_every",
+            ),
+            (
+                "[{per: hour, every: 0, requests: 3}]",
+                "config.upstream_limit_every",
+            ),
+            (
+                "[{per: month, every: 2, requests: 3}]",
+                "config.upstream_limit_every_calendar",
+            ),
+        ] {
+            assert_eq!(code(bad), want, "{bad}");
+        }
+        let m = with("[{per: hour, every: 30, tokens: 5}]", 90).unwrap_err();
+        assert_eq!(
+            (
+                m.arg("upstream"),
+                m.arg("per"),
+                m.arg("every"),
+                m.arg("max")
+            ),
+            ("u", "hour", "30", "24")
+        );
+        // 天、周、月要请求记录留够那一期：重启之后从记录里加回来
+        let m = with("[{per: week, requests: 3}]", 6).unwrap_err();
+        assert_eq!(m.code, "config.upstream_limit_retention");
+        assert_eq!((m.arg("days"), m.arg("min")), ("6", "7"));
+        assert!(with("[{per: hour, requests: 3}]", 0).is_ok());
     }
 
     #[test]
@@ -2042,6 +2426,59 @@ mod msg_codes {
                 per: "month",
                 days: 30,
                 min: 31,
+            },
+            KeyLimitEvery {
+                key: "k".into(),
+                per: "minute",
+                every: 90,
+                max: 60,
+            },
+            KeyLimitEveryCalendar {
+                key: "k".into(),
+                per: "day",
+            },
+            UpstreamLimitEmpty {
+                upstream: "u".into(),
+            },
+            UpstreamLimitTwoMeasures {
+                upstream: "u".into(),
+                measures: "requests and cost".into(),
+            },
+            UpstreamLimitNotPositive {
+                upstream: "u".into(),
+                per: "day",
+                measure: "cost",
+                value: "0".into(),
+            },
+            UpstreamLimitDuplicate {
+                upstream: "u".into(),
+                per: "day",
+                measure: "cost",
+            },
+            UpstreamLimitCacheReads {
+                upstream: "u".into(),
+                measure: "cost",
+            },
+            UpstreamLimitCostTooSmall {
+                upstream: "u".into(),
+                per: "day",
+                value: "0.005".into(),
+            },
+            UpstreamLimitRetention {
+                upstream: "u".into(),
+                per: "month",
+                days: 30,
+                min: 31,
+            },
+            UpstreamLimitEvery {
+                upstream: "u".into(),
+                per: "hour",
+                every: 0,
+                max: 24,
+            },
+            UpstreamLimitEveryCalendar {
+                upstream: "u".into(),
+                per: "week",
             },
         ];
         check(

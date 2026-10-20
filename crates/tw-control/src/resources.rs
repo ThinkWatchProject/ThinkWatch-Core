@@ -87,6 +87,11 @@ async fn update_provider(
         })
         .await
         .map_err(apply_fail)?;
+    // 改了名：用量上限的账跟着走（今天、这周、这个月用了多少，在路上的预留）。存储层那些行
+    // 记的是旧名字，重启之后加回来的只认新名字下的
+    if req.provider.name != name {
+        s.gateway.upstream_limits.rename(&name, &req.provider.name);
+    }
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
@@ -554,6 +559,8 @@ fn to_provider(
         // 沿用原来的，改名时跟着这一项走
         model_specs: existing.map(|e| e.model_specs.clone()).unwrap_or_default(),
         max_concurrent: input.max_concurrent,
+        // 写得对不对由配置校验说，和手写的同一套
+        limits: input.limits.iter().map(crate::keys::limit).collect(),
         disabled: input.disabled,
         balance: input.balance.map(Into::into).unwrap_or_default(),
         signed_in,

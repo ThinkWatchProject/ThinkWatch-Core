@@ -37,7 +37,7 @@ mod wire;
 pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
-pub use limits::{KeyLimit, LimitMeasure, LimitPer};
+pub use limits::{KeyLimit, LimitMeasure, LimitPer, UsageLimit};
 pub use model_specs::{ModelSpec, ResolvedSpec, Sourced, SpecSource};
 pub use plugins::Plugin;
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
@@ -199,6 +199,7 @@ impl Default for Provider {
             pricing: None,
             model_specs: std::collections::BTreeMap::new(),
             max_concurrent: None,
+            limits: Vec::new(),
             disabled: false,
             balance: BalanceSetting::Auto,
             signed_in: None,
@@ -848,6 +849,14 @@ pub struct Provider {
     /// 这家的对话等它空出来，别的请求换下一家（见 `tw_gateway::slots`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 用量上限：每 N 分钟、每 N 小时、每天、每周、每月最多发给这家多少个请求、多少 token、
+    /// 花多少钱。**每一条都要过**，不写就不限。写法和密钥的一样（[`limits`]）。
+    ///
+    /// **照着这家自己的限额写**（中转站、订阅套餐的「每 5 小时多少次」）：用满了就不往这家
+    /// 发，而不是发过去挨一个 429。滚动窗口满了的，请求换下一家或者等它空出来；天、周、月
+    /// 用满了的，到下一期之前只换不等（见 `tw_gateway::upstream_limits`）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<UsageLimit>,
     /// 停用。**配置原样留着**：不参与路由，它的模型也不出现在
     /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
     #[serde(default, skip_serializing_if = "is_default")]
