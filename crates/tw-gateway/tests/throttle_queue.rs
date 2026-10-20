@@ -541,3 +541,92 @@ async fn a_rate_limited_upstream_moves_the_request_on_and_stays_out_of_the_break
             .any(|e| matches!(e, Event::HealthChanged { .. }))
     );
 }
+
+/// 探路的又被限流了，回到甲的队头，接着去试乙（乙要 5 秒）。**它在乙那儿的时候不该挡着甲的队**：
+/// 甲的暂停 300 毫秒后就结束了，排在后面的请求该轮到探路，而不是等到期限回 429
+#[tokio::test]
+async fn a_probe_limited_again_does_not_hold_the_queue_while_it_tries_another_upstream() {
+    let a = upstream(
+        vec![
+            limited(&[("retry-after-ms", "300")]),
+            limited(&[("retry-after-ms", "300")]),
+        ],
+        ok(),
+    )
+    .await;
+    let slow = Reply {
+        delay_ms: 5000,
+        ..ok()
+    };
+    let b = upstream(vec![ok()], slow).await;
+    let mut cfg = config(&[&a, &b], 2);
+    cfg.providers[1].max_concurrent = Some(1);
+    let (gw, _state, _log) = serve(cfg).await;
+    // 甲 429（暂停 300 毫秒），乙当场答
+    let r = ask(gw, "零", None, 1).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    r.text().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // 探路的又被限流，去了乙（占着乙唯一的位置 5 秒）
+    let probe = tokio::spawn(ask(gw, "一", None, 1).send());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 甲暂停着、乙满着：在两家里等
+    let t = Instant::now();
+    let r = ask(gw, "二", None, 1).send().await.unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "甲早就能发了，却等了 {:?}，甲只收到 {} 个请求",
+        t.elapsed(),
+        a.hits()
+    );
+    let _ = probe.await;
+}
+
+/// 上游写了一个大得离谱的 `retry-after-ms`：照上限暂停，不能把请求弄崩
+#[tokio::test]
+async fn an_absurd_retry_after_ms_is_capped_rather_than_crashing_the_request() {
+    let up = upstream(vec![limited(&[("retry-after-ms", "1e300")])], ok()).await;
+    let (gw, _state, _log) = serve(config(&[&up], 1)).await;
+    let r = ask(gw, "一", None, 1)
+        .send()
+        .await
+        .expect("网关该回话，不是断开连接");
+    assert_eq!(r.status(), 429);
+}
+
+/// 上游一直回 429 和 `Retry-After: 0`：不能不停地重发，也不能过了等待期限还在发
+#[tokio::test]
+async fn a_zero_retry_after_neither_loops_nor_outlives_the_deadline() {
+    let up = upstream(Vec::new(), limited(&[("retry-after", "0")])).await;
+    let (gw, _state, _log) = serve(config(&[&up], 2)).await;
+    // 最多等 2 秒的请求，5 秒还没结束就是停不下来了
+    let r = tokio::time::timeout(Duration::from_secs(5), ask(gw, "一", None, 1).send()).await;
+    let hits = up.hits();
+    assert!(r.is_ok(), "过了期限 3 秒还在重发，已经发了 {hits} 次");
+    assert!(hits < 20, "两秒里发了 {hits} 次");
+}
+
+/// 探路的发出去了还没有结论：宽限期的结束不是「知道的恢复时刻」。期限比宽限期近的请求
+/// 该等探路的结论，不该当场回 429
+#[tokio::test]
+async fn a_request_waits_for_a_probe_in_flight_even_when_its_deadline_is_within_the_grace() {
+    let slow = Reply {
+        delay_ms: 1000,
+        ..ok()
+    };
+    let up = upstream(vec![limited(&[("retry-after-ms", "300")])], slow).await;
+    let (gw, _state, _log) = serve(config(&[&up], 4)).await;
+    // 头一个：429，300 毫秒后探路，1300 毫秒时探路的有了结论
+    let first = tokio::spawn(ask(gw, "一", None, 1).send());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let t = Instant::now();
+    let r = ask(gw, "二", None, 1).send().await.unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "{:?} 就回了 429，探路的不到一秒后就过了",
+        t.elapsed()
+    );
+    assert_eq!(first.await.unwrap().unwrap().status(), 200);
+}
