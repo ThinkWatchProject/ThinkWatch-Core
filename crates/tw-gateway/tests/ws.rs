@@ -1769,6 +1769,75 @@ async fn each_turn_feeds_the_upstreams_speed_and_success_like_an_http_hop() {
     assert_eq!(rate(), Some(7.0 / 8.0), "客户端走了被算进了成败");
 }
 
+/// 上游在一轮的第一帧就报了限流：这一家暂停，尝试链上那一跳带着暂停多久（`pause_ms`），
+/// **不算进这家的用量上限** —— 内存里的数和记录里重新加的（`AttemptView::counts_for_upstream`）
+/// 是同一个。内容到了之后才报的照常算一个请求
+#[tokio::test]
+async fn a_turn_rate_limited_before_any_content_does_not_count_toward_the_upstreams_limit() {
+    fn script(n: usize) -> Vec<(u64, serde_json::Value)> {
+        let id = format!("resp_{n}");
+        match n {
+            1 => vec![(0, error("rate_limit_exceeded"))],
+            _ => vec![
+                (0, created(&id)),
+                (0, delta()),
+                (0, failed(&id, "rate_limit_exceeded")),
+            ],
+        }
+    }
+    let up = scripted(script).await;
+    let (gw, mut rx, state) = turns_gateway(
+        up,
+        |c| {
+            c.providers[0].limits =
+                serde_yaml_ng::from_str("[{per: minute, requests: 5}]").unwrap();
+            c.failover.wait_secs = 10;
+            // 退避的 5 秒截成 1 秒：测试不用干等
+            c.failover.rate_limit_max_pause_secs = 1;
+        },
+        None,
+    )
+    .await;
+    let used = || {
+        let cfg = state.config();
+        state.upstream_limits.view("up", &cfg.providers[0].limits)[0].used
+    };
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    assert_eq!(until_end(&mut c).await.last().unwrap()["type"], "error");
+    let evs = requests(&mut rx, 1).await;
+    let hop = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::RequestRouted { attempts, .. } => Some(attempts[0].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert!(hop.pause_ms.is_some_and(|ms| ms > 0), "{hop:?}");
+    assert!(!hop.counts_for_upstream());
+    assert_eq!(used(), 0, "限流了的这一轮不算");
+    assert_eq!(
+        state.throttles.view("up").map(|t| t.kind),
+        Some(tw_api::ThrottleKind::RateLimited)
+    );
+
+    // 暂停结束后的下一轮：答了内容才报限流，算一个请求
+    c.send(create("two")).await.unwrap();
+    let frames = until_end(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.failed");
+    let evs = requests(&mut rx, 1).await;
+    let hop = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::RequestRouted { attempts, .. } => Some(attempts[0].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert_eq!(hop.pause_ms, None, "{hop:?}");
+    assert!(hop.counts_for_upstream());
+    assert_eq!(used(), 1);
+}
+
 /// 一轮回到一半上游就收了连接：帧里写着 `CLOSE` 的，回了开头之后发关闭帧；写着 `DROP` 的，
 /// 回了开头之后直接断开（没有关闭帧）；写着 `HOLD` 的，回了开头之后一直不说完。别的照常答完
 async fn closing() -> SocketAddr {

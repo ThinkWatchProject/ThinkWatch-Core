@@ -330,6 +330,8 @@ impl Turn {
             .then(|| crate::server::stream_fault(&self.state, &self.provider, dialect, text))
             .flatten();
         let limited = matches!(fault, Some(crate::failure::Cause::RateLimited { .. }));
+        // **在报路由事件之前**：这一轮在内容之前就被限流了的，尝试链上那一跳要带着暂停多久
+        self.pause_on(fault);
         if !self.responded {
             // 头一帧不是限流的错误：这一家没在限流（探路的过了，连续限流的次数归零）
             if !limited {
@@ -346,7 +348,6 @@ impl Turn {
                 e.responded(200);
             }
         }
-        self.pause_on(fault);
         if let Some(e) = self.ending.as_mut() {
             e.frame(text);
         }
@@ -367,17 +368,27 @@ impl Turn {
         }
     }
 
-    /// 上游在这一轮里报了限流（`fault`）：这一家暂停，这一轮在用量上限上占着的还回去。**错误照常
-    /// 交给客户端**：这一帧已经发出去了。答到一半才报的也暂停
+    /// 上游在这一轮里报了限流（`fault`）：这一家暂停。**错误照常交给客户端**：这一帧已经发出去
+    /// 了。答到一半才报的也暂停。
+    ///
+    /// 这一轮在用量上限上占着的，**还没有内容、路由事件也还没报的才还回去**，尝试链上那一跳带着
+    /// `pause_ms`：记录里不算它（`tw_api::AttemptView::counts_for_upstream`），内存里也不算，两边
+    /// 是同一个数。已经有了内容的（上游答了）、或者路由事件已经报出去了（`response.created` 之后
+    /// 才报的）照常算一个请求 —— 记录里那一跳就是这样，这里跟着它
     fn pause_on(&mut self, fault: Option<crate::failure::Cause>) {
         if let Some(crate::failure::Cause::RateLimited { retry_after }) = fault
             && !std::mem::replace(&mut self.paused, true)
         {
-            self.state
+            let pause = self
+                .state
                 .throttles
                 .limited(&self.provider, self.sent_ms, retry_after);
-            if let Some(h) = self.usage.take() {
-                h.release();
+            let fresh = !self.ending.as_ref().is_some_and(Ending::has_content);
+            if fresh && let Some(r) = self.route.as_mut() {
+                r.attempt.pause_ms = Some(pause.as_millis() as u64);
+                if let Some(h) = self.usage.take() {
+                    h.release();
+                }
             }
         }
     }

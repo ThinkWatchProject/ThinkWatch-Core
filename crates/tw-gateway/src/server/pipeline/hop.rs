@@ -837,6 +837,11 @@ pub(super) async fn try_upstreams<'a>(
                         state.glm_traffic(provider);
                         // 凭据被拒是要让用户知道的状态，**换了下一家也一样**
                         state.note_auth(&provider.name, status);
+                        // 回了 429 的（额度用完）上游没接：不算进这家的用量上限，和记录里一样
+                        // （`tw_api::AttemptView::counts_for_upstream`）
+                        if status == 429 {
+                            usage_hold.release();
+                        }
                         let cause = known_reset(state, &provider.name, cause);
                         note_health(
                             &state.bus,

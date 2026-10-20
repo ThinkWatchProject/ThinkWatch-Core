@@ -246,6 +246,11 @@ impl UpstreamLimits {
         self.shared.clock.now_ms()
     }
 
+    /// 此刻，按这里的时钟（Unix 毫秒）。[`LimitState`] 里的时刻都是这个时钟上的
+    pub fn now_ms(&self) -> i64 {
+        self.now()
+    }
+
     /// 接上请求记录：一期的开头变了（到了下一期、机器换了时区）时，用 `f` 把新的这一期从
     /// 记录里重新加起来，加好了交回 [`Self::reread`]。和 `KeyLimits::reread_with` 一样：`f` 在
     /// 锁外面调、不该等，读回来之前这一期先从 0 起，同一期只要一次
@@ -404,6 +409,8 @@ impl UpstreamLimits {
             );
             g.seq
         };
+        // 记上的这一个可能把窗口、这一期用满了：看着这家的（报状态的）再看一眼
+        self.shared.wake([upstream]);
         UpstreamHold {
             owner: Some(self.shared.clone()),
             seq,

@@ -49,12 +49,9 @@ pub const PROBE_GRACE: Duration = Duration::from_secs(10);
 /// 每次 60 秒
 const BACKOFF_SECS: [u64; 5] = [5, 10, 20, 40, 60];
 
-/// 一家上游的用量上限写在哪儿。
-///
-/// **占位**：上游的用量上限（`providers[].limits`）和 [`crate::upstream_limits`] 一起进来，那时这里
-/// 交回 `&p.limits`。在那之前一家都没有
-pub fn usage_limits(_p: &tw_config::Provider) -> &[KeyLimit] {
-    &[]
+/// 一家上游的用量上限写在哪儿（`providers[].limits`，见 [`crate::upstream_limits`]）
+pub fn usage_limits(p: &tw_config::Provider) -> &[KeyLimit] {
+    &p.limits
 }
 
 /// 这一家连续第 `strikes` 次被限流、上游又没说暂停多久时，暂停多久
@@ -287,6 +284,29 @@ impl Throttles {
         Duration::from_millis(at_ms.saturating_sub(self.now()))
     }
 
+    /// 这一家的用量上限此刻的样子（[`crate::upstream_limits::UpstreamLimits::state`]），时刻换成
+    /// 这里的时钟：用量上限按它自己的时钟算（测试会拨它），暂停、等待期限、`Retry-After` 都按
+    /// 这里的。**换的是还要多久**，两个时钟一样时什么都不变
+    fn limit_state(&self, name: &str, limits: &[KeyLimit]) -> LimitState {
+        let mine = |until_ms: u64| {
+            let left = (until_ms as i64)
+                .saturating_sub(self.limits.now_ms())
+                .max(0) as u64;
+            self.now().saturating_add(left)
+        };
+        match self.limits.state(name, limits) {
+            LimitState::Free => LimitState::Free,
+            LimitState::WindowFull { until_ms, limit } => LimitState::WindowFull {
+                until_ms: mine(until_ms),
+                limit,
+            },
+            LimitState::PeriodUsedUp { until_ms, limit } => LimitState::PeriodUsedUp {
+                until_ms: mine(until_ms),
+                limit,
+            },
+        }
+    }
+
     /// 这一家的用量上限（[`Self::configure`] 记下的）
     fn limits_of(&self, name: &str) -> Vec<KeyLimit> {
         self.settings()
@@ -338,7 +358,7 @@ impl Throttles {
         waiter: Option<u64>,
         take: bool,
     ) -> (Peek, Option<u64>) {
-        let window = match self.limits.state(name, limits) {
+        let window = match self.limit_state(name, limits) {
             LimitState::PeriodUsedUp { until_ms, limit } => {
                 return (Peek::UsedUp { until_ms, limit }, None);
             }
@@ -519,7 +539,7 @@ impl Throttles {
                 until_ms: up.until_ms,
                 limit: None,
             });
-        let limited = match self.limits.state(name, &self.limits_of(name)) {
+        let limited = match self.limit_state(name, &self.limits_of(name)) {
             LimitState::Free => None,
             LimitState::WindowFull { until_ms, limit } => Some(tw_api::Throttle {
                 kind: ThrottleKind::WindowFull,

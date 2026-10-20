@@ -1044,7 +1044,24 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 版本时配置的来源是 `sync`，改了网关密钥时发 `GatewayKeysChanged`。[`ProviderView`] 多了
 /// `sync_excluded`（不同步的上游）和 `sync_url_changed`（地址经同步变更，改之前的地址）。
 /// 同步的码是 `sync.*`。安全模式下不自动同步（`paused`）
-pub const CONTROL_API_VERSION: u32 = 50;
+///
+/// **51 起上游被限流时请求排队，上游有了用量上限**：[`FailoverView`] 的 `slot_wait_secs` 改名
+/// `wait_secs`（一个请求合计最多等多久，默认 120、最多 600；等空位、等限流暂停、等用量窗口都
+/// 算在里面）。[`ProviderView`] 多了 `throttle`（[`Throttle`]：`kind` 是 [`ThrottleKind`] 的
+/// `rate_limited` / `window_full` / `period_used_up`，`until_ms` 是又能发的时刻，`limit` 是
+/// 满了的那一条在 `limits` 里的下标；几样都有时报恢复得最晚的那一样；能发时没有）和 `limits`
+/// （[`KeyLimitView`] 的列表，和密钥的一样带着此刻用了多少）；[`ProviderInput`] 多了 `limits`
+/// （[`KeyLimitInput`]，整份替换）。[`KeyLimitView`]、[`KeyLimitInput`] 多了 `every`（滚动窗口
+/// 是几个 `per`：分钟 1 到 60、小时 1 到 24，天、周、月是 1）。新事件
+/// [`Event::ThrottleChanged`]（一家上游开始、结束、换了暂时发不出去的样子，`throttle` 为空是
+/// 又能发了；不进通知）和 [`Event::RequestQueued`]（一个请求开始排队：在等哪几家、最多等到
+/// 什么时候；也在 `InFlightRequest::events` 里）。[`ServeSkip`] 多了 `throttled`、`window_full`、
+/// `period_used_up`，[`AttemptView`] 多了 `pause_ms`（这一跳被限流，这家因此暂停了多久）；
+/// 带着 `pause_ms` 的、回了 429 的一跳不算进上游的用量上限（[`AttemptView::counts_for_upstream`]）。
+/// 新码：`config.key_limit_every*`、`config.upstream_limit_*`、`gw.key_limit.*_every`、
+/// `gw.upstream.paused`、`gw.upstream.window_full`、`gw.upstream.period_used_up`、`gw.wait.*`。
+/// 照 50 写的界面读不到 `wait_secs`，保存密钥的上限时没有 `every` 会被拒
+pub const CONTROL_API_VERSION: u32 = 51;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1889,8 +1906,9 @@ pub struct AttemptView {
     /// 是同一件事的那句话。发出去了的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<ServeSkip>,
-    /// 这一跳收到了 429，这家因此暂停了多少毫秒（见 [`ThrottleKind::RateLimited`]）。请求接着
-    /// 换下一家或者等这家，客户端察觉不到。别的结果没有
+    /// 这一跳收到了 429（或者上游在回答的第一段内容之前报了限流），这家因此暂停了多少毫秒（见
+    /// [`ThrottleKind::RateLimited`]）。请求接着换下一家或者等这家，客户端察觉不到。有它的一跳
+    /// 不算进这家的用量上限（[`Self::counts_for_upstream`]）。别的结果没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_ms: Option<u64>,
     /// 这一跳走的代理：这家上游配置的代理名（跟随系统的是 `system`），直连是 None。没发出去
@@ -1940,10 +1958,11 @@ impl AttemptView {
 
 impl AttemptView {
     /// 这一跳算进这家上游的用量上限（见 `tw_gateway::upstream_limits`）：发到了上游
-    /// （[`Self::sent`]），上游没回 429。回 429 的那一跳上游没接，请求另找一家或者等它，
-    /// 不该把这家的上限用掉
+    /// （[`Self::sent`]），上游没回 429，也没在回答开头报限流（[`Self::pause_ms`]）。被限流的
+    /// 那一跳上游没接，请求另找一家或者等它，不该把这家的上限用掉。**网关在内存里也是这么数的**：
+    /// 这几跳发出时占的当场还回去，和重启后从记录里加回来的是同一个数
     pub fn counts_for_upstream(&self) -> bool {
-        self.sent() && self.status != Some(429)
+        self.sent() && self.status != Some(429) && self.pause_ms.is_none()
     }
 }
 
@@ -6807,6 +6826,36 @@ mod tests {
             pause_ms: None,
             proxy: None,
         }
+    }
+
+    /// 算进上游用量上限的那几跳：发到了、没被限流。回了 429 的、在回答开头报了限流的
+    /// （带着 `pause_ms`）上游没接，不算 —— 网关在内存里也是这么数的
+    #[test]
+    fn a_rate_limited_hop_does_not_count_toward_the_upstreams_limit() {
+        use AttemptOutcome::*;
+        let served = attempt(Served, Some(200), None);
+        assert!(served.counts_for_upstream());
+        let mut paused = attempt(Status, Some(429), None);
+        paused.pause_ms = Some(5_000);
+        assert!(!paused.counts_for_upstream());
+        // 额度用完的 429 不暂停，也不算
+        assert!(!attempt(Status, Some(429), None).counts_for_upstream());
+        let mut opening = attempt(Error, None, Some("gw.upstream.stream_opening_error"));
+        assert!(opening.counts_for_upstream());
+        opening.pause_ms = Some(5_000);
+        assert!(!opening.counts_for_upstream());
+        let mut turn = attempt(Served, Some(200), None);
+        turn.pause_ms = Some(5_000);
+        assert!(!turn.counts_for_upstream());
+
+        let mut b = served.clone();
+        b.provider = "b".into();
+        let routing = RoutingView {
+            attempts: vec![paused, opening, b],
+            ..Default::default()
+        };
+        assert_eq!(routing.upstream_hops(), vec!["b".to_string()]);
+        assert_eq!(routing.served_by(), Some("b"));
     }
 
     /// 发到了上游的一跳：上游回了话，或者发出去之后才失败。没发出去的（满着、被拒、连不上）

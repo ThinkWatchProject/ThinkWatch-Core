@@ -412,7 +412,7 @@ impl AppState {
     }
 
     /// 换一个看用量上限的时钟（测试把时间拨到零点前后）：密钥的和上游的用同一个。**账从
-    /// 空的开始**：只在测试里、第一个请求之前调
+    /// 空的开始**，上游的暂停和排队也是：只在测试里、第一个请求之前调
     pub fn set_key_limits_clock(&mut self, clock: Arc<dyn crate::key_limits::Clock>) {
         let limits = crate::key_limits::KeyLimits::with_clock(self.bus.clone(), clock.clone());
         limits.configure(&self.config());
@@ -420,6 +420,13 @@ impl AppState {
         let upstream = crate::upstream_limits::UpstreamLimits::with_clock(self.bus.clone(), clock);
         upstream.configure(&self.config());
         self.upstream_limits = Arc::new(upstream);
+        // 暂停和排队看的是同一份用量账：跟着换
+        let throttles = Arc::new(crate::throttle::Throttles::new(
+            self.bus.clone(),
+            self.upstream_limits.clone(),
+        ));
+        throttles.configure(&self.config());
+        self.throttles = throttles;
     }
 
     /// 直接换一份插件进去，配置照旧：正在跑的请求用完它们手上那一份，新请求看到的是
