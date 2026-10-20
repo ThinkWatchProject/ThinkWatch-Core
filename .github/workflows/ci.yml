@@ -251,6 +251,12 @@ jobs:
   # 不重复跑 `cargo fmt`：格式和平台无关，跑两遍只是慢一倍。
   windows:
     runs-on: windows-latest
+    # **链接是这一档最慢的部分**：一百多个测试程序，每个都要链接一遍。不写调试信息就不用
+    # 生成 PDB，rust-lld 也比 MSVC 的 link.exe 快得多。只在 CI 上这样：本机调试要行号，
+    # 发出去的版本由 release.yml 用它自己的设置编
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
