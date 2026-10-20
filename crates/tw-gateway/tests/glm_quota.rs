@@ -58,7 +58,12 @@ async fn start_glm(g: Arc<Glm>) -> SocketAddr {
 
 /// 一个指向假 GLM 的上游，额度接口也换成假 GLM 的
 async fn state_for(glm: SocketAddr) -> tw_gateway::AppState {
-    let state = tw_gateway::AppState::new(Config {
+    state_with(glm, |_| {}).await
+}
+
+/// 同 [`state_for`]，配置先交给 `adjust` 改一改。
+async fn state_with(glm: SocketAddr, adjust: impl FnOnce(&mut Config)) -> tw_gateway::AppState {
+    let mut cfg = Config {
         clients: vec![Client {
             name: "c".into(),
             key: "tw-k".into(),
@@ -72,8 +77,9 @@ async fn state_for(glm: SocketAddr) -> tw_gateway::AppState {
             ..Default::default()
         }],
         ..Default::default()
-    })
-    .unwrap();
+    };
+    adjust(&mut cfg);
+    let state = tw_gateway::AppState::new(cfg).unwrap();
     state.set_glm_sites(tw_gateway::glm::Sites {
         zai: format!("http://{glm}"),
         bigmodel: "https://open.bigmodel.cn".into(),
@@ -231,7 +237,9 @@ async fn a_429_that_is_not_the_quota_leaves_the_quota_alone() {
             .into(),
     );
     *g.quota.lock().unwrap() = r#"{"code":500,"success":false}"#.into();
-    let state = state_for(start_glm(g.clone()).await).await;
+    // 不等：只有一家、一直回 429 的上游，网关默认会照退避一轮轮重发（5、10、20、40 秒）。
+    // 这条只问额度有没有被误记，等那一轮没有意义
+    let state = state_with(start_glm(g.clone()).await, |c| c.failover.wait_secs = 0).await;
     let mut rx = state.bus.subscribe();
     let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
         .await

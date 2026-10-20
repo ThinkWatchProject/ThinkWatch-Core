@@ -1849,7 +1849,7 @@ async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
     // 429 塌成 502 的话，客户端会当成「服务器坏了」而不是「该退避了」,
     // 而它们该做的事完全不同。
     let limited = start_broken_upstream(429).await;
-    let gw = serve_cfg(cfg_with(
+    let mut cfg = cfg_with(
         vec![Provider {
             name: "limited".into(),
             base_url: format!("http://{limited}"),
@@ -1857,8 +1857,11 @@ async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
             ..Default::default()
         }],
         vec![],
-    ))
-    .await;
+    );
+    // 不等：只有一家、一直回 429 的上游，网关默认会照退避一轮轮重发，等满一轮才交出 429。
+    // 这条只问交出去的是不是 429，等不等见 `throttle_queue`
+    cfg.failover.wait_secs = 0;
+    let gw = serve_cfg(cfg).await;
     let r = send_to(gw).await;
     assert_eq!(r.status(), 429);
     assert_eq!(

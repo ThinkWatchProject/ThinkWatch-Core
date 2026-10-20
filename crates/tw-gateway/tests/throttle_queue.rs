@@ -591,6 +591,13 @@ async fn a_conversation_waits_for_its_paused_upstream_and_a_new_one_moves_on() {
 
     let r = stays.await.unwrap().unwrap();
     assert_eq!(r.status(), 200);
+    // 等到甲的暂停过了才发出去。不看它排了多久：机器忙时这个请求晚一点才进队，排队的
+    // 时长跟着变短，可它照样是等完了暂停才走的
+    assert!(
+        t.elapsed() >= Duration::from_millis(450),
+        "{:?}",
+        t.elapsed()
+    );
     r.text().await.unwrap();
     let (chain, stayed) = log.routed("第二轮").await;
     assert_eq!(stayed, Some(Stay::Cache));
@@ -599,7 +606,7 @@ async fn a_conversation_waits_for_its_paused_upstream_and_a_new_one_moves_on() {
         (chain[0].provider.as_str(), chain[0].outcome),
         ("甲", AttemptOutcome::Served)
     );
-    assert!(chain[0].queued_ms.is_some_and(|ms| ms >= 350), "{chain:#?}");
+    assert!(chain[0].queued_ms.is_some(), "{chain:#?}");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 甲要暂停一分钟，这个请求最多等 5 秒：等也白等，不再留在甲，照常排序

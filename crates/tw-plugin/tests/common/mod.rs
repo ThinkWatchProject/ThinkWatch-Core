@@ -30,10 +30,12 @@ pub fn rt() -> &'static Runtime {
 pub fn rt_roomy() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        // 跑几千条随机用例的语料要的是「跑得完」，不是量时间：CI 上测试并行跑，同样的
+        // 活用掉的 CPU 时间也会多（缓存、超线程互相挤），10 秒贴着上限会偶尔撞上
         Runtime::new(Limits {
-            request_cpu: Duration::from_secs(10),
-            reply_call_cpu: Duration::from_secs(10),
-            reply_total_cpu: Duration::from_secs(10),
+            request_cpu: Duration::from_secs(60),
+            reply_call_cpu: Duration::from_secs(60),
+            reply_total_cpu: Duration::from_secs(60),
             ..Limits::default()
         })
         .expect("the plugin runtime starts")
