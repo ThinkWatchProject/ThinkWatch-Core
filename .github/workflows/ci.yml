@@ -274,7 +274,8 @@ jobs:
           # target 目录是安全的，它只是省掉那些与失败无关的部分。
           cache-on-failure: true
           # 见 check 那一段。PR 上不存，所以上面那条只对 main 起作用
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # TEMP(ci/faster-tests): save once on this branch to time a warm run
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci/faster-tests' }}
 
       # 镜像预装的 LLVM（C:\Program Files\LLVM），由 build.rs 自己找到
       - name: Toolchain for the plugin sandbox

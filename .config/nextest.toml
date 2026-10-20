@@ -6,11 +6,3 @@
 fail-fast = false
 final-status-level = "slow"
 
-# **Windows 上插件沙箱的测试独占整台机器跑。**沙箱的 CPU 时间上限在 Windows 上量的是
-# 墙上时间（`tw-plugin/src/cpu.rs`：只有 unix 有线程 CPU 时钟），和别的测试一起跑时，
-# 被分走的那些时间也记在它头上，跑满几万条随机用例的那几条会撞上限
-# （`CpuLimit`）。unix 上量的是这个线程自己的 CPU 时间，不受影响
-[[profile.ci.overrides]]
-platform = 'cfg(windows)'
-filter = 'package(tw-plugin) | (package(tw-gateway) & binary(/^plugins/))'
-threads-required = "num-cpus"
