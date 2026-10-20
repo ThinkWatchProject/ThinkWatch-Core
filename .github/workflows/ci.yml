@@ -92,10 +92,18 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # **测试用 nextest 跑**：`cargo test` 一个测试程序跑完才轮到下一个，工作区有几十个，
+      # 光是排队跑就要九分钟（Windows 上）；nextest 让它们同时跑，每条测试还各占一个进程，
+      # 改环境变量的那几条也不会互相干扰。版本钉死，升级是一次有意的改动。工作区没有
+      # 文档测试（`cargo test --doc` 一条都没有），nextest 不跑它们不丢东西
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+
       # 默认不跑打真实网络的那些（它们标了 #[ignore]）—— CI 上的网络
       # 抖动会变成一条和代码无关的红，而那种红看几次就没人看了。
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
 
       # 编进这一版的沙箱是哪个 clang 编的、wasm 的哈希
       - name: Which compiler built the plugin sandbox
@@ -221,8 +229,13 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # 见 macOS 那一段
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
 
       - name: Which compiler built the plugin sandbox
         run: bash scripts/wasm-toolchain.sh record target
@@ -265,8 +278,13 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # 见 macOS 那一段
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
 
       - name: Which compiler built the plugin sandbox
         shell: bash
