@@ -1,0 +1,8 @@
+# CI 上跑测试的那一套（`cargo nextest run --profile ci`，见 .github/workflows/ci.yml）。
+#
+# **一次跑完再报**：默认碰到第一条失败就停，剩下的要再推一次才看得到 —— 每多一轮就是
+# 三个平台各编一遍。慢的测试列在最后，哪条拖慢了 CI 一眼看得出来。
+[profile.ci]
+fail-fast = false
+final-status-level = "slow"
+
