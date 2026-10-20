@@ -26,27 +26,20 @@
 //! 一个跑了三分钟的请求，它的输出要等它跑完才知道，按开始的时刻记的话，「每分钟多少
 //! token」永远数不到它。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tw_config::{KeyLimit, LimitMeasure, LimitPer};
 use tw_types::{Msg, msg};
 
+pub(crate) mod books;
 mod clock;
 #[cfg(test)]
 mod tests;
 
+use books::{Amount, Books, CALENDAR, Period, Reservation, calendar_index, longest_window};
 pub use clock::{Clock, SystemClock, TestClock};
-
-/// 自然周期。下标就是 [`Books::periods`] 的下标
-const CALENDAR: [LimitPer; 3] = [LimitPer::Day, LimitPer::Week, LimitPer::Month];
-
-/// 请求已经结束、存储层却还没交来它那一行时，它的预留再留多久。
-///
-/// 存储层落后、丢了事件时那一行永远不会来：不放掉的话，那份预留一直占着这把密钥的
-/// 额度。存储层正常时几毫秒就到
-const GRACE_MS: i64 = 60_000;
 
 /// 一个请求最多等多久：`failover.wait_secs`，0 是不等。
 ///
@@ -68,79 +61,6 @@ pub fn uncounted(path: &str) -> bool {
     p.strip_prefix("/v1").unwrap_or(p) == "/responses/input_tokens"
 }
 
-/// 一份用量。四样分开记，各条上限各取各的。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Amount {
-    requests: i64,
-    /// 没走缓存的输入 + 写进缓存的 + 输出
-    tokens: i64,
-    cache_read: i64,
-    /// 微分
-    cost: i64,
-}
-
-impl Amount {
-    fn of(&self, m: LimitMeasure, cache_reads: bool) -> i64 {
-        match m {
-            LimitMeasure::Requests => self.requests,
-            LimitMeasure::Tokens if cache_reads => self.tokens.saturating_add(self.cache_read),
-            LimitMeasure::Tokens => self.tokens,
-            LimitMeasure::Cost => self.cost,
-        }
-    }
-    fn add(&mut self, o: &Amount) {
-        self.requests = self.requests.saturating_add(o.requests);
-        self.tokens = self.tokens.saturating_add(o.tokens);
-        self.cache_read = self.cache_read.saturating_add(o.cache_read);
-        self.cost = self.cost.saturating_add(o.cost);
-    }
-}
-
-/// 一期（天、周、月）的合计。
-#[derive(Debug, Clone, Copy)]
-struct Period {
-    start: i64,
-    end: i64,
-    sum: Amount,
-}
-
-/// 一把密钥的账。**跨重载存活**，按密钥的名字记 —— 存储层那一行记的也是名字。
-#[derive(Debug, Default)]
-struct Books {
-    /// 天、周、月，和 [`CALENDAR`] 同一个顺序。到了下一期就换一本新的
-    periods: [Option<Period>; 3],
-    /// 滚动窗口用：最近的每一笔（请求数在准入时，token 和费用在结算时），按记下的先后。
-    /// **只有设了分钟、小时上限的密钥才记**，留到最长的那个窗口为止
-    recent: VecDeque<(i64, Amount)>,
-    /// 开头变了、换了一本新的那几期（哪一种、新的开头），等着从请求记录里重新加（见
-    /// [`KeyLimits::reread_with`]）
-    moved: Vec<(LimitPer, i64)>,
-}
-
-impl Books {
-    /// `now` 所在的那一期。开头和记着的不一样（到了下一期、换了时区）就换一本新的，记下它
-    /// 要从请求记录里重新加；加回来之前先从 0 起。这把密钥从没记过这一种的，从 0 起就是对的
-    /// —— 启动时从库里加回来过（[`KeyLimits::rebuild`]），之后的每一行都结算过
-    fn period(&mut self, clock: &dyn Clock, per: LimitPer, now: i64) -> &mut Period {
-        let (start, end) = clock.period(per, now);
-        let slot = &mut self.periods[calendar_index(per)];
-        match slot {
-            Some(p) if p.start == start => {}
-            _ => {
-                if slot.is_some() {
-                    self.moved.push((per, start));
-                }
-                *slot = Some(Period {
-                    start,
-                    end,
-                    sum: Amount::default(),
-                })
-            }
-        }
-        slot.as_mut().expect("set just above")
-    }
-}
-
 /// 开头变了的一期：哪把密钥、哪一种、新的开头。从请求记录里重新加它（[`KeyLimits::reread_with`]）
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Moved {
@@ -153,26 +73,6 @@ pub struct Moved {
 /// 从请求记录里重新加一期的办法（[`KeyLimits::reread_with`]）。拿到要加的那一期，读完了交给
 /// [`KeyLimits::reread`]
 pub type Reread = Arc<dyn Fn(Moved) + Send + Sync>;
-
-fn calendar_index(per: LimitPer) -> usize {
-    CALENDAR.iter().position(|p| *p == per).unwrap_or(0)
-}
-
-/// 一个在跑的请求占着的那一份。
-#[derive(Debug)]
-struct Reservation {
-    key: String,
-    /// 准入的那一刻。算在哪一期、在不在滚动窗口里看它
-    at_ms: i64,
-    /// 输入 token 的估算
-    tokens: i64,
-    /// 头一个候选的输入费用估算，微分
-    cost: i64,
-    /// 它是哪个请求。准入之后、开始事件之前还没有号
-    request: Option<u64>,
-    /// 发现这个请求已经结束的那一刻（见 [`GRACE_MS`]）
-    closed_since: Option<i64>,
-}
 
 /// 报过的那一档：哪把密钥、哪一条、哪一期、八成还是到顶。**上限改了就是另一条**，
 /// 重新报
@@ -242,7 +142,7 @@ impl Recorded {
         self.reached && !self.local && !uncounted(&self.path)
     }
 
-    fn amount(&self) -> Amount {
+    pub(crate) fn amount(&self) -> Amount {
         let n = |v: u64| v.min(i64::MAX as u64) as i64;
         Amount {
             requests: n(self.requests),
@@ -285,6 +185,7 @@ impl Refusal {
     pub fn msg(&self) -> Msg {
         let key = self.key.clone();
         let per = self.limit.per.word();
+        let every = self.limit.every_or_one();
         let measure = self.limit.measure();
         let (max, used) = match measure {
             LimitMeasure::Cost => (dollars(self.limit.max()), dollars(self.used)),
@@ -309,6 +210,30 @@ impl Refusal {
                 "Gateway key `{key}` has reached its limit of {max} per {per}: {used} spent so \
                  far. It resets at {resets}."
             ),
+            // 每 5 小时这种：句子里说「每 5 个小时」，参数多一个 every，另起一套码
+            (None, measure) if every > 1 => {
+                let retry = self.retry_after_ms.div_ceil(1000).max(1);
+                match measure {
+                    LimitMeasure::Requests => msg!(
+                        "gw.key_limit.requests_every", key = key, max = max, every = every,
+                        per = per, used = used, retry = retry =>
+                        "Gateway key `{key}` has reached its limit of {max} requests every {every} \
+                         {per}s: {used} in the last {every} {per}s. Try again in {retry} s."
+                    ),
+                    LimitMeasure::Tokens => msg!(
+                        "gw.key_limit.tokens_every", key = key, max = max, every = every,
+                        per = per, used = used, retry = retry =>
+                        "Gateway key `{key}` has reached its limit of {max} tokens every {every} \
+                         {per}s: {used} in the last {every} {per}s. Try again in {retry} s."
+                    ),
+                    LimitMeasure::Cost => msg!(
+                        "gw.key_limit.cost_every", key = key, max = max, every = every,
+                        per = per, used = used, retry = retry =>
+                        "Gateway key `{key}` has reached its limit of {max} every {every} {per}s: \
+                         {used} spent in the last {every} {per}s. Try again in {retry} s."
+                    ),
+                }
+            }
             (None, measure) => {
                 let retry = self.retry_after_ms.div_ceil(1000).max(1);
                 match measure {
@@ -396,7 +321,7 @@ pub struct KeyLimits {
     /// 一期的开头变了时从请求记录里重新加（[`Self::reread_with`]）。没接上（没有存储层）是 None：
     /// 那时从 0 起
     reread: Mutex<Option<Reread>>,
-    /// 报「到了八成、到了上限」，和认请求有没有结束（见 [`GRACE_MS`]）
+    /// 报「到了八成、到了上限」，和认请求有没有结束（见 [`books::GRACE_MS`]）
     bus: tw_observe::EventBus,
 }
 
@@ -453,21 +378,7 @@ impl KeyLimits {
     /// 这把密钥刚换了新的那几期（[`Books::moved`]）里还没要过的：记下要过了，交回去，**在锁外面**
     /// 交给 [`Self::ask_reread`]
     fn moved(&self, g: &mut Inner, key: &str) -> Vec<Moved> {
-        let Some(b) = g.books.get_mut(key) else {
-            return Vec::new();
-        };
-        let moved: Vec<Moved> = std::mem::take(&mut b.moved)
-            .into_iter()
-            .map(|(per, start)| Moved {
-                key: key.to_string(),
-                per,
-                start,
-            })
-            .collect();
-        moved
-            .into_iter()
-            .filter(|m| g.asked.insert(m.clone()))
-            .collect()
+        books::take_moved(&mut g.books, &mut g.asked, key)
     }
 
     /// 去请求记录里重新加这几期。没接上记录的，从 0 起
@@ -535,7 +446,7 @@ impl KeyLimits {
     /// 准入第一步：天、周、月的上限，**用满了就拒**。在并发上限之前：一个这一期已经
     /// 用满的请求不用先排一轮队
     pub fn calendar(&self, key: &str, limits: &[KeyLimit]) -> Result<(), Box<Refusal>> {
-        if !limits.iter().any(|l| l.per.rolling_ms().is_none()) {
+        if !limits.iter().any(|l| l.window_ms().is_none()) {
             return Ok(());
         }
         let now = self.clock.now_ms();
@@ -633,7 +544,7 @@ impl KeyLimits {
             let held = g.by_request.remove(&id).and_then(|s| g.held.remove(&s));
             if !rec.counts() {
                 if let Some(r) = held {
-                    unrecord(&mut g, &r);
+                    books::unrecord(&mut g.books, &r);
                 }
                 return;
             }
@@ -720,13 +631,13 @@ impl KeyLimits {
                 let max = l.max();
                 tw_api::KeyLimitView {
                     per: l.per.into(),
+                    every: l.every_or_one(),
                     measure: l.measure().into(),
                     max: max.max(0) as u64,
                     cache_reads: l.cache_reads,
                     used: used.max(0) as u64,
                     resets_at_ms: l
-                        .per
-                        .rolling_ms()
+                        .window_ms()
                         .is_none()
                         .then(|| self.clock.period(l.per, now).1.max(0) as u64),
                     reached: used >= max,
@@ -743,52 +654,7 @@ impl KeyLimits {
 
     /// 一条上限此刻用了多少：记下的，加上在跑的请求的预留
     fn used(&self, g: &mut Inner, key: &str, l: &KeyLimit, now: i64) -> i64 {
-        let (m, cr) = (l.measure(), l.cache_reads);
-        let reserved = |r: &Reservation| match m {
-            LimitMeasure::Requests => 1,
-            LimitMeasure::Tokens => r.tokens,
-            LimitMeasure::Cost => r.cost,
-        };
-        match l.per.rolling_ms() {
-            None => {
-                let p = *g.books.entry(key.to_string()).or_default().period(
-                    self.clock.as_ref(),
-                    l.per,
-                    now,
-                );
-                let held: i64 = g
-                    .held
-                    .values()
-                    .filter(|r| r.key == key && r.at_ms >= p.start && r.at_ms < p.end)
-                    .map(reserved)
-                    .sum();
-                p.sum.of(m, cr).saturating_add(held)
-            }
-            Some(w) => {
-                let cutoff = now - w;
-                let books = g.books.get(key);
-                let done: i64 = books
-                    .map(|b| {
-                        b.recent
-                            .iter()
-                            .filter(|(t, _)| *t > cutoff)
-                            .map(|(_, a)| a.of(m, cr))
-                            .sum()
-                    })
-                    .unwrap_or(0);
-                // 请求数在准入时已经进了窗口，预留里只算 token 和费用
-                let held: i64 = g
-                    .held
-                    .values()
-                    .filter(|r| r.key == key && r.at_ms > cutoff)
-                    .map(|r| match m {
-                        LimitMeasure::Requests => 0,
-                        _ => reserved(r),
-                    })
-                    .sum();
-                done.saturating_add(held)
-            }
-        }
+        books::used(&mut g.books, &g.held, self.clock.as_ref(), key, l, now)
     }
 
     fn calendar_locked(
@@ -798,7 +664,7 @@ impl KeyLimits {
         limits: &[KeyLimit],
         now: i64,
     ) -> Result<(), Box<Refusal>> {
-        for l in limits.iter().filter(|l| l.per.rolling_ms().is_none()) {
+        for l in limits.iter().filter(|l| l.window_ms().is_none()) {
             let used = self.used(g, key, l, now);
             if used >= l.max() {
                 let end = self.clock.period(l.per, now).1;
@@ -823,55 +689,12 @@ impl KeyLimits {
         now: i64,
     ) -> Option<Refusal> {
         let mut worst: Option<Refusal> = None;
-        for l in limits {
-            let Some(w) = l.per.rolling_ms() else {
-                continue;
-            };
+        for l in limits.iter().filter(|l| l.window_ms().is_some()) {
             let used = self.used(g, key, l, now);
-            let max = l.max();
-            if used < max {
+            if used < l.max() {
                 continue;
             }
-            // 窗口里的每一笔按时间先后滑出去，滑到用量低于上限的那一刻就是空位
-            let (m, cr) = (l.measure(), l.cache_reads);
-            let cutoff = now - w;
-            let mut items: Vec<(i64, i64)> = g
-                .books
-                .get(key)
-                .map(|b| {
-                    b.recent
-                        .iter()
-                        .filter(|(t, _)| *t > cutoff)
-                        .map(|(t, a)| (*t, a.of(m, cr)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if m != LimitMeasure::Requests {
-                items.extend(
-                    g.held
-                        .values()
-                        .filter(|r| r.key == key && r.at_ms > cutoff)
-                        .map(|r| {
-                            let v = if m == LimitMeasure::Tokens {
-                                r.tokens
-                            } else {
-                                r.cost
-                            };
-                            (r.at_ms, v)
-                        }),
-                );
-            }
-            items.retain(|(_, v)| *v > 0);
-            items.sort_by_key(|(t, _)| *t);
-            let mut left = used;
-            let mut free_at = now + w;
-            for (t, v) in items {
-                left -= v;
-                if left < max {
-                    free_at = t + w;
-                    break;
-                }
-            }
+            let free_at = books::free_at(&g.books, &g.held, key, l, used, now);
             let wait = (free_at - now).max(1) as u64;
             if worst.as_ref().is_none_or(|r| wait > r.retry_after_ms) {
                 worst = Some(Refusal {
@@ -888,32 +711,11 @@ impl KeyLimits {
 
     /// 记上这个请求：滚动窗口里的一个请求，和它的预留。交回预留的号
     fn reserve(&self, g: &mut Inner, key: &str, limits: &[KeyLimit], ask: Ask, now: i64) -> u64 {
-        if let Some(w) = longest_window(limits) {
-            let books = g.books.entry(key.to_string()).or_default();
-            books.recent.push_back((
-                now,
-                Amount {
-                    requests: 1,
-                    ..Default::default()
-                },
-            ));
-            while books.recent.front().is_some_and(|(t, _)| *t <= now - w) {
-                books.recent.pop_front();
-            }
-        }
+        books::record_request(&mut g.books, key, limits, now);
         g.seq += 1;
         let seq = g.seq;
-        g.held.insert(
-            seq,
-            Reservation {
-                key: key.to_string(),
-                at_ms: now,
-                tokens: ask.tokens.min(i64::MAX as u64) as i64,
-                cost: ask.cost_micros.max(0),
-                request: None,
-                closed_since: None,
-            },
-        );
+        g.held
+            .insert(seq, Reservation::new(key, now, ask.tokens, ask.cost_micros));
         seq
     }
 
@@ -933,44 +735,17 @@ impl KeyLimits {
             if let Some(id) = r.request {
                 g.by_request.remove(&id);
             }
-            unrecord(&mut g, &r);
+            books::unrecord(&mut g.books, &r);
         }
     }
 
-    /// 放掉结束了太久、存储层却一直没交来那一行的预留（见 [`GRACE_MS`]）。顺手把滚动
+    /// 放掉结束了太久、存储层却一直没交来那一行的预留（见 [`books::GRACE_MS`]）。顺手把滚动
     /// 窗口里滑出去的扔掉
     fn sweep(&self, g: &mut Inner, now: i64) {
-        let mut gone = Vec::new();
-        for (seq, r) in g.held.iter_mut() {
-            let Some(id) = r.request else { continue };
-            if self.bus.is_open(id) {
-                r.closed_since = None;
-                continue;
-            }
-            let since = *r.closed_since.get_or_insert(now);
-            if now - since >= GRACE_MS {
-                gone.push((*seq, id));
-            }
-        }
-        for (seq, id) in gone {
-            g.held.remove(&seq);
+        for (_, id) in books::sweep_held(&mut g.held, &self.bus, now) {
             g.by_request.remove(&id);
         }
-        let windows: HashMap<String, i64> = g
-            .limits
-            .iter()
-            .filter_map(|(k, ls)| longest_window(ls).map(|w| (k.clone(), w)))
-            .collect();
-        for (key, b) in g.books.iter_mut() {
-            match windows.get(key) {
-                Some(w) => {
-                    while b.recent.front().is_some_and(|(t, _)| *t <= now - w) {
-                        b.recent.pop_front();
-                    }
-                }
-                None => b.recent.clear(),
-            }
-        }
+        books::trim_windows(&mut g.books, &g.limits, now);
     }
 
     /// 天、周、月的上限到了八成、到了顶：**每一期、每一档报一次**。只看记下的数 ——
@@ -980,7 +755,7 @@ impl KeyLimits {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for l in limits.iter().filter(|l| l.per.rolling_ms().is_none()) {
+        for l in limits.iter().filter(|l| l.window_ms().is_none()) {
             let p = *g.books.entry(key.to_string()).or_default().period(
                 self.clock.as_ref(),
                 l.per,
@@ -1064,29 +839,6 @@ impl KeyLimits {
             self.bus.emit(e);
         }
     }
-}
-
-/// 撤掉准入时给这个请求在滚动窗口里记的那一个请求（[`KeyLimits::reserve`] 记在准入的那一刻，
-/// 和预留的 `at_ms` 是同一个数）。请求数一个一个都一样，撤哪一个都行。已经滑出窗口的不用撤
-fn unrecord(g: &mut Inner, r: &Reservation) {
-    let Some(b) = g.books.get_mut(&r.key) else {
-        return;
-    };
-    if let Some(i) = b
-        .recent
-        .iter()
-        .position(|(t, a)| *t == r.at_ms && a.requests > 0)
-    {
-        b.recent[i].1.requests -= 1;
-        if b.recent[i].1 == Amount::default() {
-            b.recent.remove(i);
-        }
-    }
-}
-
-/// 一把密钥的分钟、小时上限里最长的那个窗口。没有就是 None
-fn longest_window(limits: &[KeyLimit]) -> Option<i64> {
-    limits.iter().filter_map(|l| l.per.rolling_ms()).max()
 }
 
 /// 这把密钥用得到、却没有价格的模型（`ClientView.unpriced_models`）。

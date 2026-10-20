@@ -1938,7 +1938,36 @@ impl AttemptView {
     }
 }
 
+impl AttemptView {
+    /// 这一跳算进这家上游的用量上限（见 `tw_gateway::upstream_limits`）：发到了上游
+    /// （[`Self::sent`]），上游没回 429。回 429 的那一跳上游没接，请求另找一家或者等它，
+    /// 不该把这家的上限用掉
+    pub fn counts_for_upstream(&self) -> bool {
+        self.sent() && self.status != Some(429)
+    }
+}
+
 impl RoutingView {
+    /// 算进上游用量上限的那几跳各是哪一家，按先后（[`AttemptView::counts_for_upstream`]）。
+    /// 同一家可以出现几次：每一跳算一个请求
+    pub fn upstream_hops(&self) -> Vec<String> {
+        self.attempts
+            .iter()
+            .filter(|a| a.counts_for_upstream())
+            .map(|a| a.provider.clone())
+            .collect()
+    }
+
+    /// 这个请求的 token、费用算在哪一家的用量上限上：链的最后一跳，它算进上限的话
+    /// （[`AttemptView::counts_for_upstream`]）。这一行的用量就是它的：转移在第一次成功时就
+    /// 停，前面那几跳没有用量
+    pub fn served_by(&self) -> Option<&str> {
+        self.attempts
+            .last()
+            .filter(|a| a.counts_for_upstream())
+            .map(|a| a.provider.as_str())
+    }
+
     /// 这个请求可能发到了上游：尝试链上有一跳发出去了（[`AttemptView::sent`]）。**尝试链是空的
     /// 时看它怎么收场**（`failed`）：失败的是网关在发往哪一家之前就拒了（规则、内容过滤、
     /// 用量上限）；没失败的（客户端走了）是还没等到路由事件 —— 那时请求可能正在上游那里，
@@ -2471,6 +2500,8 @@ pub struct ProviderView {
     /// 同时最多发给这家几个请求。不限是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 用量上限，按配置里的顺序，各带此刻用了多少（发出去还没结束的按估算算）。没设的是空的
+    pub limits: Vec<KeyLimitView>,
     /// 配置里的 `balance:`，原样：编辑对话框保存时交回去（[`ProviderInput::balance`]）
     pub balance_setting: BalanceSetting,
     /// 最近一次读到的余额。**是空的：这家没有余额可读**（关掉了、账号上游和 Bedrock、
@@ -2774,11 +2805,14 @@ slug_enum! {
     }
 }
 
-/// 一条用量上限，和它此刻用了多少。
+/// 一条用量上限，和它此刻用了多少。密钥的（[`ClientView::limits`]）和上游的
+/// （[`ProviderView::limits`]）都是它。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyLimitView {
     pub per: LimitPer,
+    /// 滚动窗口是几个 `per`：`hour` 的 5 是最近 5 小时。没写的是 1；天、周、月一律是 1
+    pub every: u32,
     pub measure: LimitMeasure,
     /// 上限：请求数、token 数，费用是微分
     pub max: u64,
@@ -2795,11 +2829,13 @@ pub struct KeyLimitView {
     pub reached: bool,
 }
 
-/// 新建、保存密钥时的一条用量上限。
+/// 新建、保存密钥（和上游）时的一条用量上限。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyLimitInput {
     pub per: LimitPer,
+    /// 滚动窗口是几个 `per`：`minute` 1 到 60、`hour` 1 到 24。天、周、月交 1
+    pub every: u32,
     pub measure: LimitMeasure,
     /// 上限：请求数、token 数，费用是微分。要大于 0
     pub max: u64,
@@ -3431,6 +3467,9 @@ pub struct ProviderInput {
     /// 同时最多发给这家几个请求，1 到 1000。不给就是不限
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 用量上限，整份替换。不给 = 一条都没有
+    #[serde(default)]
+    pub limits: Vec<KeyLimitInput>,
     /// 停用
     #[serde(default)]
     pub disabled: bool,

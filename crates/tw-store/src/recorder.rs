@@ -105,7 +105,8 @@ pub struct Recorder {
     settled: Option<SettleHook>,
 }
 
-/// 记下的一行里，密钥的用量上限要的那几样（见 `tw_gateway::key_limits`）。
+/// 记下的一行里，密钥和上游的用量上限要的那几样（见 `tw_gateway::key_limits`、
+/// `tw_gateway::upstream_limits`）。
 ///
 /// **和库里那一行是同一份数**：用量、费用就是写进去的那些，重启之后从库里加回来的和
 /// 此刻结算的一样多。
@@ -128,6 +129,10 @@ pub struct Settled {
     pub cache_write: u64,
     /// 记下的费用，微分。算不出来的（没有价格、没有用量）是 None
     pub cost_micros: Option<i64>,
+    /// 算进上游用量上限的那几跳各发给了哪一家（[`tw_api::RoutingView::upstream_hops`]）
+    pub hops: Vec<String>,
+    /// 这一行的用量记在哪一家上游的用量上限上（[`tw_api::RoutingView::served_by`]）
+    pub served: Option<String>,
 }
 
 /// 结算往哪儿交。由 twcore 接到网关的密钥用量上限上（`tw_control::key_limits`）
@@ -821,6 +826,8 @@ impl Recorder {
                 cache_read: u.map_or(0, |u| u.cache_read),
                 cache_write: u.map_or(0, |u| u.cache_write),
                 cost_micros,
+                hops: p.routing.upstream_hops(),
+                served: p.routing.served_by().map(str::to_string),
             });
         }
         self.write(RequestRow {

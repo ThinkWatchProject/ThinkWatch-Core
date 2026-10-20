@@ -299,8 +299,8 @@ async fn saving_a_key_writes_its_limits_and_a_rename_keeps_what_it_used() {
         "PUT",
         "/keys/k",
         serde_json::json!({ "key": { "name": "k2", "limits": [
-            { "per": "day", "measure": "cost", "max": 250_000 },
-            { "per": "hour", "measure": "tokens", "max": 1000, "cache_reads": true },
+            { "per": "day", "every": 1, "measure": "cost", "max": 250_000 },
+            { "per": "hour", "every": 5, "measure": "tokens", "max": 1000, "cache_reads": true },
         ] } }),
     )
     .await;
@@ -310,18 +310,24 @@ async fn saving_a_key_writes_its_limits_and_a_rename_keeps_what_it_used() {
     assert_eq!(k2.limits[0].cost, Some(0.25));
     assert_eq!(k2.limits[1].tokens, Some(1000));
     assert!(k2.limits[1].cache_reads);
+    // every 是 1 的不写进配置，别的照写，读回来也是它
+    assert_eq!((k2.limits[0].every, k2.limits[1].every), (None, Some(5)));
     // 改了名：今天花掉的还在，而且已经超过了新的上限
     let list = keys(&b).await;
     let k2 = key(&list, "k2");
     assert_eq!(k2["limits"][0]["used"], 300_000);
     assert_eq!(k2["limits"][0]["reached"], true);
+    assert_eq!(
+        (&k2["limits"][0]["every"], &k2["limits"][1]["every"]),
+        (&serde_json::json!(1), &serde_json::json!(5))
+    );
 
     let (st, v) = call(
         &b.app,
         "PUT",
         "/keys/k2",
         serde_json::json!({ "key": { "name": "k2", "limits": [
-            { "per": "day", "measure": "requests", "max": 0 },
+            { "per": "day", "every": 1, "measure": "requests", "max": 0 },
         ] } }),
     )
     .await;
@@ -335,7 +341,7 @@ async fn saving_a_key_writes_its_limits_and_a_rename_keeps_what_it_used() {
         "PUT",
         "/keys/k2",
         serde_json::json!({ "key": { "name": "k2", "limits": [
-            { "per": "day", "measure": "cost", "max": 1_000_000, "cache_reads": true },
+            { "per": "day", "every": 1, "measure": "cost", "max": 1_000_000, "cache_reads": true },
         ] } }),
     )
     .await;

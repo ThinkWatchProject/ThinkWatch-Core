@@ -158,7 +158,9 @@ pub struct AppState {
     /// **跨重载存活**，理由和并发闸门一样：改一条路由规则不该让今天花的钱归零，在跑的
     /// 请求的预留也不该变成孤儿。上限本身跟着配置换（[`crate::key_limits::KeyLimits::configure`]）
     pub key_limits: Arc<crate::key_limits::KeyLimits>,
-    /// 每家上游的用量上限（见 [`crate::upstream_limits`]）。**跨重载存活**，理由和 `key_limits` 一样
+    /// 每家上游的用量上限（见 [`crate::upstream_limits`]）：这家今天、这周、这个月用了多少，
+    /// 最近几分钟、几小时用了多少，在路上的那几跳占着多少。**跨重载存活**，理由和密钥的
+    /// 一样；上限本身跟着配置换（[`crate::upstream_limits::UpstreamLimits::configure`]）
     pub upstream_limits: Arc<crate::upstream_limits::UpstreamLimits>,
     /// 每家上游暂时发不出去的样子：限流暂停、用量上限，和等它们的请求排的队（见
     /// [`crate::throttle`]）。**跨重载存活**：改一条规则不该让一家正被限流的上游马上又挨一遍
@@ -409,12 +411,15 @@ impl AppState {
         self.local_time = clock;
     }
 
-    /// 换一个看用量上限的时钟（测试把时间拨到零点前后）。**账从空的开始**：只在测试里、
-    /// 第一个请求之前调
+    /// 换一个看用量上限的时钟（测试把时间拨到零点前后）：密钥的和上游的用同一个。**账从
+    /// 空的开始**：只在测试里、第一个请求之前调
     pub fn set_key_limits_clock(&mut self, clock: Arc<dyn crate::key_limits::Clock>) {
-        let limits = crate::key_limits::KeyLimits::with_clock(self.bus.clone(), clock);
+        let limits = crate::key_limits::KeyLimits::with_clock(self.bus.clone(), clock.clone());
         limits.configure(&self.config());
         self.key_limits = Arc::new(limits);
+        let upstream = crate::upstream_limits::UpstreamLimits::with_clock(self.bus.clone(), clock);
+        upstream.configure(&self.config());
+        self.upstream_limits = Arc::new(upstream);
     }
 
     /// 直接换一份插件进去，配置照旧：正在跑的请求用完它们手上那一份，新请求看到的是

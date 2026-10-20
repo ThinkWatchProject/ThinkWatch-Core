@@ -243,7 +243,8 @@ clients:
 一把密钥的用量上限：每分钟、每小时、每天、每周或每月最多多少个请求、多少 token、多少美元。
 每一条只数其中一种；一把密钥可以有好几条，请求要通过每一条。
 
-`minute`、`hour` 是滚动的：最近 60 秒、最近 60 分钟。用满之后，下一个空位在
+`minute`、`hour` 是滚动的：最近 60 秒、最近 60 分钟；写了 `every` 就是几个这样的单位，
+`{ per: hour, every: 5 }` 是最近 5 小时。用满之后，下一个空位在
 `failover.wait_secs`（默认 120 秒）之内空出来，请求就等它；等不到就拒绝。之后若还要等
 上游，用的是同一段时间里剩下的部分。`day`、`week`、`month` 按 twcore 所在机器的
 本地时区算，在零点、周一零点、每月一号零点重新开始；用满之后，到重新开始之前的请求一律拒绝。
@@ -267,7 +268,8 @@ Responses 的 WebSocket 连接上，每个 `response.create` 各算一个请求�
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **必填** | 按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。 |
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **必填** | 按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟，或者 `every` 个这样的单位）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。 |
+| `every` | 整数 | — | 滚动窗口有几分钟、几小时：`{per: hour, every: 5}` 是最近 5 小时。`minute` 取 1 到 60，`hour` 取 1 到 24；`day`、`week`、`month` 不能写。不写：1。 |
 | `requests` | 整数 | — | 最多这么多个请求。数 token 的请求、网关自己答的、没有发到上游的不算。 |
 | `tokens` | 整数 | — | 最多这么多 token：未命中缓存的输入、写入缓存的和输出。 |
 | `cost` | 数字 | — | 最多花这么多美元，按每个请求记下的费用算；至少 0.01。没有价格的模型、`billing: free` 的上游算 0。 |
@@ -309,6 +311,7 @@ clients:
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
 | `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口、输出上限、会不会推理、收不收图，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
 | `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.wait_secs`。不写：不限。 |
+| `limits` | 对象列表，见 [`providers[].limits[]`](#cfg-providers-limits) | — | 这家上游的用量上限，照着它自己的限额写：每几分钟、每几小时、每天、每周或每月的请求数、token 数或费用。每一条都有余量才往这家发。滚动窗口满了，请求换下一家或者等它空出来；天、周、月用满了，到下一期之前请求换下一家。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | 从哪里读这家上游的余额，用它自己的密钥、走它自己的代理：`openrouter`、`deepseek`、`moonshot`、`sub2api`、`newapi`（New API 和 One API）或 `thinkwatch`（ThinkWatch 企业网关）。`auto`：OpenRouter、DeepSeek、Moonshot 按 `base_url` 识别；其他地址（Anthropic、OpenAI、Gemini 的官方地址除外）询问一次它是不是 Sub2API、ThinkWatch 企业网关或 New API 中转站，结果只保存在内存中。`off`：不读余额。ChatGPT、Z.ai 账号和 Bedrock 不读余额，与这里写什么无关。 |
 | `signed_in` | `zai` \| `bigmodel` | — | `key` 来自哪一家的账号登录：`zai`（Z.ai）或 `bigmodel`（BigModel）。在桌面端登录账号时写入，在桌面端更换密钥时删除。不影响请求的发送方式。不写：密钥是手动填写的。 |
@@ -349,6 +352,45 @@ Bedrock 上只为 AWS 列出支持提示缓存的 Claude 模型标注：Claude 3
 ChatGPT 账号上游（`protocol: chatgpt`）只接受桌面应用登录得到的凭据，不能手写。不支持 Claude 和 Google 的订阅登录，请使用 API 密钥。
 
 有的中转站和账号同时只接受几个请求，多出来的直接拒绝。`max_concurrent` 让网关守住这个数：请求发出时占用这家的一个位置，回答完整交给客户端、或者客户端断开时归还。这家满了的时候，为复用提示缓存而留在这家的对话等空位，别的请求直接换下一家。最多等多久由 `failover.wait_secs` 决定。等待不算失败，这家不会因此停用。只计算 token 数的请求不占位置。Responses 的 WebSocket 连接上，每个 `response.create` 从发出起占一个位置，直到它的回答结束，密钥的 `max_concurrent` 也一样；空闲的连接不占位置。
+
+#### `providers[].limits`
+
+一家上游的用量上限，照着这家自己的限额写：每几分钟、每几小时、每天、每周或每月最多多少个
+请求、多少 token、多少美元。写法和密钥的 `limits` 一样；一家上游可以有好几条，每一条都有
+余量才往这家发。
+
+每一次发到这家的尝试算一个请求，成功失败都算，这家回 429 的不算。token 和费用算在得到回答
+的那一次尝试上。只计算 token 数的请求不算。还在进行的尝试按输入的估算计入，记下之后换成
+实数。
+
+`minute`、`hour` 的窗口满了，这家和并发数满了一样被跳过：留在这家的对话等它空出余量，别的
+请求换下一家；候选都没有余量时，请求等最先空出来的那一家，最多等一个请求能等的时间（见
+`failover`）。`day`、`week`、`month` 用满之后，到下一期开始之前请求换下一家，不等它。满了
+不算失败，这家不会因此停用。重启之后，这一天、这一周、这个月的用量从请求记录里重新加起来，
+所以 `retention.row_days` 要留够那一期，和密钥的一样；分钟、小时的窗口从空的开始。
+
+<!-- generated: table providers[].limits[] -->
+<a id="cfg-providers-limits"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **必填** | 按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟，或者 `every` 个这样的单位）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。 |
+| `every` | 整数 | — | 滚动窗口有几分钟、几小时：`{per: hour, every: 5}` 是最近 5 小时。`minute` 取 1 到 60，`hour` 取 1 到 24；`day`、`week`、`month` 不能写。不写：1。 |
+| `requests` | 整数 | — | 最多往这家发这么多个请求。每一次发到了这家的尝试都算，它回 429 的不算；数 token 的请求不算。 |
+| `tokens` | 整数 | — | 这家回答的请求最多用这么多 token：未命中缓存的输入、写入缓存的和输出。 |
+| `cost` | 数字 | — | 这家回答的请求最多花这么多美元，按每个请求记下的费用算；至少 0.01。没有价格的模型算 0，`billing: free` 时全都算 0。 |
+| `cache_reads` | 布尔 | `false` | 把读取缓存的 token 也算进去。只有 `tokens` 上限能写。 |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com
+    key: sk-relay
+    limits:
+      - { per: hour, every: 5, requests: 200 }
+      - { per: week, cost: 50 }
+```
 
 #### `providers[].oauth`
 

@@ -350,6 +350,8 @@ minute, hour, day, week or month. Each entry counts one of the three; a key
 can have several, and a request has to pass every one.
 
 `minute` and `hour` are rolling: the last 60 seconds, the last 60 minutes.
+With `every`, the window spans several of them: `{ per: hour, every: 5 }` is
+the last 5 hours.
 When one is used up, a request waits for the next free slot if it frees
 within `failover.wait_secs` (120 seconds by default), and is refused
 otherwise. Any later wait for an upstream comes out of the same time.
@@ -383,7 +385,8 @@ all its answers count when it closes.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes, or `every` of them); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
+| `every` | integer | — | How many minutes or hours the rolling window spans: `{per: hour, every: 5}` is the last 5 hours. From 1 to 60 for `minute`, from 1 to 24 for `hour`; `day`, `week` and `month` do not take it. Unset: 1. |
 | `requests` | integer | — | At most this many requests. Token counts, answers the gateway gives itself and requests that never reach an upstream do not count. |
 | `tokens` | integer | — | At most this many tokens: uncached input, cache writes and output. |
 | `cost` | number | — | At most this much, in US dollars, as recorded for each request; at least 0.01. Models without a price and upstreams with `billing: free` count as 0. |
@@ -425,6 +428,7 @@ Upstreams: the APIs requests are forwarded to.
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
 | `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window, output limit, reasoning and image input of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
 | `max_concurrent` | integer | — | Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.wait_secs`. Unset: no limit. |
+| `limits` | list of [`providers[].limits[]`](#cfg-providers-limits) | — | Usage limits of this upstream, written like its own quota: requests, tokens or cost every few minutes or hours, per day, week or month. Every one has to have room before a request is sent to it. When a rolling window is full, requests go to the next upstream or wait for room; when a day, week or month is used up, requests go to the next upstream until the next one starts. Unset: no limit. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | Where the upstream's balance is read from, with its own key and proxy: `openrouter`, `deepseek`, `moonshot`, `sub2api`, `newapi` (New API and One API) or `thinkwatch` (a ThinkWatch Enterprise gateway). `auto`: recognized from `base_url` for OpenRouter, DeepSeek and Moonshot; any other address, except Anthropic's, OpenAI's and Gemini's own, is asked once whether it is a Sub2API, ThinkWatch Enterprise or New API relay, and the answer is kept in memory only. `off`: no balance. ChatGPT and Z.ai accounts and Bedrock have no balance whatever is written here. |
 | `signed_in` | `zai` \| `bigmodel` | — | Which account sign-in the `key` came from: `zai` (Z.ai) or `bigmodel` (BigModel). Signing in to the account in the desktop app writes it; replacing the key there removes it. It does not change how requests are sent. Unset: the key was written by hand. |
@@ -512,6 +516,53 @@ not set aside. Requests that only count tokens do not take a slot. On a
 Responses WebSocket connection, each `response.create` takes a slot from when
 it is sent until its answer ends, and so does a key's `max_concurrent`; an
 idle connection takes none.
+
+#### `providers[].limits`
+
+Usage limits for an upstream, written like the quota the upstream itself
+enforces: at most so many requests, tokens or dollars every few minutes or
+hours, per day, week or month. The entries are written like a key's `limits`;
+an upstream can have several, and every one has to have room before a request
+is sent to it.
+
+Each attempt sent to the upstream counts as a request, whether it succeeds or
+fails, unless the upstream answers it with 429. Tokens and cost count for the
+attempt that is answered. Requests that only count tokens do not count. An
+attempt still running counts with an estimate of its input until it is
+recorded.
+
+When a `minute` or `hour` window is full, the upstream is passed over like a
+busy one: a conversation that stays on it waits for room, other requests go to
+the next upstream, and when no candidate has room a request waits for the
+first one that does, within the time a request may wait (see `failover`). When
+a `day`, `week` or `month` is used up, requests go to the next upstream until
+the period starts again; none waits for it. Being full is not a failure: the
+upstream is not set aside. After a restart the day, week and month are added up
+again from the request records, so `retention.row_days` has to cover the
+period, as for a key; minute and hour windows start empty.
+
+<!-- generated: table providers[].limits[] -->
+<a id="cfg-providers-limits"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes, or `every` of them); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
+| `every` | integer | — | How many minutes or hours the rolling window spans: `{per: hour, every: 5}` is the last 5 hours. From 1 to 60 for `minute`, from 1 to 24 for `hour`; `day`, `week` and `month` do not take it. Unset: 1. |
+| `requests` | integer | — | At most this many requests sent to this upstream. Each attempt that reaches it counts, unless it answers 429; token counts do not count. |
+| `tokens` | integer | — | At most this many tokens in the answers of this upstream: uncached input, cache writes and output. |
+| `cost` | number | — | At most this much, in US dollars, as recorded for the requests this upstream answers; at least 0.01. Models without a price count as 0, and so does everything with `billing: free`. |
+| `cache_reads` | bool | `false` | Count cache reads too. Only for a `tokens` limit. |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com
+    key: sk-relay
+    limits:
+      - { per: hour, every: 5, requests: 200 }
+      - { per: week, cost: 50 }
+```
 
 #### `providers[].oauth`
 
