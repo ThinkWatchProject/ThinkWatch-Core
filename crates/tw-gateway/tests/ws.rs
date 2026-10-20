@@ -1128,6 +1128,7 @@ fn id_of(e: &Event) -> Option<u64> {
         | Event::RequestFinished { id, .. }
         | Event::RequestFailed { id, .. }
         | Event::RequestCancelled { id, .. }
+        | Event::RequestQueued { id, .. }
         | Event::ContentMatched { id, .. } => Some(*id),
         _ => None,
     }
@@ -1332,7 +1333,7 @@ async fn a_used_up_key_limit_fails_the_turn_and_the_connection_stays_usable() {
 }
 
 /// 每分钟的上限：下一个空位在等得到的时候空出来，这一轮**等它**，然后照常发出；等不到的
-/// （`slot_wait_secs: 0`）当场替它回 `response.failed`，说清多久之后再来
+/// （`wait_secs: 0`）当场替它回 `response.failed`，说清多久之后再来
 #[tokio::test]
 async fn a_rolling_key_limit_waits_within_the_turn_or_refuses_it() {
     let (up, seen) = responder(None).await;
@@ -1365,7 +1366,7 @@ async fn a_rolling_key_limit_waits_within_the_turn_or_refuses_it() {
         up,
         |c| {
             c.clients[0].limits = serde_yaml_ng::from_str("[{per: minute, requests: 1}]").unwrap();
-            c.failover.slot_wait_secs = 0;
+            c.failover.wait_secs = 0;
         },
         Some(JumpClock::new()),
     )
@@ -1451,7 +1452,7 @@ async fn a_keys_max_concurrent_is_held_per_turn() {
     assert_eq!(frames.last().unwrap()["type"], "response.completed");
 }
 
-/// 这一家满着：这一轮**等它空出位置**（最多 `slot_wait_secs`），空出来了照常发，尝试链上记着
+/// 这一家满着：这一轮**等它空出位置**（最多 `wait_secs`），空出来了照常发，尝试链上记着
 /// 等了多久；等不到替它回 `response.failed`（忙，可以重试），流量里留一行，连接照常
 #[tokio::test]
 async fn a_turn_waits_for_a_full_upstream_and_fails_as_busy_when_none_frees() {
@@ -1460,7 +1461,7 @@ async fn a_turn_waits_for_a_full_upstream_and_fails_as_busy_when_none_frees() {
         up,
         |c| {
             c.providers[0].max_concurrent = Some(1);
-            c.failover.slot_wait_secs = 1;
+            c.failover.wait_secs = 1;
         },
         None,
     )
@@ -1531,6 +1532,70 @@ async fn a_turn_waits_for_a_full_upstream_and_fails_as_busy_when_none_frees() {
     c.send(create("three")).await.unwrap();
     let frames = one_answer(&mut c).await;
     assert_eq!(frames.last().unwrap()["type"], "response.completed");
+}
+
+/// 这一家回过 429、正暂停着：这一轮**等暂停结束再发**（`response.create` 推迟了，客户端照常拿到
+/// 回答），尝试链上记着等了多久，排队报一条；暂停到这一轮等不到的时候，当场替它回
+/// `response.failed`（限流，可以重试），连接照常
+#[tokio::test]
+async fn a_turn_waits_for_a_paused_upstream_and_fails_when_the_pause_outlasts_it() {
+    let (up, seen) = responder(None).await;
+    let (gw, mut rx, state) = turns_gateway(up, |c| c.failover.wait_secs = 2, None).await;
+    let mut c = connect(gw).await;
+    let now = std::time::Instant::now;
+    state
+        .throttles
+        .limited("up", now(), Some(Duration::from_millis(400)));
+    let t = std::time::Instant::now();
+    c.send(create("one")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(seen.lock().unwrap().is_empty(), "暂停着就发了");
+    let frames = one_answer(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
+    assert!(
+        t.elapsed() >= Duration::from_millis(380),
+        "{:?}",
+        t.elapsed()
+    );
+    let evs = requests(&mut rx, 1).await;
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            Event::RequestQueued { upstreams, .. } if upstreams == &["up".to_string()]
+        )),
+        "{evs:?}"
+    );
+    let queued = evs.iter().find_map(|e| match e {
+        Event::RequestRouted { attempts, .. } => attempts[0].queued_ms,
+        _ => None,
+    });
+    assert!(queued.is_some_and(|ms| ms >= 150), "{evs:?}");
+
+    // 暂停一分钟，这一轮最多等两秒：不等，当场说
+    state
+        .throttles
+        .limited("up", now(), Some(Duration::from_secs(60)));
+    let t = std::time::Instant::now();
+    c.send(create("two")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let failed = frames.last().unwrap();
+    assert_eq!(failed["type"], "response.failed", "{frames:?}");
+    assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let evs = requests(&mut rx, 1).await;
+    let hop = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::RequestRouted { attempts, .. } => Some(attempts[0].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert_eq!(hop.skipped, Some(tw_api::ServeSkip::Throttled));
+    match evs.last().unwrap() {
+        Event::RequestFailed { message, .. } => assert_eq!(message.code, "gw.wait.rate_limited"),
+        other => panic!("{other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------- 快慢和成败
@@ -1697,6 +1762,152 @@ async fn each_turn_feeds_the_upstreams_speed_and_success_like_an_http_hop() {
         }
     }
     assert_eq!(rate(), Some(7.0 / 8.0), "客户端走了被算进了成败");
+}
+
+/// 上游在一轮的第一帧就报了限流：这一家暂停，尝试链上那一跳带着暂停多久（`pause_ms`），
+/// **不算进这家的用量上限** —— 内存里的数和记录里重新加的（`AttemptView::counts_for_upstream`）
+/// 是同一个。内容到了之后才报的照常算一个请求
+#[tokio::test]
+async fn a_turn_rate_limited_before_any_content_does_not_count_toward_the_upstreams_limit() {
+    fn script(n: usize) -> Vec<(u64, serde_json::Value)> {
+        let id = format!("resp_{n}");
+        match n {
+            1 => vec![(0, error("rate_limit_exceeded"))],
+            _ => vec![
+                (0, created(&id)),
+                (0, delta()),
+                (0, failed(&id, "rate_limit_exceeded")),
+            ],
+        }
+    }
+    let up = scripted(script).await;
+    let (gw, mut rx, state) = turns_gateway(
+        up,
+        |c| {
+            c.providers[0].limits =
+                serde_yaml_ng::from_str("[{per: minute, requests: 5}]").unwrap();
+            c.failover.wait_secs = 10;
+            // 退避的 5 秒截成 1 秒：测试不用干等
+            c.failover.rate_limit_max_pause_secs = 1;
+        },
+        None,
+    )
+    .await;
+    let used = || {
+        let cfg = state.config();
+        state.upstream_limits.view("up", &cfg.providers[0].limits)[0].used
+    };
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    assert_eq!(until_end(&mut c).await.last().unwrap()["type"], "error");
+    let evs = requests(&mut rx, 1).await;
+    let hop = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::RequestRouted { attempts, .. } => Some(attempts[0].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert!(hop.pause_ms.is_some_and(|ms| ms > 0), "{hop:?}");
+    assert!(!hop.counts_for_upstream());
+    assert_eq!(used(), 0, "限流了的这一轮不算");
+    assert_eq!(
+        state.throttles.view("up").map(|t| t.kind),
+        Some(tw_api::ThrottleKind::RateLimited)
+    );
+
+    // 暂停结束后的下一轮：答了内容才报限流，算一个请求
+    c.send(create("two")).await.unwrap();
+    let frames = until_end(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.failed");
+    let evs = requests(&mut rx, 1).await;
+    let hop = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::RequestRouted { attempts, .. } => Some(attempts[0].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert_eq!(hop.pause_ms, None, "{hop:?}");
+    assert!(hop.counts_for_upstream());
+    assert_eq!(used(), 1);
+}
+
+/// 暂停结束后探路的那一轮：上游先回了 `response.created`，接着在内容之前报限流。**头一帧不说明
+/// 这一家好了**：排在后面的那一轮不能在 `response.created` 到的那一刻就跟着发，要等这一家再次
+/// 暂停完
+#[tokio::test]
+async fn a_probing_turn_limited_after_response_created_keeps_the_next_turn_waiting() {
+    let times: Arc<Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let t = times.clone();
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| {
+            let times = t.clone();
+            async move {
+                ws.on_upgrade(move |mut sock| async move {
+                    while let Some(Ok(m)) = sock.recv().await {
+                        if !matches!(m, Message::Text(_)) {
+                            continue;
+                        }
+                        let n = {
+                            let mut t = times.lock().unwrap();
+                            t.push(std::time::Instant::now());
+                            t.len()
+                        };
+                        let id = format!("resp_{n}");
+                        // 头一个（探路的）：开头当场到，300 毫秒后报限流
+                        let frames = if n == 1 {
+                            vec![(0, created(&id)), (300, error("rate_limit_exceeded"))]
+                        } else {
+                            vec![(0, created(&id)), (0, delta()), (0, completed(&id))]
+                        };
+                        for (wait, f) in frames {
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
+                            if sock
+                                .send(Message::Text(f.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                })
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let (gw, _rx, state) = turns_gateway(
+        up,
+        // 退避截成 1 秒：测试不用干等
+        |c| c.failover.rate_limit_max_pause_secs = 1,
+        None,
+    )
+    .await;
+    state.throttles.limited(
+        "up",
+        std::time::Instant::now(),
+        Some(Duration::from_millis(300)),
+    );
+    let (mut a, mut b) = (connect(gw).await, connect(gw).await);
+    a.send(create("one")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    b.send(create("two")).await.unwrap();
+    assert_eq!(until_end(&mut a).await.last().unwrap()["type"], "error");
+    assert_eq!(
+        until_end(&mut b).await.last().unwrap()["type"],
+        "response.completed"
+    );
+    let times = times.lock().unwrap().clone();
+    assert_eq!(times.len(), 2);
+    assert!(
+        times[1] - times[0] >= Duration::from_millis(1_000),
+        "探路的那一轮在 response.created 之后被限流了，后面的却跟着发了：{:?}",
+        times[1] - times[0]
+    );
 }
 
 /// 一轮回到一半上游就收了连接：帧里写着 `CLOSE` 的，回了开头之后发关闭帧；写着 `DROP` 的，
@@ -1891,7 +2102,7 @@ async fn a_turns_key_limit_wait_and_slot_wait_share_one_budget() {
         |c| {
             c.clients[0].limits = serde_yaml_ng::from_str("[{per: minute, requests: 1}]").unwrap();
             c.providers[0].max_concurrent = Some(1);
-            c.failover.slot_wait_secs = 2;
+            c.failover.wait_secs = 2;
         },
         Some(clock.clone()),
     )

@@ -80,6 +80,8 @@ config.key_limit_cache_reads
 config.key_limit_cost_too_small
 config.key_limit_duplicate
 config.key_limit_empty
+config.key_limit_every
+config.key_limit_every_calendar
 config.key_limit_not_positive
 config.key_limit_retention
 config.key_limit_two_measures
@@ -128,6 +130,15 @@ config.unknown_price_sheet
 config.unknown_rule
 config.unknown_variant
 config.unparsable passthrough
+config.upstream_limit_cache_reads
+config.upstream_limit_cost_too_small
+config.upstream_limit_duplicate
+config.upstream_limit_empty
+config.upstream_limit_every
+config.upstream_limit_every_calendar
+config.upstream_limit_not_positive
+config.upstream_limit_retention
+config.upstream_limit_two_measures
 config.zero_concurrency
 control.account_service_not_json
 control.account_service_refused
@@ -316,10 +327,13 @@ gw.count_tokens.bedrock_upstream
 gw.files.unsupported
 gw.internal
 gw.internal_panic
+gw.key_limit.cost_every
 gw.key_limit.cost_per_period
 gw.key_limit.cost_rolling
+gw.key_limit.requests_every
 gw.key_limit.requests_per_period
 gw.key_limit.requests_rolling
+gw.key_limit.tokens_every
 gw.key_limit.tokens_per_period
 gw.key_limit.tokens_rolling
 gw.listen.addr_unavailable
@@ -422,6 +436,8 @@ gw.upstream.eventstream_broken
 gw.upstream.forward_failed
 gw.upstream.idle_timeout
 gw.upstream.idle_timeout_mid_stream
+gw.upstream.paused
+gw.upstream.period_used_up
 gw.upstream.rate_limited
 gw.upstream.sign_failed
 gw.upstream.status
@@ -431,6 +447,11 @@ gw.upstream.stream_exception
 gw.upstream.stream_opening_error
 gw.upstream.timeout
 gw.upstream.unreachable
+gw.upstream.window_full
+gw.wait.mixed
+gw.wait.rate_limited
+gw.wait.used_up
+gw.wait.window_full
 gw.ws.alias_unserved
 gw.ws.alias_unserved_rewritten
 gw.ws.bad_header

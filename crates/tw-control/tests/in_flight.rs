@@ -100,6 +100,7 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
             usage: None,
             queued_ms: None,
             skipped: None,
+            pause_ms: None,
             proxy: None,
         }],
         billing: tw_api::Billing::PerToken,

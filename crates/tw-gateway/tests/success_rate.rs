@@ -62,8 +62,10 @@ async fn gateway(providers: Vec<Provider>) -> (SocketAddr, Arc<Health>) {
             ..Default::default()
         }],
         providers,
+        // 不等：一家回 429 之后暂停着，请求当场以 429 收场，不在这里干等它
         failover: Failover {
             failures_to_pause: 100,
+            wait_secs: 0,
             ..Default::default()
         },
         ..Default::default()
@@ -116,9 +118,11 @@ async fn an_upstream_that_answers_counts_as_a_success() {
 }
 
 #[tokio::test]
-async fn server_errors_and_rate_limits_count_against_the_upstream() {
+async fn server_errors_count_against_the_upstream_and_rate_limits_do_not() {
     assert_eq!(after_five(503, "{}").await, Some(0.0));
-    assert_eq!(after_five(429, "{}").await, Some(0.0));
+    // 限流不是失败：这一家暂停，请求等它（见 `tw_gateway::throttle`），不算进成功率。等不到的
+    // 那几个请求放弃了，也不算它答上了
+    assert_eq!(after_five(429, "{}").await, None);
     // 凭据被拒：换一家有意义，那边是另一把密钥
     assert_eq!(after_five(401, "{}").await, Some(0.0));
 }

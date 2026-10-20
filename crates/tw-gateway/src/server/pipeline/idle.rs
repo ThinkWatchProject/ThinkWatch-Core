@@ -98,6 +98,7 @@ pub(super) fn abandoned(
         // 等过空位的话，等了多久由尝试链补上（`stamp_queued`）
         queued_ms: None,
         skipped: None,
+        pause_ms: None,
         proxy: None,
     }
 }
@@ -120,6 +121,7 @@ pub(super) fn aborted_hop(
         usage: None,
         queued_ms: None,
         skipped: None,
+        pause_ms: None,
         proxy: None,
     }
 }

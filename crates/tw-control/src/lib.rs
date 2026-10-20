@@ -423,7 +423,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 quota_pause_secs: f.quota_pause_secs,
                 rate_limit_max_pause_secs: f.rate_limit_max_pause_secs,
                 idle_timeout_secs: f.idle_timeout_secs,
-                slot_wait_secs: f.slot_wait_secs,
+                wait_secs: f.wait_secs,
             }
         },
         listen: tw_api::ListenView {
@@ -513,6 +513,7 @@ fn provider_view(
             }
             tw_gateway::health::State::Open => tw_api::Health::Open,
         },
+        throttle: s.gateway.throttles.view(&p.name),
         auth_rejected: s.gateway.auth_rejected(&p.name),
         writeback_failed: s.gateway.writeback_failed(&p.name),
         billing: p.billing.into(),
@@ -522,6 +523,7 @@ fn provider_view(
             .collect(),
         pricing: p.pricing.clone(),
         max_concurrent: p.max_concurrent,
+        limits: s.gateway.upstream_limits.view(&p.name, &p.limits),
         balance_setting: p.balance.into(),
         balance: s.gateway.balance_of(p),
         signed_in: p.signed_in.map(Into::into),

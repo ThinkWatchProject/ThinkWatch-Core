@@ -4,9 +4,13 @@
 //! 这里是桌面版的**规矩**：
 //!
 //! **停用多久看失败的原因**（见 [`crate::failure`]）。上游说了原因的 —— 余额
-//! 不足、额度用完、限流并给了 `Retry-After` —— 一次就停用，停到那个原因该过去
-//! 的时候；说不出原因的（5xx、连不上）连续几次才停，停的时长每次翻倍，成功一次
-//! 就回到起点。几个数都在配置的 `failover` 里。
+//! 不足、额度用完 —— 一次就停用，停到那个原因该过去的时候；说不出原因的（5xx、
+//! 连不上）连续几次才停，停的时长每次翻倍，成功一次就回到起点。几个数都在配置的
+//! `failover` 里。
+//!
+//! **限流（429）不在这里**：它不是失败，是让等一会儿 —— 那一家暂停，请求排队等它（见
+//! [`crate::throttle`]）。记进熔断的话，一家只是被限流的上游连着几次就被当成坏了，唯一的
+//! 候选还会被自己停用。
 //!
 //! 两条硬边界，它们比参数重要得多：
 //!
@@ -215,22 +219,22 @@ impl Health {
     }
 
     /// 记一次失败，按原因停用。返回状态变化。
+    ///
+    /// **限流不记**（[`Cause::RateLimited`]）：不进熔断、不算进成功率，那一家由
+    /// [`crate::throttle`] 暂停。调用方该把它交给那边（[`crate::throttle::Throttles::limited`]）
     pub fn record_cause(&self, name: &str, cause: Cause) -> Option<State> {
         let s = self.settings();
         let now = (self.clock)();
         let secs =
             |n: u64| now.saturating_add(i64::try_from(n.saturating_mul(1000)).unwrap_or(i64::MAX));
         let until = match cause {
-            Cause::ModelUnavailable => return None,
+            Cause::ModelUnavailable | Cause::RateLimited { .. } => return None,
             Cause::NoBalance => secs(s.no_balance_pause_secs),
             Cause::QuotaUsedUp { resets_at_ms } => resets_at_ms
                 .and_then(|t| i64::try_from(t).ok())
                 .filter(|t| *t > now)
                 .unwrap_or_else(|| secs(s.quota_pause_secs)),
-            Cause::RateLimited {
-                retry_after: Some(d),
-            } if !d.is_zero() => secs(d.as_secs().max(1).min(s.rate_limit_max_pause_secs)),
-            Cause::RateLimited { .. } | Cause::AuthRejected | Cause::Unexplained => {
+            Cause::AuthRejected | Cause::Unexplained => {
                 return self.record_failure(name);
             }
         };
@@ -253,9 +257,10 @@ impl Health {
     /// （`tw_engine::balance_factors`）。
     ///
     /// 成败的判据就是熔断的判据，不另起一套：上面几个 `record_*` 记一次，这里就记一次。
-    /// 于是 5xx、连不上、超时、限流、额度用完、没钱了、凭据被拒或取不到、流在第一段内容
-    /// 之前断了都算失败；请求本身的问题（别的 4xx）算这家答上了；这家没有这个模型不记 ——
-    /// 它对别的模型照样好好的。客户端中途走了的不经过这里，也不记。
+    /// 于是 5xx、连不上、超时、额度用完、没钱了、凭据被拒或取不到、流在第一段内容
+    /// 之前断了都算失败；请求本身的问题（别的 4xx）算这家答上了；这家没有这个模型、限流
+    /// 不记 —— 前者它对别的模型照样好好的，后者是让等一会儿（见 [`crate::throttle`]）。
+    /// 客户端中途走了的不经过这里，也不记。
     ///
     /// **换下一家、却不是这家的错的**（它只是慢，或者正忙）不该调 `record_*`：调了，它在
     /// 熔断和这里都会被算成一次失败。
@@ -542,15 +547,6 @@ mod tests {
         h.record_cause("c", Cause::QuotaUsedUp { resets_at_ms: None });
         assert_eq!(h.cooldown_left("c"), Some(Duration::from_secs(3600)));
 
-        // Retry-After 太长的按上限
-        h.record_cause(
-            "d",
-            Cause::RateLimited {
-                retry_after: Some(Duration::from_secs(99_999)),
-            },
-        );
-        assert_eq!(h.cooldown_left("d"), Some(Duration::from_secs(3600)));
-
         // 到点了：能用，定时器看到 0；成功之后什么都不记得
         advance(&now, 1_800_000);
         assert!(h.is_available("a"));
@@ -560,17 +556,24 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_model_or_an_unstated_rate_limit_does_not_set_it_aside_at_once() {
+    fn a_missing_model_or_a_rate_limit_never_sets_it_aside() {
         let (h, _) = clocked();
         assert_eq!(h.record_cause("a", Cause::ModelUnavailable), None);
         assert!(h.is_available("a"));
-        // 没说多久的限流按说不出原因的失败算：连续三次才停
-        for _ in 0..2 {
-            h.record_cause("b", Cause::RateLimited { retry_after: None });
+        // 限流不是失败，说没说多久都一样：多少次都不停用，也不算进连续失败的次数
+        for retry_after in [None, Some(Duration::from_secs(30))] {
+            for _ in 0..10 {
+                assert_eq!(
+                    h.record_cause("b", Cause::RateLimited { retry_after }),
+                    None
+                );
+            }
         }
         assert!(h.is_available("b"));
+        assert_eq!(h.cooldown_left("b"), None);
         h.record_cause("b", Cause::Unexplained);
-        assert!(!h.is_available("b"));
+        h.record_cause("b", Cause::Unexplained);
+        assert!(h.is_available("b"), "两次说不出原因的失败还不够");
     }
 
     #[test]
@@ -639,26 +642,27 @@ mod tests {
         for cause in [
             Cause::NoBalance,
             Cause::QuotaUsedUp { resets_at_ms: None },
-            Cause::RateLimited {
-                retry_after: Some(Duration::from_secs(30)),
-            },
-            Cause::RateLimited { retry_after: None },
             Cause::AuthRejected,
             Cause::Unexplained,
         ] {
             h.record_cause("a", cause);
         }
         h.record_failure("a");
-        assert_eq!(rate(&h, "a"), Some(0.0), "七次失败");
+        assert_eq!(rate(&h, "a"), Some(0.0), "五次失败");
+        // 限流不是失败，也不算答上了：不记
+        for retry_after in [None, Some(Duration::from_secs(30))] {
+            h.record_cause("a", Cause::RateLimited { retry_after });
+        }
+        assert_eq!(rate(&h, "a"), Some(0.0), "还是五次");
         // 这家没有这个模型：不算它坏了，也不算它答上了
         for _ in 0..10 {
             h.record_cause("b", Cause::ModelUnavailable);
         }
         assert_eq!(rate(&h, "b"), None);
-        for _ in 0..3 {
+        for _ in 0..5 {
             h.record_success("a");
         }
-        assert_eq!(rate(&h, "a"), Some(0.3));
+        assert_eq!(rate(&h, "a"), Some(0.5));
     }
 
     #[test]

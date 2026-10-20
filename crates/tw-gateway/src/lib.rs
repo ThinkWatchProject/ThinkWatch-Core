@@ -56,8 +56,10 @@ pub mod session;
 pub mod slots;
 mod splice;
 pub mod state;
+pub mod throttle;
 pub mod traffic;
 pub mod translate;
+pub mod upstream_limits;
 pub mod wire;
 pub mod ws;
 

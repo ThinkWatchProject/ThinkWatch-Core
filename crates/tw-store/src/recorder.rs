@@ -105,7 +105,8 @@ pub struct Recorder {
     settled: Option<SettleHook>,
 }
 
-/// 记下的一行里，密钥的用量上限要的那几样（见 `tw_gateway::key_limits`）。
+/// 记下的一行里，密钥和上游的用量上限要的那几样（见 `tw_gateway::key_limits`、
+/// `tw_gateway::upstream_limits`）。
 ///
 /// **和库里那一行是同一份数**：用量、费用就是写进去的那些，重启之后从库里加回来的和
 /// 此刻结算的一样多。
@@ -128,6 +129,10 @@ pub struct Settled {
     pub cache_write: u64,
     /// 记下的费用，微分。算不出来的（没有价格、没有用量）是 None
     pub cost_micros: Option<i64>,
+    /// 算进上游用量上限的那几跳各发给了哪一家（[`tw_api::RoutingView::upstream_hops`]）
+    pub hops: Vec<String>,
+    /// 这一行的用量记在哪一家上游的用量上限上（[`tw_api::RoutingView::served_by`]）
+    pub served: Option<String>,
 }
 
 /// 结算往哪儿交。由 twcore 接到网关的密钥用量上限上（`tw_control::key_limits`）
@@ -687,6 +692,11 @@ impl Recorder {
             // 某家上游熔断了 —— 是「现在什么情况」，不是「刚才发生过什么」。
             // 这张表只装后者。
             | Event::HealthChanged { .. }
+            // 一家上游暂时发不出去，同上：是现状
+            | Event::ThrottleChanged { .. }
+            // 一个请求开始排队：它等了多久在尝试链（`queued_ms`）里，这一条不用落库
+            | Event::RequestQueued { .. }
+            | Event::RequestDequeued { .. }
             | Event::ModelsChanged { .. }
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
@@ -817,6 +827,8 @@ impl Recorder {
                 cache_read: u.map_or(0, |u| u.cache_read),
                 cache_write: u.map_or(0, |u| u.cache_write),
                 cost_micros,
+                hops: p.routing.upstream_hops(),
+                served: p.routing.served_by().map(str::to_string),
             });
         }
         self.write(RequestRow {
@@ -978,6 +990,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -990,6 +1003,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: Some("机场".into()),
                 },
             ],
@@ -1055,6 +1069,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -1089,6 +1104,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -1101,6 +1117,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 },
             ],
@@ -1154,6 +1171,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -1282,6 +1300,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -1608,6 +1627,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::Free,
@@ -1650,6 +1670,7 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::Free,
@@ -1731,6 +1752,7 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing,
@@ -1823,6 +1845,7 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing,
@@ -2269,6 +2292,7 @@ mod security_detail_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -2564,6 +2588,7 @@ mod translation_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 })
                 .collect(),
@@ -3256,6 +3281,7 @@ mod settle_hook_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                pause_ms: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,

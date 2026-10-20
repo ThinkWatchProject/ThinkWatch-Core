@@ -192,6 +192,25 @@ pub struct KeyUsage {
     pub cost_micros: i64,
 }
 
+/// 一家上游从某一刻起用了多少（见 [`Db::upstream_usage_since`]）。
+///
+/// **请求数按尝试链数，用量按接下它的那一家**：和上游的用量上限结算一行时
+/// （`tw_gateway::upstream_limits`）是同一个判断。按路径分开：数 token 的请求在网关那边剔掉
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UpstreamUsage {
+    pub upstream: String,
+    pub path: String,
+    /// 算数的那几跳（[`tw_api::RoutingView::upstream_hops`]）里发给这家的有几跳
+    pub requests: i64,
+    /// 这家接下的那些请求（[`tw_api::RoutingView::served_by`]）的用量合计
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 记下的费用合计，微分。算不出来的那几行算 0
+    pub cost_micros: i64,
+}
+
 /// 装上 `tw_reached(路由那一列, 失败没有)`：这一行的请求可能发到了上游
 /// （[`tw_api::RoutingView::reached_upstream`]）。**判断写在 tw-api 那一处**，记下一行时交给
 /// 网关的（[`crate::Settled::reached`]）和从库里加回来的是同一个。路由那一列读不出来的当作
@@ -1528,6 +1547,58 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 每家上游从 `since_ms` 起用了多少：重启之后（和一期的开头变了的时候），上游的用量上限
+    /// 按它把这一天、这一周、这个月的数加回来。
+    ///
+    /// **尝试链在路由那一列的 JSON 里**，一行一行读出来数（和 `tw_reached` 一样按 tw-api 的
+    /// 判断）：算数的每一跳给那一家记一个请求，这一行的用量记在接下它的那一家。网关自己答的、
+    /// 没有路由那一列的（没走到上游）不在里面；路由那一列读不出来的当作尝试链是空的
+    pub fn upstream_usage_since(&self, since_ms: i64) -> Result<Vec<UpstreamUsage>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT path, routing,
+                    COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
+                    COALESCE(cache_read_tokens, 0), COALESCE(cache_write_tokens, 0),
+                    COALESCE(cost_micros, 0)
+             FROM requests
+             WHERE at_ms >= ?1 AND local = 0 AND routing IS NOT NULL",
+        )?;
+        let mut rows = st.query(params![since_ms])?;
+        let mut by: std::collections::BTreeMap<(String, String), UpstreamUsage> =
+            std::collections::BTreeMap::new();
+        /// 一家、一个路径的那一组
+        fn entry<'a>(
+            by: &'a mut std::collections::BTreeMap<(String, String), UpstreamUsage>,
+            upstream: &str,
+            path: &str,
+        ) -> &'a mut UpstreamUsage {
+            by.entry((upstream.to_string(), path.to_string()))
+                .or_insert_with(|| UpstreamUsage {
+                    upstream: upstream.to_string(),
+                    path: path.to_string(),
+                    ..Default::default()
+                })
+        }
+        while let Some(r) = rows.next()? {
+            let path: String = r.get(0)?;
+            let Ok(routing) = serde_json::from_str::<tw_api::RoutingView>(&r.get::<_, String>(1)?)
+            else {
+                continue;
+            };
+            for up in routing.upstream_hops() {
+                entry(&mut by, &up, &path).requests += 1;
+            }
+            if let Some(up) = routing.served_by() {
+                let u = entry(&mut by, up, &path);
+                u.input_tokens += r.get::<_, i64>(2)?;
+                u.output_tokens += r.get::<_, i64>(3)?;
+                u.cache_read_tokens += r.get::<_, i64>(4)?;
+                u.cache_write_tokens += r.get::<_, i64>(5)?;
+                u.cost_micros += r.get::<_, i64>(6)?;
+            }
+        }
+        Ok(by.into_values().collect())
+    }
+
     /// 各条路由走了多少请求、各条规则命中了多少，以及记录从哪一刻起是全的（见
     /// [`tw_api::RouteStats`]）。
     pub fn route_stats(&self, since_ms: i64, until_ms: i64) -> Result<tw_api::RouteStats, DbError> {
@@ -2465,6 +2536,71 @@ pub(crate) mod tests {
             ("codex", true),
             "没有路由那一列、也没失败的：客户端在等上游时走了，可能发到了"
         );
+    }
+
+    #[test]
+    fn upstream_usage_counts_hops_and_puts_usage_on_the_upstream_that_answered() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        // 头一跳 a 超时（发出去了，算），第二跳 b 回 429（不算），第三跳 c 接下
+        let failover = r#"{"route":"default","rule":"r","rewritten_by":[],"attempts":[
+            {"provider":"a","outcome":"error","error":{"code":"gw.upstream.timeout","args":{},"text":"x"},"ms":5},
+            {"provider":"b","outcome":"status","status":429,"ms":5},
+            {"provider":"c","outcome":"served","status":200,"ms":5}]}"#;
+        let served = r#"{"route":"default","rule":"r","rewritten_by":[],
+            "attempts":[{"provider":"c","outcome":"served","status":200,"ms":5}]}"#;
+        // 都满着：跳过的那一跳没发出去
+        let busy = r#"{"route":"default","rule":"r","rewritten_by":[],"attempts":[{"provider":"c",
+            "outcome":"error","error":{"code":"gw.busy_upstream","args":{},"text":"x"},
+            "ms":0,"skipped":"busy"}]}"#;
+        let mut one = row(1, t0);
+        one.routing = Some(failover.into());
+        let mut two = row(2, t0 + 1);
+        two.routing = Some(served.into());
+        two.cost_micros = None;
+        let mut early = row(3, t0 - 1);
+        early.routing = Some(served.into());
+        let mut skipped = row(4, t0 + 2);
+        skipped.routing = Some(busy.into());
+        let mut local = row(5, t0 + 3);
+        local.routing = Some(served.into());
+        local.local = true;
+        let mut count = row(6, t0 + 4);
+        count.routing = Some(served.into());
+        count.path = "/v1/messages/count_tokens".into();
+        let no_routing = row(7, t0 + 5);
+        for r in [&one, &two, &early, &skipped, &local, &count, &no_routing] {
+            db.insert(r).unwrap();
+        }
+        let got = db.upstream_usage_since(t0).unwrap();
+        let find = |up: &str, path: &str| {
+            got.iter()
+                .find(|u| u.upstream == up && u.path == path)
+                .cloned()
+        };
+        assert_eq!(got.len(), 3, "{got:?}");
+        let a = find("a", "/v1/messages").unwrap();
+        assert_eq!(
+            (a.requests, a.input_tokens),
+            (1, 0),
+            "超时的那一跳算一个请求，用量不是它的"
+        );
+        assert!(find("b", "/v1/messages").is_none(), "回 429 的不算");
+        let c = find("c", "/v1/messages").unwrap();
+        assert_eq!(
+            (
+                c.requests,
+                c.input_tokens,
+                c.output_tokens,
+                c.cache_read_tokens,
+                c.cache_write_tokens,
+                c.cost_micros
+            ),
+            (2, 2000, 1000, 400, 0, 12_000),
+            "早于那一刻的、本地答的、跳过的不算；算不出钱的算 0"
+        );
+        // 数 token 的按路径分开交出去，网关那边剔掉
+        assert_eq!(find("c", "/v1/messages/count_tokens").unwrap().requests, 1);
     }
 
     #[test]
@@ -3496,6 +3632,7 @@ mod cost_state_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 }],
                 ..Default::default()
@@ -3996,6 +4133,7 @@ mod cost {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    pause_ms: None,
                     proxy: None,
                 }
             })

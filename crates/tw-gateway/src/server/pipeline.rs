@@ -80,7 +80,7 @@ struct Started {
     /// 那些字节时（同格式直通、一个字节都没改），换的时候照它换，不再找一遍（见 [`hop`]）
     hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>>,
     /// 这个请求最多等到什么时候：准入时定下（见 [`admission`]），等密钥的分钟、小时上限和
-    /// 等上游的空位共用这一段（`failover.slot_wait_secs`）
+    /// 等上游的空位共用这一段（`failover.wait_secs`）
     wait_until: tokio::time::Instant,
 }
 
@@ -941,13 +941,22 @@ pub(super) fn arrange<'a>(
         facts_rt = Some(f);
     }
     // 留在上次回答这段对话的那一家：同一轮里一律留，跨轮看缓存值不值得留。**排在
-    // 策略组排序之后** —— 该留的时候盖过策略，放开的时候策略照常说了算
+    // 策略组排序之后** —— 该留的时候盖过策略，放开的时候策略照常说了算。那一家熔断着、这一期
+    // 用完了、限流暂停到这个请求等不到的时候（见 `crate::throttle`）放开
+    let deadline_ms = now.saturating_add(rt.config.failover.wait_secs.saturating_mul(1000));
     let stayed = conv.and_then(|c| {
         state.affinity.stay(
             c,
             decision.via_group.as_deref(),
             &mut decision.candidates,
-            |p| state.health.is_available(p),
+            |p| {
+                state.health.is_available(p)
+                    && state.throttles.keeps_conversation(
+                        p,
+                        hop::usage_limits_of(rt, p),
+                        deadline_ms,
+                    )
+            },
             now,
         )
     });
