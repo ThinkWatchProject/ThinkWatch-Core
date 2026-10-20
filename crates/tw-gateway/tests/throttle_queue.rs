@@ -859,3 +859,59 @@ async fn a_probe_answered_with_a_used_up_quota_lets_the_queue_go_at_once() {
     assert_eq!(first.await.unwrap().unwrap().status(), 429);
     assert_eq!(up.hits(), 3);
 }
+
+/// 暂停结束、探路的名额拿到了还没发出去（插件、取密钥、等空位的时候）上游改了名：名额的
+/// 主人认的是旧名字，新名字下**不能一直挂着这张发不出去的名额** —— 它不会有结论，宽限期也
+/// 不从它算起，这一家就再也放不出一个请求
+#[tokio::test]
+async fn renaming_while_an_unsent_probe_ticket_is_out_does_not_wedge_the_upstream() {
+    let up = upstream(Vec::new(), ok()).await;
+    let (_gw, state, _log) = serve(config(&[&up], 10)).await;
+    pause(&state, "甲", 50);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ticket = match state.throttles.gate("甲", &[], None) {
+        tw_gateway::throttle::Gate::Go(Some(p)) => p,
+        _ => panic!("暂停结束后头一个该拿到探路的名额"),
+    };
+    state.throttles.rename("甲", "丙");
+    // 名额的主人放弃了（没发出去），或者照旧名字说它发出去了：新名字下都该接着有人能探路
+    drop(ticket);
+    tokio::time::sleep(tw_gateway::throttle::PROBE_GRACE + Duration::from_millis(500)).await;
+    assert!(
+        matches!(
+            state.throttles.gate("丙", &[], None),
+            tw_gateway::throttle::Gate::Go(_)
+        ),
+        "改名之后 {:?} 还发不出去：{:?}",
+        tw_gateway::throttle::PROBE_GRACE,
+        state.throttles.peek("丙", &[])
+    );
+}
+
+/// `failover.wait_secs: 0` 是不等：一家满着时当场回 429。**它没排过队**，不该报
+/// `RequestQueued`（界面会把它显示成「排队中」）
+#[tokio::test]
+async fn a_request_that_is_not_allowed_to_wait_is_never_reported_as_queued() {
+    let slow = Reply {
+        delay_ms: 1000,
+        ..ok()
+    };
+    let up = upstream(Vec::new(), slow).await;
+    let mut cfg = config(&[&up], 0);
+    cfg.providers[0].max_concurrent = Some(1);
+    let (gw, _state, log) = serve(cfg).await;
+    let first = tokio::spawn(ask(gw, "一", None, 1).send());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let r = ask(gw, "二", None, 1).send().await.unwrap();
+    assert_eq!(r.status(), 429);
+    let id = log.id("二").await;
+    let queued: Vec<Event> = log
+        .all()
+        .into_iter()
+        .filter(|e| {
+            matches!(e, Event::RequestQueued { id: i, .. } | Event::RequestDequeued { id: i, .. } if *i == id)
+        })
+        .collect();
+    assert!(queued.is_empty(), "不等的请求报了排队：{queued:#?}");
+    assert_eq!(first.await.unwrap().unwrap().status(), 200);
+}
