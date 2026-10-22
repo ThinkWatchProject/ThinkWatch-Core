@@ -78,6 +78,9 @@ pub struct Ending {
     upstream_error: Option<(String, String)>,
     /// 上游报错的那一帧的 `data`：回程照它认是不是限流（见 [`Ending::upstream_fault`]）
     upstream_fault: Option<String>,
+    /// 上游报的错是解不开对话里别家封存的内容（见 [`tw_dialect::sealed`]）：失败的说明讲清楚
+    /// 怎么回事，不只转述原话
+    sealed_refused: bool,
     /// 上游回的不是 2xx、原样交给了客户端（见 [`Ending::refused`]）。**有它就不是成功**：
     /// 客户端拿到的是上游的错误，不是回答
     refusal: Option<Refusal>,
@@ -134,6 +137,9 @@ impl Refusal {
         });
         let upstream = self.provider;
         match said {
+            Some(message) if sealed_refusal(self.dialect, &message) => {
+                sealed_elsewhere(upstream, message)
+            }
             Some(message) => msg!(
                 "gw.upstream.status_message",
                 upstream = upstream, status = status, message = message =>
@@ -145,6 +151,23 @@ impl Refusal {
             ),
         }
     }
+}
+
+/// 上游的错误是解不开对话里别家封存的内容吗（见 [`tw_dialect::sealed::refused`]）。只认
+/// Responses 的：Anthropic 拒绝别家签的推理时，网关去掉推理再发一次就接得下去（见
+/// [`crate::seal`]），不用让人换上游
+fn sealed_refusal(dialect: ir::Dialect, said: &str) -> bool {
+    dialect == ir::Dialect::Responses && tw_dialect::sealed::refused(dialect, said.as_bytes())
+}
+
+/// 上游解不开对话里别家封存的内容。**说清楚怎么办**：原话只说解不开，看不出是换了上游
+fn sealed_elsewhere(upstream: String, message: String) -> Msg {
+    msg!(
+        "gw.upstream.sealed_elsewhere", upstream = upstream, message = message =>
+        "Upstream `{upstream}` cannot read this conversation's encrypted history: another \
+         upstream encrypted it, and only that one can read it. Route the conversation back to \
+         that upstream, or start a new conversation. The upstream said: {message}"
+    )
 }
 
 /// 上游在错误正文里说的那句话：按它的格式读出来的说明，读不出来的就是正文本身。**网页
@@ -321,6 +344,7 @@ impl Ending {
             watch: None,
             upstream_error: None,
             upstream_fault: None,
+            sealed_refused: false,
             refusal: None,
             answer: None,
             abort: None,
@@ -499,6 +523,7 @@ impl Ending {
         };
         let frames = w.frames.feed(chunk);
         if let Some((found, data)) = w.error_in(frames) {
+            self.sealed_refused = sealed_refusal(w.dialect, &data);
             self.upstream_error = Some(found);
             self.upstream_fault = Some(data);
             self.watch = None;
@@ -615,19 +640,22 @@ impl Ending {
             if self.upstream_error.is_none()
                 && let Some((found, data)) = w.error_in(frames)
             {
+                self.sealed_refused = sealed_refusal(w.dialect, &data);
                 self.upstream_error = Some(found);
                 self.upstream_fault = Some(data);
             }
         }
         if let Some((upstream, message)) = self.upstream_error.take() {
             let message: String = message.chars().take(500).collect();
-            self.fail(
-                tw_api::FailureSource::Upstream,
+            let why = if self.sealed_refused {
+                sealed_elsewhere(upstream, message)
+            } else {
                 msg!(
                     "gw.upstream.stream_error", upstream = upstream, message = message =>
                     "Upstream `{upstream}` reported an error partway through the response: {message}"
-                ),
-            );
+                )
+            };
+            self.fail(tw_api::FailureSource::Upstream, why);
             return;
         }
         let (usage, answered_model) = self.settle();

@@ -2075,6 +2075,9 @@ slug_enum! {
         Turn = "turn",
         /// 新的一轮，而上一次回答读写的缓存值得留、又没凉
         Cache = "cache",
+        /// 对话里带着上次回答的那一家封存的内容（Responses 的 `encrypted_content`），别家解不开。
+        /// 封存的不只是推理时，候选里也只有它
+        Sealed = "sealed",
     }
 }
 

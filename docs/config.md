@@ -1320,6 +1320,21 @@ it to. A `load-balance` weight is therefore the long-run share of requests:
 conversations in progress stay where they are and count toward that
 upstream's share.
 
+A conversation carrying content an upstream encrypted is a different case.
+OpenAI Responses hands clients encrypted state to send back each turn
+(`encrypted_content`: reasoning, compacted history, what Codex sub-agents
+report to each other), and only the account that encrypted it can read it.
+Such a conversation goes back to the upstream that last answered it whatever
+the rule now picks, even after the configuration changed, the cache went cold
+or a day has passed (it is remembered for 30 days). When it carries more than
+encrypted reasoning, that upstream is the only candidate: there is no
+failover, and if the upstream has been removed the request is refused with an
+explanation. Encrypted reasoning alone can be left out, so other upstreams
+remain as failover. After twcore restarts the gateway no longer knows which
+upstream encrypted a conversation; if another upstream receives it and cannot
+read it, the failure says so, and the conversation has to go back to the
+original upstream or start over.
+
 `balance_by` lets a `load-balance` group also look at how each upstream has
 been doing lately. Each member's weight is multiplied by a factor, and the
 group shares out requests by the result in the same way as above.

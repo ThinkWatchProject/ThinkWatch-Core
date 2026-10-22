@@ -247,6 +247,9 @@ pub struct Reading {
     /// 请求体解得开（是 JSON）。之后每一跳按字节改它的地方（见 [`crate::egress`]）凭这个
     /// 知道不用再解一遍
     pub json: bool,
+    /// 请求里带着上游封存的内容（见 [`tw_dialect::sealed`]）：这段对话只有封存它的那一家
+    /// 读得出来。只有生成回答的 Responses 请求会带
+    pub sealed: Option<tw_dialect::sealed::Sealed>,
 }
 
 pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -> Reading {
@@ -276,6 +279,9 @@ pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -
         },
     };
     facts.dialect = api.map(|a| a.slug()).unwrap_or_default().to_string();
+    let sealed = body
+        .filter(|_| generates && api == Some(ClientApi::OpenaiResponses))
+        .and_then(tw_dialect::sealed::sealed);
     Reading {
         api,
         generates,
@@ -283,6 +289,7 @@ pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -
         facts,
         harness: None,
         json: body.is_some(),
+        sealed,
     }
 }
 

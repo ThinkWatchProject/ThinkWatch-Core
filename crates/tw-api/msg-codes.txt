@@ -422,6 +422,7 @@ gw.route.failed
 gw.route.no_upstream_alive
 gw.route.protocol_mismatch
 gw.route.rule_failed
+gw.route.sealed_upstream_gone
 gw.route.selected_upstream_missing
 gw.route.upstream_missing
 gw.toolcall.connection_cut
@@ -439,6 +440,7 @@ gw.upstream.idle_timeout_mid_stream
 gw.upstream.paused
 gw.upstream.period_used_up
 gw.upstream.rate_limited
+gw.upstream.sealed_elsewhere
 gw.upstream.sign_failed
 gw.upstream.status
 gw.upstream.status_message

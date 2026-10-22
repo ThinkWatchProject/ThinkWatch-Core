@@ -20,8 +20,14 @@
 //! 对话按「路由 + 对话标识」记（见 [`Conversation`]），回答的那一家还要对得上策略组：
 //! 同一段对话这一轮被规则送去另一个组，上次那一家的缓存和这一组无关。
 //!
-//! **只在内存里**，最多记 [`CAP`] 段、每段最多 [`KEEP_MS`]：core 重启之后第一轮
-//! 按策略重新排，最坏是一次缓存重建。**跨配置重载存活**，但沿用的路由决定只在同一
+//! **带着上游封存内容的对话另当别论**（见 [`tw_dialect::sealed`]）：那段历史只有封存它的
+//! 那个账号读得出来，换到别家整个请求被拒，而且之后每一轮都被拒。所以每段对话还记着上次
+//! 回答它的那一家（[`Affinity::holder`]），不管策略组、不管缓存凉没凉、配置改没改、那一家
+//! 中途没没了声音。怎么用它见 `server::pipeline::route`。
+//!
+//! **只在内存里**，最多记 [`CAP`] 段、每段最多 [`KEEP_MS`]（带过封存内容的 [`SEALED_KEEP_MS`]）：
+//! core 重启之后第一轮按策略重新排，最坏是一次缓存重建 —— 带着封存内容的对话这时认不出
+//! 是谁封存的，可能被送去解不开的那一家。**跨配置重载存活**，但沿用的路由决定只在同一
 //! 份配置里有效（配置改了，规则可能已经不是那条了）。
 
 use std::collections::HashMap;
@@ -43,6 +49,10 @@ pub const CACHE_COLD_MS: u64 = 5 * 60 * 1000;
 
 /// 一段对话记多久。一天没动静的对话，缓存早就没了，沿用的路由决定也不再有意义
 pub const KEEP_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// 带过封存内容的对话记多久。缓存早就凉了，可那段历史还是只有那一家读得出来：客户端
+/// 隔几天接着这段对话说话（Codex 的 `resume`）也得送回那一家
+pub const SEALED_KEEP_MS: u64 = 30 * KEEP_MS;
 
 /// 最多记几段对话。满了先清掉超期的，还满就清最久没动静的那段
 pub const CAP: usize = 4096;
@@ -142,6 +152,11 @@ struct Entry {
     held: Option<Held>,
     /// 上次回答它的那一家
     answer: Option<Answer>,
+    /// 上次回答它的那一家，**只给封存的内容用**（见 [`Affinity::holder`]）：和 `answer` 不同，
+    /// 那一家没了声音也不放开 —— 换到别家也解不开
+    holder: Option<String>,
+    /// 这段对话带过封存的内容：记得久一些（[`SEALED_KEEP_MS`]）
+    sealed: bool,
 }
 
 struct Held {
@@ -180,7 +195,7 @@ impl Affinity {
             return None;
         }
         let map = self.lock();
-        let e = map.get(&c.key).filter(|e| fresh(e, now_ms))?;
+        let e = map.get(&c.key).filter(|e| recent(e, now_ms))?;
         let h = e.held.as_ref()?;
         (h.turn == c.turn.number && Weak::ptr_eq(&h.engine, &Arc::downgrade(engine)))
             .then(|| h.decision.clone())
@@ -216,7 +231,7 @@ impl Affinity {
         let map = self.lock();
         let a = map
             .get(&c.key)
-            .filter(|e| fresh(e, now_ms))?
+            .filter(|e| recent(e, now_ms))?
             .answer
             .as_ref()?;
         if a.group.as_deref() != group {
@@ -262,7 +277,22 @@ impl Affinity {
             at_ms: now_ms,
             cache,
         };
-        self.upsert(&t.key, now_ms, |e| e.answer = Some(answer));
+        self.upsert(&t.key, now_ms, |e| {
+            e.holder = Some(answer.provider.clone());
+            e.answer = Some(answer);
+        });
+    }
+
+    /// 这段对话带着上游封存的内容：上次回答它的那一家 —— 请求里最新的那几段是它封存的，前面
+    /// 的它也读得出来（不然它回答不了）。认不出是谁的（没回答过、core 重启过、记录超期了）是
+    /// None。
+    ///
+    /// 记下这段对话带过封存的内容：之后记得久一些（[`SEALED_KEEP_MS`]）
+    pub fn holder(&self, c: &Conversation, now_ms: u64) -> Option<String> {
+        let mut map = self.lock();
+        let e = map.get_mut(&c.key).filter(|e| fresh(e, now_ms))?;
+        e.sealed = true;
+        e.holder.clone()
     }
 
     /// `provider` 在这段对话上没了声音（无响应超时，见 `server::pipeline::idle`）：上次回答它
@@ -298,11 +328,18 @@ impl Affinity {
             touched_ms: now_ms,
             held: None,
             answer: None,
+            holder: None,
+            sealed: false,
         });
-        // 超期的整段作废：一天前那一轮的决定和回答，对现在的请求都没有意义
-        if !fresh(e, now_ms) {
+        // 超期的作废：一天前那一轮的决定和回答，对现在的请求都没有意义。封存的内容是谁的，
+        // 记到它自己的期限
+        if !recent(e, now_ms) {
             e.held = None;
             e.answer = None;
+        }
+        if !fresh(e, now_ms) {
+            e.holder = None;
+            e.sealed = false;
         }
         e.touched_ms = e.touched_ms.max(now_ms);
         f(e);
@@ -314,8 +351,15 @@ impl Affinity {
     }
 }
 
-fn fresh(e: &Entry, now_ms: u64) -> bool {
+/// 这一轮的决定、上次的回答还算数：一天之内动过
+fn recent(e: &Entry, now_ms: u64) -> bool {
     now_ms.saturating_sub(e.touched_ms) <= KEEP_MS
+}
+
+/// 这段对话还记着：带过封存内容的记 [`SEALED_KEEP_MS`]，别的和 [`recent`] 一样
+fn fresh(e: &Entry, now_ms: u64) -> bool {
+    let keep = if e.sealed { SEALED_KEEP_MS } else { KEEP_MS };
+    now_ms.saturating_sub(e.touched_ms) <= keep
 }
 
 /// 这一次由谁回答。**跟着请求的结局走**：上游回了成功、响应走完了才记下它和它读写
@@ -597,6 +641,33 @@ mod tests {
         // 只有一个候选：没有留不留可言
         let mut c: Vec<String> = vec!["乙".into()];
         assert_eq!(a.stay(&conv(1, true), Some("池子"), &mut c, up, MIN), None);
+    }
+
+    #[test]
+    fn the_holder_of_sealed_content_outlasts_what_the_cache_would_keep() {
+        let a = Arc::new(Affinity::default());
+        let c = conv(1, false);
+        assert_eq!(a.holder(&c, 0), None, "没回答过：认不出是谁的");
+        answer(&a, &c, "乙", 0, 0);
+        // 没了声音也照记：换到别家也解不开
+        a.left(&c, "乙");
+        assert_eq!(a.holder(&c, MIN).as_deref(), Some("乙"));
+        // 带过封存内容的对话记一个月：隔几天接着说话也送得回去，缓存那一份早就作废了
+        let later = 3 * KEEP_MS;
+        assert_eq!(a.holder(&c, later).as_deref(), Some("乙"));
+        let mut cands = pool();
+        assert_eq!(
+            a.stay(&conv(1, true), Some("池子"), &mut cands, up, later),
+            None
+        );
+        // 之后回答它的是丙：从此是丙的
+        answer(&a, &c, "丙", 0, later);
+        assert_eq!(a.holder(&c, later + MIN).as_deref(), Some("丙"));
+        assert_eq!(a.holder(&c, later + SEALED_KEEP_MS + 1), None);
+        // 没带过封存内容的对话照旧只记一天
+        let plain = Conversation::new("default", "别的", Turn::default());
+        answer(&a, &plain, "甲", 0, 0);
+        assert_eq!(a.holder(&plain, KEEP_MS + 1), None);
     }
 
     #[test]

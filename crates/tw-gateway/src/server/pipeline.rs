@@ -839,6 +839,30 @@ fn route(
         }),
         stayed_on: None,
     };
+    // 带着上游封存内容的对话，只有封存它的那一家读得出来（见 `tw_dialect::sealed`）。认得出是
+    // 谁封存的（上次回答它的那一家，见 `crate::affinity`），就送回它那儿：规则这一次选了谁、
+    // 配置改没改、缓存凉没凉都不管。认不出来的照常路由 —— 被拒了，失败的说明会讲清楚
+    let sealed = reading
+        .sealed
+        .zip(conv)
+        .and_then(|(kind, c)| Some((kind, state.affinity.holder(c, now)?)));
+    if let Some((tw_dialect::sealed::Sealed::Content, holder)) = &sealed {
+        // 去不掉的封存：别家一个都接不下去，候选只剩它，也不故障转移
+        if !rt.config.providers.iter().any(|p| p.name == *holder) {
+            return Routed::Refused(
+                choice,
+                GatewayError::config(msg!(
+                    "gw.route.sealed_upstream_gone", upstream = holder.clone() =>
+                    "This conversation's history is encrypted by upstream `{upstream}`, which is \
+                     no longer configured, and no other upstream can read it. Start a new \
+                     conversation."
+                )),
+            );
+        }
+        decision.candidates = vec![holder.clone()];
+        decision.via_group = None;
+        choice.group = None;
+    }
     // 每个候选实际要的模型和它的来历：规则改写过的按改写后的算；客户端写的、阶段一改写的
     // 是客户端那一侧的名称（可能是别名），指定的、阶段二改的原样发出。准入看它
     let asked = rt.engine.asked(
@@ -878,7 +902,17 @@ fn route(
         conv,
         now,
     );
-    if let Some(why) = arranged.stayed {
+    let mut stayed = arranged.stayed;
+    // 封存的只有推理：封存它的那一家排到头上，推理接得上；别家照旧留着做故障转移 —— 去掉推理
+    // 也接得下去（见 `crate::seal`）
+    if let Some((_, holder)) = &sealed
+        && let Some(at) = decision.candidates.iter().position(|p| p == holder)
+    {
+        let p = decision.candidates.remove(at);
+        decision.candidates.insert(0, p);
+        stayed = Some(tw_api::Stay::Sealed);
+    }
+    if let Some(why) = stayed {
         choice.affinity = Some(tw_api::AffinityView {
             held_route,
             stayed: Some(why),

@@ -9,7 +9,8 @@
 //! `usage()`），拼上游地址（[`url`]），去掉 DeepSeek Harness 只发给 DeepSeek 的
 //! 扩展（[`harness`]），在原文上找调用方的正文（[`caller`]，内容过滤读它、删它），
 //! 读写各格式里名字不同的请求参数（[`params`]），Codex 的远程压缩转给别家时怎么做
-//! （[`compaction`]），以及请求体上的提示缓存断点（[`cache`]）。
+//! （[`compaction`]），请求体上的提示缓存断点（[`cache`]），以及上游封存、只有那个账号读得出来
+//! 的内容（[`sealed`]）。
 
 pub mod anthropic;
 pub mod bedrock;
@@ -25,6 +26,7 @@ pub mod ir;
 pub mod official;
 pub mod params;
 pub mod responses;
+pub mod sealed;
 pub mod think;
 pub mod url;
 pub mod usage;
