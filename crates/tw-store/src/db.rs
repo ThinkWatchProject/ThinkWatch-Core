@@ -1678,9 +1678,13 @@ impl Db {
             };
             let (total, rules) = routes.get(route);
             total.add(at_ms, failed);
-            let decider = rules.get(rule);
-            decider.add(at_ms, failed);
-            decider.decided += 1;
+            // 规则还没做出决定就被拒的（没有一条命中、求不了值、还没配上游）：决定去向的规则
+            // 是空的，只算进这条路由
+            if !rule.is_empty() {
+                let decider = rules.get(rule);
+                decider.add(at_ms, failed);
+                decider.decided += 1;
+            }
             let mut counted = vec![rule];
             for name in rewritten_by.iter().map(String::as_str).chain(denied_by) {
                 if !counted.contains(&name) {
@@ -3881,7 +3885,8 @@ mod route_stats_tests {
     /// 每条路由走了多少、每条规则命中了多少、多少失败了、最后一次是什么时候。
     ///
     /// **一个请求算在它命中的每条规则上，每条只算一次**：决定去向的、附加了改写
-    /// 的、选定上游之后拒绝了它的。被规则拒绝的也算命中 —— 它们是失败。
+    /// 的、选定上游之后拒绝了它的。被规则拒绝的也算命中 —— 它们是失败。规则还没做出决定
+    /// 就被拒的只算进路由。
     #[test]
     fn each_route_and_rule_counts_the_requests_it_matched() {
         let db = Db::in_memory().unwrap();
@@ -3902,6 +3907,10 @@ mod route_stats_tests {
         let mut late = routed(5, 500, "默认", "兜底", &[], Some("中转不收密钥"));
         late.error = Some(upstream_failed("denied"));
         db.insert(&late).unwrap();
+        // 规则还没做出决定就被拒了（没有一条命中）：算进这条路由，不算在哪条规则上
+        let mut undecided = routed(6, 450, "默认", "", &[], None);
+        undecided.error = Some(upstream_failed("no rule"));
+        db.insert(&undecided).unwrap();
 
         let got = db.route_stats(0, 1_000).unwrap().routes;
         assert_eq!(
@@ -3936,8 +3945,12 @@ mod route_stats_tests {
         );
 
         let default = &got[1];
-        assert_eq!((default.requests, default.failed), (1, 1));
+        assert_eq!((default.requests, default.failed), (2, 2));
         assert_eq!(hits(default, "兜底").decided, 1);
+        assert!(
+            default.rules.iter().all(|h| !h.rule.is_empty()),
+            "{default:?}"
+        );
         let late_deny = hits(default, "中转不收密钥");
         assert_eq!(
             (late_deny.decided, late_deny.requests, late_deny.failed),

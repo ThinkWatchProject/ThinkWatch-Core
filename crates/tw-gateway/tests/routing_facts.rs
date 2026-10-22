@@ -3,8 +3,9 @@
 //! - 会话在开始时就定了，开始事件带着它（以前只有指纹，落库时才算出会话）；
 //! - 走的路由、决定去向的规则、策略组、改写了它的规则，开始时就有，路由事件
 //!   给终稿（加上第二阶段的改写和拒绝）；
-//! - 规则做了决定、请求却一家上游都没去的（被规则拒绝、选中的上游都服务不了），
-//!   照样有开始、路由和一条失败 —— 以前这些请求在事件里根本不存在。
+//! - 认出了密钥、请求却一家上游都没去的（被规则拒绝、选中的上游都服务不了、密钥不让用
+//!   那个模型、没有一条规则命中、还没配上游），照样有开始、路由和一条失败 —— 以前这些
+//!   请求在事件里根本不存在。
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -325,6 +326,165 @@ async fn a_request_whose_chosen_upstreams_cannot_serve_it_is_recorded_under_its_
         matches!(&evs[2], Event::RequestFailed { source, .. } if source == "config"),
         "{evs:?}"
     );
+}
+
+/// 发一个请求，交回状态码和响应体：被拒的请求留一行，**客户端收到的照旧**
+async fn answer(gw: SocketAddr, body: &str) -> (u16, serde_json::Value) {
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    (status, r.json().await.unwrap())
+}
+
+/// 一家上游都没去的那一行：开始（不发往哪一家，模型是客户端写的）、空尝试链的路由、一条
+/// 失败。交回三条事件里的路由、决定去向的规则，和失败的来源、错误
+fn nowhere(evs: &[Event], model: &str) -> (String, String, String, tw_api::Msg) {
+    assert_eq!(evs.len(), 3, "{evs:?}");
+    let Event::RequestStarted {
+        provider,
+        model: started_model,
+        route,
+        rule,
+        ..
+    } = &evs[0]
+    else {
+        panic!("{evs:?}")
+    };
+    assert!(provider.is_empty(), "{evs:?}");
+    assert_eq!(started_model, model, "{evs:?}");
+    let Event::RequestRouted {
+        route: routed_route,
+        rule: routed_rule,
+        attempts,
+        denied_by: None,
+        ..
+    } = &evs[1]
+    else {
+        panic!("{evs:?}")
+    };
+    assert!(attempts.is_empty(), "{evs:?}");
+    assert_eq!((routed_route, routed_rule), (route, rule), "{evs:?}");
+    let Event::RequestFailed {
+        model: failed_model,
+        source,
+        message,
+        ..
+    } = &evs[2]
+    else {
+        panic!("{evs:?}")
+    };
+    assert_eq!(failed_model, model, "{evs:?}");
+    (
+        route.clone(),
+        rule.clone(),
+        source.slug().to_string(),
+        message.clone(),
+    )
+}
+
+/// 密钥不让用的模型：准入没过。**照样留一行**，记在决定去向的那条规则上，模型是客户端写的
+/// 那个，错误照告诉客户端的那一句 —— 以前这个请求在流量里根本看不见，没法排查。客户端收到
+/// 的还是那个 400
+#[tokio::test]
+async fn a_model_the_key_may_not_use_is_recorded_under_its_rule() {
+    let up = upstream().await;
+    let mut config = cfg(
+        vec![provider("up", up)],
+        vec![rule("走池子", "{}", Some("池"), None, None)],
+    );
+    config.clients[0].allow = Some(vec!["claude-sonnet-*".into()]);
+    let (gw, mut events) = serve(config).await;
+
+    let (status, body) = answer(gw, &chat("claude-opus-4-1", "hi")).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "[ThinkWatch] Gateway key `我` may not use model claude-opus-4-1. GET /v1/models lists \
+         the models that are available.",
+        "{body}"
+    );
+
+    let evs = one_request(&mut events).await;
+    let (route, rule, source, why) = nowhere(&evs, "claude-opus-4-1");
+    assert_eq!((route.as_str(), rule.as_str()), ("工作", "走池子"));
+    assert_eq!(source, "request");
+    assert_eq!(why.code, "gw.model.not_allowed");
+    assert_eq!(why.args["model"], "claude-opus-4-1");
+    assert_eq!(why.args["key"], "我");
+
+    // 让用的照常
+    assert_eq!(ask(gw, &chat("claude-sonnet-4-5", "hi")).await, 200);
+}
+
+/// 没有一条规则命中：规则还没做出决定。**也留一行**，记在密钥走的那条路由上，决定去向的规则
+/// 空着
+#[tokio::test]
+async fn a_request_no_rule_matches_is_recorded_on_its_route_with_no_rule() {
+    let up = upstream().await;
+    let (gw, mut events) = serve(cfg(
+        vec![provider("up", up)],
+        vec![rule(
+            "只给 opus",
+            "{ model: claude-opus-* }",
+            Some("池"),
+            None,
+            None,
+        )],
+    ))
+    .await;
+
+    let (status, body) = answer(gw, &chat("claude-sonnet-4-5", "hi")).await;
+    assert_eq!(status, 500, "{body}");
+    let text = body["error"]["message"].as_str().unwrap();
+    assert!(text.starts_with("[ThinkWatch] Routing failed: "), "{body}");
+
+    let evs = one_request(&mut events).await;
+    let (route, rule, source, why) = nowhere(&evs, "claude-sonnet-4-5");
+    assert_eq!((route.as_str(), rule.as_str()), ("工作", ""));
+    assert_eq!(source, "config");
+    assert_eq!(why.code, "gw.route.failed");
+    assert_eq!(format!("[ThinkWatch] {}", why.text), text);
+}
+
+/// 还没配上游：**也留一行**，记在密钥走的那条路由上，决定去向的规则空着。客户端收到的照旧
+/// 是「还没配上游」那一句
+#[tokio::test]
+async fn a_request_with_no_upstream_configured_is_recorded() {
+    let config = Config {
+        clients: vec![Client {
+            name: "我".into(),
+            key: "tw-k".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (gw, mut events) = serve(config).await;
+
+    let (status, body) = answer(gw, &chat("claude-sonnet-4-5", "hi")).await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "[ThinkWatch] No upstream is configured yet. Add one in ThinkWatch Lite, or under \
+         `providers` in config.yaml.",
+        "{body}"
+    );
+
+    let evs = one_request(&mut events).await;
+    let (route, rule, source, why) = nowhere(&evs, "claude-sonnet-4-5");
+    assert_eq!(
+        (route.as_str(), rule.as_str()),
+        (tw_engine::DEFAULT_ROUTE, "")
+    );
+    assert_eq!(source, "config");
+    assert_eq!(why.code, "gw.config.no_upstreams");
 }
 
 /// 选定上游之后才判断的规则拒绝了它（第二阶段）：**路由事件照样发**，说是哪条规则、

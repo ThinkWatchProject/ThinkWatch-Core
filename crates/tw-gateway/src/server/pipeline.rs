@@ -103,26 +103,16 @@ pub(super) async fn pipeline(
         Probe::Intent(intent) => intent,
     };
 
-    // 首次运行还没配完是正常状态，不是配置错误。这条要在路由之前挡，
-    // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
-    // 说不清下一步。
-    if rt.config.providers.is_empty() {
-        return Err(GatewayError::config(msg!(
-            "gw.config.no_upstreams" =>
-            "No upstream is configured yet. Add one in ThinkWatch Lite, or under `providers` in \
-             config.yaml."
-        )));
-    }
-
     // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
     let (reading, fp) = heavy(&req.body, || {
         read(&req, intent, parsed.as_ref(), (state.local_time)())
     });
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
-    let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
+    let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref()) {
         Routed::Go(choice, decision) => (choice, decision),
-        // 规则做了决定，请求却一家上游都不会去。**照样开始、照样报路由**，失败由
+        // 请求一家上游都不会去：还没配上游、规则没做出决定、规则拒绝了、模型准入没过、规则
+        // 选中的上游都服务不了。**照样开始、照样报路由**（尝试链是空的），失败由
         // `passthrough` 按这个错误报 —— 不排队：它一个字节都不会发出去
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
@@ -604,6 +594,9 @@ fn outgrown(
 /// 目录空着时不看清单：那说明探测还没回来或者上游都不给列表，这时候拦等于把整个网关
 /// 关掉。**密钥的 `allow` 照样看**：它写在配置里，和清单问没问到无关 —— 不看的话，
 /// 下一步按密钥跳过候选时，请求会以「没有上游可用」被拒，说不清是密钥的事。
+///
+/// 没过的请求**照样留一行**（[`Routed::Refused`]）：模型名写错了、密钥不让用，要在流量里
+/// 看得见才排查得了。
 fn admit(
     state: &AppState,
     rt: &Runtime,
@@ -752,8 +745,10 @@ fn admit(
 enum Routed {
     /// 选出了候选，照常往下走
     Go(Choice, tw_engine::Decision),
-    /// 规则做了决定，请求却一家上游都不会去：规则拒绝了它，或者规则选中的上游
-    /// 都服务不了它。**这一行要留下**（见 [`super::routed_nowhere`]）
+    /// 请求一家上游都不会去：还没配上游，规则没做出决定（没有一条命中、求不了值），规则
+    /// 拒绝了它，模型准入没过（[`admit`]），或者规则选中的上游都服务不了它。**这一行要
+    /// 留下**（见 [`super::routed_nowhere`]）：密钥认出来了，被拒的请求和别的失败一样要在
+    /// 流量里看得见。规则还没做出决定的，`Choice` 里决定去向的规则是空的
     Refused(Choice, GatewayError),
 }
 
@@ -761,20 +756,36 @@ enum Routed {
 /// provider」就是留给这一段的接缝。
 ///
 /// 出来的候选已经去掉了服务不了的、按策略组排好了序；熔断过滤在并发
-/// 闸门之后（见 [`start`]）。
-///
-/// 返回的错误是**规则还没做出决定**的那些（没有一条规则命中、规则求不了值）：
-/// 那时说不出这个请求算在哪条规则上，不留这一行，和鉴权没过一样。模型准入没过
-/// （[`admit`]）也从这里返回，同样不留这一行 —— 和准入放在路由之前时一样。
+/// 闸门之后（见 [`start`]）。去不了任何一家的一律是 [`Routed::Refused`]，留一行。
 fn route(
     state: &AppState,
     rt: &Runtime,
     req: &Inbound,
     reading: &crate::client_api::Reading,
     conv: Option<&crate::affinity::Conversation>,
-) -> Result<Routed, GatewayError> {
+) -> Routed {
     let facts = &reading.facts;
     let route = rt.engine.route_of(&req.client_name).to_string();
+    // 规则还没做出决定：说不出这个请求算在哪条规则上，决定去向的规则空着
+    let undecided = |why| {
+        Routed::Refused(
+            Choice {
+                route: route.clone(),
+                ..Default::default()
+            },
+            why,
+        )
+    };
+    // 首次运行还没配完是正常状态，不是配置错误。这条要在规则求值之前挡，
+    // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
+    // 说不清下一步。
+    if rt.config.providers.is_empty() {
+        return undecided(GatewayError::config(msg!(
+            "gw.config.no_upstreams" =>
+            "No upstream is configured yet. Add one in ThinkWatch Lite, or under `providers` in \
+             config.yaml."
+        )));
+    }
     let now = now_ms();
     // 同一轮里沿用这一轮开头的决定：按输入大小、有没有图片分流的规则，不能让一轮
     // 半路换家（见 `crate::affinity`）。输入超出了所选模型的上下文的，重新求值
@@ -784,16 +795,19 @@ fn route(
     let held_route = held.is_some();
     let mut decision = match held {
         Some(d) => d,
-        None => match rt.engine.route(facts).map_err(|e| {
-            GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
-        })? {
-            tw_engine::Outcome::Route(d) => {
+        None => match rt.engine.route(facts) {
+            Err(e) => {
+                return undecided(GatewayError::config(msg!(
+                    "gw.route.failed", detail = e => "Routing failed: {detail}"
+                )));
+            }
+            Ok(tw_engine::Outcome::Route(d)) => {
                 if let Some(c) = conv {
                     state.affinity.decided(c, &rt.engine, &d, now);
                 }
                 d
             }
-            tw_engine::Outcome::Deny { rule, reason } => {
+            Ok(tw_engine::Outcome::Deny { rule, reason }) => {
                 // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
                 // 眼里没有区别。
                 tracing::info!(%rule, "a rule denied the request");
@@ -810,7 +824,7 @@ fn route(
                     affinity: None,
                     stayed_on: None,
                 };
-                return Ok(Routed::Refused(choice, why));
+                return Routed::Refused(choice, why);
             }
         },
     };
@@ -832,7 +846,10 @@ fn route(
         facts,
         &decision,
     );
-    admit(state, rt, req, reading, &decision, &asked)?;
+    // 准入没过：规则做了决定，模型却去不了（写错了、没有上游提供、密钥不让用）。照样留一行
+    if let Err(why) = admit(state, rt, req, reading, &decision, &asked) {
+        return Routed::Refused(choice, why);
+    }
     // 每一家发出去的名字：别名对到各家自己的名称。跳过、比价看它（见 `crate::sent`）
     let catalog = state.catalog.load();
     let allow = crate::models::key_allow(&rt.config, &req.client_name);
@@ -847,7 +864,7 @@ fn route(
     let serving = crate::sent::serving(&rt.config, &catalog, &decision, &asked, allow);
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
     if serving.usable.is_empty() {
-        return Ok(Routed::Refused(choice, serving.explain(model)));
+        return Routed::Refused(choice, serving.explain(model));
     }
     if !serving.skipped.is_empty() {
         tracing::debug!(skipped = ?serving.skipped, %model, "skipping the candidates that cannot serve this request");
@@ -874,7 +891,7 @@ fn route(
     if let Some(leader) = decision.candidates.first() {
         arranged.charge(&decision.candidates, leader);
     }
-    Ok(Routed::Go(choice, decision))
+    Routed::Go(choice, decision)
 }
 
 /// 排好了的候选（[`arrange`]）：会话粘性留下了哪一家的理由，和 `load-balance` 这一次还没记的账。
