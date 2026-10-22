@@ -75,32 +75,10 @@ impl Refused {
     }
 }
 
-/// 上游这个 400 是在拒绝封存的推理吗。`wire` 是发给它的那一份的格式。
-///
-/// 看原话，不看错误外壳的结构：同一句话，OpenAI 放在 `error.code`，Codex 后端和
-/// 中转各有各的包法。
+/// 上游这个 400 是在拒绝封存的推理吗。`wire` 是发给它的那一份的格式。认法见
+/// [`tw_dialect::sealed::refused`]
 pub fn refusal(wire: Dialect, body: &[u8]) -> bool {
-    if body.len() > REFUSAL_MAX {
-        return false;
-    }
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    match wire {
-        Dialect::Responses => {
-            text.contains("invalid_encrypted_content")
-                || ((text.contains("encrypted content") || text.contains("encrypted_content"))
-                    && [
-                        "could not be verified",
-                        "could not be decrypted",
-                        "could not decrypt",
-                    ]
-                    .iter()
-                    .any(|w| text.contains(w)))
-        }
-        Dialect::Anthropic => {
-            text.contains("invalid") && text.contains("signature") && text.contains("thinking")
-        }
-        _ => false,
-    }
+    body.len() <= REFUSAL_MAX && tw_dialect::sealed::refused(wire, body)
 }
 
 /// 去掉请求体里封存的推理。`only` 给了的只去掉其中的那些，没给的全去掉。
@@ -211,30 +189,14 @@ mod tests {
     }
 
     #[test]
-    fn openais_refusal_is_recognised_and_other_400s_are_not() {
+    fn a_refusal_is_read_only_from_a_short_body() {
         let refused = json!({"error": {
             "message": "The encrypted content for item rs_68 could not be verified.",
-            "type": "invalid_request_error", "param": null, "code": "invalid_encrypted_content"}});
-        assert!(refusal(Dialect::Responses, refused.to_string().as_bytes()));
-        // 没带码、只有那句话的中转
-        assert!(refusal(
-            Dialect::Responses,
-            br#"{"detail":"Could not decrypt the provided encrypted_content."}"#
-        ));
-        let other = json!({"error": {"message": "max_output_tokens is too large", "code": "invalid_value"}});
-        assert!(!refusal(Dialect::Responses, other.to_string().as_bytes()));
-        // 格式不对上：Anthropic 的那句不算 Responses 的
-        assert!(!refusal(Dialect::Chat, refused.to_string().as_bytes()));
-    }
-
-    #[test]
-    fn anthropics_refusal_is_recognised() {
-        let refused = json!({"type": "error", "error": {"type": "invalid_request_error",
-            "message": "messages.1.content.0: Invalid `signature` in `thinking` block"}});
-        assert!(refusal(Dialect::Anthropic, refused.to_string().as_bytes()));
-        let other = json!({"type": "error", "error": {"type": "invalid_request_error",
-            "message": "max_tokens: must be greater than thinking.budget_tokens"}});
-        assert!(!refusal(Dialect::Anthropic, other.to_string().as_bytes()));
+            "code": "invalid_encrypted_content"}})
+        .to_string();
+        assert!(refusal(Dialect::Responses, refused.as_bytes()));
+        let huge = format!("{refused}{}", " ".repeat(REFUSAL_MAX));
+        assert!(!refusal(Dialect::Responses, huge.as_bytes()));
     }
 
     #[test]
