@@ -79,11 +79,21 @@ pub(super) async fn ws_upgrade(
             at_ms: now_ms(),
         })
     };
-    let mut decision = match rt.engine.route(&facts).map_err(|e| {
-        GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
-    })? {
-        tw_engine::Outcome::Route(d) => d,
-        tw_engine::Outcome::Deny { rule, reason } => {
+    // 一家上游都不去的升级：开始、空尝试链的路由（阶段二拒绝的记上是哪条规则）、一条失败，
+    // 交回这个错误
+    let refuse = |choice: Choice, denied_by: Option<String>, why: GatewayError| {
+        let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
+        let mut routed = super::routed_nowhere(id, choice);
+        if let tw_api::Event::RequestRouted { denied_by: d, .. } = &mut routed {
+            *d = denied_by;
+        }
+        state.bus.emit(routed);
+        ending.failed(why.source.into(), why.detail.clone());
+        why
+    };
+    let mut decision = match rt.engine.route(&facts) {
+        Ok(tw_engine::Outcome::Route(d)) => d,
+        Ok(tw_engine::Outcome::Deny { rule, reason }) => {
             tracing::info!(%rule, "a rule denied the WebSocket upgrade");
             let err = GatewayError::denied(msg!(
                 "gw.route.denied", rule = rule.clone(), reason = reason =>
@@ -92,15 +102,20 @@ pub(super) async fn ws_upgrade(
             let choice = Choice {
                 route,
                 rule,
-                group: None,
-                rewritten_by: Vec::new(),
-                affinity: None,
-                stayed_on: None,
+                ..Default::default()
             };
-            let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
-            state.bus.emit(super::routed_nowhere(id, choice));
-            ending.failed(err.source.into(), err.detail.clone());
-            return Err(err);
+            return Err(refuse(choice, None, err));
+        }
+        // 规则没做出决定（没有一条命中、求不了值）：照样留一行，决定去向的规则空着
+        Err(e) => {
+            let err = GatewayError::config(msg!(
+                "gw.route.failed", detail = e => "Routing failed: {detail}"
+            ));
+            let choice = Choice {
+                route,
+                ..Default::default()
+            };
+            return Err(refuse(choice, None, err));
         }
     };
     // 候选的次序：**和 HTTP 那条路同一段**（见 `super::pipeline::arrange`）。先去掉服务不了的
@@ -137,6 +152,14 @@ pub(super) async fn ws_upgrade(
         local_time: state.local_time.clone(),
     };
     let (alive, _) = state.health.filter(&decision.candidates);
+    // 规则做了决定、却一家都连不上时留的那一行记在哪儿
+    let decided = || Choice {
+        route: route.clone(),
+        rule: decision.matched_rule.clone(),
+        group: decision.via_group.clone(),
+        rewritten_by: decision.rewritten_by.clone(),
+        ..Default::default()
+    };
     // 升级请求带着模型的（Realtime）：挑头一家连得上的 —— 别名对得上、要发给它的名字密钥
     // 让用，和 HTTP 那条路挑候选时一样。别的连接升级时不知道模型，连头一家活着的
     let picked = if facts.model.is_empty() {
@@ -164,35 +187,23 @@ pub(super) async fn ws_upgrade(
                     unserved.get_or_insert(why);
                 }
                 // 阶段二的规则拒绝了：**和规则在阶段一拒绝一样留一行**，拒绝它的是哪条规则
-                // 写进路由事件
+                // 写进路由事件。阶段二求不了值的也留一行
                 crate::ws::Connect::Refused { rule, why } => {
-                    let choice = Choice {
-                        route,
-                        rule: decision.matched_rule.clone(),
-                        group: decision.via_group.clone(),
-                        rewritten_by: decision.rewritten_by.clone(),
-                        affinity: None,
-                        stayed_on: None,
-                    };
-                    let Some(rule) = rule else { return Err(why) };
-                    tracing::info!(%rule, provider = %c, "a phase-two rule denied the WebSocket upgrade");
-                    let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
-                    let mut routed = super::routed_nowhere(id, choice);
-                    if let tw_api::Event::RequestRouted { denied_by, .. } = &mut routed {
-                        *denied_by = Some(rule);
+                    if let Some(rule) = &rule {
+                        tracing::info!(%rule, provider = %c, "a phase-two rule denied the WebSocket upgrade");
                     }
-                    state.bus.emit(routed);
-                    ending.failed(why.source.into(), why.detail.clone());
-                    return Err(why);
+                    return Err(refuse(decided(), rule, why));
                 }
             }
         }
         // 一家都连不上。每一家要发的名字密钥都不让用的，说是密钥的事（和 HTTP 那条路的准入
-        // 一样）；有让用的，说它为什么连不上（别名对不上）。**不留这一行**，和 HTTP 那条路
+        // 一样）；有让用的，说它为什么连不上（别名对不上）。**照样留一行**，和 HTTP 那条路
         // 准入没过一样
         match (picked, unserved, barred) {
             (Some(p), _, _) => Some(p),
-            (None, Some(why), _) | (None, None, Some(why)) => return Err(why),
+            (None, Some(why), _) | (None, None, Some(why)) => {
+                return Err(refuse(decided(), None, why));
+            }
             (None, None, None) => None,
         }
     };

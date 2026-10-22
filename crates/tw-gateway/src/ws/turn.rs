@@ -10,8 +10,9 @@
 //!
 //! **连接本身不留行**：一条连接跑好几轮、中间可以闲着很久，流量里该看的是每一轮。会话照
 //! HTTP 那条路按每一帧认（Codex 每段对话带着 `prompt_cache_key`），同一段对话的几轮归到同一
-//! 次会话里。没有哪一轮可挂的 —— 升级时就被规则拒绝的、连不上上游的 —— 那条连接自己留一行
-//! （见 `server::upgrade`）。
+//! 次会话里。没有哪一轮可挂的 —— 升级时就被规则拒绝的、规则没做出决定的、连不上上游的 ——
+//! 那条连接自己留一行（见 `server::upgrade`）。一轮没发出去的（规则拒绝了、密钥不让用要发的
+//! 模型、这一家服务不了要的别名）也留一行（见 [`not_sent`]）。
 //!
 //! **上限和并发按轮算，和 HTTP 那条路的一个请求同一套**（[`admit`]）：天、周、月用满了就拒，
 //! 密钥的并发上限等前面的结束，分钟、小时等得到就等；然后等这一家能发 —— 这条连接只连着这一家，
@@ -851,14 +852,15 @@ fn refused(a: &Admit, choice: &Choice, why: GatewayError) -> NotAdmitted {
     NotAdmitted::Failed(why)
 }
 
-/// 规则拒绝了这一帧：**和 HTTP 那条路被规则拒绝的请求一样留一行**（开始、空尝试链的路由、
-/// 一条 `denied` 的失败）。阶段二拒绝的，拒绝它的那条规则记在路由事件的 `denied_by` 上；阶段
-/// 一拒绝的，它就是决定去向的那条
+/// 这一帧没发出去（规则拒绝了、密钥不让用要发的模型、这一家服务不了要的别名、规则没做出
+/// 决定）：**和 HTTP 那条路一家上游都不去的请求一样留一行**（开始、空尝试链的路由、一条失败，
+/// 错误照告诉客户端的那一句）。阶段二拒绝的，拒绝它的那条规则记在路由事件的 `denied_by` 上；
+/// 阶段一拒绝的，它就是决定去向的那条；规则没做出决定的，决定去向的规则空着
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn denied(
+pub(crate) fn not_sent(
     state: &AppState,
     line: &Line,
-    by: super::Denied,
+    by: super::Decider,
     why: &GatewayError,
     requested: String,
     fingerprint: Option<&str>,
@@ -868,11 +870,19 @@ pub(crate) fn denied(
 ) {
     let mut choice = line.choice.clone();
     let denied_by = match by {
-        super::Denied::PhaseOne(rule) => {
+        super::Decider::Upgrade => None,
+        super::Decider::Undecided => {
+            choice = Choice {
+                route: choice.route,
+                ..Default::default()
+            };
+            None
+        }
+        super::Decider::PhaseOne(rule) => {
             choice.rule = rule;
             None
         }
-        super::Denied::PhaseTwo(rule) => Some(rule),
+        super::Decider::PhaseTwo(rule) => Some(rule),
     };
     let (id, ending) = line.opener.open(Opening {
         choice: &choice,

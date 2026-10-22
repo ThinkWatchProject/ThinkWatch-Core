@@ -79,13 +79,19 @@ async fn ask(gw: SocketAddr, model: &str) -> u16 {
         .as_u16()
 }
 
-#[tokio::test]
-async fn every_route_and_rule_counts_what_went_through_it_including_denials() {
+/// 真网关、真存储层、控制面，和 `twcore` 一样接：网关的事件经总线落库
+struct World {
+    _dir: tempfile::TempDir,
+    gw: SocketAddr,
+    store: Arc<tokio::sync::Mutex<tw_store::Recorder>>,
+    app: axum::Router,
+}
+
+async fn world(text: &str) -> World {
     let d = tempfile::tempdir().unwrap();
-    let text = yaml(upstream().await);
     let p = d.path().join("config.yaml");
-    std::fs::write(&p, &text).unwrap();
-    let cfg: tw_config::Config = serde_yaml_ng::from_str(&text).unwrap();
+    std::fs::write(&p, text).unwrap();
+    let cfg: tw_config::Config = serde_yaml_ng::from_str(text).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
     // 和 twcore 一样：存储层从总线给它的那条通道收事件，落库
     let (_bodies, rx) = tokio::sync::mpsc::channel(8);
@@ -113,33 +119,56 @@ async fn every_route_and_rule_counts_what_went_through_it_including_denials() {
     let addr = tw_gateway::serve(gw, ([127, 0, 0, 1], 0).into())
         .await
         .unwrap();
+    World {
+        _dir: d,
+        gw: addr,
+        store,
+        app,
+    }
+}
+
+impl World {
+    /// 落库在另一个任务上：等 `n` 行都写下
+    async fn landed(&self, n: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.store.lock().await.db().count().unwrap() < n {
+            assert!(std::time::Instant::now() < deadline, "{n} 个请求没有都落库");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn get(&self, path: &str) -> serde_json::Value {
+        let resp = self
+            .app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn every_route_and_rule_counts_what_went_through_it_including_denials() {
+    let w = world(&yaml(upstream().await)).await;
+    let addr = w.gw;
 
     let before = now_ms();
     assert_eq!(ask(addr, "claude-sonnet-4-5").await, 200);
     assert_eq!(ask(addr, "claude-haiku-4-5").await, 200);
     assert_eq!(ask(addr, "claude-opus-4-1").await, 403, "该被规则拒绝");
-
-    // 落库在另一个任务上：等三行都写下
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while store.lock().await.db().count().unwrap() < 3 {
-        assert!(std::time::Instant::now() < deadline, "三个请求没有都落库");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    w.landed(3).await;
 
     // 窗口的右端给到将来：缺省是「此刻」，而最后那个请求可能就开始在这一毫秒
-    let resp = app
-        .oneshot(
-            Request::get("/summary/routes?from_ms=0&to_ms=99999999999999")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let stats: tw_api::RouteStats = serde_json::from_slice(&body).unwrap();
+    let stats: tw_api::RouteStats = serde_json::from_value(
+        w.get("/summary/routes?from_ms=0&to_ms=99999999999999")
+            .await,
+    )
+    .unwrap();
     // 库是这个测试里新建的：记录从第一个请求开始，不是问的起点（0）
     let covered = stats.covered_since_ms.expect("库里有请求，记录有起点");
     assert!(
@@ -169,6 +198,73 @@ async fn every_route_and_rule_counts_what_went_through_it_including_denials() {
         "只附加改写的规则也数得到，只是没决定去向"
     );
     assert_eq!(rule("从没命中过"), None, "没命中过的规则不在里面");
+}
+
+/// 认出了密钥、却一家上游都没去的请求**落进请求库**：密钥不让用的模型（准入没过）、没有一条
+/// 规则命中的。流量里那一行的模型是客户端写的、错误是告诉客户端的那一句；路由的统计数得到
+/// 它们，规则没做出决定的只算进路由，不冒出一条没有名字的规则
+#[tokio::test]
+async fn a_request_refused_before_any_upstream_is_a_row_with_the_model_the_client_asked_for() {
+    let up = upstream().await;
+    let w = world(&format!(
+        r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: 我
+    key: tw-k
+    route: 工作
+    allow: [claude-sonnet-*]
+providers:
+  - name: up
+    base_url: http://{up}
+    key: sk-x
+    protocol: anthropic
+routes:
+  - name: 工作
+    rules:
+      - name: 只走 claude
+        when: {{ model: claude-* }}
+        to: up
+"#
+    ))
+    .await;
+
+    assert_eq!(ask(w.gw, "claude-opus-4-1").await, 400, "密钥不让用");
+    assert_eq!(ask(w.gw, "gpt-5").await, 500, "没有一条规则命中");
+    w.landed(2).await;
+
+    let history = w.get("/history?limit=10").await;
+    let row = |model: &str| {
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model"] == model)
+            .unwrap_or_else(|| panic!("流量里没有 {model}：{history}"))
+            .clone()
+    };
+    let barred = row("claude-opus-4-1");
+    assert_eq!(barred["error"]["code"], "gw.model.not_allowed", "{barred}");
+    assert_eq!(barred["error"]["args"]["model"], "claude-opus-4-1");
+    assert_eq!(barred["client"], "我");
+    assert_eq!(barred["routing"]["rule"], "只走 claude", "{barred}");
+    assert_eq!(barred["routing"]["attempts"], serde_json::json!([]));
+    let unrouted = row("gpt-5");
+    assert_eq!(unrouted["error"]["code"], "gw.route.failed", "{unrouted}");
+    assert_eq!(unrouted["routing"]["route"], "工作", "{unrouted}");
+    assert_eq!(unrouted["routing"]["rule"], "", "{unrouted}");
+
+    let stats: tw_api::RouteStats = serde_json::from_value(
+        w.get("/summary/routes?from_ms=0&to_ms=99999999999999")
+            .await,
+    )
+    .unwrap();
+    let work = &stats.routes[0];
+    assert_eq!((work.requests, work.failed), (2, 2), "{work:?}");
+    let names: Vec<&str> = work.rules.iter().map(|h| h.rule.as_str()).collect();
+    assert_eq!(names, ["只走 claude"], "{work:?}");
 }
 
 /// 还没有一条记录的库：线上的起点是 null，界面不会把空表读成「一周都没命中」。

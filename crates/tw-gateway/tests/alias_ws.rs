@@ -179,6 +179,51 @@ fn answered(frames: &[Value]) -> Vec<String> {
 }
 
 /// 这一次没发出去：替它回的 `response.failed` 里那句话
+/// 没发出去的那个请求留下的一行：开始（不发往哪一家、模型是客户端写的 `model`）、空尝试链
+/// 的路由、一条来源为 `request` 的失败。交回决定去向的规则和失败的错误
+async fn nowhere(events: &mut Receiver<Event>, model: &str) -> (String, tw_api::Msg) {
+    let mut rule_of = None;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("no ending within 5 s")
+            .expect("the event stream broke");
+        match ev {
+            Event::RequestStarted {
+                provider,
+                model: m,
+                rule,
+                ..
+            } => {
+                assert!(provider.is_empty(), "{provider}");
+                assert_eq!(m, model);
+                rule_of = Some(rule);
+            }
+            Event::RequestRouted {
+                rule,
+                attempts,
+                denied_by,
+                ..
+            } => {
+                assert!(attempts.is_empty() && denied_by.is_none(), "{attempts:?}");
+                assert_eq!(Some(&rule), rule_of.as_ref());
+            }
+            Event::RequestFailed {
+                model: m,
+                source,
+                message,
+                ..
+            } => {
+                assert_eq!(m, model);
+                assert_eq!(source.slug(), "request");
+                return (rule_of.expect("started before it failed"), message);
+            }
+            Event::RequestFinished { .. } | Event::RequestCancelled { .. } => panic!("{ev:?}"),
+            _ => {}
+        }
+    }
+}
+
 fn refusal(frames: &[Value]) -> String {
     let last = frames.last().expect("no frame at all");
     assert_eq!(last["type"], "response.failed", "{frames:?}");
@@ -373,16 +418,13 @@ async fn an_alias_the_upstream_cannot_serve_fails_that_request_and_the_connectio
          (claude-sonnet-5, us.anthropic.claude-sonnet-5-v1:0), so the request was not sent."
     );
     assert!(seen.lock().unwrap().is_empty());
-    // 这一家服务不了要的别名：**不留这一行**，和 HTTP 那条路准入没过一样
-    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
-        assert!(
-            !matches!(
-                ev,
-                Event::RequestStarted { .. } | Event::RequestRouted { .. }
-            ),
-            "{ev:?}"
-        );
-    }
+    // 这一家服务不了要的别名：**这一轮照样留一行**，和 HTTP 那条路准入没过一样 —— 记在决定
+    // 去向的规则上，模型是客户端写的，错误照回给客户端的那一句
+    let (rule, why) = nowhere(&mut events, "gpt-5.1-codex").await;
+    assert_eq!(rule, "兜底");
+    assert_eq!(why.code, "gw.ws.alias_unserved_rewritten");
+    assert_eq!(why.args["from"], "gpt-5.1-codex");
+    assert_eq!(format!("[ThinkWatch] {}", why.text), refusal(&frames));
 }
 
 /// 插件把模型名换成别名：发给这一家的是它自己的名称，回答里写回客户端要的。插件的
@@ -454,11 +496,12 @@ fn scoped(p: Provider, aliases: &str, rules: &str, allow: &[&str]) -> Config {
 }
 
 /// 密钥的 `allow` 每一帧都看：范围外的模型这一帧不发，替它回一个说清楚的 `response.failed`，
-/// 连接照常 —— 下一帧要的是范围里的就照发。和 HTTP 那条路同一句话
+/// 连接照常 —— 下一帧要的是范围里的就照发。和 HTTP 那条路同一句话，这一轮也和 HTTP 那条路
+/// 一样留一行
 #[tokio::test]
 async fn a_frame_asking_for_a_model_outside_the_keys_allow_is_refused_and_the_connection_stays() {
     let (up, seen) = upstream().await;
-    let (gw, _) = gateway(scoped(provider(up, &[]), "", "", &["gpt-5*"]), vec![]).await;
+    let (gw, mut events) = gateway(scoped(provider(up, &[]), "", "", &["gpt-5*"]), vec![]).await;
     let mut c = connect(gw).await;
 
     c.send(create("other-model")).await.unwrap();
@@ -469,6 +512,10 @@ async fn a_frame_asking_for_a_model_outside_the_keys_allow_is_refused_and_the_co
          models that are available."
     );
     assert!(seen.lock().unwrap().is_empty());
+    let (rule, why) = nowhere(&mut events, "other-model").await;
+    assert_eq!(rule, tw_engine::CATCH_ALL_RULE);
+    assert_eq!(why.code, "gw.model.not_allowed");
+    assert_eq!(why.args["key"], "codex");
 
     c.send(create("gpt-5.1-codex")).await.unwrap();
     let frames = one_answer(&mut c).await;
@@ -795,7 +842,7 @@ async fn a_realtime_alias_in_the_query_connects_with_the_upstreams_own_name() {
 async fn a_realtime_model_outside_the_keys_allow_refuses_the_upgrade() {
     let (up, queries) = realtime_upstream().await;
     let aliases = format!("voice: [gpt-realtime-2, gpt-realtime]\n{SONNET}");
-    let (gw, _) = gateway(
+    let (gw, mut events) = gateway(
         scoped(
             provider(up, &["gpt-realtime", "other-model"]),
             &aliases,
@@ -816,12 +863,17 @@ async fn a_realtime_model_outside_the_keys_allow_refuses_the_upgrade() {
         "{body}"
     );
     assert!(queries.lock().unwrap().is_empty());
+    // 被拒的升级**照样留一行**，和 HTTP 那条路准入没过一样
+    let (rule, why) = nowhere(&mut events, "other-model").await;
+    assert_eq!(rule, tw_engine::CATCH_ALL_RULE);
+    assert_eq!(why.code, "gw.model.not_allowed");
+    assert_eq!(why.args["model"], "other-model");
 
     let mut c = realtime(gw, "model=voice").await.unwrap();
     c.next().await;
     assert_eq!(queries.lock().unwrap().as_slice(), ["model=gpt-realtime"]);
 
-    let (gw, _) = gateway(
+    let (gw, mut events) = gateway(
         config(provider(up, &["gpt-realtime"]), &aliases, ""),
         vec![],
     )
@@ -833,4 +885,6 @@ async fn a_realtime_model_outside_the_keys_allow_refuses_the_upgrade() {
         "{body}"
     );
     assert_eq!(queries.lock().unwrap().len(), 1);
+    let (_, why) = nowhere(&mut events, "claude-sonnet").await;
+    assert_eq!(why.code, "gw.ws.alias_unserved");
 }

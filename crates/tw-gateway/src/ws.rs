@@ -282,26 +282,34 @@ struct Outgoing {
     rewritten_by: Vec<String>,
 }
 
-/// 一帧为什么没发出去（[`Naming::frame`]）。
+/// 一帧为什么没发出去（[`Naming::frame`]）。**这一帧照样留一行**（见 [`turn::not_sent`]），
+/// 和 HTTP 那条路一家上游都不去的请求一样：规则拒绝了它、密钥不让用要发的模型、这一家服务
+/// 不了要的别名、规则没做出决定或者求不了值
 struct NotSent {
     why: GatewayError,
-    /// 规则拒绝了它：**这一帧照样留一行**，和 HTTP 那条路被规则拒绝的请求一样（见
-    /// [`turn::denied`]）。别的 —— 密钥不让用要发的模型、这一家服务不了要的别名、规则求不了
-    /// 值 —— 不留，和 HTTP 那条路准入没过一样
-    denied: Option<Denied>,
+    /// 这一行记在哪条规则上
+    by: Decider,
 }
 
 impl NotSent {
+    /// 去向照升级时的决定，只是这一帧发不出去
     fn plain(why: GatewayError) -> Box<Self> {
-        Box::new(Self { why, denied: None })
+        Box::new(Self {
+            why,
+            by: Decider::Upgrade,
+        })
     }
 }
 
-/// 拒绝了一帧的那条规则，在哪个阶段。
-pub(crate) enum Denied {
-    /// 阶段一：它就是决定这一帧去向的那条
+/// 没发出去的一帧记在哪条规则上。
+pub(crate) enum Decider {
+    /// 升级时决定去向的那条：密钥不让用要发的模型、这一家服务不了要的别名、阶段二求不了值
+    Upgrade,
+    /// 这一帧没有规则做出决定（没有一条命中、求不了值）：空着
+    Undecided,
+    /// 阶段一拒绝了它：它就是决定这一帧去向的那条
     PhaseOne(String),
-    /// 阶段二：记在路由事件的 `denied_by` 上
+    /// 阶段二拒绝了它：决定去向的还是升级时那条，拒绝它的记在路由事件的 `denied_by` 上
     PhaseTwo(String),
 }
 
@@ -447,7 +455,7 @@ impl Naming {
                 tracing::info!(%rule, provider = %p.name, "a phase-two rule denied a WebSocket request");
                 return Err(Box::new(NotSent {
                     why: denied(rule.clone(), reason),
-                    denied: Some(Denied::PhaseTwo(rule)),
+                    by: Decider::PhaseTwo(rule),
                 }));
             }
             Err(e) => return Err(NotSent::plain(rule_failed(e))),
@@ -494,12 +502,15 @@ impl Naming {
                 tracing::info!(%rule, "a rule denied a WebSocket request");
                 Err(Box::new(NotSent {
                     why: denied(rule.clone(), reason),
-                    denied: Some(Denied::PhaseOne(rule)),
+                    by: Decider::PhaseOne(rule),
                 }))
             }
-            Err(e) => Err(NotSent::plain(GatewayError::config(msg!(
-                "gw.route.failed", detail = e => "Routing failed: {detail}"
-            )))),
+            Err(e) => Err(Box::new(NotSent {
+                why: GatewayError::config(msg!(
+                    "gw.route.failed", detail = e => "Routing failed: {detail}"
+                )),
+                by: Decider::Undecided,
+            })),
         }
     }
 
@@ -1339,7 +1350,7 @@ fn create_frame(text: &str) -> Option<serde_json::Value> {
 /// 一轮的开头：一帧 `response.create`（`raw` 是客户端的原话，`frame` 是它解出来的样子）。
 ///
 /// 位置和 HTTP 那条路一样：内容过滤先下结论（不报：结论挂在这一轮的号上报），定发给这一家的
-/// 模型名和参数改写（[`Naming`]：规则拒绝了的照样留一行），然后交去准入（[`turn::admit`]）。
+/// 模型名和参数改写（[`Naming`]：发不出去的照样留一行），然后交去准入（[`turn::admit`]）。
 /// 插件的请求钩子、脱敏、发出在过了准入之后（[`admitted`]）。
 async fn begin_turn(
     state: &AppState,
@@ -1392,23 +1403,21 @@ async fn begin_turn(
     let catalog = state.catalog.load();
     let out = match naming.frame(&catalog, &reading.facts) {
         Ok(out) => out,
-        // 只是这一帧不发：替它回一个 `response.failed`，连接照常
+        // 只是这一帧不发：照样留一行，替它回一个 `response.failed`，连接照常
         Err(no) => {
             tracing::info!(provider = %p.provider, why = %no.why.detail.text,
                 "a WebSocket request was not sent");
-            if let Some(by) = no.denied {
-                turn::denied(
-                    state,
-                    &line,
-                    by,
-                    &no.why,
-                    requested,
-                    fingerprint.as_deref(),
-                    input_estimate,
-                    arrived,
-                    at_ms,
-                );
-            }
+            turn::not_sent(
+                state,
+                &line,
+                no.by,
+                &no.why,
+                requested,
+                fingerprint.as_deref(),
+                input_estimate,
+                arrived,
+                at_ms,
+            );
             return reply_failed(c_tx, no.why).await;
         }
     };
