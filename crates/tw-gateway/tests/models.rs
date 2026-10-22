@@ -283,6 +283,7 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
     }])];
     let state = tw_gateway::AppState::new(cfg).unwrap();
     tw_gateway::models::refresh_all(&state).await;
+    let mut events = state.bus.subscribe();
     let gw = serve(state).await;
 
     let (status, body) = ask(gw, "official-only").await;
@@ -292,12 +293,71 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
         msg.contains("official-only") && msg.contains("relay does not offer this model"),
         "{msg}"
     );
+    let failed = refused(&mut events, "official-only").await;
+    assert_eq!(failed.code, "gw.model.no_upstream_available");
 
     // 没有任何上游提供的模型：准入就拦下，而不是说客户端不允许
     let (status, body) = ask(gw, "nobody-has-this").await;
     assert_eq!(status, 400, "{body}");
     let msg = body["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("No upstream serves model"), "{msg}");
+    assert_eq!(
+        msg,
+        "[ThinkWatch] No upstream serves model nobody-has-this. GET /v1/models lists the models \
+         that are available."
+    );
+    // 写错了、谁都不提供的模型名**照样留一行**：流量里看得见才排查得了。记在决定去向的那条
+    // 规则上，模型是客户端写的那个，错误照告诉客户端的那一句
+    let failed = refused(&mut events, "nobody-has-this").await;
+    assert_eq!(failed.code, "gw.model.no_upstream");
+    assert_eq!(failed.args["model"], "nobody-has-this");
+    assert_eq!(format!("[ThinkWatch] {}", failed.text), msg);
+}
+
+/// 一家上游都没去的那个请求的几条事件：开始（不发往哪一家）、空尝试链的路由、一条来源为
+/// `request` 的失败，都记在规则「都给 relay」上、模型是客户端写的 `model`。交回失败的错误
+async fn refused(
+    events: &mut tokio::sync::broadcast::Receiver<tw_api::Event>,
+    model: &str,
+) -> tw_api::Msg {
+    use tw_api::Event;
+    let mut started = false;
+    let mut routed = false;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("5 秒内没等到结局")
+            .expect("事件流断了");
+        match ev {
+            Event::RequestStarted {
+                provider,
+                model: m,
+                rule,
+                ..
+            } => {
+                assert!(provider.is_empty() && m == model && rule == "都给 relay");
+                started = true;
+            }
+            Event::RequestRouted { rule, attempts, .. } => {
+                assert!(attempts.is_empty() && rule == "都给 relay", "{attempts:?}");
+                routed = true;
+            }
+            Event::RequestFailed {
+                model: m,
+                source,
+                message,
+                ..
+            } => {
+                assert!(started && routed, "开始、路由都要在失败之前");
+                assert_eq!(m, model);
+                assert_eq!(source.slug(), "request");
+                return message;
+            }
+            Event::RequestFinished { .. } | Event::RequestCancelled { .. } => {
+                panic!("{ev:?}")
+            }
+            _ => {}
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────── 手动添加的模型
