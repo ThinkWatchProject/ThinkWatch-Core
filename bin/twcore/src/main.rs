@@ -812,6 +812,27 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         },
     };
     let taking_over = incoming.is_some();
+    // **还在排空的前任**（见 `lockfile::Draining`）：接替者在它排空完之前退了，这个进程是照常
+    // 拿到的锁，可前任还在写请求库。这时候和接替者一样：等它们都退了才开库，请求号跳过它们的
+    let draining = lockfile::draining(&dir);
+    let mut predecessors: Vec<u32> = draining.iter().map(|d| d.pid).collect();
+    if let Some(inc) = &incoming {
+        predecessors.push(inc.predecessor);
+    }
+    predecessors.sort_unstable();
+    predecessors.dedup();
+    let orphaned_ids = (!taking_over)
+        .then(|| draining.iter().map(|d| d.ids_below).max())
+        .flatten();
+    if orphaned_ids.is_some() {
+        tracing::warn!(
+            ?predecessors,
+            "a core that handed over is still draining; the request history opens once it exits"
+        );
+    }
+    // 还没进库的记录有几条（库开之前退出时说一声）
+    let pending = record::Pending::default();
+    let pending_outer = pending.clone();
 
     // **配置不存在就地生成**（第 1 步）。
     //
@@ -904,6 +925,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             state.oauth.hold_renewals(true);
             inc.import(&state);
         }
+        if let Some(below) = orphaned_ids {
+            state.bus.resume_after(below.saturating_add(handover::ID_GAP));
+        }
 
         // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
         // 照常转发。所以这里所有的失败都只记一行日志。
@@ -920,38 +944,40 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             runs: run_rx,
             settled: tw_control::key_limits::settle_hook(&state),
         };
-        let (store, store_opened) = match &incoming {
-            None => {
-                let store = record::open_now(&dir, wiring);
-                if let Some(rec) = &store {
-                    // 密钥的用量上限：这一天、这一周、这个月已经用了多少，从记录里加回来。**在第一个
-                    // 请求之前**（网关还没开始听）
-                    tw_control::key_limits::rebuild(&state, rec.lock().await.db());
-                    // 之后一期的开头变了（到了下一期、换了时区），从记录里把新的那一期加起来
-                    tw_control::key_limits::follow(&state, rec.clone());
-                }
-                (store, watch::channel(true).1)
+        let (store, store_opened) = if predecessors.is_empty() {
+            let store = record::open_now(&dir, wiring);
+            if let Some(rec) = &store {
+                // 密钥的用量上限：这一天、这一周、这个月已经用了多少，从记录里加回来。**在第一个
+                // 请求之前**（网关还没开始听）
+                tw_control::key_limits::rebuild(&state, rec.lock().await.db());
+                // 之后一期的开头变了（到了下一期、换了时区），从记录里把新的那一期加起来
+                tw_control::key_limits::follow(&state, rec.clone());
             }
-            // 接替者：旧 core 退出之后才打开请求库（R3，见 `record`）。用量从记录重建在打开的
-            // 那一刻、这个进程排着的记录进库之前
-            Some(inc) => {
-                let gw = state.clone();
-                let (store, opened) = record::open_later(
-                    &dir,
-                    wiring,
-                    inc.predecessor,
-                    Box::new(move |db| tw_control::key_limits::rebuild(&gw, db)),
-                );
-                if let Some(rec) = store.clone() {
-                    let (gw, mut opened) = (state.clone(), opened.clone());
-                    tokio::spawn(async move {
-                        if opened.wait_for(|o| *o).await.is_ok() {
-                            tw_control::key_limits::follow(&gw, rec);
-                        }
-                    });
-                }
-                (store, opened)
+            (store, watch::channel(true).1)
+        } else {
+            // 接替者（或者前任还在排空）：前任都退了才打开请求库（R3，见 `record`）。用量从
+            // 记录重建在打开的那一刻；排空标记在那时清掉
+            let gw = state.clone();
+            let marks = dir.clone();
+            let (store, opened) = record::open_later(
+                &dir,
+                wiring,
+                predecessors.clone(),
+                Box::new(move |db| {
+                    tw_control::key_limits::rebuild(&gw, db);
+                    lockfile::prune_draining(&marks);
+                }),
+                pending,
+            );
+            if let Some(rec) = store.clone() {
+                let (gw, mut opened) = (state.clone(), opened.clone());
+                tokio::spawn(async move {
+                    if opened.wait_for(|o| *o).await.is_ok() {
+                        tw_control::key_limits::follow(&gw, rec);
+                    }
+                });
             }
+            (store, opened)
         };
         if store.is_some() {
             state.set_body_sink(body_tx);
@@ -1012,6 +1038,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         };
         // 安全模式没有数据面：没有可交接的，arm 一律拒绝
         control.handover.set_no_data_plane(safe);
+        // 前任还在排空、却没有交接连接（它的接替者先退了）：照「前任在排空」起来，等它退了回到平常
+        if orphaned_ids.is_some() {
+            handover::follow_vanished(predecessors.clone(), control.handover.clone());
+        }
         let gateway = tw_gateway::listen::Handoff::default();
         if let Some(inc) = incoming.as_mut() {
             // 接替者：控制面在旧 core 交过来的监听上服务；网关、远程控制端口提交之前不跟配置走
@@ -1069,17 +1099,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 谁来收养都一样。
         //
         // **arm 之后关掉**（见 `handover`）：桌面端装好更新要重启，core 留下来等接替者
-        let parent_watch = parent.map(|ppid| {
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    if !proc::alive(ppid) {
-                        tracing::info!(ppid, "the parent exited; exiting with it");
-                        std::process::exit(0);
-                    }
-                }
-            })
-        });
+        let parent_watch = parent.map(handover::watch_parent);
 
         if safe {
             // 安全模式：只起控制面。数据面不动，让用户还能改配置、回滚。
@@ -1131,7 +1151,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                     }
                 }
                 let inherited = tokio::select! {
-                    r = inc.listeners() => r?,
+                    r = inc.listeners(&state) => r?,
                     msg = &mut control_dead => {
                         anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
                     }
@@ -1157,13 +1177,24 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                 tokio::time::timeout(handover::commit_within(), gateway.listening())
                     .await
                     .context("the listeners handed over could not be served in time")?;
-                inc.commit().await;
-                // 从此续期由这一边做（旧 core 交出快照起已暂停）
+                // 旧 core 回了 CommitAck（或者它已经没了）才算提交；它还在却没回，这边退出，
+                // 守护重来（这时它仍握着全部监听）
+                inc.commit().await?;
+                // ── 从这里起不再回退（H5）。旧 core 已经停止 accept：**下面任何一步出错都只记
+                // 一行、照常服务**，退出的话就没人在听了
+                //
+                // 从此续期由这一边做（旧 core 交出第二份快照起已暂停）
                 state.oauth.hold_renewals(false);
-                // 成为锁的持有者：写上自己的 pid（旧 core 已经放弃了锁）
+                // 成为锁的持有者：写上自己的 pid（旧 core 已经放弃了锁），记下它在排空
                 match LockFile::claim(&dir) {
                     Ok(l) => lock = Some(l),
                     Err(e) => tracing::warn!("the lock file could not be taken over: {e}"),
+                }
+                if let Err(e) = lockfile::mark_draining(
+                    &dir,
+                    lockfile::Draining::new(inc.predecessor, inc.ids_from),
+                ) {
+                    tracing::warn!("the draining core could not be noted down: {e}");
                 }
                 gateway.follow();
                 control.remote.follow();
@@ -1171,18 +1202,24 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                 tracing::info!("took over; the previous core is draining");
                 let s = tw_control::plugins::defaults::Seeder::shipped();
                 s.seed(&manager).await;
-                let started = bg
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("the background lock is poisoned"))?
-                    .start(background::Start {
-                        control: &control,
-                        safe: false,
-                        seeder: Some(s),
-                        store: store.clone(),
-                        store_opened: store_opened.clone(),
-                    })
-                    .context("starting the background tasks")?;
-                sync = Some(started);
+                let started = match bg.lock() {
+                    Ok(mut g) => g
+                        .start(background::Start {
+                            control: &control,
+                            safe: false,
+                            seeder: Some(s),
+                            store: store.clone(),
+                            store_opened: store_opened.clone(),
+                        })
+                        .map_err(|e| e.to_string()),
+                    Err(_) => Err("the background lock is poisoned".to_string()),
+                };
+                match started {
+                    Ok(started) => sync = Some(started),
+                    Err(e) => tracing::error!(
+                        "the background tasks could not start, so token write-back, sync and price updates are off this run; forwarding is unaffected: {e}"
+                    ),
+                }
                 inc.follow_drain(state.clone(), control.handover.clone());
                 serve
             }
@@ -1199,6 +1236,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             watchers: Mutex::new(watchers),
             lock: Mutex::new(lock),
             parent: Mutex::new(parent_watch),
+            parent_pid: parent,
             store_opened,
             handed_over: Default::default(),
         });
@@ -1249,6 +1287,14 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             }
         }
     });
+    // 前任还在写库、这边的库还没开就退了：排着的记录写不进去，**说一声丢了多少**
+    let left = pending_outer.get();
+    if left > 0 {
+        tracing::warn!(
+            events = left,
+            "exiting before the previous core finished draining; {left} queued request events are not recorded"
+        );
+    }
     // 后台事务的运行时在异步上下文之外关（在里面丢掉一个运行时会 panic）
     let leftover = bg_outer.lock().ok().and_then(|mut g| g.take_runtime());
     if let Some(bg_rt) = leftover {

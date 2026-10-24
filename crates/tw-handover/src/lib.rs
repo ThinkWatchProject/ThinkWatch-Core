@@ -97,8 +97,10 @@ pub enum Role {
 /// 旧 → 新  Refused（版本不同，到此为止）| Control + 控制面套接字
 /// 旧 → 新  Snapshot
 /// 新 → 旧  WantListeners            （新 core 的配置读进来了、运行时建好了）
+/// 旧 → 新  Snapshot                 （再导出一次：暂停续期之后的 OAuth、此刻的状态）
 /// 旧 → 新  Listeners + 网关、远程控制端口的套接字
-/// 新 → 旧  Commit                   （新 core 已在全部监听上 accept；不可逆）
+/// 新 → 旧  Commit                   （新 core 已在全部监听上 accept）
+/// 旧 → 新  CommitAck                （旧 core 收下了提交、不再 accept；从此不可逆）
 /// 旧 → 新  Settled* / InFlight*     （排空期，每个请求结束一条）
 /// 旧 → 新  Bye                      （马上退出）
 /// 新 → 旧  Fallback                 （任何时候：请按现行方式排空后退出，新的自己绑）
@@ -125,6 +127,9 @@ pub enum Message {
         infos: Vec<ListenerInfo>,
     },
     Commit,
+    /// 旧 core 收下了提交。**新 core 收到它（或者确认旧进程已经没了）才算提交**：旧 core 在
+    /// 等提交的时限到了之后放弃、又收到一个迟到的 Commit 时不回它，两边就不会都以为自己是主
+    CommitAck,
     Settled {
         data: serde_json::Value,
     },

@@ -140,6 +140,22 @@ pub(crate) fn refused_busy() -> Fail {
     )
 }
 
+/// arm 之后要开始一次账号登录：不行（回调端口不交接，登录要在接替者上走）。
+pub(crate) fn login_refused() -> Fail {
+    fail(
+        StatusCode::CONFLICT,
+        msg!(
+            "control.handover.login_refused" =>
+            "The gateway is about to be updated; sign in again once the update has finished."
+        ),
+    )
+}
+
+/// 正在交接（已 arm、或者接替者正在接管）：这时候不开始新的账号登录
+pub(crate) fn refuses_logins(h: &Handover) -> bool {
+    matches!(h.phase(), HandoverState::Armed | HandoverState::TakingOver)
+}
+
 /// 交接端点开不了（arm 答应不了）。
 pub fn endpoint_failed(detail: impl std::fmt::Display) -> Msg {
     msg!(
@@ -210,6 +226,8 @@ pub(crate) async fn arm(
 /// 接着接。
 pub struct ControlListener {
     accepting: watch::Sender<bool>,
+    /// 跳一下：已经连着的本机连接全部断开（见 [`ControlListener::close_connections`]）
+    closing: watch::Sender<u64>,
     held: Mutex<Option<tw_handover::Socket>>,
     inherited: Mutex<Option<tw_handover::Socket>>,
 }
@@ -218,6 +236,7 @@ impl Default for ControlListener {
     fn default() -> Self {
         Self {
             accepting: watch::channel(true).0,
+            closing: watch::channel(0).0,
             held: Mutex::new(None),
             inherited: Mutex::new(None),
         }
@@ -266,6 +285,32 @@ impl ControlListener {
 
     pub(crate) fn accepting(&self) -> watch::Receiver<bool> {
         self.accepting.subscribe()
+    }
+
+    /// 断开已经连着的本机控制面连接（交出控制面时调）。
+    ///
+    /// **为什么断开而不是只拒绝改配置**：连着的多半是新桌面端在交接之前连上来的（它的事件流、
+    /// 请求都落在这个旧 core 上），只拒绝改动的话它照样从这里读状态、收事件，看到的是一个已经
+    /// 不再转发新请求的进程；断开之后它按断线重连，连到的就是接替者。命令行的一次 `twcore call`
+    /// 碰巧在这时候被断，重来一次就好。交接没成时控制面恢复 accept，断开的那些重连回到这里
+    pub fn close_connections(&self) {
+        self.closing.send_modify(|n| *n += 1);
+    }
+
+    pub(crate) fn closing(&self) -> watch::Receiver<u64> {
+        self.closing.subscribe()
+    }
+}
+
+/// 等「断开」那一下。没有信号（测试）就一直等
+pub(crate) async fn closed(rx: &mut Option<watch::Receiver<u64>>) {
+    match rx {
+        Some(rx) => {
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -317,6 +362,37 @@ mod tests {
                 .expect("远程连接上该被挡掉");
         assert_eq!(refused.0, StatusCode::FORBIDDEN);
         assert_eq!(refused.1.0.code, "control.handover.remote");
+    }
+
+    #[test]
+    fn only_a_core_being_handed_over_refuses_sign_ins() {
+        let h = Handover::default();
+        for (p, refused) in [
+            (HandoverState::Idle, false),
+            (HandoverState::Armed, true),
+            (HandoverState::TakingOver, true),
+            // 交接完成、前任在排空的新 core 是主：照常能登
+            (HandoverState::Draining, false),
+        ] {
+            h.set_phase(p);
+            assert_eq!(refuses_logins(&h), refused, "{p:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_wakes_the_connections_and_no_signal_waits_forever() {
+        let c = ControlListener::default();
+        let mut rx = Some(c.closing());
+        c.close_connections();
+        tokio::time::timeout(Duration::from_secs(1), closed(&mut rx))
+            .await
+            .expect("断开的信号没到");
+        let mut none = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), closed(&mut none))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

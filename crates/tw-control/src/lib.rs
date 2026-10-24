@@ -2122,7 +2122,12 @@ async fn accept_loop<L: Accept>(
         handover::until_accepting(&mut accepting).await;
         tokio::select! {
             r = listener.accept_one() => match r {
-                Ok(stream) => hand_off(stream, app.clone(), gate.clone(), None),
+                Ok(stream) => hand_off(
+                    stream,
+                    app.clone(),
+                    gate.clone(),
+                    Local(Some(handover.control().closing())),
+                ),
                 Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
             },
             // 停下的那一刻放下手里这次 accept：不然它还会再接一个
@@ -2215,10 +2220,14 @@ async fn serve_loopback(
 /// **每种传输共用**：它们的差别只在怎么拿到这个流，拿到之后的每一件事
 /// （握手、协议协商、错误怎么记）都该一模一样 —— 写两遍就是两遍会漂。
 /// 远程端口接进来的连接也走这里，多带一个 [`RemoteConn`]。
-fn hand_off<S>(stream: S, app: Router, gate: gate::Gate, remote: Option<RemoteConn>)
+fn hand_off<S>(stream: S, app: Router, gate: gate::Gate, remote: impl Into<Conn>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
+    let (remote, mut closing) = match remote.into() {
+        Conn::Remote(r) => (Some(r), None),
+        Conn::Local(c) => (None, c),
+    };
     tokio::spawn(async move {
         let link = match gate.admit(stream).await {
             Ok(l) => l,
@@ -2252,6 +2261,10 @@ where
                 _ = gate.key_changed_from(&link.key) => {
                     tracing::info!("the control key changed; closing a connection made with the previous one");
                 }
+                // 控制面交给了接替者：已经连着的这一条也断开（见 `handover::ControlListener::close_connections`）
+                _ = handover::closed(&mut closing) => {
+                    tracing::info!("the control plane was handed over; closing a connection to this core");
+                }
             }
             return;
         };
@@ -2281,6 +2294,28 @@ where
         })
         .await;
     });
+}
+
+/// 一条连接是从哪儿进来的。
+pub(crate) enum Conn {
+    Remote(RemoteConn),
+    /// 本机的通道。带着的是「控制面交出去了」的信号（测试里没有）
+    Local(Option<tokio::sync::watch::Receiver<u64>>),
+}
+
+/// 本机的连接
+pub(crate) struct Local(pub(crate) Option<tokio::sync::watch::Receiver<u64>>);
+
+impl From<Local> for Conn {
+    fn from(l: Local) -> Self {
+        Conn::Local(l.0)
+    }
+}
+
+impl From<RemoteConn> for Conn {
+    fn from(r: RemoteConn) -> Self {
+        Conn::Remote(r)
+    }
 }
 
 /// 从远程端口进来的一条连接多带的东西。

@@ -550,3 +550,33 @@ async fn a_feed_that_overflowed_is_replaced_by_a_full_report_at_drain() {
         "排空开始时没报占着的名额"
     );
 }
+
+/// 快照来两份（旧 core 交出监听之前再导出一次，那时它已暂停续期）：**后一份的 OAuth 盖掉
+/// 前一份的**，新 core 用的是旧 core 最后手上的那个 access token
+#[tokio::test]
+async fn a_later_snapshot_replaces_the_oauth_tokens_of_an_earlier_one() {
+    let new = AppState::new(config(1, "at-1")).unwrap();
+    // 第一份：旧 core 手上是 at-1
+    let first = AppState::new(config(1, "at-1")).unwrap();
+    first
+        .oauth
+        .token("甲", &oauth("at-1"), &first.http)
+        .await
+        .unwrap();
+    new.handover_import(&over_the_wire(first.handover_export()));
+    // 第二份：之间旧 core 换到了 at-2（同一份配置、同一个 refresh token）
+    let second = AppState::new(config(1, "at-2")).unwrap();
+    second
+        .oauth
+        .token("甲", &oauth("at-2"), &second.http)
+        .await
+        .unwrap();
+    new.handover_import(&over_the_wire(second.handover_export()));
+    new.oauth.hold_renewals(true);
+    let (token, _) = new
+        .oauth
+        .token("甲", &oauth("at-1"), &new.http)
+        .await
+        .unwrap();
+    assert_eq!(token, "at-2", "后一份快照没盖掉前一份");
+}

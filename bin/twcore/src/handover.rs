@@ -8,7 +8,7 @@
 //! - **新 core**（[`approach`] → [`Incoming`]）：取锁时发现持有者活着，就去连它的交接端点；
 //!   连上了就在交过来的控制面上服务、读配置建运行时、要监听、提交，成为锁的持有者。
 //!
-//! **提交是唯一的不可逆点。**提交之前任何一步出错，旧 core 回到待交接、照常服务（它始终
+//! **提交是唯一的不可逆点**，以旧 core 回的 CommitAck 为准（它在时限之后收到的提交不回）。提交之前任何一步出错，旧 core 回到待交接、照常服务（它始终
 //! 握着全部监听）；提交之后新 core 是唯一的「主」，旧 core 只做完手上的请求。任何情况下
 //! 都不出现两个进程都不监听的时刻。
 //!
@@ -18,6 +18,7 @@
 //! | --- | --- | --- |
 //! | 待交接 | arm 给的 `wait_secs`，缺省 120 秒 | 旧 core 等接替者连上来（H7） |
 //! | 接管 | 30 秒（[`TAKEOVER_LIMIT`]） | 旧 core 交出监听之后等提交（F4） |
+//! | 确认 | 10 秒（[`ACK_WITHIN`]） | 新 core 发出提交之后等 CommitAck |
 //! | 排空 | 30 分钟（[`DRAIN_LIMIT`]） | 旧 core 提交之后等手上的请求（H6） |
 //! | 退回 | 180 秒（[`FALLBACK_DRAIN`]） | 版本不同时旧 core 等请求结束再退（H2） |
 //!
@@ -52,6 +53,13 @@ pub const DRAIN_LIMIT: Duration = Duration::from_secs(30 * 60);
 pub const FALLBACK_DRAIN: Duration = Duration::from_secs(180);
 /// 连上之后对方多久不说话就算了：新 core 等旧 core 的第一句、旧 core 等 `Hello`。
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
+/// 交出 access token 之前等正在进行的续期换完最多多久
+const RENEWAL_SETTLE: Duration = Duration::from_secs(10);
+/// 新 core 等快照多久。**要盖得住旧 core 发快照之前的收尾**：OAuth 写回最多 5 秒、上传本机
+/// 改动最多 8 秒（`sync::FLUSH_WITHIN`）、暂停续期最多 [`RENEWAL_SETTLE`]，再留余量
+const SNAPSHOT_WITHIN: Duration = Duration::from_secs(30);
+/// 新 core 发出提交之后等 CommitAck 多久
+const ACK_WITHIN: Duration = Duration::from_secs(10);
 /// 连着几次交接在交出监听之后失败（F4、F5），下一个接替者就请它退回现行流程（F5）。
 pub const MAX_STRIKES: u32 = 3;
 /// 新 core 请旧 core 退回之后，等它退出多久（[`FALLBACK_DRAIN`] 加上退出的余量）。
@@ -182,6 +190,9 @@ pub struct Core {
     pub lock: Mutex<Option<LockFile>>,
     /// `--parent` 守望。arm 之后关掉：桌面端要重启，core 不能跟着退
     pub parent: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 原来的父进程（`--parent`）。arm 之后等到点时它还在，说明桌面端没有重启（更新失败、
+    /// 取消了），撤销 arm（见 [`run_arms`]）
+    pub parent_pid: Option<u32>,
     /// 请求库打开了没有。接替者要等它的前任退出才打开（见 `record::open_later`）；
     /// **它自己排空完也要等这个**才说 `Bye`（H8：库只在最老的那个退出之后才由下一个打开）
     pub store_opened: watch::Receiver<bool>,
@@ -220,8 +231,22 @@ async fn run_arms(
     core: &Arc<Core>,
     arms: &mut tokio::sync::mpsc::Receiver<tw_control::handover::Arm>,
 ) -> Exit {
-    // 第一次 arm：开端点、脱离父进程
-    let (mut endpoint, mut params) = loop {
+    loop {
+        let (endpoint, params) = first_arm(core, arms).await;
+        match armed(core, arms, endpoint, params).await {
+            Some(exit) => return exit,
+            // 撤销了：回到平常，等下一次 arm
+            None => continue,
+        }
+    }
+}
+
+/// 等第一次 arm：开端点、脱离父进程。
+async fn first_arm(
+    core: &Core,
+    arms: &mut tokio::sync::mpsc::Receiver<tw_control::handover::Arm>,
+) -> (tw_handover::Endpoint, Params) {
+    loop {
         let Some(a) = arms.recv().await else {
             return std::future::pending().await;
         };
@@ -231,14 +256,17 @@ async fn run_arms(
                 // 往管道里写会出错，`eprintln!` 和日志的出错处理会因此 panic，排空中的旧 core
                 // 就挂了
                 stdio_to_file(&core.dir);
+                // **自己另起一个会话**：桌面端退出时给整个进程组发的信号（SIGTERM、SIGHUP）
+                // 不能把等着交接、排空中的 core 一起带走
+                leave_process_group();
                 if let Some(h) = core.parent.lock().ok().and_then(|mut g| g.take()) {
                     h.abort();
                     tracing::info!("armed for a handover; no longer exiting with the parent");
                 }
                 core.handover().set_phase(HandoverState::Armed);
                 let _ = a.reply.send(Ok(()));
-                break (
-                    Some(ep),
+                return (
+                    ep,
                     Params {
                         wait: a.wait,
                         relaunch: a.relaunch,
@@ -250,7 +278,17 @@ async fn run_arms(
                 let _ = a.reply.send(Err(tw_control::handover::endpoint_failed(&e)));
             }
         }
-    };
+    }
+}
+
+/// 待交接：等接替者、交接。`None` = 撤销了 arm（桌面端没有重启），回到平常
+async fn armed(
+    core: &Arc<Core>,
+    arms: &mut tokio::sync::mpsc::Receiver<tw_control::handover::Arm>,
+    endpoint: tw_handover::Endpoint,
+    mut params: Params,
+) -> Option<Exit> {
+    let mut endpoint = Some(endpoint);
     let mut clock = ArmClock::new(Instant::now(), params.wait, params.relaunch.is_some());
     let mut strikes = 0u32;
     loop {
@@ -286,14 +324,14 @@ async fn run_arms(
                 match give(core, link, strikes >= MAX_STRIKES).await {
                     Given::Committed(link) => {
                         drain(core, link).await;
-                        return Exit::HandedOver;
+                        return Some(Exit::HandedOver);
                     }
                     Given::Fallback => {
                         // 接替者自己绑端口、起来之后才续期；这边排空期间仍是唯一在转发的那个
                         core.state.oauth.hold_renewals(false);
                         tracing::info!("the successor cannot take over; draining and exiting the current way");
                         retire(core, FALLBACK_DRAIN).await;
-                        return Exit::Retired;
+                        return Some(Exit::Retired);
                     }
                     Given::Abandoned { strike } => {
                         if strike {
@@ -310,23 +348,39 @@ async fn run_arms(
                     Given::NotASuccessor => {}
                 }
             }
-            _ = tokio::time::sleep_until(clock.deadline) => match clock.expired(Instant::now()) {
-                Expiry::Relaunch => {
-                    if let Some(r) = &params.relaunch {
-                        relaunch(r);
-                    }
-                }
-                Expiry::GiveUp => {
-                    // H7：不留孤儿进程
-                    tracing::info!("no successor arrived; draining and exiting the current way");
+            _ = tokio::time::sleep_until(clock.deadline) => {
+                // 桌面端根本没重启（更新失败、取消了）：**撤销 arm**，不重开它、不退出
+                if let Some(ppid) = core.parent_pid
+                    && crate::proc::alive(ppid)
+                {
+                    tracing::info!(ppid, "the desktop app did not restart; the handover is called off");
                     if let Some(ep) = endpoint.take() {
                         ep.close();
                     }
+                    if let Ok(mut g) = core.parent.lock() {
+                        *g = Some(watch_parent(ppid));
+                    }
                     core.handover().set_phase(HandoverState::Idle);
-                    retire(core, FALLBACK_DRAIN).await;
-                    return Exit::Retired;
+                    return None;
                 }
-            },
+                match clock.expired(Instant::now()) {
+                    Expiry::Relaunch => {
+                        if let Some(r) = &params.relaunch {
+                            relaunch(r);
+                        }
+                    }
+                    Expiry::GiveUp => {
+                        // H7：不留孤儿进程
+                        tracing::info!("no successor arrived; draining and exiting the current way");
+                        if let Some(ep) = endpoint.take() {
+                            ep.close();
+                        }
+                        core.handover().set_phase(HandoverState::Idle);
+                        retire(core, FALLBACK_DRAIN).await;
+                        return Some(Exit::Retired);
+                    }
+                }
+            }
             Some(a) = arms.recv() => {
                 // 又 arm 了一次（桌面端重试）：按新的参数重新等
                 params = Params { wait: a.wait, relaunch: a.relaunch };
@@ -336,6 +390,45 @@ async fn run_arms(
         }
     }
 }
+
+/// 父进程守望：GUI 没了我们跟着退。轮询而不是用 kqueue，是因为
+/// 这段代码要能在被重新 parent 之后仍然正确 —— macOS 上收养我们的
+/// 是 launchd（getppid() 变成 1），Linux 桌面会话里多半是
+/// `systemd --user`（它是 subreaper，getppid() 变成它的 pid，不是 1）。
+/// 所以**不看 getppid()**，只看原来那个 pid 还在不在，哪个平台、
+/// 谁来收养都一样。
+pub fn watch_parent(ppid: u32) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !crate::proc::alive(ppid) {
+                tracing::info!(ppid, "the parent exited; exiting with it");
+                std::process::exit(0);
+            }
+        }
+    })
+}
+
+/// 另起一个会话（unix 的 `setsid`）。已经是进程组组长时会失败，只记一行
+#[cfg(unix)]
+fn leave_process_group() {
+    // SAFETY: getsid/getpid/setsid 都不碰内存，只问、只改这个进程的会话和进程组
+    let me = unsafe { libc::getpid() };
+    if unsafe { libc::getsid(0) } == me {
+        // 已经是自己会话的头了（上一次 arm 时另起的）
+        return;
+    }
+    if unsafe { libc::setsid() } == -1 {
+        tracing::info!(
+            "could not start a session of its own: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Windows 上没有进程组信号这回事：桌面端退出不会顺带结束 core
+#[cfg(windows)]
+fn leave_process_group() {}
 
 enum Given {
     /// 提交了：从此只做完手上的请求
@@ -364,11 +457,21 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
             // Windows 上 peer_pid 要等收到 Hello 才有（就是它报的那个）
             (version, link.peer_pid().unwrap_or(pid))
         }
+        // **读不懂第一帧也回一句**：将来 Hello 改了样子，新的那个据此退回现行流程，而不是
+        // 只看见连接断了
+        Ok(Err(tw_handover::Error::Malformed(e))) => {
+            core.handover().set_phase(HandoverState::TakingOver);
+            return refuse_with(
+                &mut link,
+                format!("the greeting could not be read here ({e})"),
+            )
+            .await;
+        }
         _ => return Given::NotASuccessor,
     };
     core.handover().set_phase(HandoverState::TakingOver);
     if version != tw_handover::VERSION || refuse {
-        // H2 / F5：退回现行流程。等它说一声 Fallback（它会马上说）
+        // H2 / F5：退回现行流程
         let reason = if refuse {
             format!("{MAX_STRIKES} handovers in a row failed after the listeners were handed over")
         } else {
@@ -377,15 +480,10 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
                 tw_handover::VERSION
             )
         };
-        tracing::info!(%reason, "refusing the handover");
-        let _ = link.send(&Message::Refused { reason }).await;
-        return match tokio::time::timeout(HELLO_WITHIN, link.recv()).await {
-            Ok(Ok((Message::Fallback, _))) => Given::Fallback,
-            _ => Given::Abandoned { strike: false },
-        };
+        return refuse_with(&mut link, reason).await;
     }
 
-    // ① 控制面。**交出去就不再从它上面接新连接**（见 `tw_control::handover`）
+    // ① 控制面。**交出去就不再从它上面接新连接**，已经连着的也断开（见 `tw_control::handover`）
     let sock = match core.handover().control().export() {
         Ok(s) => s,
         Err(e) => {
@@ -394,6 +492,7 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
         }
     };
     core.handover().control().pause();
+    core.handover().control().close_connections();
     let control = Message::Control {
         info: ListenerInfo {
             role: Role::Control,
@@ -406,20 +505,20 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
     }
     drop(sock);
 
-    // ② 快照。之前先把手上的收尾：正在写回的 refresh token、还没上传的本机改动
+    // ② 第一份快照。之前把还没上传的本机改动传上去（同现行退出时的 `sync.flush`）
     background::settle_rotation(&core.background).await;
     if let Some(sync) = core.sync() {
         sync.flush().await;
     }
-    // 交出 access token 起暂停续期：两边各换一次 refresh token 必有一边作废（接管没成再恢复）
-    core.state.oauth.hold_renewals(true);
     let snapshot = wrap(core.state.handover_export(), core.state.bus.next_id());
     if let Err(e) = link.send(&Message::Snapshot { data: snapshot }).await {
         tracing::warn!("the snapshot could not be sent to the successor: {e}");
-        return Given::Abandoned { strike: false };
+        return Given::Abandoned { strike: true };
     }
+    let sent = Instant::now();
 
-    // ③ 等它要监听。**不限时**（H3：它的配置读不进来时在等人修），断了就是没成
+    // ③ 等它要监听。**不限时**（H3：它的配置读不进来时在等人修），断了就是没成。**这一段照常
+    // 续期**：这边还在转发，可能要等几个小时
     loop {
         match link.recv().await {
             Ok((Message::WantListeners, _)) => break,
@@ -428,13 +527,30 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
                 tracing::warn!(?other, "an unexpected handover message; ignoring it")
             }
             Err(e) => {
-                tracing::info!("the successor left before taking the listeners: {e}");
-                return Given::Abandoned { strike: false };
+                // 快照刚发出去就断了：多半是它等快照等得不耐烦（或者起来就崩了），记一次；
+                // 等了很久才断的是在等配置修好的那一种（H3），不记
+                let strike = sent.elapsed() < SNAPSHOT_WITHIN + Duration::from_secs(5);
+                tracing::info!(
+                    strike,
+                    "the successor left before taking the listeners: {e}"
+                );
+                return Given::Abandoned { strike };
             }
         }
     }
 
-    // ④ 监听：网关的每一个、远程控制端口
+    // ④ 第二份快照：**先暂停续期、等正在换的换完**，再收尾写回，再导出。交出去的 access
+    // token 和 refresh token 从此只有接替者在用（接管没成再恢复）。顺带也是此刻的全部状态：
+    // 接替者在 H3 里等了很久的话，第一份早就过时了，而且那时它是对着临时顶上的配置接的
+    core.state.oauth.hold_renewals_settled(RENEWAL_SETTLE).await;
+    background::settle_rotation(&core.background).await;
+    let snapshot = wrap(core.state.handover_export(), core.state.bus.next_id());
+    if let Err(e) = link.send(&Message::Snapshot { data: snapshot }).await {
+        tracing::warn!("the snapshot could not be sent to the successor: {e}");
+        return Given::Abandoned { strike: true };
+    }
+
+    // ⑤ 监听：网关的每一个、远程控制端口
     let mut infos = Vec::new();
     let mut socks = Vec::new();
     match core.gateway.export() {
@@ -477,9 +593,20 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
     drop(refs);
     drop(socks);
 
-    // ⑤ 等提交（F4：30 秒）。提交之前两边同时 accept 是允许的（H4）
+    // ⑥ 等提交（F4：30 秒）。提交之前两边同时 accept 是允许的（H4）。**过了时限就不再收**：
+    // 这条连接随之关掉，迟到的 Commit 没人回 CommitAck，接替者自己退出
     match tokio::time::timeout(TAKEOVER_LIMIT, link.recv()).await {
-        Ok(Ok((Message::Commit, _))) => Given::Committed(link),
+        Ok(Ok((Message::Commit, _))) => {
+            // 先回 CommitAck 再停止 accept：回不出去（接替者已经没了）就当没提交，这边的
+            // 监听还都在，接着服务。回出去了才停 —— 接替者收到它才把自己当主
+            match link.send(&Message::CommitAck).await {
+                Ok(()) => Given::Committed(link),
+                Err(e) => {
+                    tracing::warn!("the commit could not be acknowledged: {e}");
+                    Given::Abandoned { strike: true }
+                }
+            }
+        }
         Ok(Ok((Message::Fallback, _))) => Given::Fallback,
         Ok(Ok((other, _))) => {
             tracing::warn!(?other, "expected a commit from the successor");
@@ -493,6 +620,16 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
             tracing::warn!("the successor did not commit within {TAKEOVER_LIMIT:?}");
             Given::Abandoned { strike: true }
         }
+    }
+}
+
+/// 拒绝这一次交接（H2、F5、读不懂的招呼），等它说一声 Fallback（它会马上说）。
+async fn refuse_with(link: &mut Link, reason: String) -> Given {
+    tracing::info!(%reason, "refusing the handover");
+    let _ = link.send(&Message::Refused { reason }).await;
+    match tokio::time::timeout(HELLO_WITHIN, link.recv()).await {
+        Ok(Ok((Message::Fallback, _))) => Given::Fallback,
+        _ => Given::Abandoned { strike: false },
     }
 }
 
@@ -581,16 +718,22 @@ fn abort_all(state: &tw_gateway::AppState) -> usize {
         .count()
 }
 
-/// arm 之后的日志写到哪：数据目录里，每次 arm 从头写。
+/// arm 之后的日志写到哪：数据目录里，**接着往后写**（上一次交接的日志留着，排查时要对照）。
 pub const HANDOVER_LOG: &str = "twcore.handover.log";
+/// 它长过这么多就挪成上一份（`.log.1`）
+const HANDOVER_LOG_MAX: u64 = 4 * 1024 * 1024;
 
 /// 标准输出、错误输出改写进 [`HANDOVER_LOG`]（开不了就丢掉），标准输入接空设备。**再也
 /// 不碰桌面端的管道**：它退出之后写管道会出错。
 fn stdio_to_file(dir: &Path) {
     let path = dir.join(HANDOVER_LOG);
+    // 接着写，但不无限长：过了几 MB 就把它挪成上一份，从头开始
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > HANDOVER_LOG_MAX) {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
     let file = {
         let mut o = std::fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
+        o.append(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -719,6 +862,8 @@ pub struct Incoming {
     snapshot: Option<Snapshot>,
     /// 旧 core 的 pid（锁文件里的那个）
     pub predecessor: u32,
+    /// 这边的请求号从这里起（旧 core 的号 + [`ID_GAP`]）。旧 core 用的都在它之下
+    pub ids_from: u64,
 }
 
 /// 旧 core 交过来的网关与远程控制端口的监听。
@@ -770,7 +915,8 @@ pub async fn approach(dir: &Path, holder: u32) -> Approach {
         // 不说话：它正在交给另一个接替者
         Err(_) => return Approach::NotArmed,
     };
-    let snapshot = match tokio::time::timeout(HELLO_WITHIN, link.recv()).await {
+    // 旧 core 发快照之前要收尾（写回、上传本机改动），等得够久（见 SNAPSHOT_WITHIN）
+    let snapshot = match tokio::time::timeout(SNAPSHOT_WITHIN, link.recv()).await {
         Ok(Ok((Message::Snapshot { data }, _))) => unwrap(data),
         other => {
             tracing::warn!(ok = other.is_ok(), "the snapshot did not arrive");
@@ -784,6 +930,7 @@ pub async fn approach(dir: &Path, holder: u32) -> Approach {
         control,
         snapshot,
         predecessor: holder,
+        ids_from: 0,
     })
 }
 
@@ -805,6 +952,20 @@ async fn gone_or_busy(holder: u32) -> Approach {
     } else {
         Approach::NotArmed
     }
+}
+
+/// 前任还在排空、却没有交接连接（它的接替者先退出了，这个进程是照常起来的）：状态报
+/// 「排空中」，它们都退了回到平常。在途数报不出来（没有连接），是 0
+pub fn follow_vanished(pids: Vec<u32>, handover: Arc<tw_control::handover::Handover>) {
+    handover.set_phase(HandoverState::Draining);
+    tokio::spawn(async move {
+        for pid in pids {
+            let _ = wait_gone(pid, DRAIN_LIMIT + Duration::from_secs(5 * 60)).await;
+        }
+        if handover.phase() == HandoverState::Draining {
+            handover.set_phase(HandoverState::Idle);
+        }
+    });
 }
 
 async fn wait_gone(pid: u32, within: Duration) -> bool {
@@ -829,16 +990,27 @@ impl Incoming {
             );
             return;
         };
-        state.bus.resume_after(s.next_id.saturating_add(ID_GAP));
+        self.ids_from = self.ids_from.max(s.next_id.saturating_add(ID_GAP));
+        state.bus.resume_after(self.ids_from);
         state.handover_import(&s.gateway);
     }
 
-    /// 要监听（配置读进来了、运行时建好了）。
-    pub async fn listeners(&mut self) -> Result<Inherited> {
+    /// 要监听（配置读进来了、运行时建好了）。**先收到第二份快照**：旧 core 暂停了续期之后
+    /// 导出的那一份，这时接进来（盖掉第一份；H3 时第一份还是对着临时顶上的配置接的）
+    pub async fn listeners(&mut self, state: &tw_gateway::AppState) -> Result<Inherited> {
         self.link
             .send(&Message::WantListeners)
             .await
             .context("the previous core left before handing over the listeners")?;
+        let (m, _) = tokio::time::timeout(SNAPSHOT_WITHIN, self.link.recv())
+            .await
+            .context("the previous core did not send the snapshot in time")?
+            .context("the previous core left before handing over the listeners")?;
+        let Message::Snapshot { data } = m else {
+            anyhow::bail!("expected a snapshot from the previous core, got {m:?}");
+        };
+        self.snapshot = unwrap(data);
+        self.import(state);
         let (m, socks) = tokio::time::timeout(HELLO_WITHIN, self.link.recv())
             .await
             .context("the previous core did not hand over the listeners in time")?
@@ -849,12 +1021,27 @@ impl Incoming {
         inherited(infos, socks)
     }
 
-    /// 提交：从此不再回退（H5）。**发不出去也算提交了**：旧 core 这时候没了的话（F6），
-    /// 套接字已经在手上，直接接着服务
-    pub async fn commit(&mut self) {
-        if let Err(e) = self.link.send(&Message::Commit).await {
-            tracing::warn!("the previous core is gone at commit; serving on without it: {e}");
+    /// 提交（H5）。**旧 core 回了 CommitAck、或者它的进程已经没了（F6，套接字已经在手上）
+    /// 才算数**；它还活着却没回（它等提交的时限已过、回到了待交接），这边就不能当主 ——
+    /// `Err`，调用方退出，守护重来一次
+    pub async fn commit(&mut self) -> Result<()> {
+        let sent = self.link.send(&Message::Commit).await;
+        if sent.is_ok() {
+            loop {
+                match tokio::time::timeout(ACK_WITHIN, self.link.recv()).await {
+                    Ok(Ok((Message::CommitAck, _))) => return Ok(()),
+                    Ok(Ok((other, _))) => {
+                        tracing::debug!(?other, "ignoring a handover message before the commit ack")
+                    }
+                    _ => break,
+                }
+            }
         }
+        if wait_gone(self.predecessor, Duration::from_secs(2)).await {
+            tracing::warn!("the previous core is gone at commit; serving on without it");
+            return Ok(());
+        }
+        anyhow::bail!("the previous core did not acknowledge the commit and is still running")
     }
 
     /// 提交之后跟着旧 core 排空：结算、在途数、`Bye`。连接断了（旧 core 退出或崩溃）就放掉
@@ -874,9 +1061,14 @@ impl Incoming {
                     Err(_) => break,
                 }
             }
-            // 收到 Bye 的话等它的进程真没了再放：它说完 Bye 到退出之间手上已经没有请求了，
-            // 但名额要等它真的不可能再用才算放开。连接断了（崩了）也一样等一下
-            let _ = wait_gone(self.predecessor, Duration::from_secs(60)).await;
+            // **等它的进程真没了再放**：说完 Bye 到退出之间、或者连接异常断开（它的进程可能还
+            // 在跑、手上还有请求），名额要等它真的不可能再用才算放开。最多等到它的排空上限
+            if !wait_gone(self.predecessor, DRAIN_LIMIT + Duration::from_secs(5 * 60)).await {
+                tracing::warn!(
+                    pid = self.predecessor,
+                    "the previous core is still running past its drain limit"
+                );
+            }
             state.handover_release_all();
             handover.set_draining(0);
             // 期间又被 arm 了（H8）就别改回去
@@ -1013,6 +1205,12 @@ mod tests {
         assert_eq!(got.gateway[0].0, a);
         assert_eq!(got.remote.as_ref().map(|x| x.0), Some(r));
         assert!(inherited(infos, vec![Socket::Tcp(l())]).is_err());
+    }
+
+    #[test]
+    fn the_successor_waits_for_the_snapshot_longer_than_the_old_core_may_take_to_send_it() {
+        // 旧 core 发快照之前：OAuth 写回最多 5 秒、上传本机改动最多 8 秒、暂停续期最多 10 秒
+        const { assert!(SNAPSHOT_WITHIN.as_secs() >= 5 + 8 + RENEWAL_SETTLE.as_secs()) };
     }
 
     #[test]

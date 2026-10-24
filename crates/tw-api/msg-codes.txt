@@ -180,6 +180,7 @@ control.group.weight_out_of_range
 control.group_in_use
 control.handover.busy
 control.handover.endpoint_failed
+control.handover.login_refused
 control.handover.remote
 control.handover.safe_mode
 control.header_no_value

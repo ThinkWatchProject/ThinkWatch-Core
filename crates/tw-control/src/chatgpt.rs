@@ -240,6 +240,10 @@ async fn start(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ChatgptLoginStart>,
 ) -> Result<Json<tw_api::ChatgptLogin>, Fail> {
+    // arm 之后不开始新的登录：回调端口不交接，登录要走完才能交（见 `handover`）
+    if crate::handover::refuses_logins(&s.handover) {
+        return Err(crate::handover::login_refused());
+    }
     let want = Want::read(&s, &req)?;
     // 还没完成的上一次登录作废：回调端口要让出来
     let prev = s.chatgpt.current.lock().ok().and_then(|mut g| g.take());

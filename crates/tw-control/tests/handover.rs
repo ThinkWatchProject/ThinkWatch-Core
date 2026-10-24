@@ -148,3 +148,34 @@ async fn status_reports_the_handover_phase_and_the_draining_count() {
     assert_eq!(st.draining, 3);
     assert_eq!(st.api_version, 52);
 }
+
+/// arm 之后（以及接替者正在接管时）不开始新的账号登录：回调端口不交接。（平常、排空中的
+/// 新 core 照常能登：见 `handover::tests` 里那条，这里不真的去登）
+#[tokio::test]
+async fn a_sign_in_that_starts_after_arming_is_refused() {
+    let (_d, s) = state();
+    for phase in [
+        tw_api::HandoverState::Armed,
+        tw_api::HandoverState::TakingOver,
+    ] {
+        s.handover.set_phase(phase);
+        for path in ["/chatgpt/login", "/zai/login"] {
+            let resp = tw_control::router(s.clone())
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            assert_eq!(status, StatusCode::CONFLICT, "{path} {phase:?}: {body}");
+            assert_eq!(body["code"], "control.handover.login_refused", "{body}");
+        }
+    }
+}
