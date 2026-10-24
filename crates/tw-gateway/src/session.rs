@@ -66,6 +66,30 @@ impl Sessions {
         e.0.clone()
     }
 
+    /// 交接：每段对话此刻归在哪一次会话（见 [`crate::handover`]）。不交的话，交接时正在进行的
+    /// 任务在流量里被切成两段
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::SessionEntry> {
+        let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        open.iter()
+            .map(|(fp, (id, last))| crate::handover::wire::SessionEntry {
+                fp: fp.clone(),
+                id: id.clone(),
+                last_ms: *last,
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 记着的。这里已经记着、而且更新的不动
+    pub(crate) fn handover_import(&self, entries: Vec<crate::handover::wire::SessionEntry>) {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        for e in entries {
+            if open.get(&e.fp).is_some_and(|(_, last)| *last >= e.last_ms) {
+                continue;
+            }
+            open.insert(e.fp, (e.id, e.last_ms));
+        }
+    }
+
     #[cfg(test)]
     fn tracked(&self) -> usize {
         self.open.lock().unwrap().len()

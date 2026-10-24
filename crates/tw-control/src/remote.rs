@@ -101,6 +101,12 @@ pub struct Remote {
     slots: Arc<Semaphore>,
     /// 每换入一次配置跳一下。已经连着的远程连接听它，名单把自己划出去了就断开
     reloads: watch::Sender<u64>,
+    /// 交接时跟不跟配置走（和网关的监听同一个规矩，见 `tw_gateway::listen::Handoff`）
+    mode: watch::Sender<Mode>,
+    /// 此刻在听的那个的复制句柄，交接时交出去。**弱引用**：攥着它，关掉的端口就放不开
+    held: Mutex<Option<(SocketAddr, std::sync::Weak<std::net::TcpListener>)>>,
+    /// 旧 core 交过来、还没起服务的那个
+    adopted: Mutex<Option<(SocketAddr, std::net::TcpListener)>>,
 }
 
 impl Default for Remote {
@@ -110,6 +116,60 @@ impl Default for Remote {
             strikes: Mutex::default(),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             reloads: watch::channel(0).0,
+            mode: watch::channel(Mode::Follow).0,
+            held: Mutex::default(),
+            adopted: Mutex::default(),
+        }
+    }
+}
+
+/// 交接时远程端口听谁的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Follow,
+    /// 新 core 提交之前：只在交过来的那个上面 accept，不跟配置换
+    Hold,
+    /// 旧 core 提交之后：停下，从它进来的连接一起断开（远端按断线重连连到新 core）
+    Stop,
+}
+
+impl Remote {
+    /// 先别跟配置开关远程端口（新 core 提交之前）。**在控制面起来之前调**
+    pub fn hold(&self) {
+        self.mode.send_replace(Mode::Hold);
+    }
+
+    /// 旧 core 交过来的远程端口：马上在它上面 accept
+    pub fn adopt(&self, want: SocketAddr, l: std::net::TcpListener) {
+        if let Ok(mut g) = self.adopted.lock() {
+            *g = Some((want, l));
+        }
+        // 叫醒跟着的那一路：值不变也要叫
+        self.mode.send_modify(|_| {});
+    }
+
+    /// 从现在起跟着配置走（新 core 提交之后）。交过来的地址和配置不一样就换过去
+    pub fn follow(&self) {
+        self.mode.send_replace(Mode::Follow);
+    }
+
+    /// 停下（旧 core 提交之后）：不再 accept，从它进来的连接一起断开。**只丢自己的句柄**
+    pub fn stop_accepting(&self) {
+        self.mode.send_replace(Mode::Stop);
+    }
+
+    /// 此刻在听的那个：配置算出来的地址，和一个复制出来的句柄
+    pub fn export(&self) -> std::io::Result<Option<(SocketAddr, std::net::TcpListener)>> {
+        let held = self.held.lock().ok().and_then(|g| g.clone());
+        match held.and_then(|(want, l)| l.upgrade().map(|l| (want, l))) {
+            Some((want, l)) => Ok(Some((want, l.try_clone()?))),
+            None => Ok(None),
+        }
+    }
+
+    fn set_held(&self, run: Option<&Running>) {
+        if let Ok(mut g) = self.held.lock() {
+            *g = run.map(|r| (r.want, Arc::downgrade(&r.dup)));
         }
     }
 }
@@ -196,6 +256,8 @@ pub fn reachable(addr: SocketAddr) -> Vec<String> {
 /// 进来的连接也一起断开**：关掉远程端口的意思就是现在谁都不能从远程进来。
 struct Running {
     want: SocketAddr,
+    /// 复制出来的句柄，交接时交出去
+    dup: Arc<std::net::TcpListener>,
     stop: watch::Sender<()>,
     /// accept 循环。**它结束了，监听的 socket 才真的放开** —— 同一个端口换地址
     /// 时要等到这一刻才能绑新的
@@ -218,17 +280,74 @@ impl Running {
 pub(crate) async fn follow(state: ControlState, app: Router, gate: Gate) {
     use tokio::sync::broadcast::error::RecvError;
     let mut events = state.bus().subscribe();
+    let mut mode = state.remote.mode.subscribe();
     let mut running: Option<Running> = None;
     loop {
-        apply(&state, &app, &gate, &mut running).await;
-        // 已经连着的远程连接各自对一遍名单（见 `revoked`）
-        state.remote.reloads.send_modify(|n| *n += 1);
-        loop {
-            match events.recv().await {
-                Ok(tw_api::Event::ConfigReloaded { .. }) | Err(RecvError::Lagged(_)) => break,
-                Ok(_) => {}
-                Err(RecvError::Closed) => return,
+        let now = *mode.borrow_and_update();
+        if now == Mode::Stop {
+            state.remote.set_held(None);
+            if let Some(run) = running.take() {
+                tracing::info!("handed over; the remote control port no longer accepts here");
+                run.close().await;
             }
+            return;
+        }
+        adopt(&state, &app, &gate, &mut running).await;
+        if now == Mode::Follow {
+            apply(&state, &app, &gate, &mut running).await;
+            state.remote.set_held(running.as_ref());
+            // 已经连着的远程连接各自对一遍名单（见 `revoked`）
+            state.remote.reloads.send_modify(|n| *n += 1);
+        }
+        loop {
+            tokio::select! {
+                ev = events.recv() => match ev {
+                    // 提交之前不跟配置走（见 `Mode::Hold`）
+                    Ok(tw_api::Event::ConfigReloaded { .. }) | Err(RecvError::Lagged(_))
+                        if now == Mode::Follow => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                r = mode.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 旧 core 交过来的那个：在它上面起服务（替掉手上的，提交之前手上本来就没有）。
+async fn adopt(state: &ControlState, app: &Router, gate: &Gate, running: &mut Option<Running>) {
+    let Some((want, l)) = state.remote.adopted.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    let listener = match tw_gateway::listen::adopt_listener(l) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(%want, %e, "the remote control port handed over could not be used");
+            return;
+        }
+    };
+    let actual = listener.local_addr().ok();
+    state.remote.set_held(None);
+    if let Some(old) = running.take() {
+        old.close().await;
+    }
+    match start(state, app, gate, want, listener) {
+        Ok(run) => {
+            *running = Some(run);
+            state.remote.set_held(running.as_ref());
+            state.remote.set_listening(Listening {
+                addr: actual,
+                error: None,
+            });
+            tracing::info!(addr = ?actual, "the remote control port is serving on the listener handed over");
+        }
+        Err(e) => {
+            tracing::warn!(%want, %e, "the remote control port handed over could not be used")
         }
     }
 }
@@ -239,6 +358,7 @@ async fn apply(state: &ControlState, app: &Router, gate: &Gate, running: &mut Op
     let want = match &cfg.listen.control.remote {
         Some(x) if x.enabled => x.clone(),
         _ => {
+            r.set_held(None);
             if running.take().is_some() {
                 tracing::info!("the remote control port is closed");
             }
@@ -279,6 +399,7 @@ async fn apply(state: &ControlState, app: &Router, gate: &Gate, running: &mut Op
         {
             let old = running.take().expect("checked just above");
             let old_want = old.want;
+            r.set_held(None);
             old.close().await;
             match TcpListener::bind(addr).await {
                 Ok(l) => l,
@@ -288,7 +409,7 @@ async fn apply(state: &ControlState, app: &Router, gate: &Gate, running: &mut Op
                     match TcpListener::bind(old_want).await {
                         Ok(l) => {
                             let actual = l.local_addr().ok();
-                            *running = Some(start(state, app, gate, old_want, l));
+                            *running = start(state, app, gate, old_want, l).ok();
                             r.set_listening(Listening {
                                 addr: actual,
                                 error,
@@ -314,10 +435,21 @@ async fn apply(state: &ControlState, app: &Router, gate: &Gate, running: &mut Op
     };
     let actual = listener.local_addr().ok();
     // 旧的那个关掉：不再接新连接，从它进来的也断开
+    r.set_held(None);
     if let Some(old) = running.take() {
         old.close().await;
     }
-    *running = Some(start(state, app, gate, addr, listener));
+    *running = match start(state, app, gate, addr, listener) {
+        Ok(run) => Some(run),
+        Err(e) => {
+            tracing::warn!(%addr, %e, "the remote control port cannot be listened on");
+            r.set_listening(Listening {
+                addr: None,
+                error: Some(tw_gateway::listen::bind_failure(addr, &e)),
+            });
+            return;
+        }
+    };
     r.set_listening(Listening {
         addr: actual,
         error: None,
@@ -331,7 +463,8 @@ fn start(
     gate: &Gate,
     want: SocketAddr,
     listener: TcpListener,
-) -> Running {
+) -> std::io::Result<Running> {
+    let dup = Arc::new(tw_gateway::listen::dup_listener(&listener)?);
     let (stop, stopped) = watch::channel(());
     let task = tokio::spawn(accept_loop(
         listener,
@@ -340,7 +473,12 @@ fn start(
         app.clone(),
         gate.clone(),
     ));
-    Running { want, stop, task }
+    Ok(Running {
+        want,
+        dup,
+        stop,
+        task,
+    })
 }
 
 /// 等到这个来源不再被放行：名单改了把它划出去，或者远程端口关了。
@@ -414,12 +552,12 @@ async fn accept_loop(
             stream,
             app.clone(),
             gate.clone(),
-            Some(crate::RemoteConn {
+            crate::RemoteConn {
                 on_failure: Box::new(move || remote.strike(ip, Instant::now())),
                 closed: stopped.clone(),
                 revoked: Box::pin(revoked(state.clone(), reloads, ip)),
                 _slot: slot,
-            }),
+            },
         );
     }
 }

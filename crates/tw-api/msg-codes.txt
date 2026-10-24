@@ -178,6 +178,11 @@ control.group.weight_not_load_balance
 control.group.weight_not_member
 control.group.weight_out_of_range
 control.group_in_use
+control.handover.busy
+control.handover.endpoint_failed
+control.handover.login_refused
+control.handover.remote
+control.handover.safe_mode
 control.header_no_value
 control.internal_error
 control.key_create_failed
@@ -361,6 +366,7 @@ gw.oauth.backoff.no_token
 gw.oauth.backoff.status
 gw.oauth.backoff.unreachable
 gw.oauth.expired
+gw.oauth.held
 gw.oauth.no_token
 gw.oauth.not_configured
 gw.oauth.rotation_no_manager

@@ -5,17 +5,23 @@
 //! 干净退出。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::sync::watch;
 
+mod background;
 mod call;
+mod handover;
 mod lockfile;
 mod pack_cli;
 mod proc;
+mod record;
 mod sync_cmd;
 mod upgrade;
 
+use background::Background;
 use lockfile::{LockFile, LockOutcome};
 
 #[derive(Parser)]
@@ -768,6 +774,15 @@ fn cmd_check(path: &Path) -> Result<()> {
     }
 }
 
+fn already_running(dir: &Path, pid: u32) -> anyhow::Error {
+    anyhow::anyhow!(
+        "已有 twcore 实例正在运行（pid {pid}）。\n\
+         两个实例无法共用同一个网关端口，请先停止该实例。\n\
+         如果该进程实际已退出，请删除 {} 后重试",
+        dir.join("twcore.lock").display()
+    )
+}
+
 fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) -> Result<()> {
     let dir = path
         .parent()
@@ -777,17 +792,47 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // 端口文件）都会顺手 `create_dir_all`，谁先到谁建 —— 而 Windows 上「谁
     // 建的」决定了它的 ACL，也就决定了那份明文密钥同机的其他用户读不读得到。
     tw_config::private_dir::create(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let _lock = match LockFile::acquire(&dir)? {
-        LockOutcome::Acquired(l) => l,
-        LockOutcome::AlreadyRunning { pid } => {
-            anyhow::bail!(
-                "已有 twcore 实例正在运行（pid {pid}）。\n\
-                 两个实例无法共用同一个网关端口，请先停止该实例。\n\
-                 如果该进程实际已退出，请删除 {} 后重试",
-                dir.join("twcore.lock").display()
-            );
-        }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // **锁被一个活着的 core 占着时，先问它是不是在等接替者**（升级不断线，见 `handover`）。
+    // 是的话接管它；不是的话照旧报「已有实例在运行」
+    let (mut lock, mut incoming) = match LockFile::acquire(&dir)? {
+        LockOutcome::Acquired(l) => (Some(l), None),
+        LockOutcome::AlreadyRunning { pid } => match rt.block_on(handover::approach(&dir, pid)) {
+            handover::Approach::Proceed(inc) => {
+                tracing::info!(pid, "taking over from the running core");
+                (None, Some(inc))
+            }
+            handover::Approach::StartFresh => match LockFile::acquire(&dir)? {
+                LockOutcome::Acquired(l) => (Some(l), None),
+                LockOutcome::AlreadyRunning { pid } => return Err(already_running(&dir, pid)),
+            },
+            handover::Approach::NotArmed => return Err(already_running(&dir, pid)),
+        },
     };
+    let taking_over = incoming.is_some();
+    // **还在排空的前任**（见 `lockfile::Draining`）：接替者在它排空完之前退了，这个进程是照常
+    // 拿到的锁，可前任还在写请求库。这时候和接替者一样：等它们都退了才开库，请求号跳过它们的
+    let draining = lockfile::draining(&dir);
+    let mut predecessors: Vec<u32> = draining.iter().map(|d| d.pid).collect();
+    if let Some(inc) = &incoming {
+        predecessors.push(inc.predecessor);
+    }
+    predecessors.sort_unstable();
+    predecessors.dedup();
+    let orphaned_ids = (!taking_over)
+        .then(|| draining.iter().map(|d| d.ids_below).max())
+        .flatten();
+    if orphaned_ids.is_some() {
+        tracing::warn!(
+            ?predecessors,
+            "a core that handed over is still draining; the request history opens once it exits"
+        );
+    }
+    // 还没进库的记录有几条（库开之前退出时说一声）
+    let pending = record::Pending::default();
+    let pending_outer = pending.clone();
 
     // **配置不存在就地生成**（第 1 步）。
     //
@@ -821,17 +866,20 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     //
     // 顶上的是一份临时的空配置，只有控制面的钥匙取自原文（桌面端从同一个文件读它）。原文连
     // 钥匙都找不到（YAML 坏到解析不了）就照旧退出：那时起了控制面也没人进得来
+    //
+    // **接管时也一样**（H3）：新版本读不进这份配置，就只接管控制面、等配置修好，网关的监听
+    // 留在旧 core 上按旧配置转发
     let (cfg, stood_in) = match tw_config::load(path) {
         Ok(cfg) => (cfg, None),
         Err(e) => {
-            let standin = safe
+            let standin = (safe || taking_over)
                 .then(|| std::fs::read_to_string(path).ok())
                 .flatten()
                 .and_then(|text| tw_config::stand_in(&text));
             match standin {
                 Some((cfg, r)) => {
                     tracing::error!(
-                        "safe mode: the configuration does not load ({r}); serving the control plane with a stand-in"
+                        "the configuration does not load ({r}); serving the control plane with a stand-in"
                     );
                     (cfg, Some(r))
                 }
@@ -853,9 +901,6 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // 听回环，网卡出现了再补上，换了地址也跟着换，见 `tw_gateway::serve_at`
     let listen_at = format!("{}:{}", listen.bind, listen.port);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     // 控制面听在哪由平台决定，见 `tw_api::control::Address`。
     let endpoint = tw_api::control::Address::in_dir(&dir);
     // **在起任何东西之前问**。等到 bind 失败时，网关已经在监听、客户端
@@ -865,12 +910,24 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // 一份，而控制面可能在主循环开始等之前就收到那条请求。
     let shutdown = tw_control::Shutdown::default();
     let config_path = path.to_path_buf();
-    rt.block_on(async move {
+    // 后台事务的运行时（见 `background`）。**在这里留一份**：进程退出时要在异步上下文之外关掉它
+    let bg = Arc::new(Mutex::new(Background::default()));
+    let bg_outer = bg.clone();
+    let r = rt.block_on(async move {
         let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
         // 默认价目表：上次联网刷新存下的那份，或者内置的。自定义价目表已经
         // 随配置进了价格簿
         state.set_price_table(tw_control::pricing::load_table(&config_path));
+        // 接替者：旧 core 的内存状态接进来，**在第一个请求之前**
+        if let Some(inc) = incoming.as_mut() {
+            // 提交之前续期归旧 core（见 `Cache::hold_renewals`）
+            state.oauth.hold_renewals(true);
+            inc.import(&state);
+        }
+        if let Some(below) = orphaned_ids {
+            state.bus.resume_after(below.saturating_add(handover::ID_GAP));
+        }
 
         // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
         // 照常转发。所以这里所有的失败都只记一行日志。
@@ -880,66 +937,51 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         let (body_tx, body_rx) = tw_gateway::bodies::channel();
         // 插件在每个请求上的运行记录，和正文同一个道理：网关交出去，存储层落库
         let (run_tx, run_rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
-        let store = build_store(
-            &dir,
-            state.bus.clone(),
-            state.pricing.clone(),
-            body_rx,
-            run_rx,
-            tw_control::key_limits::settle_hook(&state),
-        );
-        if let Some(rec) = &store {
+        let wiring = record::Wiring {
+            bus: state.bus.clone(),
+            pricing: state.pricing.clone(),
+            bodies: body_rx,
+            runs: run_rx,
+            settled: tw_control::key_limits::settle_hook(&state),
+        };
+        let (store, store_opened) = if predecessors.is_empty() {
+            let store = record::open_now(&dir, wiring);
+            if let Some(rec) = &store {
+                // 密钥的用量上限：这一天、这一周、这个月已经用了多少，从记录里加回来。**在第一个
+                // 请求之前**（网关还没开始听）
+                tw_control::key_limits::rebuild(&state, rec.lock().await.db());
+                // 之后一期的开头变了（到了下一期、换了时区），从记录里把新的那一期加起来
+                tw_control::key_limits::follow(&state, rec.clone());
+            }
+            (store, watch::channel(true).1)
+        } else {
+            // 接替者（或者前任还在排空）：前任都退了才打开请求库（R3，见 `record`）。用量从
+            // 记录重建在打开的那一刻；排空标记在那时清掉
+            let gw = state.clone();
+            let marks = dir.clone();
+            let (store, opened) = record::open_later(
+                &dir,
+                wiring,
+                predecessors.clone(),
+                Box::new(move |db| {
+                    tw_control::key_limits::rebuild(&gw, db);
+                    lockfile::prune_draining(&marks);
+                }),
+                pending,
+            );
+            if let Some(rec) = store.clone() {
+                let (gw, mut opened) = (state.clone(), opened.clone());
+                tokio::spawn(async move {
+                    if opened.wait_for(|o| *o).await.is_ok() {
+                        tw_control::key_limits::follow(&gw, rec);
+                    }
+                });
+            }
+            (store, opened)
+        };
+        if store.is_some() {
             state.set_body_sink(body_tx);
             state.set_plugin_sink(run_tx);
-            // 密钥的用量上限：这一天、这一周、这个月已经用了多少，从记录里加回来。**在第一个
-            // 请求之前**（网关还没开始听）
-            tw_control::key_limits::rebuild(&state, rec.lock().await.db());
-            // 之后一期的开头变了（到了下一期、换了时区），从记录里把新的那一期加起来
-            tw_control::key_limits::follow(&state, rec.clone());
-        }
-
-        /*
-          日志回收。**启动先跑一次，之后每小时一次。**
-
-          只在启动时跑的话，一台一直开着的机器永远轮不到它；只定时跑的
-          话，关机过夜的那台永远等不到那一小时。两个都要。
-
-          每一轮都重新读配置，所以改完期限不用重启 —— 下一轮就按新的算。
-          扫的是目录和一条 DELETE，空跑一次的代价可以忽略。
-
-          **在阻塞线程上跑，删正文时不拿记录库的锁**（见 `tw_store::task::gc`）：一次删几个
-          GB 可以要好几秒，以前那期间这把锁一直攥着，记录和查询都在等。
-        */
-        if let Some(rec) = store.clone() {
-            let gw = state.clone();
-            tokio::spawn(async move {
-                loop {
-                    let r = gw.config().retention.clone();
-                    let freed = {
-                        let rec = rec.clone();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        let (body_days, row_days, max) =
-                            (r.body_days, r.row_days, r.body_max_bytes);
-                        tokio::task::spawn_blocking(move || {
-                            tw_store::task::gc(&rec, now, body_days, row_days, max)
-                        })
-                        .await
-                        .unwrap_or(0)
-                    };
-                    if freed > 0 {
-                        tracing::info!(
-                            freed_bytes = freed,
-                            body_days = r.body_days,
-                            row_days = r.row_days,
-                            "reclaimed expired request logs"
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                }
-            });
         }
 
         // 配置的唯一入口。UI、CLI、文件监听都从这里进。
@@ -954,54 +996,79 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 默认插件（随 core 发的那几个）：没给过的装上（停用着），没动过的换成新版。
         // 启动时在控制面起来之前走一遍，界面第一次取插件就看得到它们；之后每换入一份
         // 配置再走一遍。**不挡启动**：哪个没办成只记一行、说一声。安全模式不走 ——
-        // 那时只有控制面，不替人往配置里写东西
-        if !safe {
-            let seeder = tw_control::plugins::defaults::Seeder::shipped();
-            seeder.seed(&manager).await;
-            tw_control::plugins::defaults::spawn(seeder, manager.clone());
+        // 那时只有控制面，不替人往配置里写东西。**接替者提交之后才走**：之前写配置的是旧 core
+        let mut seeder = None;
+        if !safe && !taking_over {
+            let s = tw_control::plugins::defaults::Seeder::shipped();
+            s.seed(&manager).await;
+            seeder = Some(s);
         }
         // **监听要留着** —— 扔掉它就停止监听，而那个失效是静默的。
         // 起不来不是致命的：手改文件不会自动生效，但界面和 CLI 照常能用，
         // 所以说一句就继续。
-        let _watch = match tw_control::spawn_watcher(manager.clone()) {
-            Ok(w) => Some(w),
+        let mut watchers: Vec<Box<dyn Send>> = Vec::new();
+        match tw_control::spawn_watcher(manager.clone()) {
+            Ok(w) => watchers.push(Box::new(w)),
             Err(e) => {
                 tracing::warn!("the configuration file cannot be watched, so a hand edit will not take effect on its own: {e}");
-                None
             }
-        };
+        }
         // 插件目录也盯着：**插件文件被改了，那个插件马上停用**，不等下一次改配置。
         // 盯不住时退回到每次换配置时重算哈希，所以同样只说一句
-        let _plugin_watch = match tw_control::plugins::spawn_watcher(state.clone(), manager.path())
-        {
-            Ok(w) => Some(w),
+        match tw_control::plugins::spawn_watcher(state.clone(), manager.path()) {
+            Ok(w) => watchers.push(Box::new(w)),
             Err(e) => {
                 tracing::warn!("the plugin directory cannot be watched, so a changed plugin file is noticed only at the next configuration change: {e}");
-                None
             }
-        };
+        }
 
         // 控制面无论如何都要起来 —— **网关挂了的时候，用户最需要的恰恰
         // 是能改配置**。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
             shutdown: shutdown.clone(),
             remote: Default::default(),
+            handover: Default::default(),
             started: std::time::Instant::now(),
             gateway: state.clone(),
-            cfg: manager,
-            store,
+            cfg: manager.clone(),
+            store: store.clone(),
             price_updater: Default::default(),
             chatgpt: Default::default(),
             zai: Default::default(),
         };
-        // 凭据轮换要写回 config.yaml。**不是人发起的配置写入只有两种**，
-        // 这是一种（另一种是上面的默认插件）—— 理由是服务器换发新 refresh
-        // token 的那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
-        tw_control::rotation::spawn(control.clone());
-        // 多设备同步：启动时一轮，之后按本机改动、定时、文件夹变化、唤醒。安全模式下不自动同步
-        let sync = tw_control::sync::start(&control, safe);
-        // 定期刷新默认价目表（`pricing.auto_update`，默认开）
-        tw_control::pricing::spawn(control.clone());
+        // 安全模式没有数据面：没有可交接的，arm 一律拒绝
+        control.handover.set_no_data_plane(safe);
+        // 前任还在排空、却没有交接连接（它的接替者先退了）：照「前任在排空」起来，等它退了回到平常
+        if orphaned_ids.is_some() {
+            handover::follow_vanished(predecessors.clone(), control.handover.clone());
+        }
+        let gateway = tw_gateway::listen::Handoff::default();
+        if let Some(inc) = incoming.as_mut() {
+            // 接替者：控制面在旧 core 交过来的监听上服务；网关、远程控制端口提交之前不跟配置走
+            control.handover.set_phase(tw_api::HandoverState::TakingOver);
+            if let Some(s) = inc.control.take() {
+                control.handover.control().inherit(s);
+            }
+            control.remote.hold();
+            gateway.hold();
+        }
+        // 后台事务（写回、同步、价目表、默认插件、模型目录、余额、日志回收）。**接替者提交
+        // 之后才起**：之前做这些事的是旧 core
+        let mut sync = None;
+        if !taking_over {
+            let started = bg
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the background lock is poisoned"))?
+                .start(background::Start {
+                    control: &control,
+                    safe,
+                    seeder: seeder.take(),
+                    store: store.clone(),
+                    store_opened: store_opened.clone(),
+                })
+                .context("starting the background tasks")?;
+            sync = Some(started);
+        }
 
         let at = endpoint.clone();
         // **控制面没了就得退，不能只记一行日志。**
@@ -1010,203 +1077,249 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 也关不掉。守护那边的心跳会因此失败，然后按重启阶梯反复拉起来，
         // 而用户看到的是「core 连续失败」——真正的原因（比如 socket 路径
         // 太长）只在日志里躺着。退出让那句话有机会走到人眼前。
-        let (control_died, control_dead) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let r = tw_control::serve(control, &at).await;
-            let msg = match r {
-                Err(e) => format!("{e}"),
-                // serve 正常返回意味着 accept 循环结束了，同样是没了
-                Ok(()) => "the control plane ended unexpectedly".to_string(),
-            };
-            let _ = control_died.send(msg);
-        });
-
-        if let Some(ppid) = parent {
-            // 父进程守望：GUI 没了我们跟着退。轮询而不是用 kqueue，是因为
-            // 这段代码要能在被重新 parent 之后仍然正确 —— macOS 上收养我们的
-            // 是 launchd（getppid() 变成 1），Linux 桌面会话里多半是
-            // `systemd --user`（它是 subreaper，getppid() 变成它的 pid，不是 1）。
-            // 所以**不看 getppid()**，只看原来那个 pid 还在不在，哪个平台、
-            // 谁来收养都一样。
+        let (control_died, mut control_dead) = tokio::sync::oneshot::channel();
+        {
+            let control = control.clone();
             tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    if !proc::alive(ppid) {
-                        tracing::info!(ppid, "the parent exited; exiting with it");
-                        std::process::exit(0);
-                    }
-                }
+                let r = tw_control::serve(control, &at).await;
+                let msg = match r {
+                    Err(e) => format!("{e}"),
+                    // serve 正常返回意味着 accept 循环结束了，同样是没了
+                    Ok(()) => "the control plane ended unexpectedly".to_string(),
+                };
+                let _ = control_died.send(msg);
             });
         }
+
+        // 父进程守望：GUI 没了我们跟着退。轮询而不是用 kqueue，是因为
+        // 这段代码要能在被重新 parent 之后仍然正确 —— macOS 上收养我们的
+        // 是 launchd（getppid() 变成 1），Linux 桌面会话里多半是
+        // `systemd --user`（它是 subreaper，getppid() 变成它的 pid，不是 1）。
+        // 所以**不看 getppid()**，只看原来那个 pid 还在不在，哪个平台、
+        // 谁来收养都一样。
+        //
+        // **arm 之后关掉**（见 `handover`）：桌面端装好更新要重启，core 留下来等接替者
+        let parent_watch = parent.map(handover::watch_parent);
 
         if safe {
             // 安全模式：只起控制面。数据面不动，让用户还能改配置、回滚。
             // **这时候控制面就是全部** —— 它没了，这个进程一件事都干不了。
+            //
+            // 安全模式的接替者只接管控制面，**一直握着交接连接**：松手的话旧 core 回到待交接，
+            // 又从控制面上接新连接了
             tracing::warn!("safe mode: starting the control plane only, not the data plane");
+            let held = async {
+                match incoming {
+                    Some(inc) => inc.hold().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 msg = control_dead => {
                     anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
                 }
                 _ = shutdown_requested(&shutdown) => {}
+                _ = held => {}
             }
             return Ok(());
         }
 
-        // 模型目录：后台去问每个上游有哪些模型。**不挡启动** ——
-        // 探测要打网络，而网关不该因为一次探测慢而起不来。
-        tw_gateway::models::spawn(state.clone());
-        // 余额：启动时读一遍，之后按节奏读（见 `tw_gateway::balances`）。**不挡启动，不挡转发**
-        tw_gateway::balances::spawn(state.clone());
+        let follow = !overridden;
+        let mut serve = match incoming {
+            None => {
+                tracing::info!(listen = %listen_at, "starting");
+                tokio::spawn(tw_gateway::listen::serve_with(
+                    state.clone(),
+                    listen,
+                    follow,
+                    gateway.clone(),
+                    Vec::new(),
+                ))
+            }
+            Some(mut inc) => {
+                // H3：配置读不进来就只接管控制面，等配置修好（换入成功）再接着走
+                if stood_in.is_some() {
+                    tracing::warn!("taking over the control plane only until the configuration loads; the previous core keeps forwarding");
+                    tokio::select! {
+                        _ = config_fixed(&manager) => {
+                            tracing::info!("the configuration loads now; taking over the gateway");
+                        }
+                        msg = &mut control_dead => {
+                            anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
+                        }
+                        _ = shutdown_requested(&shutdown) => return Ok(()),
+                    }
+                }
+                let inherited = tokio::select! {
+                    r = inc.listeners(&state) => r?,
+                    msg = &mut control_dead => {
+                        anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
+                    }
+                    _ = shutdown_requested(&shutdown) => return Ok(()),
+                };
+                // 配置换入过（H3 修好了），按此刻的配置跟
+                let listen = if follow {
+                    state.config().listen.gateway.clone()
+                } else {
+                    listen
+                };
+                let serve = tokio::spawn(tw_gateway::listen::serve_with(
+                    state.clone(),
+                    listen,
+                    follow,
+                    gateway.clone(),
+                    inherited.gateway,
+                ));
+                if let Some((want, l)) = inherited.remote {
+                    control.remote.adopt(want, l);
+                }
+                // 已经在全部监听上 accept 了才提交（不可逆，H5）
+                tokio::time::timeout(handover::commit_within(), gateway.listening())
+                    .await
+                    .context("the listeners handed over could not be served in time")?;
+                // 旧 core 回了 CommitAck（或者它已经没了）才算提交；它还在却没回，这边退出，
+                // 守护重来（这时它仍握着全部监听）
+                inc.commit().await?;
+                // ── 从这里起不再回退（H5）。旧 core 已经停止 accept：**下面任何一步出错都只记
+                // 一行、照常服务**，退出的话就没人在听了
+                //
+                // 从此续期由这一边做（旧 core 交出第二份快照起已暂停）
+                state.oauth.hold_renewals(false);
+                // 成为锁的持有者：写上自己的 pid（旧 core 已经放弃了锁），记下它在排空
+                match LockFile::claim(&dir) {
+                    Ok(l) => lock = Some(l),
+                    Err(e) => tracing::warn!("the lock file could not be taken over: {e}"),
+                }
+                if let Err(e) = lockfile::mark_draining(
+                    &dir,
+                    lockfile::Draining::new(inc.predecessor, inc.ids_from),
+                ) {
+                    tracing::warn!("the draining core could not be noted down: {e}");
+                }
+                gateway.follow();
+                control.remote.follow();
+                control.handover.set_phase(tw_api::HandoverState::Draining);
+                tracing::info!("took over; the previous core is draining");
+                let s = tw_control::plugins::defaults::Seeder::shipped();
+                s.seed(&manager).await;
+                let started = match bg.lock() {
+                    Ok(mut g) => g
+                        .start(background::Start {
+                            control: &control,
+                            safe: false,
+                            seeder: Some(s),
+                            store: store.clone(),
+                            store_opened: store_opened.clone(),
+                        })
+                        .map_err(|e| e.to_string()),
+                    Err(_) => Err("the background lock is poisoned".to_string()),
+                };
+                match started {
+                    Ok(started) => sync = Some(started),
+                    Err(e) => tracing::error!(
+                        "the background tasks could not start, so token write-back, sync and price updates are off this run; forwarding is unaffected: {e}"
+                    ),
+                }
+                inc.follow_drain(state.clone(), control.handover.clone());
+                serve
+            }
+        };
 
-        tracing::info!(listen = %listen_at, "starting");
-        tokio::select! {
-            r = tw_gateway::serve_at(state, listen, !overridden) => {
-                r.with_context(|| format!("{listen_at} could not be listened on. If the port is taken, check whether an earlier instance has fully exited"))
-            }
-            msg = control_dead => {
-                anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
-            }
-            _ = shutdown_requested(&shutdown) => {
-                tracing::info!("got a shutdown signal");
-                // 还没上传的本机改动，退出前上传（等不了太久：没传成的下次启动时传）
-                sync.flush().await;
-                Ok(())
+        // 旧 core 那一半：接 arm、等接替者、交接、排空（见 `handover`）
+        let core = Arc::new(handover::Core {
+            dir: dir.clone(),
+            state: state.clone(),
+            control: control.clone(),
+            gateway: gateway.clone(),
+            background: bg.clone(),
+            sync: Mutex::new(sync.clone()),
+            watchers: Mutex::new(watchers),
+            lock: Mutex::new(lock),
+            parent: Mutex::new(parent_watch),
+            parent_pid: parent,
+            store_opened,
+            handed_over: Default::default(),
+        });
+        let mut exit = handover::serve_arms(core.clone());
+
+        let mut serving = true;
+        let mut armed_task = true;
+        loop {
+            tokio::select! {
+                r = &mut serve, if serving => match r {
+                    // 交接提交之后停止了 accept：在跑的请求还在，等交接那一边说退
+                    Ok(Ok(())) => serving = false,
+                    Ok(Err(e)) => {
+                        return Err(e).with_context(|| format!("{listen_at} could not be listened on. If the port is taken, check whether an earlier instance has fully exited"));
+                    }
+                    Err(e) => anyhow::bail!("the gateway stopped: {e}"),
+                },
+                msg = &mut control_dead => {
+                    anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
+                }
+                // 系统的退出信号、`/shutdown`：照旧立即退出（F9；`/shutdown` 的语义不变）
+                _ = shutdown_requested(&shutdown) => {
+                    tracing::info!("got a shutdown signal");
+                    // 还没上传的本机改动，退出前上传（等不了太久：没传成的下次启动时传）。
+                    // **交出去了就不传**：同步已经归接替者
+                    if !core.handed_over.load(std::sync::atomic::Ordering::SeqCst)
+                        && let Some(sync) = &sync
+                    {
+                        sync.flush().await;
+                    }
+                    return Ok(());
+                }
+                e = &mut exit, if armed_task => match e {
+                    Ok(e) => {
+                        if e == handover::Exit::Retired
+                            && let Some(sync) = &sync
+                        {
+                            sync.flush().await;
+                        }
+                        return Ok(());
+                    }
+                    // 交接那一路自己没了（panic）：不是退出的理由，照常服务
+                    Err(_) => {
+                        tracing::error!("the handover task ended unexpectedly; serving on without handovers");
+                        armed_task = false;
+                    }
+                },
             }
         }
-    })
+    });
+    // 前任还在写库、这边的库还没开就退了：排着的记录写不进去，**说一声丢了多少**
+    let left = pending_outer.get();
+    if left > 0 {
+        tracing::warn!(
+            events = left,
+            "exiting before the previous core finished draining; {left} queued request events are not recorded"
+        );
+    }
+    // 后台事务的运行时在异步上下文之外关（在里面丢掉一个运行时会 panic）
+    let leftover = bg_outer.lock().ok().and_then(|mut g| g.take_runtime());
+    if let Some(bg_rt) = leftover {
+        bg_rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
+    r
 }
 
-/// 建观测层。**每一步失败都只是「没有历史记录」，不是「起不来」。**
-///
-/// 这条边界值得写死在代码形状里：这个函数返回 `Option`，而不是
-/// `Result` —— 调用方连处理错误的机会都不该有，因为没有任何一种
-/// 处理方式是「不转发了」。
-fn build_store(
-    dir: &Path,
-    // **收整条总线，不只是一个订阅端。**存储层算完价钱要往回报一条
-    // （见 `Event::RequestPriced`）—— 它是这条链上唯一知道单价的地方。
-    bus: tw_observe::EventBus,
-    // **和网关同一份价格簿**，不是一份副本：改了价目表，下一个结束的请求就按新价算
-    pricing: tw_pricing::Shared,
-    bodies: tokio::sync::mpsc::Receiver<tw_gateway::bodies::BodyRecord>,
-    runs: tokio::sync::mpsc::Receiver<tw_gateway::plugin::RunRecord>,
-    // 每记下一行请求，交给网关的密钥用量上限结算（见 `tw_control::key_limits`）
-    settled: tw_store::SettleHook,
-) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
-    // **存储层自己的那条通道，不订阅界面的广播**（见 `EventBus::record_feed`）：广播上
-    // 掉队丢的是界面上的几个点，记录丢的是那几个请求
-    let Some(events) = bus.record_feed() else {
-        tracing::warn!(
-            "request recording is already attached to the event bus; not starting a second one"
-        );
-        return None;
-    };
-    let (db, blobs) = match tw_store::open(dir) {
-        Ok(opened) => opened,
-        Err(e) => {
-            tracing::warn!(
-                "request recording could not start, so nothing is recorded this run; forwarding is unaffected: {e}"
-            );
-            return None;
+/// 等配置读得进来了（H3）：换入了一份、不再是被拒的那一份。
+async fn config_fixed(manager: &tw_control::ConfigManager) {
+    let mut events = manager.bus().subscribe();
+    loop {
+        match events.recv().await {
+            Ok(tw_api::Event::ConfigReloaded { .. })
+            | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if manager.rejected().is_none() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return std::future::pending().await;
+            }
         }
-    };
-    /*
-      **接着上次的号往下发。**这里是唯一同时看得见总线和库的地方，
-      而且它跑在 `serve` 之前（见 `cmd_serve`）—— 第一个请求拿到号
-      的时候，计数器已经归位了。
-
-      读不到就照常跑：那顶多是这一次重启又压掉几条历史，比起因为
-      一次查询失败而不记录任何东西要好得多。
-    */
-    match db.last_request_id() {
-        Ok(0) => {}
-        Ok(last) => {
-            tracing::debug!(last, "request ids resume from where they left off");
-            bus.resume_after(last);
-        }
-        Err(e) => tracing::warn!(
-            "could not read the last request id, so this run may overwrite the oldest records: {e}"
-        ),
     }
-    /*
-      两边的 body 结构在这里对接，**落盘的不是原文**：脱敏规则认得出的值在这里换掉、
-      打码（`BodyRecord::for_disk`，见 `tw_gateway::bodies`）。放在阻塞线程上 ——
-      一份 4 MB 的正文要扫好几遍，占着异步线程的话，同一个线程上的转发都得等它。
-
-      交给存储层的这一头**只留一个空位**。等着落盘的正文由网关那一头按字节记账
-      （`bodies::QUEUED_MAX`），一份正文的额度要等存储层收下它才还回去；这里再开一个
-      大口子的话，攒在这里的那些就没人管了。
-    */
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let mut bodies = bodies;
-    tokio::spawn(async move {
-        while let Some(b) = bodies.recv().await {
-            let Ok(disk) = tokio::task::spawn_blocking(move || b.for_disk()).await else {
-                continue;
-            };
-            let tw_gateway::bodies::ForDisk {
-                id,
-                at_ms,
-                kind,
-                body,
-                original_len,
-                held,
-            } = disk;
-            let mapped = tw_store::StoredBody {
-                id,
-                at_ms,
-                which: match kind {
-                    tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
-                    tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
-                    tw_gateway::bodies::BodyKind::AfterPlugins => tw_store::Which::AfterPlugins,
-                    tw_gateway::bodies::BodyKind::UpstreamRequest => {
-                        tw_store::Which::UpstreamRequest
-                    }
-                    tw_gateway::bodies::BodyKind::ClientResponse => tw_store::Which::ClientResponse,
-                    tw_gateway::bodies::BodyKind::Heads => tw_store::Which::Heads,
-                },
-                body,
-                original_len,
-            };
-            if tx.send(mapped).await.is_err() {
-                return;
-            }
-            // 存储层收下了：额度还回去
-            drop(held);
-        }
-    });
-    let recorder = tw_store::task::spawn(
-        // 算完价钱往回报一条 —— 见 `Event::RequestPriced`。这里是唯一
-        // 同时看得见总线和存储层的地方，所以接线在这儿完成。
-        tw_store::Recorder::new(db, blobs, pricing)
-            .reporting_to(bus)
-            .settling_to(settled),
-        events,
-        rx,
-    );
-    // 插件的运行记录同样在这里对接：网关那边的一次运行，换成存储层的一行
-    let (run_tx, run_rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
-    let mut runs = runs;
-    tokio::spawn(async move {
-        while let Some(r) = runs.recv().await {
-            let row = tw_store::PluginRunRow {
-                request_id: r.request_id as i64,
-                at_ms: r.at_ms as i64,
-                plugin_id: r.run.plugin_id,
-                plugin_name: r.run.plugin_name,
-                hook: r.run.hook,
-                outcome: r.run.outcome,
-                error: r.run.error,
-                cpu_us: r.run.cpu_us.min(i64::MAX as u64) as i64,
-                detail: r.run.detail.map(|d| d.to_string()),
-            };
-            if run_tx.send(row).await.is_err() {
-                return;
-            }
-        }
-    });
-    tw_store::task::record_plugin_runs(recorder.clone(), run_rx);
-    Some(recorder)
 }
 
 /// 等一个「该退了」。

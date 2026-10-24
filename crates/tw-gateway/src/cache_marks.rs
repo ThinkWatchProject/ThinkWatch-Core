@@ -46,6 +46,25 @@ impl Refused {
         by.contains_key(&(upstream.to_string(), model.to_string()))
     }
 
+    /// 交接：全部拒过的（见 [`crate::handover`]）
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::CacheMark> {
+        let by = self.by.lock().unwrap_or_else(|p| p.into_inner());
+        by.iter()
+            .map(|((upstream, model), at)| crate::handover::wire::CacheMark {
+                upstream: upstream.clone(),
+                model: model.clone(),
+                at_ms: *at,
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 记着的
+    pub(crate) fn handover_import(&self, marks: Vec<crate::handover::wire::CacheMark>) {
+        for m in marks {
+            self.note(&m.upstream, &m.model, m.at_ms);
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.by.lock().unwrap().len()

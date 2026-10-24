@@ -44,12 +44,69 @@ pub const CHANNEL_CAP: usize = 8;
 const TRIES: usize = 3;
 const GAP: Duration = Duration::from_millis(400);
 
+/// 写回那一路的把手：交接之前等它把手上的写完（升级不断线）。
+pub struct Rotation {
+    /// 看通道里还排着几份（不拿它发东西）
+    tx: tokio::sync::mpsc::Sender<Renewed>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Rotation {
+    /// 等到手上没有要写回的：排着的写完、正在写的写完。最多等 `within`。
+    ///
+    /// **交接之前调**：新 core 读的是配置文件里的 refresh token，旧 core 刚换到、还没写回
+    /// 的那一份要是丢了，新 core 手里的就是一张已经作废的。
+    pub async fn settle(&self, within: Duration) {
+        use std::sync::atomic::Ordering;
+        // **连着两次看到闲着才算**：取出一份和记下「在忙」之间有一瞬间两边都看不见它
+        let quiet = async {
+            let mut calm = 0;
+            loop {
+                let queued = self.tx.max_capacity() - self.tx.capacity();
+                if queued == 0 && !self.busy.load(Ordering::SeqCst) {
+                    calm += 1;
+                    if calm >= 2 {
+                        return;
+                    }
+                } else {
+                    calm = 0;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        if tokio::time::timeout(within, quiet).await.is_err() {
+            tracing::warn!("a token write-back was still in progress when the handover went ahead");
+        }
+    }
+}
+
 /// 起一个任务收刷新结果并写回文件。**控制面起来之后调一次。**
-pub fn spawn(state: crate::ControlState) {
+pub fn spawn(state: crate::ControlState) -> Rotation {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Renewed>(CHANNEL_CAP);
-    state.gateway.set_renewal_sink(tx);
+    state.gateway.set_renewal_sink(tx.clone());
+    let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = Rotation {
+        tx,
+        busy: busy.clone(),
+    };
     tokio::spawn(async move {
-        while let Some(r) = rx.recv().await {
+        use std::sync::atomic::Ordering;
+        loop {
+            // **先记「在忙」再取**：取出来到写完之间，`settle` 要看得见这一份
+            busy.store(true, Ordering::SeqCst);
+            let r = match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => {
+                    busy.store(false, Ordering::SeqCst);
+                    match rx.recv().await {
+                        Some(r) => {
+                            busy.store(true, Ordering::SeqCst);
+                            r
+                        }
+                        None => return,
+                    }
+                }
+            };
             let (ok, detail) = persist(&state, &r).await;
             if r.refresh.is_some() {
                 // 换发了 refresh token：成没成都要报（「成功」只报一次，由网关那边管）
@@ -59,6 +116,7 @@ pub fn spawn(state: crate::ControlState) {
             }
         }
     });
+    handle
 }
 
 /// 真正写那一次。返回（成没成，那句话）。

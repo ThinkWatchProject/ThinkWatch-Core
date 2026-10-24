@@ -136,6 +136,31 @@ impl Latency {
         self.batch(names, Window::measured)
     }
 
+    /// 交接：每家的样本和垫的底（见 [`crate::handover`]）
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::LatencyEntry> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter()
+            .map(|(name, w)| crate::handover::wire::LatencyEntry {
+                upstream: name.clone(),
+                real: w.real.iter().copied().collect(),
+                seed: w.seed,
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 的样本。这里已经有样本的那一家不动
+    pub(crate) fn handover_import(&self, entries: Vec<crate::handover::wire::LatencyEntry>) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        for e in entries {
+            let mut real: VecDeque<u32> = e.real.into_iter().collect();
+            while real.len() > WINDOW {
+                real.pop_front();
+            }
+            let seed = e.seed.filter(|_| real.len() < MIN_SAMPLES);
+            g.entry(e.upstream).or_insert(Window { real, seed });
+        }
+    }
+
     fn batch(&self, names: &[String], of: fn(&Window) -> Option<u32>) -> HashMap<String, u32> {
         let g = self.inner.lock().expect("lock not poisoned");
         names
