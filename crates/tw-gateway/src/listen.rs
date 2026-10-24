@@ -23,10 +23,25 @@
 //!
 //! 界面上的地址以前是启动时记的一次。换了端口，网关已经在新端口上服务，
 //! 界面还写着旧的 —— 用户分不清是没生效还是没刷新。
+//!
+//! # 交接（升级不断线）
+//!
+//! 新旧 core 交接时，监听的套接字原样交给新的那个（见 `tw-handover`），**不是重新绑**。
+//! 这一边要做的三件事都在 [`Handoff`] 上：交出此刻在听的每一个（[`Handoff::export`]，
+//! 复制出来的句柄）、从交过来的那些起服务（[`serve_with`]）、以及旧的那个停止 accept
+//! （[`Handoff::stop_accepting`]）。
+//!
+//! **停止 accept 只丢自己的句柄。**交出去的是同一个内核套接字：axum 丢下监听器关的
+//! 只是这个进程里的那个描述符，新的那个手里的照样在听，内核队列里还没被接受的连接
+//! 由它取走。unix 上一个套接字要等最后一个描述符关掉才关；Windows 上
+//! `WSADuplicateSocketW` 复制出来的也是一样（最后一个 `closesocket` 才真正关）。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tw_types::{Msg, msg};
 
 use crate::server::{now_ms, router};
@@ -118,12 +133,148 @@ fn overlaps_ours(a: SocketAddr, held: &[SocketAddr]) -> bool {
     })
 }
 
+/// 复制一个监听器的句柄：**同一个内核套接字**，多一个描述符。交接时交出去的是它，
+/// 自己手里的那个照样 accept。
+pub fn dup_listener(l: &TcpListener) -> std::io::Result<std::net::TcpListener> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        Ok(std::net::TcpListener::from(l.as_fd().try_clone_to_owned()?))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsSocket;
+        Ok(std::net::TcpListener::from(
+            l.as_socket().try_clone_to_owned()?,
+        ))
+    }
+}
+
+/// 从交过来的套接字起一个 tokio 的监听器。**先设成非阻塞**：交过来的那一头不保证。
+pub fn adopt_listener(l: std::net::TcpListener) -> std::io::Result<TcpListener> {
+    l.set_nonblocking(true)?;
+    TcpListener::from_std(l)
+}
+
+/// 交接时监听那一边听谁的：照常跟着配置走、先别动、还是停下。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Follow,
+    /// 新 core 还没提交：从交过来的监听上 accept，但**不跟配置换监听** —— 提交之前
+    /// 旧的那个也还在这些套接字上 accept，这时候换掉、让出端口都不对
+    Hold,
+    /// 旧 core 提交之后：全部停止 accept，**只丢自己的句柄**
+    Stop,
+}
+
+/// 交接用的把手：交出监听、停止 accept、等起来。[`serve_with`] 拿一份，交接那一边拿
+/// 另一份（克隆出来的是同一个）。
+#[derive(Clone)]
+pub struct Handoff(Arc<HandoffInner>);
+
+struct HandoffInner {
+    mode: watch::Sender<Mode>,
+    /// 此刻在听的：配置算出来的地址，和复制出来的句柄。换监听时跟着换。
+    ///
+    /// **弱引用**：句柄归 [`Bound`]。这里要是攥着一份，退场的监听器就关不掉 —— 内核
+    /// 套接字还有一个描述符开着，端口一直占着，「旧的先让出来」那一步就永远绑不上
+    held: std::sync::Mutex<Vec<(SocketAddr, std::sync::Weak<std::net::TcpListener>)>>,
+    /// 起始那一套起来了
+    up: watch::Sender<bool>,
+    /// 还没结束的 axum 服务（停止 accept 之后，它要等手上的连接都结束才结束）
+    serving: Arc<AtomicUsize>,
+}
+
+impl Default for Handoff {
+    fn default() -> Self {
+        Self(Arc::new(HandoffInner {
+            mode: watch::channel(Mode::Follow).0,
+            held: Default::default(),
+            up: watch::channel(false).0,
+            serving: Default::default(),
+        }))
+    }
+}
+
+impl Handoff {
+    /// 先别跟配置换监听（新 core 提交之前）。**在 [`serve_with`] 之前调。**
+    pub fn hold(&self) {
+        self.0.mode.send_replace(Mode::Hold);
+    }
+
+    /// 从现在起跟着配置走。交过来的地址和配置里的不一样时，**马上**按现有的换监听
+    /// 规矩换过去（新 core 提交之后调）。
+    pub fn follow(&self) {
+        self.0.mode.send_if_modified(|m| {
+            let was = *m == Mode::Hold;
+            if was {
+                *m = Mode::Follow;
+            }
+            was
+        });
+    }
+
+    /// 全部停止 accept（旧 core 提交之后调）。在跑的连接照常跑完；**共享的套接字不关**
+    /// （见模块文档）。之后 [`serve_with`] 返回 `Ok(())`，不再换监听。
+    pub fn stop_accepting(&self) {
+        self.0.mode.send_replace(Mode::Stop);
+    }
+
+    /// 此刻在听的每一个：配置算出来的地址，和一个复制出来的句柄（交给新 core）。
+    pub fn export(&self) -> std::io::Result<Vec<(SocketAddr, std::net::TcpListener)>> {
+        let held = self.0.held.lock().map(|g| g.clone()).unwrap_or_default();
+        held.iter()
+            .filter_map(|(want, l)| l.upgrade().map(|l| (*want, l)))
+            .map(|(want, l)| Ok((want, l.try_clone()?)))
+            .collect()
+    }
+
+    /// 等到起始那一套起来了。
+    pub async fn listening(&self) {
+        let mut rx = self.0.up.subscribe();
+        let _ = rx.wait_for(|up| *up).await;
+    }
+
+    /// 还没结束的服务有几个。停止 accept 之后它们各自等手上的连接结束；**归零 = 走 HTTP
+    /// 的连接都结束了**（WebSocket 升级之后不归它们管，看网关的在途计数）。
+    pub fn serving(&self) -> usize {
+        self.0.serving.load(Ordering::SeqCst)
+    }
+
+    fn publish(&self, bound: &[Bound]) {
+        if let Ok(mut g) = self.0.held.lock() {
+            *g = bound
+                .iter()
+                .map(|b| (b.want, Arc::downgrade(&b.dup)))
+                .collect();
+        }
+    }
+}
+
+/// 一个服务在跑，结束时减一。
+struct Serving(Arc<AtomicUsize>);
+
+impl Serving {
+    fn enter(n: &Arc<AtomicUsize>) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        Self(n.clone())
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// 一个地址上的服务。
 struct Bound {
     /// 配置算出来的地址。比对「变没变」用它 —— 端口写 0 时实际拿到的每次都不一样
     want: SocketAddr,
     /// 真的绑上的
     actual: SocketAddr,
+    /// 复制出来的句柄，交接时交出去（见 [`Handoff::export`]）
+    dup: Arc<std::net::TcpListener>,
     /// 发一下（或者丢掉）就停止接新连接，已经在跑的请求自己跑完
     stop: tokio::sync::oneshot::Sender<()>,
     /// 端口真正放掉的那一刻：axum 丢下了监听器
@@ -175,13 +326,21 @@ async fn bind_all(
     Ok(out)
 }
 
-fn start(state: &AppState, want: SocketAddr, listener: TcpListener) -> std::io::Result<Bound> {
+fn start(
+    state: &AppState,
+    handoff: &Handoff,
+    want: SocketAddr,
+    listener: TcpListener,
+) -> std::io::Result<Bound> {
     let actual = listener.local_addr()?;
+    let dup = Arc::new(dup_listener(&listener)?);
     tracing::info!(%actual, "the gateway is listening");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let (release, released) = tokio::sync::oneshot::channel::<()>();
     let st = state.clone();
+    let serving = Serving::enter(&handoff.0.serving);
     tokio::spawn(async move {
+        let _serving = serving;
         use axum::serve::ListenerExt;
         let listener = Tracked {
             inner: listener,
@@ -208,9 +367,27 @@ fn start(state: &AppState, want: SocketAddr, listener: TcpListener) -> std::io::
     Ok(Bound {
         want,
         actual,
+        dup,
         stop,
         released,
     })
+}
+
+/// 记下此刻在听的（界面看的那份，和交接要交出去的那份）。
+fn publish(state: &AppState, handoff: &Handoff, bound: &[Bound], error: Option<Msg>) {
+    handoff.publish(bound);
+    state.set_listening(snapshot(bound, error));
+}
+
+/// 全部停止 accept。**只丢自己的句柄**（见模块文档）；在跑的连接各自跑完。
+fn stop_all(handoff: &Handoff, bound: Vec<Bound>) {
+    for b in bound {
+        tracing::info!(addr = %b.actual, "handed over; no longer accepting here");
+        let _ = b.stop.send(());
+    }
+    if let Ok(mut g) = handoff.0.held.lock() {
+        g.clear();
+    }
 }
 
 fn snapshot(bound: &[Bound], error: Option<Msg>) -> Listening {
@@ -228,7 +405,7 @@ pub(crate) async fn serve_detached(
     let listener = TcpListener::bind(want)
         .await
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}", bind_failure(want, &e))))?;
-    let bound = start(&state, want, listener)?;
+    let bound = start(&state, &Handoff::default(), want, listener)?;
     let actual = bound.actual;
     state.set_listening(snapshot(std::slice::from_ref(&bound), None));
     // 丢掉 `Bound` 就停止接新连接：把它留在一个不会结束的任务里
@@ -286,11 +463,37 @@ pub async fn serve_at(
     listen: tw_config::GatewayListen,
     follow: bool,
 ) -> std::io::Result<()> {
-    let (want, mut note) = plan(&listen);
-    let mut bound = Vec::with_capacity(want.len());
+    serve_with(state, listen, follow, Handoff::default(), Vec::new()).await
+}
+
+/// 同 [`serve_at`]，多两样交接用的东西：
+///
+/// - `handoff`：交出监听、停止 accept（旧 core），先别跟配置换监听（新 core 提交之前，
+///   见 [`Handoff::hold`]）；
+/// - `inherited`：旧 core 交过来的监听（配置算出来的地址，和套接字）。**不空就不绑**，
+///   直接在它们上面 accept；地址和这边的配置不一样的，跟配置走时（[`Handoff::follow`]）
+///   按现有的换监听规矩换过去。
+///
+/// [`Handoff::stop_accepting`] 之后返回 `Ok(())`。
+pub async fn serve_with(
+    state: AppState,
+    listen: tw_config::GatewayListen,
+    follow: bool,
+    handoff: Handoff,
+    inherited: Vec<(SocketAddr, std::net::TcpListener)>,
+) -> std::io::Result<()> {
+    let (want, mut note) = if inherited.is_empty() {
+        plan(&listen)
+    } else {
+        (Vec::new(), None)
+    };
+    let mut bound = Vec::with_capacity(want.len().max(inherited.len()));
+    for (a, l) in inherited {
+        bound.push(start(&state, &handoff, a, adopt_listener(l)?)?);
+    }
     for a in want {
         match TcpListener::bind(a).await {
-            Ok(l) => bound.push(start(&state, a, l)?),
+            Ok(l) => bound.push(start(&state, &handoff, a, l)?),
             Err(e) if absent(a, &e) => {
                 tracing::warn!(%a, %e, "not an address of this machine yet; listening without it until it is");
                 note = Some(bind_failure(a, &e));
@@ -306,7 +509,30 @@ pub async fn serve_at(
     if let Some(e) = &note {
         tracing::warn!(%e, "listening on loopback only for now; the rest is added once it appears");
     }
-    state.set_listening(snapshot(&bound, note));
+    publish(&state, &handoff, &bound, note);
+    handoff.0.up.send_replace(true);
+    // 提交之前先别动（见 `Mode::Hold`）；停下就停下。跟配置走的那一刻马上对一遍：
+    // 交过来的地址可能和这边的配置不一样
+    let mut mode = handoff.0.mode.subscribe();
+    let mut held = false;
+    loop {
+        let now = *mode.borrow_and_update();
+        match now {
+            Mode::Follow => break,
+            Mode::Stop => {
+                stop_all(&handoff, bound);
+                return Ok(());
+            }
+            Mode::Hold => held = true,
+        }
+        if mode.changed().await.is_err() {
+            stop_all(&handoff, bound);
+            return Ok(());
+        }
+    }
+    if held {
+        state.relisten();
+    }
     // 眼下这些监听器是照着哪份设置绑的。**设置没变、网卡却解析不出来了**，是
     // 我们跟着的那张网卡没了（WSL 关了）：退回只听回环，等它回来。设置变了
     // 而新的解析不出来，那是另一回事，见下面
@@ -321,6 +547,13 @@ pub async fn serve_at(
         let asked = tokio::select! {
             _ = state.relisten_signal().notified() => true,
             _ = recheck.tick() => false,
+            r = mode.changed() => {
+                if r.is_err() || *mode.borrow_and_update() == Mode::Stop {
+                    stop_all(&handoff, bound);
+                    return Ok(());
+                }
+                continue;
+            }
         };
         let listen = if follow {
             state.runtime().config.listen.gateway.clone()
@@ -349,7 +582,7 @@ pub async fn serve_at(
                 if asked {
                     tracing::error!(%e, "the new listen address cannot be resolved; keeping the current one");
                 }
-                state.set_listening(snapshot(&bound, Some(unresolved(&e))));
+                publish(&state, &handoff, &bound, Some(unresolved(&e)));
                 continue;
             }
         };
@@ -357,7 +590,7 @@ pub async fn serve_at(
         if want == have {
             // 通知来了但地址没变（比如又改回去了）。上一次没换成的那句话到此作废
             following = spec;
-            state.set_listening(snapshot(&bound, note));
+            publish(&state, &handoff, &bound, note);
             continue;
         }
         // **还要的地址原样留着，只绑新增的** —— 从「仅本机」换到「局域网」时，
@@ -395,14 +628,14 @@ pub async fn serve_at(
                         // 能听的照听，`addrs` 说的就是此刻真在听的
                         for w in back {
                             match TcpListener::bind(w).await {
-                                Ok(l) => bound.push(start(&state, w, l)?),
+                                Ok(l) => bound.push(start(&state, &handoff, w, l)?),
                                 Err(e) => {
                                     tracing::error!(%w, %e, "the previous listen address could not be taken back")
                                 }
                             }
                         }
                         bound.sort_by_key(|b| have.iter().position(|w| *w == b.want));
-                        state.set_listening(snapshot(&bound, Some(bind_failure(a, &e))));
+                        publish(&state, &handoff, &bound, Some(bind_failure(a, &e)));
                         continue;
                     }
                 }
@@ -415,18 +648,18 @@ pub async fn serve_at(
                 }
                 bound = keep.into_iter().chain(gone).collect();
                 bound.sort_by_key(|b| have.iter().position(|w| *w == b.want));
-                state.set_listening(snapshot(&bound, Some(bind_failure(a, &e))));
+                publish(&state, &handoff, &bound, Some(bind_failure(a, &e)));
                 continue;
             }
         };
         bound = keep;
         for (a, l) in listeners {
-            bound.push(start(&state, a, l)?);
+            bound.push(start(&state, &handoff, a, l)?);
         }
         following = spec;
         // 配置里写的那个排在最后，和 `addrs()` 同一个顺序
         bound.sort_by_key(|b| want.iter().position(|w| *w == b.want));
-        state.set_listening(snapshot(&bound, note));
+        publish(&state, &handoff, &bound, note);
     }
 }
 

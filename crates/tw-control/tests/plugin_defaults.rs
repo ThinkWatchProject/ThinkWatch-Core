@@ -170,6 +170,7 @@ fn open(dir: PathBuf, engine: Arc<dyn Engine>) -> Bed {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: mgr.clone(),
         gateway: gw.clone(),
         store: None,

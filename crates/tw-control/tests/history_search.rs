@@ -105,6 +105,7 @@ fn app(
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: Some(Arc::new(tokio::sync::Mutex::new(rec))),
@@ -226,6 +227,7 @@ async fn without_a_store_the_search_says_recording_is_unavailable() {
     let app = tw_control::router(ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: None,

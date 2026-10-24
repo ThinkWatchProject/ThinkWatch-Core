@@ -84,6 +84,7 @@ fn bed_with(db: Option<tw_store::Db>, clock: Arc<dyn tw_gateway::key_limits::Clo
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p.clone(), gw.clone(), gw.bus.clone())),
         gateway: gw.clone(),
         store: Some(rec.clone()),

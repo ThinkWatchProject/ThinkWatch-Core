@@ -101,6 +101,14 @@ impl Accounts {
         }
     }
 
+    /// 有一次登录正在等用户授权。**这时不交接**（升级不断线）：登录要在这个 core 上走完
+    pub fn in_progress(&self) -> bool {
+        self.current.lock().is_ok_and(|g| {
+            g.as_ref()
+                .is_some_and(|c| c.status.status == tw_api::LoginStatus::Pending)
+        })
+    }
+
     fn set_status(&self, status: tw_api::ChatgptLoginStatus) {
         if let Ok(mut g) = self.current.lock()
             && let Some(c) = g.as_mut()
