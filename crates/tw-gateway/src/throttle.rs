@@ -61,9 +61,6 @@ const MIN_HINT: Duration = Duration::from_millis(1);
 /// 每次 60 秒
 const BACKOFF_SECS: [u64; 5] = [5, 10, 20, 40, 60];
 
-/// 一家最近一次被限流之后这么久之内，它还「可能在限流」（[`Throttles::wary`]）
-const WARY_FOR: Duration = Duration::from_secs(300);
-
 /// 两个时钟走的差，到了这么多才当是系统时间被拨过（见 [`Span::end_ms`]）；两个时钟换算出来的
 /// 时刻差不到这么多的当是同一刻（见 [`Throttles::limit_state`]）。先后读两个时钟，差会抖一两毫秒
 const SLACK_MS: u64 = 1_000;
@@ -581,17 +578,6 @@ impl Throttles {
             };
         }
         (Peek::Open, None)
-    }
-
-    /// 这一家此刻**可能在限流**：在探路、连续被限流还没有别的答复，或者最近
-    /// （[`WARY_FOR`]）被限流过。最后一家的流式回答这时也压着开头（见 `hop`）：流的开头报的
-    /// 限流要排队等它恢复，不交给客户端。一直好好的上游不压 —— 客户端照常当场拿到响应头和
-    /// 开头的那几个事件
-    pub fn wary(&self, name: &str) -> bool {
-        let now = self.moment();
-        self.lock().get(name).is_some_and(|up| {
-            up.probing || up.strikes > 0 || up.limited_at.is_some_and(|t| t.since(now) < WARY_FOR)
-        })
     }
 
     /// 留在这一家的对话还留不留（见 [`crate::affinity`]）：这一期用完了的、限流暂停要到
@@ -1953,20 +1939,6 @@ mod tests {
         assert!(!is_go(&t.gate("甲", &[], None)));
         probe.withdraw();
         assert!(matches!(t.gate("甲", &[], None), Gate::Go(Some(_))));
-    }
-
-    #[test]
-    fn an_upstream_is_wary_while_probing_and_for_a_while_after_a_429() {
-        let (t, c) = clocked();
-        assert!(!t.wary("甲"), "没被限流过");
-        t.limited("甲", c.at(T0), None);
-        assert!(t.wary("甲"));
-        c.advance(5_000);
-        t.answered("甲", c.at(T0 + 5_000));
-        // 探路的过了、连续的次数归零：最近被限流过，还要当心
-        assert!(t.wary("甲"));
-        c.advance(295_000);
-        assert!(!t.wary("甲"));
     }
 
     #[tokio::test]

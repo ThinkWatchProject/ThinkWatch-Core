@@ -63,6 +63,11 @@ async fn serve(upstream: SocketAddr) -> (SocketAddr, tw_gateway::live::Live) {
             protocol: Some(tw_config::Protocol::Anthropic),
             ..Default::default()
         }],
+        // 不等、不重试：唯一的上游不压开头，流的第一帧当场交给客户端
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
