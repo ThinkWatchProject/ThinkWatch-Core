@@ -84,6 +84,7 @@ fn state_for(
     ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: mgr,
         gateway: gw,
         store: None,

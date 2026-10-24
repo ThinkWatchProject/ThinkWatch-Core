@@ -16,6 +16,8 @@ categories.workspace = true
 [dependencies]
 tw-config = { workspace = true }
 tw-control = { workspace = true }
+# 升级不断线：新旧 core 之间的交接连接
+tw-handover = { workspace = true }
 # `twcore export` / `import` / `backup`：配置包和本机备份
 tw-pack = { workspace = true }
 tw-gateway = { workspace = true }
@@ -53,6 +55,8 @@ libc = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # 交接时把标准输出、错误输出从桌面端的管道上挪开（SetStdHandle）
+    "Win32_System_Console",
 ] }
 
 [dev-dependencies]
@@ -60,3 +64,5 @@ tempfile = "3"
 # `twcore upgrade` 的测试对着一个假的 GitHub 跑
 axum = { workspace = true }
 serde_json = { workspace = true }
+# 交接的端到端测试：假上游流式回答，测试自己扮接替者
+futures = { workspace = true }

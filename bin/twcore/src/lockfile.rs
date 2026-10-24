@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub struct LockFile {
     path: PathBuf,
+    /// 退出时删不删文件。**交接之后不删**：那时文件里写的已经是接替者的 pid
+    owned: bool,
 }
 
 #[derive(Debug)]
@@ -35,14 +37,43 @@ impl LockFile {
         }
         // 到这儿说明：没有锁文件、内容不是数字、或者那个 pid 已经死了。
         // 后两种都是「上次没退干净」，直接覆盖。
+        Ok(LockOutcome::Acquired(Self::write(path)?))
+    }
+
+    /// 接替者在交接提交时成为锁的持有者：**不看现在写的是谁**，直接写上自己。
+    ///
+    /// 此刻文件里写的是旧 core 的 pid、它也还活着（在排空），但它已经放弃了锁（见
+    /// [`LockFile::disown`]）。
+    pub fn claim(dir: &Path) -> std::io::Result<LockFile> {
+        std::fs::create_dir_all(dir)?;
+        Self::write(dir.join("twcore.lock"))
+    }
+
+    /// 放弃锁：退出时不删文件（交接提交之后，文件里马上会是接替者的 pid）。
+    pub fn disown(mut self) {
+        self.owned = false;
+    }
+
+    fn write(path: PathBuf) -> std::io::Result<LockFile> {
         let mut f = std::fs::File::create(&path)?;
         write!(f, "{}", std::process::id())?;
-        Ok(LockOutcome::Acquired(LockFile { path }))
+        Ok(LockFile { path, owned: true })
     }
+}
+
+/// 锁文件里此刻写的 pid（读不到、不是数字是 `None`）。
+#[cfg(test)]
+pub fn holder(dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join("twcore.lock"))
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
 }
 
 impl Drop for LockFile {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         // 尽力而为。删不掉也无所谓 —— 下次启动的僵尸检测会认出它。
         let _ = std::fs::remove_file(&self.path);
     }
@@ -131,6 +162,30 @@ mod tests {
             LockOutcome::AlreadyRunning { pid } => assert_eq!(pid, alive),
             other => panic!("应该被挡住，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_disowned_lock_leaves_the_file_for_the_successor() {
+        // 交接提交之后旧 core 放弃锁：它退出时文件里写的已经是接替者，不能删
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("twcore.lock");
+        let LockOutcome::Acquired(l) = LockFile::acquire(d.path()).unwrap() else {
+            panic!("应该拿到锁");
+        };
+        l.disown();
+        assert!(p.exists(), "放弃了锁，文件还该在");
+    }
+
+    #[test]
+    fn claiming_writes_our_pid_over_a_live_holder() {
+        let d = tempfile::tempdir().unwrap();
+        let mut child = sleeping_child();
+        std::fs::write(d.path().join("twcore.lock"), child.id().to_string()).unwrap();
+        let claimed = LockFile::claim(d.path());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _l = claimed.unwrap();
+        assert_eq!(holder(d.path()), Some(std::process::id()));
     }
 
     #[test]

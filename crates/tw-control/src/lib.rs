@@ -31,6 +31,7 @@ mod contract;
 pub mod diagnostics;
 pub mod dryrun;
 mod gate;
+pub mod handover;
 pub mod key_limits;
 pub mod keys;
 pub mod listen;
@@ -73,6 +74,8 @@ pub struct ControlState {
     pub shutdown: Shutdown,
     /// 远程控制端口此刻在听哪儿、谁被晾着。
     pub remote: Arc<remote::Remote>,
+    /// 升级不断线：交接走到哪一步、本机控制面的监听（见 [`handover`]）
+    pub handover: Arc<handover::Handover>,
 }
 
 impl ControlState {
@@ -95,6 +98,7 @@ pub fn router(state: ControlState) -> Router {
     Router::new()
         .at(ep::Status, status)
         .at(ep::Shutdown, ask_shutdown)
+        .at(ep::HandoverArm, handover::arm)
         .at(ep::Interfaces, interfaces)
         .merge(keys::router())
         .merge(listen::router())
@@ -232,9 +236,8 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
         providers: cfg.providers.len(),
         uptime_secs: s.started.elapsed().as_secs(),
         in_flight: s.gateway.live.count(),
-        // C2 接上交接状态
-        handover: tw_api::HandoverState::Idle,
-        draining: 0,
+        handover: s.handover.phase(),
+        draining: s.handover.draining(),
         remote_control,
         gateway_reachable,
     })
@@ -2028,13 +2031,103 @@ pub async fn serve(state: ControlState, at: &tw_api::control::Address) -> Result
     use tw_api::control::Address;
     let gate = gate::Gate::new(&state);
     let app = router(state.clone());
+    let handover = state.handover.clone();
     tokio::spawn(remote::follow(state, app.clone(), gate.clone()));
+    // **交接过来的控制面不自己绑**：新 core 在旧 core 交过来的那个上面服务（socket 文件、
+    // Windows 的端口文件都不动 —— 桌面端认的就是它们）
+    if let Some(s) = handover.control().take_inherited() {
+        return serve_inherited(app, gate, &handover, s, at).await;
+    }
     match at {
         #[cfg(unix)]
-        Address::Socket(path) => serve_socket(app, gate, path).await,
+        Address::Socket(path) => serve_socket(app, gate, &handover, path).await,
         #[cfg(not(unix))]
         Address::Socket(path) => Err(ControlError::NoUnixSockets { path: path.clone() }),
-        Address::Loopback { port_file } => serve_loopback(app, gate, port_file).await,
+        Address::Loopback { port_file } => serve_loopback(app, gate, &handover, port_file).await,
+    }
+}
+
+/// 在旧 core 交过来的监听上服务。
+// Windows 上只有 TCP 一种，下面的 match 在那儿只有一支
+#[allow(clippy::match_single_binding, clippy::infallible_destructuring_match)]
+async fn serve_inherited(
+    app: Router,
+    gate: gate::Gate,
+    handover: &handover::Handover,
+    s: tw_handover::Socket,
+    at: &tw_api::control::Address,
+) -> Result<(), ControlError> {
+    let path = match at {
+        tw_api::control::Address::Socket(p) => p.clone(),
+        tw_api::control::Address::Loopback { port_file } => port_file.clone(),
+    };
+    let bind_err = |source| ControlError::Bind {
+        path: path.clone(),
+        source,
+    };
+    match s {
+        tw_handover::Socket::Tcp(l) => {
+            handover
+                .control()
+                .hold(tw_handover::Socket::Tcp(l.try_clone().map_err(bind_err)?));
+            let listener = tw_gateway::listen::adopt_listener(l).map_err(bind_err)?;
+            tracing::info!("the control plane is serving on the listener handed over");
+            accept_loop(&listener, app, gate, handover).await
+        }
+        #[cfg(unix)]
+        tw_handover::Socket::Unix(l) => {
+            handover
+                .control()
+                .hold(tw_handover::Socket::Unix(l.try_clone().map_err(bind_err)?));
+            // 收到的那一头只能设成非阻塞，**绝不改回阻塞**：O_NONBLOCK 是两个进程共享的
+            l.set_nonblocking(true).map_err(bind_err)?;
+            let listener = tokio::net::UnixListener::from_std(l).map_err(bind_err)?;
+            tracing::info!("the control plane is serving on the socket handed over");
+            accept_loop(&listener, app, gate, handover).await
+        }
+    }
+}
+
+/// 两种监听器的 accept。
+trait Accept {
+    type Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static;
+    fn accept_one(&self) -> impl std::future::Future<Output = std::io::Result<Self::Io>> + Send;
+}
+
+impl Accept for tokio::net::TcpListener {
+    type Io = tokio::net::TcpStream;
+    async fn accept_one(&self) -> std::io::Result<Self::Io> {
+        self.accept().await.map(|(s, _)| s)
+    }
+}
+
+#[cfg(unix)]
+impl Accept for tokio::net::UnixListener {
+    type Io = tokio::net::UnixStream;
+    async fn accept_one(&self) -> std::io::Result<Self::Io> {
+        self.accept().await.map(|(s, _)| s)
+    }
+}
+
+/// accept 循环。**交接时停下**（[`handover::ControlListener::pause`]）：停的时候不去接，
+/// 监听器本身留着，恢复了接着接 —— 见 [`handover`] 的模块文档。
+async fn accept_loop<L: Accept>(
+    listener: &L,
+    app: Router,
+    gate: gate::Gate,
+    handover: &handover::Handover,
+) -> Result<(), ControlError> {
+    let mut accepting = handover.control().accepting();
+    loop {
+        handover::until_accepting(&mut accepting).await;
+        tokio::select! {
+            r = listener.accept_one() => match r {
+                Ok(stream) => hand_off(stream, app.clone(), gate.clone(), None),
+                Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
+            },
+            // 停下的那一刻放下手里这次 accept：不然它还会再接一个
+            _ = accepting.wait_for(|on| !*on) => {}
+        }
     }
 }
 
@@ -2043,7 +2136,12 @@ pub async fn serve(state: ControlState, at: &tw_api::control::Address) -> Result
 /// 陈旧的 socket 文件直接删掉重建 —— 它和 lock 文件不一样，没有「另一个
 /// 实例可能还在用」的歧义：单实例锁已经在上一步挡住了。
 #[cfg(unix)]
-async fn serve_socket(app: Router, gate: gate::Gate, path: &Path) -> Result<(), ControlError> {
+async fn serve_socket(
+    app: Router,
+    gate: gate::Gate,
+    handover: &handover::Handover,
+    path: &Path,
+) -> Result<(), ControlError> {
     socket_path_fits(path)?;
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -2051,23 +2149,26 @@ async fn serve_socket(app: Router, gate: gate::Gate, path: &Path) -> Result<(), 
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let listener = tokio::net::UnixListener::bind(path).map_err(|source| ControlError::Bind {
+    let bind_err = |source| ControlError::Bind {
         path: path.to_path_buf(),
         source,
-    })?;
+    };
+    // **先建 std 的监听，复制一份给 tokio，原件留着交接用**（同一个内核套接字）
+    let std_listener = std::os::unix::net::UnixListener::bind(path).map_err(bind_err)?;
     {
         use std::os::unix::fs::PermissionsExt;
         // 0700：只有当前用户能连。握手那道门在它之外，不是替代它 ——
         // 两道都在，而只有这一道是平台给的。
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
+    let mine = std_listener.try_clone().map_err(bind_err)?;
+    mine.set_nonblocking(true).map_err(bind_err)?;
+    let listener = tokio::net::UnixListener::from_std(mine).map_err(bind_err)?;
+    handover
+        .control()
+        .hold(tw_handover::Socket::Unix(std_listener));
     tracing::info!(path = %path.display(), "the control plane is listening");
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone(), None),
-            Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
-        }
-    }
+    accept_loop(&listener, app, gate, handover).await
 }
 
 /// 回环 TCP 上的控制面。Windows 只有这一档。
@@ -2083,36 +2184,30 @@ async fn serve_socket(app: Router, gate: gate::Gate, path: &Path) -> Result<(), 
 async fn serve_loopback(
     app: Router,
     gate: gate::Gate,
+    handover: &handover::Handover,
     port_file: &Path,
 ) -> Result<(), ControlError> {
     use std::net::Ipv4Addr;
     if let Some(dir) = port_file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .map_err(|source| ControlError::Bind {
-            path: port_file.to_path_buf(),
-            source,
-        })?;
-    let port = listener
-        .local_addr()
-        .map_err(|source| ControlError::Bind {
-            path: port_file.to_path_buf(),
-            source,
-        })?
-        .port();
+    let bind_err = |source| ControlError::Bind {
+        path: port_file.to_path_buf(),
+        source,
+    };
+    let std_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(bind_err)?;
+    let port = std_listener.local_addr().map_err(bind_err)?.port();
+    let mine = std_listener.try_clone().map_err(bind_err)?;
+    let listener = tw_gateway::listen::adopt_listener(mine).map_err(bind_err)?;
     std::fs::write(port_file, port.to_string()).map_err(|source| ControlError::PortFile {
         path: port_file.to_path_buf(),
         source,
     })?;
+    handover
+        .control()
+        .hold(tw_handover::Socket::Tcp(std_listener));
     tracing::info!(port, "the control plane is listening on loopback");
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone(), None),
-            Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
-        }
-    }
+    accept_loop(&listener, app, gate, handover).await
 }
 
 /// 一条连接：先握手，握上了交给 hyper。

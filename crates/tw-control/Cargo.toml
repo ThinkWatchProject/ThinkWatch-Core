@@ -17,6 +17,8 @@ tw-api = { workspace = true }
 tw-types = { workspace = true }
 # 每条控制面连接先握手
 tw-link = { workspace = true }
+# 升级不断线：控制面的监听交给接替的 core（套接字的类型在那里）
+tw-handover = { workspace = true }
 # 列网卡用 getifaddrs —— 比引一个 crate 便宜
 libc = { workspace = true }
 # 配置包（导出、导入、本机备份、恢复）。文件内容在线上是 base64
