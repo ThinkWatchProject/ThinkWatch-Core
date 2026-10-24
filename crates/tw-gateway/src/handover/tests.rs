@@ -270,7 +270,7 @@ async fn a_snapshot_round_trip_leaves_the_new_core_where_the_old_one_was() {
     assert!(new.seals.of("对话", "乙").unwrap().contains(&[7u8; 32]));
     assert!(new.cache_marks.refused("甲", "claude-opus"));
     assert_eq!(new.sessions.assign("fp", now + 1), session);
-    assert!(!new.health.is_available("乙"), "熔断着的那一家又被放行了");
+    assert!(!new.health.is_available("乙"), "熔断中的上游又被放行了");
     let paused = new.throttles.view("甲").expect("限流暂停丢了");
     assert_eq!(paused.kind, tw_api::ThrottleKind::RateLimited);
     assert!(paused.until_ms > now + 100_000);

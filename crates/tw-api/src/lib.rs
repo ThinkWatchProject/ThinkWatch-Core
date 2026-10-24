@@ -7690,7 +7690,7 @@ mod tests {
         // 而不是「gateway_addr 是空字符串」这种约定。
         let json = r#"{"api_version":1,"version":"x","pid":1,"gateway_addr":null,
                        "config_path":"/x","clients":0,"providers":0,"uptime_secs":0,
-                       "in_flight":0,"gateway_reachable":[],
+                       "in_flight":0,"handover":"idle","draining":0,"gateway_reachable":[],
                        "remote_control":{"enabled":false,"addr":null,"allow_from":[],"reachable":[]}}"#;
         let s: Status = serde_json::from_str(json).unwrap();
         assert!(s.gateway_addr.is_none());

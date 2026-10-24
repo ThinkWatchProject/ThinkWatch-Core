@@ -265,7 +265,7 @@ async fn quick(c: &reqwest::Client, gw: SocketAddr) -> Result<(), String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "等 C1/C3 集成"]
+
 async fn a_handover_under_load_refuses_no_connection_and_finishes_the_long_stream() {
     let bed = Bed::new(25).await;
     let mut reap = Reap(vec![bed.core_on_a_pipe()]);
@@ -415,7 +415,7 @@ async fn fake_successor(dir: &Path, version: u32) -> tw_handover::Link {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "等 C1/C3 集成"]
+
 async fn a_successor_that_leaves_before_committing_leaves_the_old_core_serving() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
@@ -464,7 +464,7 @@ async fn a_successor_that_leaves_before_committing_leaves_the_old_core_serving()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "等 C1/C3 集成"]
+
 async fn a_different_handover_version_falls_back_to_drain_and_exit() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
@@ -497,7 +497,7 @@ async fn a_different_handover_version_falls_back_to_drain_and_exit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "等 C1/C3 集成"]
+
 async fn without_a_successor_the_armed_core_drains_and_exits() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
