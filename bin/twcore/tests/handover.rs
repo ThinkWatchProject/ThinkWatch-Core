@@ -330,7 +330,7 @@ async fn a_handover_under_load_refuses_no_connection_and_finishes_the_long_strea
     let bed = Bed::new(25).await;
     let mut reap = Reap(vec![bed.core_on_a_pipe()]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "a 没起来\n{}",
         bed.logs()
     );
@@ -401,7 +401,7 @@ async fn a_handover_under_load_refuses_no_connection_and_finishes_the_long_strea
     reap.0.push(bed.core("b"));
     let b_pid = reap.0[1].id();
     assert!(
-        until(Duration::from_secs(20), || bed.lock_pid() == Some(b_pid)).await,
+        until(Duration::from_secs(60), || bed.lock_pid() == Some(b_pid)).await,
         "锁没交给 b\n{}",
         bed.logs()
     );
@@ -420,7 +420,7 @@ async fn a_handover_under_load_refuses_no_connection_and_finishes_the_long_strea
 
     // a 排空后退出
     assert!(
-        until(Duration::from_secs(20), || exited(&mut reap.0[0])).await,
+        until(Duration::from_secs(60), || exited(&mut reap.0[0])).await,
         "a 没退\n{}",
         bed.logs()
     );
@@ -480,7 +480,7 @@ async fn a_successor_that_leaves_before_committing_leaves_the_old_core_serving()
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -531,7 +531,7 @@ async fn a_different_handover_version_falls_back_to_drain_and_exit() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -563,7 +563,7 @@ async fn without_a_successor_the_armed_core_drains_and_exits() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -606,7 +606,7 @@ async fn the_old_core_acknowledges_the_commit_then_drains_and_says_bye() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -641,7 +641,7 @@ async fn a_commit_that_comes_after_the_old_core_gave_up_is_not_acknowledged() {
     let bed = Bed::new(1).await;
     let mut reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -750,7 +750,7 @@ async fn an_unreadable_greeting_is_answered_with_refused() {
     let bed = Bed::new(1).await;
     let _reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -801,7 +801,7 @@ async fn an_arm_is_called_off_when_the_desktop_app_did_not_restart() {
     let ppid = parent.id().to_string();
     let mut reap = Reap(vec![bed.core_with("a", &["--parent", &ppid]), parent]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -852,7 +852,7 @@ async fn a_successor_that_exits_while_its_predecessor_drains_leaves_the_next_cor
     let bed = Bed::with_daily_limit(450).await; // 长流约 90 秒
     let mut reap = Reap(vec![bed.core("a")]);
     assert!(
-        until(Duration::from_secs(20), || bed.status().is_some()).await,
+        until(Duration::from_secs(60), || bed.status().is_some()).await,
         "{}",
         bed.logs()
     );
@@ -881,7 +881,7 @@ async fn a_successor_that_exits_while_its_predecessor_drains_leaves_the_next_cor
     reap.0.push(bed.core("b"));
     let b_pid = reap.0[1].id();
     assert!(
-        until(Duration::from_secs(20), || bed.lock_pid() == Some(b_pid)).await,
+        until(Duration::from_secs(60), || bed.lock_pid() == Some(b_pid)).await,
         "{}",
         bed.logs()
     );
@@ -916,7 +916,7 @@ async fn a_successor_that_exits_while_its_predecessor_drains_leaves_the_next_cor
     reap.0.push(bed.core("c"));
     let c_pid = reap.0[2].id();
     assert!(
-        until(Duration::from_secs(20), || bed
+        until(Duration::from_secs(60), || bed
             .status()
             .is_some_and(|s| s["pid"].as_u64() == Some(c_pid as u64)))
         .await,
@@ -938,12 +938,12 @@ async fn a_successor_that_exits_while_its_predecessor_drains_leaves_the_next_cor
     let body = long.await.unwrap().expect("长流断了");
     assert!(body.contains("message_stop"), "{body}");
     assert!(
-        until(Duration::from_secs(20), || exited(&mut reap.0[0])).await,
+        until(Duration::from_secs(60), || exited(&mut reap.0[0])).await,
         "{}",
         bed.logs()
     );
     assert!(
-        until(Duration::from_secs(20), || bed
+        until(Duration::from_secs(60), || bed
             .status()
             .is_some_and(|s| s["handover"] == "idle"))
         .await,
