@@ -9,10 +9,12 @@ use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::Networking::WinSock::{
     FROM_PROTOCOL_INFO, INVALID_SOCKET, SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
     WSADuplicateSocketW, WSAGetLastError, WSAPROTOCOL_INFOW, WSASocketW,
@@ -21,16 +23,13 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 
-use crate::{ENDPOINT_FILE, Error, Result, Socket, TOKEN_FILE, token};
+use crate::{ENDPOINT_FILE, Error, Gate, Result, Socket, TOKEN_FILE, token};
 
 /// 一次最多读这么多。
 const CHUNK: usize = 64 * 1024;
 
 /// 连上来之后交口令的时限。
-pub(crate) const TOKEN_WAIT: Duration = Duration::from_secs(5);
-
-/// 口令帧的长度上限（口令本身是 64 个十六进制字符）。
-pub(crate) const TOKEN_FRAME_MAX: usize = 256;
+const TOKEN_WAIT: Duration = Duration::from_secs(5);
 
 /// 口令的随机字节数（文件里是它的十六进制）。
 const TOKEN_BYTES: usize = 32;
@@ -46,6 +45,7 @@ pub(crate) struct Listener {
 impl Listener {
     pub(crate) async fn bind(dir: &Path) -> Result<Listener> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        no_inherit(listener.as_raw_socket())?;
         let port = listener.local_addr()?.port();
         let token = token::hex(&random(TOKEN_BYTES)?);
         // **先口令后端口**：对端以端口文件为准判断 arm 了没有，看见端口时口令必须已经在
@@ -62,12 +62,23 @@ impl Listener {
     /// 身份核对（口令）在 `Endpoint::accept` 里做，这里只管接。
     pub(crate) async fn accept(&self) -> Result<Option<(Stream, Option<u32>)>> {
         let (s, _) = self.listener.accept().await?;
+        if no_inherit(s.as_raw_socket()).is_err() {
+            return Ok(None);
+        }
         // pid 要等对端的 Hello
         Ok(Some((Stream { s }, None)))
     }
 
-    pub(crate) fn token(&self) -> &[u8] {
-        self.token.as_bytes()
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> RawSocket {
+        self.listener.as_raw_socket()
+    }
+
+    pub(crate) fn gate(&self) -> Gate {
+        Gate::Token {
+            token: Arc::from(self.token.as_bytes()),
+            wait: TOKEN_WAIT,
+        }
     }
 }
 
@@ -98,6 +109,7 @@ pub(crate) async fn connect(dir: &Path) -> Result<Option<(Stream, Option<u32>)>>
     let Ok(s) = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await else {
         return Ok(None);
     };
+    no_inherit(s.as_raw_socket())?;
     // 旧 core 的 pid 这一头问不到（它不发 Hello）；调用方要的话看锁文件
     Ok(Some((Stream { s }, None)))
 }
@@ -188,9 +200,23 @@ fn socket_from_info(hex: &str) -> Result<Socket> {
         )));
     }
     // SAFETY: s 是刚还原出来、只归我们所有的套接字
-    Ok(Socket::Tcp(unsafe {
-        std::net::TcpListener::from_raw_socket(s as RawSocket)
-    }))
+    let listener = unsafe { std::net::TcpListener::from_raw_socket(s as RawSocket) };
+    // WSA_FLAG_NO_HANDLE_INHERIT 对 FROM_PROTOCOL_INFO 还原出来的套接字是否生效，
+    // 文档没有说；std 的 CreateProcess 又总是 bInheritHandles=TRUE —— 漏进子进程的
+    // 监听会在我们退出后一直占着端口。所以再明确清一次继承标志
+    no_inherit(s as RawSocket)
+        .map_err(|e| Error::Transfer(format!("SetHandleInformation failed: {e}")))?;
+    Ok(Socket::Tcp(listener))
+}
+
+/// 不让子进程继承这个套接字（std 起子进程时 `bInheritHandles` 总是 TRUE，
+/// 能不能继承全看句柄自己的标志）。
+pub(crate) fn no_inherit(raw: RawSocket) -> io::Result<()> {
+    // SAFETY: raw 是本进程里有效的套接字句柄；只改它的继承标志
+    if unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn wsa_error() -> io::Error {

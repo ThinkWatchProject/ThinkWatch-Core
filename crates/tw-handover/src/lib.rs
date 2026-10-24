@@ -143,6 +143,46 @@ const MAX_FRAME: usize = 16 << 20;
 /// 也在 Linux 一条辅助消息的上限（`SCM_MAX_FD` = 253）之内。
 const MAX_SOCKETS: usize = 64;
 
+/// 同时在过门的连接最多几个，见 [`Endpoint::admit`]。
+const MAX_CHECKS: usize = 64;
+
+/// 端点的门：连上来的连接要过了它才交出去。
+#[derive(Clone)]
+enum Gate {
+    /// unix：同一用户已经由内核核对过（`Listener::accept` 里），直接放行
+    #[cfg(unix)]
+    Open,
+    /// 第一帧必须是这个口令，`wait` 之内交上来
+    #[cfg(any(windows, test))]
+    Token {
+        token: std::sync::Arc<[u8]>,
+        wait: std::time::Duration,
+    },
+}
+
+/// 口令帧的长度上限（口令本身是 64 个十六进制字符）。没过门的连接不配让我们
+/// 分配 16 MiB。
+#[cfg(any(windows, test))]
+const TOKEN_FRAME_MAX: usize = 256;
+
+impl Gate {
+    async fn check(self, link: Link) -> Option<Link> {
+        match self {
+            #[cfg(unix)]
+            Gate::Open => Some(link),
+            #[cfg(any(windows, test))]
+            Gate::Token { token, wait } => {
+                let mut link = link;
+                let frame = link.read_frame(TOKEN_FRAME_MAX);
+                match tokio::time::timeout(wait, frame).await {
+                    Ok(Ok(t)) if token::eq(&t, &token) => Some(link),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 /// 线上的一帧：消息外面包一层，带上套接字的附件信息。两端都在本 crate，
 /// 不对外。
 #[derive(serde::Serialize)]
@@ -184,25 +224,53 @@ impl Endpoint {
 
     /// 等一个接替者。**核对过身份才交出 [`Link`]**（unix：同一用户；Windows：口令）；
     /// 不对的连接直接断开，接着等下一个。
+    ///
+    /// 可以被取消（放在 `select!` 里）：正在核对的连接随之丢掉。
     pub async fn accept(&self) -> Result<Link> {
+        self.admit(self.listener.gate()).await
+    }
+
+    /// 接连接、过门，第一个过了门的交出去。
+    ///
+    /// **各个连接并发地过门**：Windows 的门是「5 秒内交口令」，而回环端口同机谁都
+    /// 连得上 —— 一个一个核对的话，反复连上来不说话就能把真正的接替者一直挡在外面。
+    /// 同时核对的个数有上限，满了就**丢掉最早的那个**再接新的：真正的接替者连上
+    /// 就交口令（回环上是微秒级），要把它挤掉，得在这点时间里连进来上限那么多个。
+    /// 满了停下不接是不行的：那样占满名额就能一直堵着。
+    ///
+    /// unix 的门是一次 `getsockopt`，当场就有结论，不存在被拖住的问题；走同一条
+    /// 路只是为了两边一套代码。
+    async fn admit(&self, gate: Gate) -> Result<Link> {
+        use std::collections::VecDeque;
+        use tokio::task::{AbortHandle, JoinSet};
+
+        // JoinSet 被丢掉时（返回、取消）会中止里面所有任务，没过门的连接跟着关掉
+        let mut checks: JoinSet<Option<Link>> = JoinSet::new();
+        let mut order: VecDeque<AbortHandle> = VecDeque::new();
         loop {
-            let Some((io, pid)) = self.listener.accept().await? else {
-                continue;
-            };
-            #[allow(unused_mut)] // Windows 上要先在它上面读口令
-            let mut link = Link::new(io, pid);
-            #[cfg(windows)]
-            {
-                // 口令是连上之后的第一帧。**限时**：一个连上来不说话的进程
-                // 不能把门一直堵着；口令帧也不许长 —— 没过门的不配让我们分配 16 MiB
-                let frame = link.read_frame(sys::TOKEN_FRAME_MAX);
-                let token = tokio::time::timeout(sys::TOKEN_WAIT, frame).await;
-                match token {
-                    Ok(Ok(t)) if token::eq(&t, self.listener.token()) => {}
-                    _ => continue,
+            tokio::select! {
+                r = self.listener.accept() => {
+                    let Some((io, pid)) = r? else {
+                        continue;
+                    };
+                    if order.len() >= MAX_CHECKS {
+                        order.pop_front().expect("full").abort();
+                    }
+                    let gate = gate.clone();
+                    order.push_back(checks.spawn(gate.check(Link::new(io, pid))));
+                }
+                Some(done) = checks.join_next_with_id(), if !checks.is_empty() => {
+                    let (id, link) = match done {
+                        Ok((id, link)) => (id, link),
+                        // 被挤掉的那个
+                        Err(e) => (e.id(), None),
+                    };
+                    order.retain(|h| h.id() != id);
+                    if let Some(link) = link {
+                        return Ok(link);
+                    }
                 }
             }
-            return Ok(link);
         }
     }
 
