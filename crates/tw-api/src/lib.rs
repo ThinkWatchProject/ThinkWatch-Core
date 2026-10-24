@@ -1061,7 +1061,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 新码：`config.key_limit_every*`、`config.upstream_limit_*`、`gw.key_limit.*_every`、
 /// `gw.upstream.paused`、`gw.upstream.window_full`、`gw.upstream.period_used_up`、`gw.wait.*`。
 /// 照 50 写的界面读不到 `wait_secs`，保存密钥的上限时没有 `every` 会被拒
-pub const CONTROL_API_VERSION: u32 = 51;
+///
+/// **52 起升级不断线**：`POST /handover/arm`（[`HandoverArm`] → [`HandoverArmed`]）请 core 脱离
+/// 父进程、开交接端点、等接替者；[`Status`] 多了 `handover`（[`HandoverState`]）和 `draining`
+/// （排空中的旧 core 手上还有几个请求，只有接管了它的新 core 报，平时是 0）。
+/// 新码：`control.handover.*`
+pub const CONTROL_API_VERSION: u32 = 52;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1097,6 +1102,11 @@ pub struct Status {
     ///
     /// 重启网关之前要看它 —— 重启会掐断所有还没结束的流。
     pub in_flight: usize,
+    /// 交接走到了哪一步。见 [`HandoverState`]
+    pub handover: HandoverState,
+    /// 排空中的旧 core 手上还有几个请求（它每结束一个就报一次）。**只有接管了它的新 core
+    /// 报**，平时是 0。界面把它加进在途个数，不单独提示
+    pub draining: usize,
     /// 远程控制端口此刻的样子。
     pub remote_control: RemoteControlView,
     /// 别的机器连网关该用的地址（`地址:端口`），**不含回环**。
@@ -1109,6 +1119,52 @@ pub struct Status {
     /// 端口（`gateway_addr` 里的端口）：那个主机名已经被证明从那台 Mac 上
     /// 连得通。这里的清单是给它核对和兜底用的。
     pub gateway_reachable: Vec<String>,
+}
+
+/// 交接走到了哪一步（[`Status::handover`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum HandoverState {
+    /// 平常
+    #[default]
+    Idle,
+    /// 已 arm：脱离了父进程，交接端点开着，等接替者
+    Armed,
+    /// 接替者连上来了，还没提交
+    TakingOver,
+    /// 已提交：这个 core 是接替者，旧的那个还在排空（[`Status::draining`]）
+    Draining,
+}
+
+/// `POST /handover/arm` 的请求体。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HandoverArm {
+    /// 等接替者多久，秒。缺省 120
+    pub wait_secs: Option<u64>,
+    /// 等不到时怎么重新打开桌面端（只试一次，之后再等一个 `wait_secs`，仍等不到就排空退出）。
+    /// 空 = 不重新打开
+    pub relaunch: Option<Relaunch>,
+}
+
+/// 重新打开桌面端的方式。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Relaunch {
+    /// macOS：`open -b <id>`
+    BundleId { id: String },
+    /// Windows、Linux：直接起这个可执行文件，和 core 脱开
+    Exe { path: String, args: Vec<String> },
+}
+
+/// `POST /handover/arm` 的应答。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HandoverArmed {
+    /// 交接连接的版本号（`tw_handover::VERSION`）。接替者的不同就不交接，退回现行流程
+    pub version: u32,
 }
 
 /// 远程控制端口（`listen.control.remote`）。
@@ -7618,6 +7674,8 @@ mod tests {
             providers: 1,
             uptime_secs: 0,
             in_flight: 3,
+            handover: HandoverState::Draining,
+            draining: 2,
             remote_control: RemoteControlView::default(),
             gateway_reachable: vec![],
         };

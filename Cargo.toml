@@ -35,6 +35,8 @@ members = [
     "crates/tw-sync",
     # 控制通道的握手与加密。桌面端按 tag 依赖它，所以只依赖契约层和 tw-yaml
     "crates/tw-link",
+    # 新旧 core 之间的交接：传监听套接字、搬运快照与结算（升级不断线）
+    "crates/tw-handover",
     # ── bin ──────────────────────────────────────────────
     "bin/twcore",
 ]
@@ -83,6 +85,7 @@ tw-link     = { path = "crates/tw-link" }
 tw-plugin   = { path = "crates/tw-plugin" }
 tw-pack     = { path = "crates/tw-pack" }
 tw-sync     = { path = "crates/tw-sync" }
+tw-handover = { path = "crates/tw-handover" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }

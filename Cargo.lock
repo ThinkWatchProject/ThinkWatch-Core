@@ -3872,6 +3872,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tw-handover"
+version = "0.81.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tw-link"
 version = "0.81.0"
 dependencies = [

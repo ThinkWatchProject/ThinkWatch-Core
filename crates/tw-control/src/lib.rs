@@ -232,6 +232,9 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
         providers: cfg.providers.len(),
         uptime_secs: s.started.elapsed().as_secs(),
         in_flight: s.gateway.live.count(),
+        // C2 接上交接状态
+        handover: tw_api::HandoverState::Idle,
+        draining: 0,
         remote_control,
         gateway_reachable,
     })

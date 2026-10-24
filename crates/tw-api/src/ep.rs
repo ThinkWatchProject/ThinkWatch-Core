@@ -12,6 +12,9 @@ endpoints! {
     Status: GET "/status", () => api::Status;
     /// 请网关退出（202）
     Shutdown: POST "/shutdown", () => api::Msg;
+    /// 请 core 等接替者：脱离父进程、开交接端点（升级不断线）。被拒时是结构化错误，
+    /// 码 `control.handover.*`，桌面端退回「等请求结束再重启」
+    HandoverArm: POST "/handover/arm", api::HandoverArm => api::HandoverArmed;
     /// 本机的网卡，一张一行
     Interfaces: GET "/interfaces", () => Vec<api::NicView>;
     /// 实时事件流
