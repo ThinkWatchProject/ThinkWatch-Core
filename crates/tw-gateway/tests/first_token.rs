@@ -49,6 +49,8 @@ fn streaming(frames_after_prefill: Vec<&'static [u8]>, first: &'static [u8]) -> 
     }))
 }
 
+/// 不等、不重试（`wait_secs: 0`）：唯一的上游不压开头，响应头和流的开头当场交给客户端 ——
+/// 这里量的正是它们各在什么时候到
 fn cfg(upstream: SocketAddr, protocol: Protocol) -> Config {
     Config {
         clients: vec![Client {
@@ -63,6 +65,10 @@ fn cfg(upstream: SocketAddr, protocol: Protocol) -> Config {
             protocol: Some(protocol),
             ..Default::default()
         }],
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

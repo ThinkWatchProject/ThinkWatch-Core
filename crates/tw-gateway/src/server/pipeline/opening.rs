@@ -11,10 +11,10 @@
 //! 和无响应超时是同一个判据（见 [`crate::pulse`]）。
 //!
 //! 等到无响应超时那一刻（`failover.idle_timeout_secs`，从请求发出去算起）还没有内容是
-//! [`Opening::Slow`]：调用方放弃这一家、换下一家。**最后一家只在它可能在限流时在这里等**（流式
-//! 的、请求还等得起，见 `hop`）：开头报的限流要暂停这一家、排队等它恢复；别的错、到点了还没有
-//! 内容，没有下一家可换，照原样交给回程。别的时候最后一家不等：压着它只会让客户端晚一点看到
-//! 同样的东西。
+//! [`Opening::Slow`]：调用方放弃这一家、换下一家。**最后一家在请求还等得起时也在这里等**（见
+//! `hop`）：开头报的暂时的错（过载、5xx）、流在内容之前断了，退避一阵再试（见 [`crate::retry`]）；
+//! 报的限流暂停这一家、排队等它恢复；别的错、到点了还没有内容，没有下一家可换，照原样交给回程。
+//! 等不起的最后一家不等：压着它只会让客户端晚一点看到同样的东西。
 //! 开头压得太多（[`HOLD_LIMIT`]）也不再压，交出去由回程照常计时。压着的这段时间里客户端等的是响应头：流式的回答过了
 //! [`crate::OPENING_HOLD`] 先拿到 `200` 和保活注释，上游的事件照旧压在这里（见
 //! [`super::commit`]）。
@@ -301,6 +301,19 @@ pub(super) fn stream_error(dialect: Dialect, data: &str) -> Option<(u16, Bytes)>
     }
 }
 
+/// 流里报的这个错（[`Opening::Failed`] 的 `body`）说的是请求本身的问题：错误的类型是
+/// `invalid_request_error`。OpenAI 在流里报的码有的认不出（`invalid_encrypted_content`），按状态码
+/// 算是说不出原因的失败，照样换下一家；**可它不是暂时的错**，同一家再发一遍也一样（见
+/// [`crate::retry`]）
+pub(super) fn faults_the_request(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    ["/error/type", "/response/error/type"]
+        .iter()
+        .any(|p| v.pointer(p).and_then(|t| t.as_str()) == Some("invalid_request_error"))
+}
+
 fn error(status: u16, data: &str, kind: String, message: String) -> Judge {
     Judge::Error {
         status,
@@ -499,6 +512,15 @@ mod tests {
             first_verdict(Dialect::Gemini, err),
             Some(Judge::Error { status: 503, .. })
         ));
+    }
+
+    #[test]
+    fn an_invalid_request_in_the_stream_faults_the_request() {
+        let refused = r#"{"type":"error","error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"x"}}"#;
+        assert!(faults_the_request(refused.as_bytes()));
+        let overloaded = r#"{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"x"}}"#;
+        assert!(!faults_the_request(overloaded.as_bytes()));
+        assert!(!faults_the_request(b"not json"));
     }
 
     #[test]

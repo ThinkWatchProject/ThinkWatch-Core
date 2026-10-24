@@ -177,6 +177,30 @@ async fn gateway_with(
     tw_gateway::AppState,
     tokio::sync::broadcast::Receiver<tw_api::Event>,
 ) {
+    gateway_of(p, security, tw_config::Failover::default().wait_secs).await
+}
+
+/// 起网关，一个请求最多等 `wait_secs` 秒（见 `failover.wait_secs`）
+async fn gateway_waiting(
+    p: Provider,
+    wait_secs: u64,
+) -> (
+    SocketAddr,
+    tw_gateway::AppState,
+    tokio::sync::broadcast::Receiver<tw_api::Event>,
+) {
+    gateway_of(p, Security::default(), wait_secs).await
+}
+
+async fn gateway_of(
+    p: Provider,
+    security: Security,
+    wait_secs: u64,
+) -> (
+    SocketAddr,
+    tw_gateway::AppState,
+    tokio::sync::broadcast::Receiver<tw_api::Event>,
+) {
     let cfg = Config {
         version: 1,
         listen: Listen::default(),
@@ -187,6 +211,10 @@ async fn gateway_with(
         }],
         providers: vec![p],
         security,
+        failover: tw_config::Failover {
+            wait_secs,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
@@ -382,7 +410,8 @@ async fn an_exception_inside_the_stream_fails_the_request() {
         json!({"message": "Too many tokens, please wait before trying again."}),
     ));
     let (up, _) = bedrock(Arc::new(move |_| eventstream_answer(wire.clone()))).await;
-    let (gw, _, mut rx) = gateway(with_keys(up)).await;
+    // 不等：唯一的上游不压开头，它在流里报的限流原样交给客户端（等它恢复见 `throttle_queue.rs`）
+    let (gw, _, mut rx) = gateway_waiting(with_keys(up), 0).await;
     let (status, body) = post(
         gw,
         "/v1/messages",

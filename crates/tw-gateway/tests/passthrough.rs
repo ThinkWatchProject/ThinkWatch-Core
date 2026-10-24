@@ -353,7 +353,11 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     let dead_port = spare_port();
     let cfg = Config {
         retention: Default::default(),
-        failover: Default::default(),
+        // 不重试：连不上的那一次当场交出去（退避着重试见 `retry.rs`）
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         aliases: Default::default(),
         default_route: None,
         default_key: None,
@@ -860,7 +864,7 @@ async fn the_only_provider_keeps_being_tried_no_matter_how_broken() {
     // 唯一的上游被自己熔断就把用户锁死了。没有别的家可切的时候，
     // 熔断纯粹是自伤。
     let dead = start_broken_upstream(503).await;
-    let gw = serve_cfg(cfg_with(
+    let mut cfg = cfg_with(
         vec![Provider {
             name: "only".into(),
             base_url: format!("http://{dead}"),
@@ -868,8 +872,10 @@ async fn the_only_provider_keeps_being_tried_no_matter_how_broken() {
             ..Default::default()
         }],
         vec![],
-    ))
-    .await;
+    );
+    // 不重试：每个请求只打一次，这里数的是熔断（重试见 `retry.rs`）
+    cfg.failover.wait_secs = 0;
+    let gw = serve_cfg(cfg).await;
     // 打满熔断阈值之后再打一次，仍然应该是「上游的错误」而不是
     // 「我们编的无可用上游」
     for _ in 0..5 {
@@ -885,7 +891,7 @@ async fn everything_broken_still_tries_rather_than_refusing() {
     // 返回一个我们自己编的「无可用上游」—— 后者会让用户以为是我们坏了。
     let a = start_broken_upstream(503).await;
     let b = start_broken_upstream(503).await;
-    let gw = serve_cfg(cfg_with(
+    let mut cfg = cfg_with(
         vec![
             Provider {
                 name: "a".into(),
@@ -901,8 +907,10 @@ async fn everything_broken_still_tries_rather_than_refusing() {
             },
         ],
         vec![],
-    ))
-    .await;
+    );
+    // 不重试：每个请求只走一遍，这里数的是熔断（重试见 `retry.rs`）
+    cfg.failover.wait_secs = 0;
+    let gw = serve_cfg(cfg).await;
     for _ in 0..6 {
         send_to(gw).await;
     }
@@ -1788,7 +1796,7 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
         }
     });
 
-    let cfg = cfg_with(
+    let mut cfg = cfg_with(
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
@@ -1797,6 +1805,8 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
         }],
         vec![],
     );
+    // 不等、不重试：唯一的上游不压开头，第一帧当场交给客户端，断在交出去之后
+    cfg.failover.wait_secs = 0;
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
     let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
@@ -2200,7 +2210,7 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
     // **失败那条路才是最需要看尝试链的时候。**挂在 RequestFinished 上
     // 的话，它恰好在那时缺席。
     let dead = start_broken_upstream(503).await;
-    let state = tw_gateway::AppState::new(cfg_with(
+    let mut cfg = cfg_with(
         vec![Provider {
             name: "挂了的".into(),
             base_url: format!("http://{dead}"),
@@ -2208,8 +2218,10 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
             ..Default::default()
         }],
         vec![],
-    ))
-    .unwrap();
+    );
+    // 不重试：链上只有那一跳（重试的一跳见 `retry.rs`）
+    cfg.failover.wait_secs = 0;
+    let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
     let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
         .await

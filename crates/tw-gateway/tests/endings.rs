@@ -205,6 +205,8 @@ fn provider(upstream: SocketAddr) -> Provider {
     }
 }
 
+/// 不等、不重试（`wait_secs: 0`）：唯一的上游不压开头，第一帧当场交给客户端 —— 这里看的是
+/// 之后怎么收场。最后一家压着开头、退避重试见 `retry.rs`
 fn cfg(provider: Provider) -> Config {
     Config {
         clients: vec![Client {
@@ -213,6 +215,10 @@ fn cfg(provider: Provider) -> Config {
             ..Default::default()
         }],
         providers: vec![provider],
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -598,13 +604,11 @@ async fn a_phase_two_deny_after_the_request_started_is_reported_as_denied() {
 /// 每一家上游都没接住。**只报一次失败，`source` 是它真正的原因** —— 被限流
 /// 就是 `rate_limited`，和客户端收到的 `x-thinkwatch-error` 是同一个词。
 ///
-/// 限流的上游请求会等它恢复（见 `tw_gateway::throttle`）：这里不让等（`wait_secs: 0`），
+/// 限流的上游请求会等它恢复（见 `tw_gateway::throttle`）：这里不让等（`cfg` 的 `wait_secs: 0`），
 /// 被限流的那一次就是结局
 #[tokio::test]
 async fn a_request_every_upstream_refused_is_failed_once_for_the_reason_it_was_refused() {
-    let mut c = cfg(provider(refusing_upstream(429).await));
-    c.failover.wait_secs = 0;
-    let (gw, mut events) = serve(c).await;
+    let (gw, mut events) = serve(cfg(provider(refusing_upstream(429).await))).await;
     let r = post(gw).send().await.unwrap();
     assert_eq!(r.status(), 429);
     let header = r.headers().get("x-thinkwatch-error").cloned();
