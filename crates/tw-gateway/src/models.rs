@@ -558,10 +558,16 @@ pub async fn refresh_one(state: &AppState, name: &str) -> Option<Listing> {
 ///
 /// **`url-test` 的垫底跟着它一起跑**：两者都是「启动时打一次网络、之后靠
 /// 真实流量」，而且都不该挡住启动。
+///
+/// **排空开始就停**（交接之后的旧 core）：探测和测速由接替者做，两边各打一遍只是重复的网络
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         let mut seeded_at: Option<u64> = None;
+        let mut draining = state.handover.draining();
         loop {
+            if *draining.borrow() {
+                return;
+            }
             let now = now_ms();
             if seeded_at.is_none_or(|t| now.saturating_sub(t) >= REFRESH_EVERY.as_millis() as u64) {
                 crate::latency::seed_url_test(&state).await;
@@ -574,6 +580,7 @@ pub fn spawn(state: AppState) {
             tokio::select! {
                 _ = tokio::time::sleep(TICK) => {}
                 _ = state.models.wake.notified() => {}
+                _ = draining.changed() => {}
             }
         }
     });

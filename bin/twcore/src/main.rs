@@ -900,6 +900,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         state.set_price_table(tw_control::pricing::load_table(&config_path));
         // 接替者：旧 core 的内存状态接进来，**在第一个请求之前**
         if let Some(inc) = incoming.as_mut() {
+            // 提交之前续期归旧 core（见 `Cache::hold_renewals`）
+            state.oauth.hold_renewals(true);
             inc.import(&state);
         }
 
@@ -1156,6 +1158,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                     .await
                     .context("the listeners handed over could not be served in time")?;
                 inc.commit().await;
+                // 从此续期由这一边做（旧 core 交出快照起已暂停）
+                state.oauth.hold_renewals(false);
                 // 成为锁的持有者：写上自己的 pid（旧 core 已经放弃了锁）
                 match LockFile::claim(&dir) {
                     Ok(l) => lock = Some(l),

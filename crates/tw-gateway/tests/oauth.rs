@@ -516,3 +516,40 @@ async fn an_error_body_from_the_token_endpoint_is_masked_before_being_reported()
     );
     assert!(e.contains("<omitted>"), "抹掉了但没说抹掉了什么：{e}");
 }
+
+/// 交接期间暂停续期：**一次都不去换**，手上没有 access token 的请求失败，恢复之后照常换。
+///
+/// 两个 core 各换一次 refresh token，必有一边拿着作废的那个 —— ChatGPT 会因此吊销整个登录。
+#[tokio::test]
+async fn renewals_held_during_a_handover_never_reach_the_token_endpoint() {
+    let t = Arc::new(Token {
+        expires_in: Some(3600),
+        ..Default::default()
+    });
+    let token_addr = start_token_endpoint(t.clone()).await;
+    let (up, seen) = start_upstream().await;
+    let (gw, s) = start_gateway(vec![oauth_provider(
+        "p",
+        up,
+        &format!("http://{token_addr}/token"),
+    )])
+    .await;
+
+    s.oauth.hold_renewals(true);
+    assert_ne!(ask(gw).await, 200, "暂停续期时没有 access token 也放行了");
+    assert_eq!(
+        t.calls.load(Ordering::SeqCst),
+        0,
+        "暂停续期时仍去换了 token"
+    );
+    assert!(seen.lock().unwrap().is_empty(), "没有令牌的请求到了上游");
+
+    s.oauth.hold_renewals(false);
+    assert_eq!(ask(gw).await, 200);
+    assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+
+    // 已经有一个能用的：暂停期间照用，不换
+    s.oauth.hold_renewals(true);
+    assert_eq!(ask(gw).await, 200);
+    assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+}

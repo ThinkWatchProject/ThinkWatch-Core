@@ -69,6 +69,9 @@ pub enum OauthError {
     /// refresh token 已经作废。**重试没有用**，要重新登录或换一个 refresh token
     #[error("{}", self.msg())]
     Expired { status: u16, body: String },
+    /// 交接期间暂停续期（见 [`Cache::hold_renewals`]），手上又没有能用的 access token
+    #[error("{}", self.msg())]
+    Held,
 }
 
 impl OauthError {
@@ -90,6 +93,11 @@ impl OauthError {
             ),
             OauthError::NoToken => msg!(
                 "gw.oauth.no_token" => "The token endpoint's response has no access_token."
+            ),
+            OauthError::Held => msg!(
+                "gw.oauth.held" =>
+                "The sign-in token cannot be renewed while the gateway is being updated. \
+                 Retry the request in a moment."
             ),
             OauthError::Expired { status, body } => msg!(
                 "gw.oauth.expired", status = status, body = body =>
@@ -113,7 +121,9 @@ impl OauthError {
                      endpoint's response has no access_token."
                 ),
                 // 不会退避在这两种上：作废的另记，退避不套退避
-                OauthError::Backoff { .. } | OauthError::Expired { .. } => cause.msg(),
+                OauthError::Backoff { .. } | OauthError::Expired { .. } | OauthError::Held => {
+                    cause.msg()
+                }
             },
         }
     }
@@ -245,6 +255,8 @@ pub struct Cache {
     inner: Mutex<HashMap<String, Live>>,
     /// 每个 provider 一把刷新锁（见模块文档第四条）
     flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 交接期间暂停续期（见 [`Self::hold_renewals`]）
+    held: std::sync::atomic::AtomicBool,
 }
 
 /// 换回来的东西。
@@ -469,6 +481,17 @@ impl Cache {
         Ok(None)
     }
 
+    /// 暂停或恢复续期。
+    ///
+    /// **交接期间新旧两个 core 不能各自续期**：服务器换发新的 refresh token 的那一刻旧的就
+    /// 作废，两边各换一次，必有一边拿着作废的令牌（ChatGPT 会因此吊销整个登录）。所以旧 core
+    /// 交出快照（里面有它手上的 access token）起暂停，接管没成再恢复；新 core 在提交之前暂停，
+    /// 提交之后由它一家续期。暂停时照旧用手上那个 access token，过期了就让请求失败（[`OauthError::Held`]）
+    /// —— 比把整个登录弄丢好得多，而这只发生在令牌恰好在交接那几十秒里到期的时候
+    pub fn hold_renewals(&self, hold: bool) {
+        self.held.store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// 真的去换。**调用方持有这家的刷新锁**，所以这里不会有并发的第二次。
     async fn refresh(
         &self,
@@ -476,6 +499,16 @@ impl Cache {
         cfg: &OAuth,
         http: &reqwest::Client,
     ) -> Result<(String, Option<Renewed>), OauthError> {
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) {
+            let g = self.inner.lock().expect("lock not poisoned");
+            return g
+                .get(provider)
+                .filter(|l| l.usable_for(cfg) && !l.access.is_empty())
+                .map(|l| l.access.clone())
+                .or_else(|| cfg.access.clone().filter(|a| !a.is_empty()))
+                .map(|a| (a, None))
+                .ok_or(OauthError::Held);
+        }
         // 用手里那个 refresh（可能是服务器换过的），没有就用配置里的
         let refresh = {
             let g = self.inner.lock().expect("lock not poisoned");

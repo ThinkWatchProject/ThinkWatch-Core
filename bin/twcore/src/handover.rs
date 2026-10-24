@@ -289,6 +289,8 @@ async fn run_arms(
                         return Exit::HandedOver;
                     }
                     Given::Fallback => {
+                        // 接替者自己绑端口、起来之后才续期；这边排空期间仍是唯一在转发的那个
+                        core.state.oauth.hold_renewals(false);
                         tracing::info!("the successor cannot take over; draining and exiting the current way");
                         retire(core, FALLBACK_DRAIN).await;
                         return Exit::Retired;
@@ -297,6 +299,8 @@ async fn run_arms(
                         if strike {
                             strikes += 1;
                         }
+                        // 接管没成：续期回到这一边
+                        core.state.oauth.hold_renewals(false);
                         // 回到待交接：控制面接着接，重新等一个周期（F4）
                         core.handover().control().resume();
                         core.handover().set_phase(HandoverState::Armed);
@@ -407,6 +411,8 @@ async fn give(core: &Core, mut link: Link, refuse: bool) -> Given {
     if let Some(sync) = core.sync() {
         sync.flush().await;
     }
+    // 交出 access token 起暂停续期：两边各换一次 refresh token 必有一边作废（接管没成再恢复）
+    core.state.oauth.hold_renewals(true);
     let snapshot = wrap(core.state.handover_export(), core.state.bus.next_id());
     if let Err(e) = link.send(&Message::Snapshot { data: snapshot }).await {
         tracing::warn!("the snapshot could not be sent to the successor: {e}");

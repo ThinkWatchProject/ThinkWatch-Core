@@ -365,6 +365,7 @@ gw.oauth.backoff.no_token
 gw.oauth.backoff.status
 gw.oauth.backoff.unreachable
 gw.oauth.expired
+gw.oauth.held
 gw.oauth.no_token
 gw.oauth.not_configured
 gw.oauth.rotation_no_manager
