@@ -742,6 +742,10 @@ impl Sync {
     /// 同步一轮（顺带处理几处冲突），更新状态、发事件
     pub async fn round(&self, decisions: &[Decision]) -> Result<tw_api::SyncView, Fail> {
         let mut guard = self.run.lock().await;
+        // Consume this trigger before any early return, or an expired deadline spins the scheduler.
+        if let Ok(mut d) = self.dirty.lock() {
+            *d = None;
+        }
         let r = match self.ensure(&mut guard) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -763,9 +767,6 @@ impl Sync {
             let v = self.compute_view(None, None);
             self.publish(v.clone());
             return Ok(v);
-        }
-        if let Ok(mut d) = self.dirty.lock() {
-            *d = None;
         }
         if let Ok(mut g) = self.view.lock()
             && let Some(v) = g.as_mut()
@@ -1739,6 +1740,59 @@ async fn disable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn early_round_returns_consume_the_dirty_deadline() {
+        for expected in [
+            tw_api::SyncState::Off,
+            tw_api::SyncState::Paused,
+            tw_api::SyncState::Misconfigured,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            let text = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: test\n    key: tw-test\n";
+            std::fs::write(&path, text).unwrap();
+            let mut cfg = tw_config::try_parse(text).unwrap();
+            if expected != tw_api::SyncState::Off {
+                cfg.sync = Some(tw_config::sync::Sync {
+                    device_id: "0123456789abcdef".into(),
+                    device_name: "test".into(),
+                    encrypt: false,
+                    passphrase: None,
+                    exclude: Vec::new(),
+                    target: tw_config::sync::Target::Folder {
+                        path: if expected == tw_api::SyncState::Misconfigured {
+                            String::new()
+                        } else {
+                            dir.path().join("remote").display().to_string()
+                        },
+                        proxy: "direct".into(),
+                    },
+                });
+            }
+            let gw = tw_gateway::AppState::new(cfg).unwrap();
+            gw.set_plugin_engine(Arc::new(tw_gateway::plugin::fake::FakeEngine));
+            let mgr = Arc::new(ConfigManager::new(path, gw.clone(), gw.bus.clone()));
+            let sync = of(&mgr);
+            sync.paused
+                .store(expected == tw_api::SyncState::Paused, Ordering::Relaxed);
+
+            // An expired dirty deadline must not override the next periodic poll forever.
+            for _ in 0..2 {
+                sync.touch();
+                assert!(sync.dirty.lock().unwrap().is_some());
+                *sync.dirty.lock().unwrap() = Some(tokio::time::Instant::now() - SETTLE);
+                let result = sync.round(&[]).await;
+                if expected == tw_api::SyncState::Misconfigured {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap().state, expected);
+                }
+                assert!(sync.dirty.lock().unwrap().is_none(), "{expected:?}");
+                assert_eq!(sync.view().state, expected);
+            }
+        }
+    }
 
     #[test]
     fn targets_convert_both_ways_and_blank_proxies_are_direct() {
