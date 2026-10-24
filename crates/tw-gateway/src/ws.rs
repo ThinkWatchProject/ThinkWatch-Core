@@ -1100,7 +1100,13 @@ enum End {
     Broke(Msg),
     /// 被防护切断了：回答里的工具调用命中了切断规则，或者客户端发来的一帧被内容过滤拒了
     Cut(Msg),
+    /// 这个 core 在排空（交给了新版本的 core，见 [`crate::handover`]），手上这一轮答完了：以
+    /// 1012（服务重启）关闭，客户端重连到新的那一个
+    Restart,
 }
+
+/// 排空时关连接用的关闭码：服务重启（RFC 6455 7.4.1 之后 IANA 登记的 1012）。客户端照它重连
+pub(crate) const CLOSE_RESTART: u16 = 1012;
 
 /// 在等准入的那一轮（见 [`turn::admit`]）：等到了交回这一轮和这一帧接下来要用的。
 type Waiting = std::pin::Pin<
@@ -1135,6 +1141,11 @@ async fn pump(
     let mut waiting: Option<Waiting> = None;
     // 等的时候客户端接着发来的帧：排在那一轮后面，轮到了按顺序处理
     let mut held: std::collections::VecDeque<Message> = Default::default();
+    // 排空（见 `crate::handover`）：Responses 的连接手上没有在跑的轮次了就以 1012 关闭 —— 闲着的
+    // 当场关，在答的答完这一轮再关。整条连接一行的那几种分不出一轮一轮，照常开着
+    let mut drain = state.handover.draining();
+    let mut draining = *drain.borrow_and_update();
+    let mut drain_gone = false;
     let end = 'pump: loop {
         while waiting.is_none()
             && let Some(m) = held.pop_front()
@@ -1153,7 +1164,21 @@ async fn pump(
                 break 'pump end;
             }
         }
+        if draining
+            && waiting.is_none()
+            && held.is_empty()
+            && p.turns.as_ref().is_some_and(turn::Turns::is_empty)
+        {
+            break End::Restart;
+        }
         tokio::select! {
+            changed = drain.changed(), if !draining && !drain_gone => {
+                match changed {
+                    Ok(()) => draining = *drain.borrow_and_update(),
+                    // 发的那一头没了（网关整个收了）：不再看
+                    Err(_) => drain_gone = true,
+                }
+            }
             msg = c_rx.next() => {
                 let Some(Ok(m)) = msg else { break End::Closed };
                 if waiting.is_some() {
@@ -1254,12 +1279,21 @@ async fn pump(
             _ => t.clear(),
         }
     }
+    let restart = matches!(end, End::Restart);
     if let Some(ending) = ending {
         match end {
-            End::Closed | End::UpstreamClosed => ending.finished(101),
+            End::Closed | End::UpstreamClosed | End::Restart => ending.finished(101),
             End::Broke(why) => ending.failed(tw_api::FailureSource::Upstream, why),
             End::Cut(why) => ending.failed(tw_api::FailureSource::Denied, why),
         }
+    }
+    if restart {
+        let _ = c_tx
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: CLOSE_RESTART,
+                reason: "the gateway is restarting; reconnect".into(),
+            })))
+            .await;
     }
     let _ = c_tx.close().await;
     let _ = u_tx.close().await;

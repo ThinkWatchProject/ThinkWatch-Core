@@ -156,6 +156,7 @@ fn bed(yaml: &str, rows: Option<&[tw_store::db::RequestRow]>) -> Bed {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store,

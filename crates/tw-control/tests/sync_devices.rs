@@ -43,6 +43,7 @@ impl Dev {
         let state = ControlState {
             shutdown: Default::default(),
             remote: Default::default(),
+            handover: Default::default(),
             cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
             gateway: gw,
             store: None,
@@ -616,6 +617,7 @@ async fn in_safe_mode_the_sync_location_still_lists_its_versions() {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(path, gw.clone(), bus).standing_in(&rejected)),
         gateway: gw,
         store: None,

@@ -53,7 +53,7 @@ const EXPIRED_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 
 /// 换 access token 失败了。**英文只写一遍**：`Display` 就是 [`OauthError::msg`] 的原句，
 /// 界面拿码去翻；端点回的正文（已打码）和连接库的原话留在参数里。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum OauthError {
     /// 连不上 token 端点。`detail` 是连接库的原话
     #[error("{}", self.msg())]
@@ -69,6 +69,9 @@ pub enum OauthError {
     /// refresh token 已经作废。**重试没有用**，要重新登录或换一个 refresh token
     #[error("{}", self.msg())]
     Expired { status: u16, body: String },
+    /// 交接期间暂停续期（见 [`Cache::hold_renewals`]），手上又没有能用的 access token
+    #[error("{}", self.msg())]
+    Held,
 }
 
 impl OauthError {
@@ -90,6 +93,11 @@ impl OauthError {
             ),
             OauthError::NoToken => msg!(
                 "gw.oauth.no_token" => "The token endpoint's response has no access_token."
+            ),
+            OauthError::Held => msg!(
+                "gw.oauth.held" =>
+                "The sign-in token cannot be renewed while the gateway is being updated. \
+                 Retry the request in a moment."
             ),
             OauthError::Expired { status, body } => msg!(
                 "gw.oauth.expired", status = status, body = body =>
@@ -113,7 +121,9 @@ impl OauthError {
                      endpoint's response has no access_token."
                 ),
                 // 不会退避在这两种上：作废的另记，退避不套退避
-                OauthError::Backoff { .. } | OauthError::Expired { .. } => cause.msg(),
+                OauthError::Backoff { .. } | OauthError::Expired { .. } | OauthError::Held => {
+                    cause.msg()
+                }
             },
         }
     }
@@ -133,6 +143,15 @@ fn fingerprint(cfg: &OAuth) -> u64 {
     cfg.client_id.hash(&mut h);
     cfg.client_secret.hash(&mut h);
     h.finish()
+}
+
+/// 交接时比的配置指纹（[`Cache::handover_export`]）。**和 [`fingerprint`] 管的是同几样**，但
+/// 要跨进程、跨版本比：std 的 hasher 不保证换个编译器版本还算出同一个数
+fn config_digest(cfg: &OAuth) -> String {
+    let parts = serde_json::json!([cfg.refresh, cfg.endpoint, cfg.client_id, cfg.client_secret]);
+    blake3::hash(parts.to_string().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 struct Live {
@@ -236,6 +255,8 @@ pub struct Cache {
     inner: Mutex<HashMap<String, Live>>,
     /// 每个 provider 一把刷新锁（见模块文档第四条）
     flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 交接期间暂停续期（见 [`Self::hold_renewals`]）
+    held: std::sync::atomic::AtomicBool,
 }
 
 /// 换回来的东西。
@@ -328,6 +349,88 @@ impl Cache {
         Some((f.error().msg(), f.expired()))
     }
 
+    /// 交接：每家手里能用的 access token（见 [`crate::handover`]），免得新 core 一起来就各换一次
+    /// —— 会轮换的服务器每换一次作废一个 refresh token，配置文件跟着写一次。**只交还认得这份
+    /// 配置的**（[`Live::usable_for`]）；时刻换成「还有多久」「多久之前」
+    pub(crate) fn handover_export(
+        &self,
+        providers: &[tw_config::Provider],
+    ) -> Vec<crate::handover::wire::OauthEntry> {
+        let now = Instant::now();
+        let ms = |d: Duration| d.as_millis().min(u128::from(u64::MAX)) as u64;
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter()
+            .filter_map(|(name, live)| {
+                let cfg = providers.iter().find(|p| &p.name == name)?.oauth.as_ref()?;
+                if !live.usable_for(cfg) {
+                    return None;
+                }
+                Some(crate::handover::wire::OauthEntry {
+                    upstream: name.clone(),
+                    cfg: config_digest(cfg),
+                    access: live.access.clone(),
+                    refresh: live.refresh.clone(),
+                    renew_in_ms: live.renew_at.map(|t| ms(t.saturating_duration_since(now))),
+                    age_ms: live.obtained.map(|t| ms(now.saturating_duration_since(t))),
+                    failed: live
+                        .failed
+                        .as_ref()
+                        .map(|f| crate::handover::wire::OauthFailed {
+                            cause: f.cause.clone(),
+                            retry_in_ms: ms(f.until.saturating_duration_since(now)),
+                        }),
+                })
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 手里的 token。这里的配置认得它才接：生成它的那份配置和这里的一样，
+    /// 或者它手里的 refresh 就是这里配置里的（轮换之后写回了）。`lag_ms` 是快照导出到现在
+    /// 过了多久。
+    ///
+    /// **这里已经有的那一家换掉**：提交之前续期归旧 core（这边暂停着），旧 core 手里的才是
+    /// 准的。快照会来两份（交出监听之前再导出一次，那时旧 core 已经暂停续期），后一份要盖掉
+    /// 前一份；这边从配置里读进来的那个也一样
+    pub(crate) fn handover_import(
+        &self,
+        entries: Vec<crate::handover::wire::OauthEntry>,
+        providers: &[tw_config::Provider],
+        lag_ms: u64,
+    ) {
+        let now = Instant::now();
+        let lag = Duration::from_millis(lag_ms);
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        for e in entries {
+            let Some(cfg) = providers
+                .iter()
+                .find(|p| p.name == e.upstream)
+                .and_then(|p| p.oauth.as_ref())
+            else {
+                continue;
+            };
+            if e.cfg != config_digest(cfg) && e.refresh != cfg.refresh {
+                continue;
+            }
+            let after = |ms: u64| now + Duration::from_millis(ms).saturating_sub(lag);
+            g.insert(
+                e.upstream,
+                Live {
+                    fp: fingerprint(cfg),
+                    access: e.access,
+                    renew_at: e.renew_in_ms.map(after),
+                    refresh: e.refresh,
+                    obtained: e
+                        .age_ms
+                        .and_then(|ms| now.checked_sub(Duration::from_millis(ms) + lag)),
+                    failed: e.failed.map(|f| Failure {
+                        cause: f.cause,
+                        until: after(f.retry_in_ms),
+                    }),
+                },
+            );
+        }
+    }
+
     fn flight(&self, provider: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.flights
             .lock()
@@ -380,6 +483,41 @@ impl Cache {
         Ok(None)
     }
 
+    /// 暂停或恢复续期。
+    ///
+    /// **交接期间新旧两个 core 不能各自续期**：服务器换发新的 refresh token 的那一刻旧的就
+    /// 作废，两边各换一次，必有一边拿着作废的令牌（ChatGPT 会因此吊销整个登录）。所以旧 core
+    /// 交出快照（里面有它手上的 access token）起暂停，接管没成再恢复；新 core 在提交之前暂停，
+    /// 提交之后由它一家续期。暂停时照旧用手上那个 access token，过期了就让请求失败（[`OauthError::Held`]）
+    /// —— 比把整个登录弄丢好得多，而这只发生在令牌恰好在交接那几十秒里到期的时候
+    pub fn hold_renewals(&self, hold: bool) {
+        self.held.store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 暂停续期，**并等正在换的那几家换完**：每家的刷新锁都拿一下再放。暂停之后进来的
+    /// 换不了（拿到锁时看见暂停着），暂停之前已经在换的拿着锁 —— 等它回来，它换到的
+    /// access token 和新 refresh token 才在手里、才交得出去。最多等 `within`
+    pub async fn hold_renewals_settled(&self, within: Duration) {
+        self.hold_renewals(true);
+        let flights: Vec<Arc<tokio::sync::Mutex<()>>> = self
+            .flights
+            .lock()
+            .expect("lock not poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let all = async {
+            for f in flights {
+                drop(f.lock().await);
+            }
+        };
+        if tokio::time::timeout(within, all).await.is_err() {
+            tracing::warn!(
+                "a sign-in token renewal was still running when renewals were paused for the handover"
+            );
+        }
+    }
+
     /// 真的去换。**调用方持有这家的刷新锁**，所以这里不会有并发的第二次。
     async fn refresh(
         &self,
@@ -387,6 +525,16 @@ impl Cache {
         cfg: &OAuth,
         http: &reqwest::Client,
     ) -> Result<(String, Option<Renewed>), OauthError> {
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) {
+            let g = self.inner.lock().expect("lock not poisoned");
+            return g
+                .get(provider)
+                .filter(|l| l.usable_for(cfg) && !l.access.is_empty())
+                .map(|l| l.access.clone())
+                .or_else(|| cfg.access.clone().filter(|a| !a.is_empty()))
+                .map(|a| (a, None))
+                .ok_or(OauthError::Held);
+        }
         // 用手里那个 refresh（可能是服务器换过的），没有就用配置里的
         let refresh = {
             let g = self.inner.lock().expect("lock not poisoned");

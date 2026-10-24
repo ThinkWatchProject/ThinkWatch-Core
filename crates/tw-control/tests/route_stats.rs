@@ -107,6 +107,7 @@ async fn world(text: &str) -> World {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), gw.bus.clone())),
         gateway: gw.clone(),
         store: Some(store.clone()),
@@ -289,6 +290,7 @@ async fn a_store_with_no_history_yet_says_nothing_is_covered() {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), gw.bus.clone())),
         gateway: gw,
         store: Some(store),
@@ -335,6 +337,7 @@ async fn without_a_store_it_says_so() {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), gw.bus.clone())),
         gateway: gw,
         store: None,

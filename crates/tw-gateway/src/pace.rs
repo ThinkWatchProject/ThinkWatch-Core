@@ -36,6 +36,31 @@ impl Pace {
             .unwrap_or(1.0)
     }
 
+    /// 交接：每家每个模型校准到的比例（见 [`crate::handover`]）
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::PaceEntry> {
+        let r = self.ratios.lock().unwrap_or_else(|p| p.into_inner());
+        r.iter()
+            .map(
+                |((upstream, model), ratio)| crate::handover::wire::PaceEntry {
+                    upstream: upstream.clone(),
+                    model: model.clone(),
+                    ratio: *ratio,
+                },
+            )
+            .collect()
+    }
+
+    /// 交接：接进旧 core 校准到的。这里已经校准过的不动；不在范围里的（读坏了）丢掉
+    pub(crate) fn handover_import(&self, entries: Vec<crate::handover::wire::PaceEntry>) {
+        let mut r = self.ratios.lock().unwrap_or_else(|p| p.into_inner());
+        for e in entries
+            .into_iter()
+            .filter(|e| (RANGE.0..=RANGE.1).contains(&e.ratio))
+        {
+            r.entry((e.upstream, e.model)).or_insert(e.ratio);
+        }
+    }
+
     /// 一个流式请求结束了：估出来 `estimated` 个（没乘比例的），上游说是 `actual` 个
     pub fn learn(&self, provider: &str, model: &str, estimated: u64, actual: u64) {
         if estimated < MIN_SAMPLE || actual == 0 {

@@ -54,6 +54,30 @@ impl Balance {
         Turn { rounds, group: g }
     }
 
+    /// 交接：每个组轮到哪儿了（见 [`crate::handover`]）
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::BalanceRound> {
+        self.lock()
+            .iter()
+            .map(|(group, r)| crate::handover::wire::BalanceRound {
+                group: group.clone(),
+                members: r.members.clone(),
+                current: r.current.clone(),
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 轮到的地方。成员和权重和这里的配置对不上的，下一次排时自己从头轮
+    /// （见 [`Self::turn`]）；这里已经轮过的组不动
+    pub(crate) fn handover_import(&self, rounds: Vec<crate::handover::wire::BalanceRound>) {
+        let mut map = self.lock();
+        for r in rounds {
+            map.entry(r.group).or_insert(Round {
+                members: r.members,
+                current: r.current,
+            });
+        }
+    }
+
     /// 组 `g` 此刻的当前权重，**只看不记**。试算用：它和数据面读同一份，说完了不改变答案
     pub fn peek(&self, g: &Group) -> HashMap<String, i64> {
         self.lock()

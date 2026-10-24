@@ -160,6 +160,7 @@ fn bed_with(sub: &str, fake: bool) -> Bed {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw.clone(),
         store: Some(store.clone()),

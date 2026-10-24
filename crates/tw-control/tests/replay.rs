@@ -127,6 +127,7 @@ fn app_of(
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: Some(Arc::new(tokio::sync::Mutex::new(rec))),

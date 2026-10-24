@@ -287,6 +287,9 @@ pub struct AppState {
     pub opening_hold: std::time::Duration,
     /// 响应头先交出去之后隔多久发一行保活（[`crate::KEEPALIVE_EVERY`]）。**测试会把它调短**
     pub keepalive_every: std::time::Duration,
+    /// 新旧 core 交接时网关这一边的东西：排空的标记、替旧 core 占着的名额（见
+    /// [`crate::handover`]）。**跨重载存活**
+    pub(crate) handover: Arc<crate::handover::Handover>,
 }
 
 impl AppState {
@@ -372,6 +375,7 @@ impl AppState {
             idle_tick: std::time::Duration::from_secs(1),
             opening_hold: crate::OPENING_HOLD,
             keepalive_every: crate::KEEPALIVE_EVERY,
+            handover: Default::default(),
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();

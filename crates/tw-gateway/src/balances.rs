@@ -375,13 +375,20 @@ pub async fn run(http: &reqwest::Client, step: Step, base_url: &str, auth: &str)
 }
 
 /// 后台：启动时读一遍，之后按节奏读（见 [`tracker`]）。有请求结束时被提前叫醒。
+///
+/// **排空开始就停**（交接之后的旧 core）：余额由接替者读
 pub fn spawn(state: crate::AppState) {
     tokio::spawn(async move {
+        let mut draining = state.handover.draining();
         loop {
+            if *draining.borrow() {
+                return;
+            }
             let _ = state.start_due_balances();
             tokio::select! {
                 _ = tokio::time::sleep(TICK) => {}
                 _ = state.balances.wake.notified() => {}
+                _ = draining.changed() => {}
             }
         }
     });

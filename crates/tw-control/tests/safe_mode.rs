@@ -42,6 +42,7 @@ fn safe_mode(yaml: &str) -> Bed {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: mgr.clone(),
         gateway: gw.clone(),
         store: None,

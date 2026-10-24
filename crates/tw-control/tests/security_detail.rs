@@ -121,6 +121,7 @@ security:
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), gw.bus.clone())),
         gateway: gw.clone(),
         store: Some(store.clone()),

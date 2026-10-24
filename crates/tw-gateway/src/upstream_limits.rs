@@ -68,6 +68,10 @@ struct Inner {
     asked: HashSet<Moved>,
     /// 等这家变化的（[`UpstreamLimits::changed`]）
     wake: HashMap<String, Arc<Notify>>,
+    /// 交接：预留和结算往哪儿报（旧 core，见 [`crate::handover`]），在这把锁里报
+    feed: Option<Arc<crate::handover::feed::Feed>>,
+    /// 交接：替旧 core 记着的预留，旧 core 那边的号 → 这里的号（新 core）
+    imported: HashMap<u64, u64>,
 }
 
 struct Shared {
@@ -92,6 +96,7 @@ impl Shared {
         let before: HashMap<u64, String> =
             g.held.iter().map(|(s, r)| (*s, r.key.clone())).collect();
         for (seq, id) in books::sweep_held(&mut g.held, &self.bus, now) {
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::UpDrop { seq });
             if let Some(seqs) = g.by_request.get_mut(&id) {
                 seqs.retain(|s| *s != seq);
                 if seqs.is_empty() {
@@ -149,22 +154,28 @@ impl Shared {
     fn release(&self, seq: u64) {
         let key = {
             let mut g = self.lock();
-            let g = &mut *g;
-            let Some(r) = g.held.remove(&seq) else {
+            let Some(key) = Self::release_locked(&mut g, seq) else {
                 return;
             };
-            if let Some(id) = r.request
-                && let Some(seqs) = g.by_request.get_mut(&id)
-            {
-                seqs.retain(|s| *s != seq);
-                if seqs.is_empty() {
-                    g.by_request.remove(&id);
-                }
-            }
-            books::unrecord(&mut g.books, &r);
-            r.key
+            key
         };
         self.wake([key.as_str()]);
+    }
+
+    /// 交回还回去的那一家
+    fn release_locked(g: &mut Inner, seq: u64) -> Option<String> {
+        let r = g.held.remove(&seq)?;
+        if let Some(id) = r.request
+            && let Some(seqs) = g.by_request.get_mut(&id)
+        {
+            seqs.retain(|s| *s != seq);
+            if seqs.is_empty() {
+                g.by_request.remove(&id);
+            }
+        }
+        books::unrecord(&mut g.books, &r);
+        crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::UpRelease { seq });
+        Some(r.key)
     }
 }
 
@@ -403,10 +414,12 @@ impl UpstreamLimits {
             let g = &mut *g;
             books::record_request(&mut g.books, upstream, limits, now);
             g.seq += 1;
-            g.held.insert(
-                g.seq,
-                Reservation::new(upstream, now, ask.tokens, ask.cost_micros),
-            );
+            let r = Reservation::new(upstream, now, ask.tokens, ask.cost_micros);
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::UpReserve {
+                held: books::held_wire(g.seq, &r),
+                windowed: books::longest_window(limits).is_some(),
+            });
+            g.held.insert(g.seq, r);
             g.seq
         };
         // 记上的这一个可能把窗口、这一期用满了：看着这家的（报状态的）再看一眼
@@ -432,74 +445,238 @@ impl UpstreamLimits {
         rec: &Recorded,
     ) {
         let now = self.now();
-        let clock = self.shared.clock.as_ref();
         let (touched, moved) = {
             let mut g = self.shared.lock();
             let g = &mut *g;
-            let held: Vec<Reservation> = g
+            let held: Vec<(u64, Reservation)> = g
                 .by_request
                 .remove(&id)
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|s| g.held.remove(&s))
+                .filter_map(|s| g.held.remove(&s).map(|r| (s, r)))
                 .collect();
-            let mut touched: HashSet<String> = held.iter().map(|r| r.key.clone()).collect();
-            let counted = counts(rec);
-            // 滚动窗口里的请求数：发出时就记上了。记录里算数的那几跳留着，别的撤掉
-            let mut left: Vec<&str> = if counted {
-                hops.iter().map(String::as_str).collect()
-            } else {
-                Vec::new()
-            };
-            for r in &held {
-                match left.iter().position(|h| *h == r.key) {
-                    Some(i) => {
-                        left.swap_remove(i);
-                    }
-                    None => books::unrecord(&mut g.books, r),
-                }
-            }
-            if counted {
-                let one = Amount {
-                    requests: 1,
-                    ..Default::default()
-                };
-                for up in hops {
-                    add_to_periods(
-                        g.books.entry(up.clone()).or_default(),
-                        clock,
-                        &one,
-                        at_ms,
-                        now,
-                    );
-                    touched.insert(up.clone());
-                }
-                if let Some(up) = served {
-                    let amount = Amount {
-                        requests: 0,
-                        ..rec.amount()
-                    };
-                    let rolling = g
-                        .limits
-                        .get(up)
-                        .and_then(|ls| books::longest_window(ls))
-                        .is_some();
-                    let b = g.books.entry(up.to_string()).or_default();
-                    add_to_periods(b, clock, &amount, at_ms, now);
-                    if rolling {
-                        b.recent.push_back((now, amount));
-                    }
-                    touched.insert(up.to_string());
-                }
-            }
-            let moved: Vec<Moved> = touched
-                .iter()
-                .flat_map(|k| books::take_moved(&mut g.books, &mut g.asked, k))
-                .collect();
-            (touched, moved)
+            self.settle_locked(g, held, at_ms, hops, served, rec, now)
         };
         self.shared.wake(touched.iter().map(String::as_str));
         self.shared.ask_reread(moved);
+    }
+
+    /// 结算一行：`held` 是它那几跳占着的预留和预留的号。交回动过的那几家和换了新一期的那几期
+    #[allow(clippy::too_many_arguments)]
+    fn settle_locked(
+        &self,
+        g: &mut Inner,
+        held: Vec<(u64, Reservation)>,
+        at_ms: i64,
+        hops: &[String],
+        served: Option<&str>,
+        rec: &Recorded,
+        now: i64,
+    ) -> (HashSet<String>, Vec<Moved>) {
+        let clock = self.shared.clock.as_ref();
+        if !held.is_empty() || counts(rec) {
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::UpSettle {
+                seqs: held.iter().map(|(s, _)| *s).collect(),
+                at_ms,
+                hops: hops.to_vec(),
+                served: served.map(str::to_string),
+                rec: rec.clone(),
+            });
+        }
+        let held: Vec<Reservation> = held.into_iter().map(|(_, r)| r).collect();
+        let mut touched: HashSet<String> = held.iter().map(|r| r.key.clone()).collect();
+        let counted = counts(rec);
+        // 滚动窗口里的请求数：发出时就记上了。记录里算数的那几跳留着，别的撤掉
+        let mut left: Vec<&str> = if counted {
+            hops.iter().map(String::as_str).collect()
+        } else {
+            Vec::new()
+        };
+        for r in &held {
+            match left.iter().position(|h| *h == r.key) {
+                Some(i) => {
+                    left.swap_remove(i);
+                }
+                None => books::unrecord(&mut g.books, r),
+            }
+        }
+        if counted {
+            let one = Amount {
+                requests: 1,
+                ..Default::default()
+            };
+            for up in hops {
+                add_to_periods(
+                    g.books.entry(up.clone()).or_default(),
+                    clock,
+                    &one,
+                    at_ms,
+                    now,
+                );
+                touched.insert(up.clone());
+            }
+            if let Some(up) = served {
+                let amount = Amount {
+                    requests: 0,
+                    ..rec.amount()
+                };
+                let rolling = g
+                    .limits
+                    .get(up)
+                    .and_then(|ls| books::longest_window(ls))
+                    .is_some();
+                let b = g.books.entry(up.to_string()).or_default();
+                add_to_periods(b, clock, &amount, at_ms, now);
+                if rolling {
+                    b.recent.push_back((now, amount));
+                }
+                touched.insert(up.to_string());
+            }
+        }
+        let moved: Vec<Moved> = touched
+            .iter()
+            .flat_map(|k| books::take_moved(&mut g.books, &mut g.asked, k))
+            .collect();
+        (touched, moved)
+    }
+
+    // ------------------------------------------------------------ 交接（见 `crate::handover`）
+
+    /// 旧 core：此刻的账和在路上的预留，之后的变化报给 `feed`（同一把锁里，见
+    /// `KeyLimits::handover_export`）
+    pub(crate) fn handover_export(
+        &self,
+        feed: Option<Arc<crate::handover::feed::Feed>>,
+    ) -> crate::handover::wire::LimitBooks {
+        let mut g = self.shared.lock();
+        let out = books::export(&g.books, &g.held);
+        g.feed = feed;
+        out
+    }
+
+    /// 旧 core：排空开始。报一份此刻在路上的全部预留，之后的变化接着报
+    pub(crate) fn handover_drain(&self, feed: Arc<crate::handover::feed::Feed>) {
+        let mut g = self.shared.lock();
+        feed.send(&crate::handover::wire::Event::UpHolds {
+            held: books::export(&HashMap::new(), &g.held).held,
+        });
+        g.feed = Some(feed);
+    }
+
+    /// 新 core：接进旧 core 的账，在路上的预留记成替它占着的
+    pub(crate) fn handover_import(&self, b: crate::handover::wire::LimitBooks) {
+        let names: Vec<String> = {
+            let mut g = self.shared.lock();
+            let g = &mut *g;
+            books::import(&mut g.books, b.books);
+            for h in &b.held {
+                Self::phantom(g, h, false);
+            }
+            g.books.keys().cloned().collect()
+        };
+        self.shared.wake(names.iter().map(String::as_str));
+    }
+
+    fn phantom(g: &mut Inner, h: &crate::handover::wire::Held, windowed: bool) {
+        if g.imported.contains_key(&h.seq) {
+            return;
+        }
+        g.seq += 1;
+        let seq = g.seq;
+        let r = books::held_reservation(h);
+        if windowed {
+            books::record_at(&mut g.books, &r.key, r.at_ms);
+        }
+        crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::UpReserve {
+            held: books::held_wire(seq, &r),
+            windowed,
+        });
+        g.held.insert(seq, r);
+        g.imported.insert(h.seq, seq);
+    }
+
+    /// 替旧 core 记着的这一份作废（不撤滚动窗口里那一个请求）。交回它是哪一家的
+    fn drop_phantom(g: &mut Inner, theirs: u64) -> Option<String> {
+        let seq = g.imported.remove(&theirs)?;
+        let r = g.held.remove(&seq)?;
+        crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::UpDrop { seq });
+        Some(r.key)
+    }
+
+    /// 新 core：旧 core 报来一条变化（`up_*` 那几种）。别的不认，交回 false
+    pub(crate) fn handover_apply(&self, ev: &crate::handover::wire::Event) -> bool {
+        use crate::handover::wire::Event;
+        let now = self.now();
+        let (touched, moved) = {
+            let mut g = self.shared.lock();
+            let g = &mut *g;
+            match ev {
+                Event::UpHolds { held } => {
+                    let want: HashSet<u64> = held.iter().map(|h| h.seq).collect();
+                    let stale: Vec<u64> = g
+                        .imported
+                        .keys()
+                        .filter(|s| !want.contains(s))
+                        .copied()
+                        .collect();
+                    let mut touched: HashSet<String> = stale
+                        .into_iter()
+                        .filter_map(|s| Self::drop_phantom(g, s))
+                        .collect();
+                    for h in held {
+                        Self::phantom(g, h, false);
+                        touched.insert(h.key.clone());
+                    }
+                    (touched, Vec::new())
+                }
+                Event::UpReserve { held, windowed } => {
+                    Self::phantom(g, held, *windowed);
+                    (HashSet::from([held.key.clone()]), Vec::new())
+                }
+                Event::UpSettle {
+                    seqs,
+                    at_ms,
+                    hops,
+                    served,
+                    rec,
+                } => {
+                    let held: Vec<(u64, Reservation)> = seqs
+                        .iter()
+                        .filter_map(|s| g.imported.remove(s))
+                        .filter_map(|s| g.held.remove(&s).map(|r| (s, r)))
+                        .collect();
+                    self.settle_locked(g, held, *at_ms, hops, served.as_deref(), rec, now)
+                }
+                Event::UpRelease { seq } => {
+                    let touched = g
+                        .imported
+                        .remove(seq)
+                        .and_then(|s| Shared::release_locked(g, s));
+                    (touched.into_iter().collect(), Vec::new())
+                }
+                Event::UpDrop { seq } => (
+                    Self::drop_phantom(g, *seq).into_iter().collect(),
+                    Vec::new(),
+                ),
+                _ => return false,
+            }
+        };
+        self.shared.wake(touched.iter().map(String::as_str));
+        self.shared.ask_reread(moved);
+        true
+    }
+
+    /// 新 core：交接连接断了。替旧 core 记着的预留全部作废
+    pub(crate) fn handover_release_all(&self) {
+        let touched: Vec<String> = {
+            let mut g = self.shared.lock();
+            let theirs: Vec<u64> = g.imported.keys().copied().collect();
+            theirs
+                .into_iter()
+                .filter_map(|s| Self::drop_phantom(&mut g, s))
+                .collect()
+        };
+        self.shared.wake(touched.iter().map(String::as_str));
     }
 
     /// 重启之后把天、周、月的数从请求记录里加回来。`since(t)` 给出从 `t` 起每家上游记下的

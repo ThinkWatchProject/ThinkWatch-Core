@@ -73,6 +73,36 @@ impl Refused {
         by.get(&(conversation.to_string(), upstream.to_string()))
             .map(|(_, s)| s.clone())
     }
+
+    /// 交接：全部拒过的（见 [`crate::handover`]）。指纹写成十六进制
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::SealEntry> {
+        let by = self.by.lock().unwrap_or_else(|p| p.into_inner());
+        by.iter()
+            .map(
+                |((conversation, upstream), (last, seals))| crate::handover::wire::SealEntry {
+                    conversation: conversation.clone(),
+                    upstream: upstream.clone(),
+                    last_ms: *last,
+                    seals: seals
+                        .iter()
+                        .map(|s| blake3::Hash::from(*s).to_hex().to_string())
+                        .collect(),
+                },
+            )
+            .collect()
+    }
+
+    /// 交接：接进旧 core 记着的，和这里的并起来。读不懂的指纹丢掉
+    pub(crate) fn handover_import(&self, entries: Vec<crate::handover::wire::SealEntry>) {
+        for e in entries {
+            let seals: Vec<Seal> = e
+                .seals
+                .iter()
+                .filter_map(|h| blake3::Hash::from_hex(h).ok().map(|h| *h.as_bytes()))
+                .collect();
+            self.note(&e.conversation, &e.upstream, &seals, e.last_ms);
+        }
+    }
 }
 
 /// 上游这个 400 是在拒绝封存的推理吗。`wire` 是发给它的那一份的格式。认法见

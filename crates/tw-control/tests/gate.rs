@@ -50,6 +50,7 @@ fn bed() -> Bed {
     let state = ControlState {
         shutdown: Default::default(),
         remote: Default::default(),
+        handover: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: None,
@@ -251,6 +252,45 @@ async fn a_new_key_closes_the_connections_made_with_the_old_one() {
         Err(LinkError::WrongKey)
     ));
     let (mut s, _) = open(&at, &new).await.unwrap();
+    assert_eq!(get(&mut s, "/status").await.0, StatusCode::OK);
+}
+
+/// 交出控制面（升级不断线）：已经连着这个 core 的本机连接断开、不再接新的；交接没成、恢复
+/// accept 之后又连得上。连着的多半是新桌面端交接之前连上来的，断开它才会重连到接替者
+#[tokio::test]
+async fn handing_over_the_control_plane_closes_the_connections_to_this_core() {
+    let b = bed();
+    let at = Address::Loopback {
+        port_file: b.dir.path().join("control.port"),
+    };
+    listen(&b, at.clone()).await;
+    let (mut s, conn) = open(&at, &key(KEY)).await.unwrap();
+    assert_eq!(get(&mut s, "/status").await.0, StatusCode::OK);
+
+    b.state.handover.control().pause();
+    b.state.handover.control().close_connections();
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("交出控制面之后，连着的那一条该被断开")
+        .unwrap();
+    // 停着 accept：新连接握不上手（没人接）
+    let port: u16 = std::fs::read_to_string(b.dir.path().join("control.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let stalled = tokio::time::timeout(Duration::from_millis(300), async {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tw_link::connect(tcp, &key(KEY), "gate test").await
+    })
+    .await;
+    assert!(stalled.is_err(), "停了 accept 还握得上手");
+
+    // 交接没成：接着接
+    b.state.handover.control().resume();
+    let (mut s, _) = open(&at, &key(KEY)).await.unwrap();
     assert_eq!(get(&mut s, "/status").await.0, StatusCode::OK);
 }
 

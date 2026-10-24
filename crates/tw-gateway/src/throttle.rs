@@ -742,6 +742,80 @@ impl Throttles {
         }
     }
 
+    /// 交接：每家的限流暂停（见 [`crate::handover`]）。时刻换成「还剩多久」「过去多久」：
+    /// 单调时钟出不了这个进程。**排着的队和探路的名额不交**：那是旧 core 手上的请求
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::ThrottleEntry> {
+        let now = self.moment();
+        let ms = |d: Duration| d.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.lock()
+            .iter()
+            .filter_map(|(name, up)| {
+                let pause_left_ms = up.pause.filter(|p| !p.over(now)).map(|p| ms(p.left(now)));
+                let limited_ago_ms = up.limited_at.map(|t| ms(t.since(now)));
+                if pause_left_ms.is_none()
+                    && limited_ago_ms.is_none()
+                    && up.strikes == 0
+                    && !up.probing
+                {
+                    return None;
+                }
+                Some(crate::handover::wire::ThrottleEntry {
+                    upstream: name.clone(),
+                    pause_left_ms,
+                    limited_ago_ms,
+                    strikes: up.strikes,
+                    probing: up.probing,
+                })
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 的限流暂停。`lag_ms` 是快照导出到现在过了多久，从剩下的里扣掉。这里
+    /// 已经被限流过的那一家不动 —— 那是更新的事。暂停结束那一刻照样报一次（[`Self::at`]）
+    pub(crate) fn handover_import(
+        self: &Arc<Self>,
+        entries: Vec<crate::handover::wire::ThrottleEntry>,
+        lag_ms: u64,
+    ) {
+        let now = self.moment();
+        let back = |ago_ms: u64| {
+            let d = Duration::from_millis(ago_ms);
+            Moment {
+                mono: now.mono.checked_sub(d).unwrap_or(now.mono),
+                wall: now.wall.saturating_sub(ago_ms),
+            }
+        };
+        let mut touched = Vec::new();
+        {
+            let mut map = self.lock();
+            for e in entries {
+                let up = map.entry(e.upstream.clone()).or_insert_with(Up::new);
+                if up.pause.is_some() || up.limited_at.is_some() {
+                    continue;
+                }
+                up.pause = e
+                    .pause_left_ms
+                    .map(|ms| ms.saturating_sub(lag_ms))
+                    .filter(|ms| *ms > 0)
+                    .map(|ms| Span {
+                        from: now,
+                        len: Duration::from_millis(ms),
+                    });
+                up.limited_at = e.limited_ago_ms.map(|ago| back(ago.saturating_add(lag_ms)));
+                up.strikes = e.strikes;
+                up.probing = e.probing;
+                up.bump();
+                touched.push((e.upstream, up.pause));
+            }
+        }
+        for (name, pause) in touched {
+            self.refresh(&name);
+            if let Some(p) = pause {
+                self.at(&name, p);
+            }
+        }
+    }
+
     /// `span` 结束时重报一次这一家的样子、叫醒排队的。**睡一会儿起来看一眼**（[`NAP`]）：睡着的
     /// 时候单调时钟不走，只按它睡，醒来后还要再等完剩下的
     fn at(self: &Arc<Self>, name: &str, span: Span) {
