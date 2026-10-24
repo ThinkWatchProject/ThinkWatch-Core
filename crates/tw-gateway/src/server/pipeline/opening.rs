@@ -11,8 +11,9 @@
 //! 和无响应超时是同一个判据（见 [`crate::pulse`]）。
 //!
 //! 等到无响应超时那一刻（`failover.idle_timeout_secs`，从请求发出去算起）还没有内容是
-//! [`Opening::Slow`]：调用方放弃这一家、换下一家。**最后一家只在它可能在限流时在这里等**（流式
-//! 的、请求还等得起，见 `hop`）：开头报的限流要暂停这一家、排队等它恢复；别的错、到点了还没有
+//! [`Opening::Slow`]：调用方放弃这一家、换下一家。**最后一家只在请求还等得起时等流式的**（客户端
+//! 收 SSE 流、或者这一家可能在限流，见 `hop`）：开头报的暂时的错（过载、5xx）、流在内容之前断了，
+//! 退避一阵再试（见 [`crate::retry`]）；报的限流暂停这一家、排队等它恢复；别的错、到点了还没有
 //! 内容，没有下一家可换，照原样交给回程。别的时候最后一家不等：压着它只会让客户端晚一点看到
 //! 同样的东西。
 //! 开头压得太多（[`HOLD_LIMIT`]）也不再压，交出去由回程照常计时。压着的这段时间里客户端等的是响应头：流式的回答过了
@@ -27,6 +28,7 @@ use futures::StreamExt;
 
 use crate::error::GatewayError;
 use tw_dialect::ir::Dialect;
+use tw_types::msg;
 
 /// 开头最多压多少字节。前导事件都很小，攒到这么多还没有内容，就不是在等开头了
 pub(super) const HOLD_LIMIT: usize = 1024 * 1024;
@@ -46,16 +48,18 @@ pub(super) enum Opening {
     /// 上游的原话，交给 [`crate::failure::classify`] 判断换不换。
     ///
     /// **读过的字节也还在 `response` 里**：判断下来是请求本身的问题（换一家也一样
-    /// 被拒）时，照常把它交给客户端
+    /// 被拒）时，照常把它交给客户端。`transient` 是这个错是不是暂时的（见 [`transient_in`]）：
+    /// 最后一家报的暂时的错退避重试（见 [`crate::retry`]）
     Failed {
         status: u16,
         headers: http::HeaderMap,
         body: Bytes,
         kind: String,
         message: String,
+        transient: bool,
         response: reqwest::Response,
     },
-    /// 流在第一段内容之前断了
+    /// 流在第一段内容之前断了，或者只发了开头的例行事件就好好地收了尾
     Broken(GatewayError),
 }
 
@@ -87,7 +91,8 @@ pub(super) async fn watch(
             }
         };
         let chunk = match next {
-            None => break Judge::Content,
+            // 只有开头的例行事件就收了尾：一段内容都没有，和断了一样
+            None => return Opening::Broken(ended()),
             Some(Ok(c)) => c,
             Some(Err(e)) => {
                 return Opening::Broken(crate::forward::map_reqwest_error(e));
@@ -132,12 +137,14 @@ pub(super) async fn watch(
             body,
             kind,
             message,
+            transient,
         } => Opening::Failed {
             status,
             headers,
             body,
             kind,
             message,
+            transient,
             response,
         },
         Judge::Content | Judge::Preamble if slow => Opening::Slow {
@@ -203,6 +210,8 @@ enum Judge {
         body: Bytes,
         kind: String,
         message: String,
+        /// 暂时的错（见 [`transient_in`]）
+        transient: bool,
     },
 }
 
@@ -223,7 +232,10 @@ fn judge(dialect: Dialect, event: Option<&str>, data: &str) -> Judge {
         .map(str::to_string)
         .or_else(|| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
         .unwrap_or_default();
-    if let Some(e) = error_in(dialect, &ty, &v, data) {
+    if let Some(mut e) = error_in(dialect, &ty, &v, data) {
+        if let Judge::Error { transient, .. } = &mut e {
+            *transient = transient_in(dialect, &ty, &v);
+        }
         return e;
     }
     if crate::pulse::advances(dialect, &ty, &v) {
@@ -301,12 +313,53 @@ pub(super) fn stream_error(dialect: Dialect, data: &str) -> Option<(u16, Bytes)>
     }
 }
 
+/// 上游在流里报的这个错是不是暂时的（过载、服务端出错）：码或者类型在名单里（见
+/// [`crate::retry::transient_kind`]），Chat、Gemini 的数字码是暂时的状态码（见
+/// [`crate::retry::transient_status`]）。**认不出的一律不算**：图片解不开、内容被拦这类错同一家
+/// 再发一遍也一样。只管同一家要不要再试，换不换下一家照旧看状态码（[`error_in`]）
+fn transient_in(dialect: Dialect, ty: &str, v: &serde_json::Value) -> bool {
+    let named = |e: &serde_json::Value, keys: &[&str]| {
+        keys.iter()
+            .any(|k| crate::retry::transient_kind(&text_of(e, k)))
+    };
+    let numbered = |e: &serde_json::Value| {
+        e.get("code")
+            .and_then(|c| c.as_u64())
+            .and_then(|c| u16::try_from(c).ok())
+            .is_some_and(crate::retry::transient_status)
+    };
+    match dialect {
+        Dialect::Anthropic => named(v.get("error").unwrap_or(v), &["type"]),
+        Dialect::Responses => {
+            let e = match ty {
+                "response.failed" => v.pointer("/response/error"),
+                _ => v.get("error"),
+            };
+            named(e.unwrap_or(v), &["code", "type"])
+        }
+        Dialect::Chat | Dialect::Gemini => v
+            .get("error")
+            .is_some_and(|e| named(e, &["code", "type", "status"]) || numbered(e)),
+        // Bedrock 的异常不是 SSE 事件，见 [`bedrock_exception`]
+        Dialect::Bedrock => false,
+    }
+}
+
+/// 流只发了开头的例行事件就收了尾：一段内容都没有
+fn ended() -> GatewayError {
+    GatewayError::upstream(msg!(
+        "gw.upstream.stream_ended_early" =>
+        "The upstream ended the stream before sending any content."
+    ))
+}
+
 fn error(status: u16, data: &str, kind: String, message: String) -> Judge {
     Judge::Error {
         status,
         body: Bytes::copy_from_slice(data.as_bytes()),
         kind,
         message,
+        transient: false,
     }
 }
 
@@ -356,6 +409,7 @@ fn bedrock_exception(kind: String, message: String) -> Judge {
     Judge::Error {
         status,
         body: Bytes::from(body),
+        transient: crate::retry::transient_kind(&kind),
         kind,
         message,
     }
@@ -499,6 +553,69 @@ mod tests {
             first_verdict(Dialect::Gemini, err),
             Some(Judge::Error { status: 503, .. })
         ));
+    }
+
+    fn transient(dialect: Dialect, text: &str) -> bool {
+        match first_verdict(dialect, text) {
+            Some(Judge::Error { transient, .. }) => transient,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 只有名单里的码是暂时的错；认不出的码（图片解不开、内容被拦）状态码照旧是 500、照旧换
+    /// 下一家，可同一家不再试
+    #[test]
+    fn only_listed_kinds_in_the_stream_are_temporary() {
+        let overloaded = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"x\"}}\n\n";
+        assert!(transient(Dialect::Responses, overloaded));
+        let top = "event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"x\"}\n\n";
+        assert!(transient(Dialect::Responses, top));
+        let refused = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_encrypted_content\",\"message\":\"x\"}}\n\n";
+        assert!(!transient(Dialect::Responses, refused));
+        let image = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_image\",\"message\":\"x\"}}}\n\n";
+        assert!(matches!(
+            first_verdict(Dialect::Responses, image),
+            Some(Judge::Error {
+                status: 500,
+                transient: false,
+                ..
+            })
+        ));
+        let server = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"x\"}}}\n\n";
+        assert!(transient(Dialect::Responses, server));
+        let anthropic = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        assert!(transient(Dialect::Anthropic, anthropic));
+        let gemini =
+            "data: {\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"x\"}}\n\n";
+        assert!(transient(Dialect::Gemini, gemini));
+        let numbered = "data: {\"error\":{\"code\":503,\"message\":\"busy\"}}\n\n";
+        assert!(transient(Dialect::Chat, numbered));
+        let filtered = "data: {\"error\":{\"code\":\"content_filter\",\"message\":\"x\"}}\n\n";
+        assert!(!transient(Dialect::Chat, filtered));
+        assert!(matches!(
+            bedrock_exception("serviceUnavailableException".into(), "x".into()),
+            Judge::Error {
+                transient: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            bedrock_exception("validationException".into(), "x".into()),
+            Judge::Error {
+                transient: false,
+                ..
+            }
+        ));
+    }
+
+    /// 只发了开头的例行事件就收了尾：和断了一样
+    #[tokio::test]
+    async fn a_stream_that_ends_after_its_opening_is_broken() {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\n";
+        match watch(served(body).await, Dialect::Anthropic, false, soon(5)).await {
+            Opening::Broken(e) => assert_eq!(e.detail.code, "gw.upstream.stream_ended_early"),
+            _ => panic!("该算断了"),
+        }
     }
 
     #[test]

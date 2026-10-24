@@ -1066,7 +1066,15 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 父进程、开交接端点、等接替者；[`Status`] 多了 `handover`（[`HandoverState`]）和 `draining`
 /// （排空中的旧 core 手上还有几个请求，只有接管了它的新 core 报，平时是 0）。
 /// 新码：`control.handover.*`
-pub const CONTROL_API_VERSION: u32 = 52;
+///
+/// **53 起最后一家暂时出错时退避重试**：候选都试过了、最后那一跳在第一段内容之前过载、5xx、
+/// 连不上、流断了，请求在等待期限（`wait_secs`，等上游和重试共用）之内退避一阵，把暂时出错的
+/// 那几家再试一轮。新事件 [`Event::RequestRetrying`]（开始退避：再试哪几家、第几次、什么时候
+/// 发出去），退避结束发 [`Event::RequestDequeued`]，两条都在 `InFlightRequest::events` 里。
+/// [`AttemptView`] 多了 `retry`（这一跳是第几次重试）和 `backoff_ms`（发出之前退避了多久）。
+/// 新码：`gw.upstream.stream_ended_early`（流只发了开头的例行事件就收了尾，算在
+/// [`FAILED_AFTER_SENDING`] 里）
+pub const CONTROL_API_VERSION: u32 = 53;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1423,10 +1431,28 @@ pub enum Event {
     },
     /// 这个请求不排队了：等到了一家、要发出去了，被手动中止了，或者等不到了。和它之前的那条
     /// [`Event::RequestQueued`] 成对；路由事件要等整条尝试链走完才发，界面靠这一条知道它不在
-    /// 排队了。也在 [`InFlightRequest::events`] 里。
+    /// 排队了。也在 [`InFlightRequest::events`] 里。退避重试结束时也发，和之前的那条
+    /// [`Event::RequestRetrying`] 成对。
     ///
     /// 客户端在排队时走了的不发：紧跟着的结局（取消）就是它的结束
     RequestDequeued { id: u64, at_ms: u64 },
+    /// 这个请求在退避，之后重试：候选都试过了，最后那一跳在第一段内容之前出了暂时的错（过载、
+    /// 5xx、连不上、流断了），暂时出错的那几家在等待期限之内再试一轮。
+    ///
+    /// **一次退避发一条**，退避结束发 [`Event::RequestDequeued`]（重试发出去了、被手动中止了、
+    /// 等不到了）。在 [`InFlightRequest::events`] 里
+    RequestRetrying {
+        id: u64,
+        /// 要再试哪几家，按候选的顺序
+        upstreams: Vec<String>,
+        /// 接下来是第几次重试，从 1 数
+        attempt: u32,
+        /// 下一次什么时候发出去（Unix 毫秒）
+        retry_at_ms: u64,
+        /// 这个请求的等待期限（Unix 毫秒），同 [`Event::RequestQueued`] 的 `until_ms`
+        until_ms: u64,
+        at_ms: u64,
+    },
     /// 路由决定完了，尝试链也走完了。
     ///
     /// **单独一个事件，因为成功和失败两条路都要发它。**挂在
@@ -1975,6 +2001,13 @@ pub struct AttemptView {
     /// 不算进这家的用量上限（[`Self::counts_for_upstream`]）。别的结果没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_ms: Option<u64>,
+    /// 这一跳是第几次重试，从 1 数（见 [`Event::RequestRetrying`]）：一轮重试里的每一跳都带着。
+    /// 第一轮的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<u32>,
+    /// 这一跳发出去之前退避了多少毫秒：一轮重试的头一跳带着。不算在 `ms` 里。别的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
     /// 这一跳走的代理：这家上游配置的代理名（跟随系统的是 `system`），直连是 None。没发出去
     /// 的一跳（满着、被拒、转换不了……）是它要走的那个 —— 连不上的那一跳，问题可能就出在
     /// 这个代理上。WebSocket 只连直连的上游，一律是 None
@@ -1993,6 +2026,7 @@ pub const FAILED_AFTER_SENDING: &[&str] = &[
     "gw.upstream.forward_failed",
     "gw.upstream.body_broken",
     "gw.upstream.stream_opening_error",
+    "gw.upstream.stream_ended_early",
 ];
 
 /// 手动中止的请求报的码（[`FailureSource::Aborted`] 的 `message`，尝试链上 `aborted` 那一跳的
@@ -2215,6 +2249,7 @@ impl Event {
             | Event::ThrottleChanged { id, .. }
             | Event::RequestQueued { id, .. }
             | Event::RequestDequeued { id, .. }
+            | Event::RequestRetrying { id, .. }
             | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
             | Event::AuthChanged { id, .. }
@@ -6892,6 +6927,8 @@ mod tests {
             queued_ms: None,
             skipped: None,
             pause_ms: None,
+            retry: None,
+            backoff_ms: None,
             proxy: None,
         }
     }

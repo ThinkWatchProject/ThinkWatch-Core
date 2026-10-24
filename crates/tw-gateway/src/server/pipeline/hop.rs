@@ -12,6 +12,9 @@
 //!
 //! 发出去之后 `failover.idle_timeout_secs` 还没有内容的一家也换掉（见 [`super::idle`]）；在等
 //! 上游的时候被手动中止的，丢掉这一跳、不再换（见 [`crate::abort`]）。
+//!
+//! 候选都试过了，最后一跳在内容之前出了暂时的错（过载、5xx、连不上、流断了）：在这个请求的
+//! 等待期限之内退避一阵，把暂时出错的那几家再试一轮（见 [`crate::retry`]）。
 
 use bytes::Bytes;
 
@@ -187,9 +190,44 @@ pub(super) async fn try_upstreams<'a>(
     // 等发不出去的那几家等到最后的话，交出去的是这一家的错，不是「都发不出去」（见下面的
     // `stalled`）。**回 429 的不算**：那是让等一会儿，不是失败
     let mut reached = false;
+    // 退避重试的账（见 `crate::retry`）：最后一个失败是不是暂时的错、这一轮里暂时出错的是哪几家、
+    // 重试过的那几轮
+    let mut retries = Retries::default();
+    // 客户端收的是 SSE 流：压着开头过了时限先交响应头、发保活（见 `super::commit`）。最后一家的
+    // 开头只在这时为重试压着
+    let early = super::commit::early(state, req, reading).is_some();
+    // 插件写进来的、这个请求已经报过的命中：每一跳再查一遍，同样的只报一次（见
+    // `crate::guard::Reported`）
+    let mut reported = crate::guard::Reported::default();
 
     loop {
         stamp_queued(&mut chain, queued.take());
+        // 候选都试过了，最后一跳在内容之前暂时出错：等待期限之内退避一阵，把暂时出错的那几家再
+        // 试一轮。不重试的，交出去的是最后那个错误
+        if queue.is_empty() && waiting.is_empty() {
+            let Some((round, wait)) = retry_round(state, started, &mut retries, counting, until)
+            else {
+                break;
+            };
+            let n = retries.next();
+            retrying(state, id, &round, n, wait, deadline_ms);
+            let t = std::time::Instant::now();
+            let woke = tokio::select! {
+                biased;
+                _ = tokio::time::sleep(wait) => true,
+                // 退避的时候被手动中止：一个字节都还没发出去，尝试链上不多一跳
+                _ = req.abort.wait() => false,
+            };
+            dequeued(state, id);
+            if !woke {
+                halt = Some(GatewayError::aborted());
+                break;
+            }
+            retries
+                .rounds
+                .push((chain.len(), n, t.elapsed().as_millis() as u64));
+            queue.extend(round);
+        }
         // 下一个候选。都看过了，就在等得到的那几家里等先能发的：等到的那一家带着占到的位置
         let (name, mut granted) = match queue.pop_front() {
             Some(name) => (name, None),
@@ -246,6 +284,8 @@ pub(super) async fn try_upstreams<'a>(
         };
         // 后面没有别的候选了。暂时发不出去、还等得到的那几家也算在后面
         let last = queue.is_empty() && waiting.is_empty();
+        // 最后一个失败是不是暂时的错，看的是这一跳：暂时出错的那几处再记上
+        retries.fault = None;
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
             // 校验时挡过一次，能到这儿说明配置在运行中被换过。
             last_err = Some(GatewayError::config(msg!(
@@ -516,6 +556,7 @@ pub(super) async fn try_upstreams<'a>(
             provider,
             &sent,
             chain.len(),
+            &mut reported,
         )
         .await
         {
@@ -889,6 +930,15 @@ pub(super) async fn try_upstreams<'a>(
                             &provider.name,
                             state.health.record_cause(&provider.name, cause),
                         );
+                        // 同一家再试只认几个状态码（见 `crate::retry::transient_status`），正文说是
+                        // 请求本身的问题的不算
+                        if crate::retry::transient(cause)
+                            && crate::retry::transient_status(status)
+                            && !crate::retry::request_fault(&head)
+                        {
+                            let hint = crate::throttle::pause_hint(&headers, &head, now_ms());
+                            retries.shaky(name, hint);
+                        }
                         chain.push(hop(
                             &provider.name,
                             model.clone(),
@@ -957,17 +1007,19 @@ pub(super) async fn try_upstreams<'a>(
                 // 回答的开头：**第一段内容到之前**上游在流里报的错照样换下一家（报的是限流就排队
                 // 等它，和回 429 一样），一直没有内容也换（见 `opening`）。
                 //
-                // 最后一家只在这一家可能在限流时压（探路的、最近被限流过的，见
-                // `throttle::Throttles::wary`），而且只压流式的、这个请求又还等得起的：流的开头报的
-                // 限流要暂停这一家、排队等它恢复，客户端察觉不到（不压的话那个错误直接交给了客户端）。
-                // 别的时候不压：没有下一家可换，客户端该当场拿到响应头和开头的事件；整包的回答不在
-                // 正文里报限流，等不起的也排不了队。不压的由回程按无响应超时收尾（见 `relay`）
+                // 最后一家只压流式的、这个请求又还等得起的，而且是两种时候：客户端收的是 SSE 流（过了
+                // 时限先拿到响应头和保活，见 `super::commit`）—— 开头报的暂时的错（过载、5xx）、流在
+                // 内容之前断了，退避一阵再试一遍（见 `crate::retry`）；或者这一家可能在限流（探路的、
+                // 最近被限流过的，见 `throttle::Throttles::wary`）。流的开头报的限流暂停这一家、排队
+                // 等它恢复。客户端都察觉不到 —— 不压的话那个错误直接交给了客户端。别的时候不压：
+                // 整包的回答压着的话，客户端到正文的第一个字节才拿到响应头，中转站的空格保活也被
+                // 吞掉；等不起的没有下一家可换、也不能再试。不压的由回程按无响应超时收尾（见 `relay`）
                 let hold = hold_of(req, reading, provider, &out, &r);
                 let held = hold.as_ref().is_some_and(|h| {
                     !last
                         || (matches!(h, Hold::Stream(..))
                             && tokio::time::Instant::now() < until
-                            && state.throttles.wary(&provider.name))
+                            && (early || state.throttles.wary(&provider.name)))
                 });
                 // 不压开头的最后一家：它答没答上（成败的账）要等回程看到第一段内容才知道
                 let mut unconfirmed = last && hold.is_some() && !held;
@@ -1052,6 +1104,7 @@ pub(super) async fn try_upstreams<'a>(
                                 body,
                                 kind,
                                 message,
+                                transient,
                                 response,
                             }) => {
                                 let verdict =
@@ -1061,9 +1114,21 @@ pub(super) async fn try_upstreams<'a>(
                                 if !limited {
                                     to_throttle(state, &provider.name, sent_at, verdict);
                                 }
-                                if verdict == Verdict::ClientError || (last && !limited) {
-                                    // 请求本身的问题，或者最后一家报了限流以外的错：原样交出去，和
-                                    // 不压开头时一样（后者的成败由回程记）
+                                // 暂时的错（名单里的码，见 `opening::transient_in`）同一家可以再试。
+                                // 最后一家报的、又真的再试得了（等待期限够下一次退避、留在一家的
+                                // 对话留的就是能再试的那一家，同 `retry_round`）：和换下一家时一样
+                                // 记下，候选都试过了就退避重试（见 `crate::retry`）。再试不了的原样
+                                // 交出去，不丢上游自己的那句话
+                                let shaky = transient
+                                    && matches!(verdict, Verdict::Failed(c) if crate::retry::transient(c));
+                                let hint = crate::throttle::pause_hint(&headers, &body, now_ms());
+                                let retried = shaky
+                                    && retries
+                                        .feasible(state, started, name, hint, counting, until);
+                                if verdict == Verdict::ClientError || (last && !limited && !retried)
+                                {
+                                    // 请求本身的问题，或者最后一家报了限流以外、不再重试的错：原样
+                                    // 交出去，和不压开头时一样（后者的成败由回程记）
                                     unconfirmed |= verdict != Verdict::ClientError;
                                     response
                                 } else {
@@ -1114,6 +1179,9 @@ pub(super) async fn try_upstreams<'a>(
                                                 &provider.name,
                                                 state.health.record_cause(&provider.name, cause),
                                             );
+                                            if shaky {
+                                                retries.shaky(name, hint);
+                                            }
                                             chain.push(a);
                                             last_err = Some(if status == 429 {
                                                 GatewayError::rate_limited(said)
@@ -1129,6 +1197,7 @@ pub(super) async fn try_upstreams<'a>(
                             }
                             Some(super::opening::Opening::Broken(err)) => {
                                 reached = true;
+                                retries.shaky(name, None);
                                 state.throttles.released(&provider.name, sent_at);
                                 note_health(
                                     &state.bus,
@@ -1190,6 +1259,7 @@ pub(super) async fn try_upstreams<'a>(
                     SendError::Http(e) if e.is_connect() => {
                         usage_hold.release();
                         reached = true;
+                        retries.shaky(name, None);
                         // 没有结论：探路的不再探，交给熔断（见 `crate::throttle`）
                         state.throttles.released(&provider.name, sent_at);
                         state.check_proxy(&provider.proxy);
@@ -1197,6 +1267,8 @@ pub(super) async fn try_upstreams<'a>(
                     }
                     SendError::Http(e) => {
                         reached = true;
+                        // 响应头之前断了：和连不上一样是暂时的错
+                        retries.shaky(name, None);
                         state.throttles.released(&provider.name, sent_at);
                         // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                         state.check_proxy(&provider.proxy);
@@ -1229,6 +1301,7 @@ pub(super) async fn try_upstreams<'a>(
     }
 
     stamp_queued(&mut chain, queued.take());
+    stamp_retries(&mut chain, &retries.rounds);
     // 尝试链走完了，两条路都要发 —— 挂在 RequestFinished 上的话，
     // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
     // 最终服务的那家怎么收钱。**跟着请求走，不能事后查配置** ——
@@ -1344,7 +1417,14 @@ pub(super) async fn try_upstreams<'a>(
         // `source` 也是这个错误自己的（被限流的就是 `rate_limited`）。
         return Err(err);
     };
-    if attempts.len() > 1 {
+    if !retries.rounds.is_empty() {
+        tracing::info!(
+            chain = %attempts.join(" → "),
+            retries = retries.rounds.len(),
+            "retried after a temporary failure; {} answered in the end",
+            served.provider.name
+        );
+    } else if attempts.len() > 1 {
         tracing::info!(
             chain = %attempts.join(" → "),
             "failed over; {} answered in the end",
@@ -1395,6 +1475,132 @@ impl Drop for Spent {
     fn drop(&mut self) {
         if let Some(h) = self.hold.take() {
             h.bind(self.id);
+        }
+    }
+}
+
+/// 退避重试的账（见 [`crate::retry`]）。
+#[derive(Default)]
+struct Retries<'n> {
+    /// 最后一个失败是暂时的错：外面一层是有没有，里面是那一跳上游说了多久之后再来（没说是
+    /// None，按退避算）
+    fault: Option<Option<std::time::Duration>>,
+    /// 这一轮里暂时出错的那几家。重试时再试它们
+    shaky: Vec<&'n String>,
+    /// 重试过的每一轮：在尝试链上从哪一跳起、是第几次、发出去之前退避了多少毫秒
+    rounds: Vec<(usize, u32, u64)>,
+    /// 下一次重试之前按退避该等多久，算过一次就定了（浮动是随机的）：先看再试不试得了
+    /// （[`Self::feasible`]）、再真的退避（[`retry_round`]），两处用的是同一个数
+    drawn: Option<std::time::Duration>,
+}
+
+impl<'n> Retries<'n> {
+    /// 这一跳暂时出错了。`hint` 是上游说的多久之后再来
+    fn shaky(&mut self, name: &'n String, hint: Option<std::time::Duration>) {
+        self.fault = Some(hint);
+        if !self.shaky.contains(&name) {
+            self.shaky.push(name);
+        }
+    }
+
+    /// 下一次是第几次重试，从 1 数
+    fn next(&self) -> u32 {
+        self.rounds.len() as u32 + 1
+    }
+
+    /// 下一次重试之前按退避该等多久（见 [`Self::drawn`]）
+    fn backoff(&mut self, state: &AppState) -> std::time::Duration {
+        let n = self.next();
+        *self
+            .drawn
+            .get_or_insert_with(|| state.retry_backoff.before(n))
+    }
+
+    /// 这一跳（最后一家）暂时出错的话，再试得了吗：和 [`retry_round`] 同一个判据，只是不动账。
+    /// 再试不了的，上游自己的回答原样交出去
+    fn feasible(
+        &mut self,
+        state: &AppState,
+        started: &'n Started,
+        name: &'n String,
+        hint: Option<std::time::Duration>,
+        counting: bool,
+        until: tokio::time::Instant,
+    ) -> bool {
+        let mut shaky = self.shaky.clone();
+        if !shaky.contains(&name) {
+            shaky.push(name);
+        }
+        let backoff = self.backoff(state);
+        plan(state, started, &shaky, backoff, hint, counting, until).is_some()
+    }
+}
+
+/// 候选都试过了，要不要退避重试（见 [`crate::retry`]）：要的话，交回这一轮再试哪几家、先退避
+/// 多久。最后一个失败不是暂时的错的、数 token 的（它不排队，也不该为它等）、剩下的时间不够
+/// 这一次退避的不重试。留在一家的对话只再试那一家；在冷却的跳过，都在冷却的照样试（同
+/// [`crate::health::Health::filter`]）
+fn retry_round<'n>(
+    state: &AppState,
+    started: &'n Started,
+    retries: &mut Retries<'n>,
+    counting: bool,
+    until: tokio::time::Instant,
+) -> Option<(Vec<&'n String>, std::time::Duration)> {
+    let hint = retries.fault.take()?;
+    let shaky = std::mem::take(&mut retries.shaky);
+    let backoff = retries.backoff(state);
+    let planned = plan(state, started, &shaky, backoff, hint, counting, until);
+    if planned.is_some() {
+        retries.drawn = None;
+    }
+    planned
+}
+
+/// 暂时出错的是 `shaky` 这几家，这一次按退避该等 `backoff`、上游说的是 `hint`：再试哪几家、先
+/// 等多久（见 [`retry_round`]）。等多久取两者里长的（[`crate::retry::wait`]）
+fn plan<'n>(
+    state: &AppState,
+    started: &'n Started,
+    shaky: &[&'n String],
+    backoff: std::time::Duration,
+    hint: Option<std::time::Duration>,
+    counting: bool,
+    until: tokio::time::Instant,
+) -> Option<(Vec<&'n String>, std::time::Duration)> {
+    if counting {
+        return None;
+    }
+    let wait = crate::retry::wait(backoff, hint);
+    if until.saturating_duration_since(tokio::time::Instant::now()) < wait {
+        return None;
+    }
+    let pinned = started.choice.stayed_on.as_ref();
+    let mut round: Vec<&String> = started
+        .alive
+        .iter()
+        .filter(|a| shaky.contains(a) && pinned.is_none_or(|p| p == *a))
+        .collect();
+    let open: Vec<&String> = round
+        .iter()
+        .copied()
+        .filter(|a| state.health.is_available(a))
+        .collect();
+    if round.len() > 1 && !open.is_empty() {
+        round = open;
+    }
+    (!round.is_empty()).then_some((round, wait))
+}
+
+/// 重试的那几轮：在尝试链上补上每一跳是第几次重试，每一轮的头一跳发出去之前退避了多久
+fn stamp_retries(chain: &mut [tw_api::AttemptView], rounds: &[(usize, u32, u64)]) {
+    for (i, &(from, n, ms)) in rounds.iter().enumerate() {
+        let to = rounds.get(i + 1).map_or(chain.len(), |r| r.0);
+        for a in chain.get_mut(from..to).into_iter().flatten() {
+            a.retry = Some(n);
+        }
+        if from < to {
+            chain[from].backoff_ms = Some(ms);
         }
     }
 }
@@ -1522,7 +1728,29 @@ fn queued_up(
     });
 }
 
-/// 这个请求不排队了（见 [`tw_api::Event::RequestDequeued`]）：等到了要发出去、被中止了、等不到了
+/// 这个请求开始退避、之后重试（见 [`tw_api::Event::RequestRetrying`]）：再试哪几家、第几次、
+/// 退避多久，最多等到什么时候
+fn retrying(
+    state: &AppState,
+    id: u64,
+    round: &[&String],
+    attempt: u32,
+    wait: std::time::Duration,
+    deadline_ms: u64,
+) {
+    let at_ms = now_ms();
+    state.bus.emit(tw_api::Event::RequestRetrying {
+        id,
+        upstreams: round.iter().map(|n| n.to_string()).collect(),
+        attempt,
+        retry_at_ms: at_ms + wait.as_millis() as u64,
+        until_ms: deadline_ms,
+        at_ms,
+    });
+}
+
+/// 这个请求不排队、不退避了（见 [`tw_api::Event::RequestDequeued`]）：等到了要发出去、被中止了、
+/// 等不到了
 fn dequeued(state: &AppState, id: u64) {
     state.bus.emit(tw_api::Event::RequestDequeued {
         id,
@@ -1618,6 +1846,8 @@ fn estimated_hop(
         queued_ms: None,
         skipped: None,
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }

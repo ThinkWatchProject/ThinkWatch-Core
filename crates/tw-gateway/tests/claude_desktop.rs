@@ -110,6 +110,11 @@ async fn gateway_pinging_for(p: Provider, ping_for: Duration) -> Gateway {
             ..Default::default()
         }],
         providers: vec![p],
+        // 不等、不重试：唯一的上游不压开头，内容之前的静默也由回程补 `ping`
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut state = tw_gateway::AppState::new(cfg).unwrap();

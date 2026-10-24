@@ -182,6 +182,35 @@ pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
         .collect()
 }
 
+/// 一个请求已经报过的命中。插件改过的请求每一跳都再查一遍内容过滤、再找一遍密钥（见
+/// `server::pipeline::plug`）：重试、故障转移时插件写进来的还是那几处，**一个请求只报一次** ——
+/// 安全日志里一处一行，不因为多试了几跳多出几行
+#[derive(Default)]
+pub struct Reported {
+    /// 出站脱敏报过的值：规则和打了码的那个值
+    secrets: HashSet<(String, String)>,
+    /// 内容过滤报过的命中：规则和摘录
+    content: HashSet<(String, String)>,
+}
+
+impl Reported {
+    /// `found` 里这个请求还没报过的，记下来
+    pub fn fresh_secrets(&mut self, found: Vec<Finding>) -> Vec<Finding> {
+        found
+            .into_iter()
+            .filter(|f| {
+                self.secrets
+                    .insert((f.rule.id().to_string(), f.masked.clone()))
+            })
+            .collect()
+    }
+
+    /// 先前几跳已经报过几个值。一个请求加起来最多报 [`REPORTED_MAX`] 个
+    pub fn secrets(&self) -> usize {
+        self.secrets.len()
+    }
+}
+
 /// 一个请求报出去的值最多几个。
 ///
 /// 安全日志一个值一行（[`tw_api::Event::SecretsFound`] 的一项就是一行）。一个请求里贴进来
@@ -317,6 +346,44 @@ pub fn report_with(
         "the request matched content rules"
     );
     sc.refusal().map(|r| refusal(&r.hit))
+}
+
+/// [`report_with`]，这个请求先前几跳报过的命中不再报（见 [`Reported`]）。拒绝照旧按这一次查下来
+/// 的结论：拒绝的那一条先前报过的话，请求那时就被拒了，到不了这一跳
+pub fn report_once(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    sc: &Screening,
+    details: Vec<tw_api::SecurityHitDetail>,
+    reported: &mut Reported,
+) -> Option<tw_types::Msg> {
+    if sc.hits.is_empty() {
+        return None;
+    }
+    let refused = sc.refusal().map(|r| refusal(&r.hit));
+    let refusing = sc.refused;
+    let mut details = details.into_iter();
+    let mut fresh = Screening {
+        body: sc.body.clone(),
+        ..Default::default()
+    };
+    let mut kept = Vec::new();
+    for (i, h) in sc.hits.iter().enumerate() {
+        let detail = details.next().unwrap_or_default();
+        if reported
+            .content
+            .insert((h.hit.rule.clone(), h.hit.snippet.clone()))
+        {
+            if refusing == Some(i) {
+                fresh.refused = Some(fresh.hits.len());
+            }
+            fresh.hits.push(h.clone());
+            kept.push(detail);
+        }
+    }
+    report_with(bus, id, provider, &fresh, kept);
+    refused
 }
 
 /// 回答里的命中报出去：每条规则一条 [`tw_api::Event::ContentMatched`]（方向是回答），挂在请求

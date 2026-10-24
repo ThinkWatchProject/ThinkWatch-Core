@@ -13,7 +13,7 @@
 //!   流式的回答压过 [`crate::OPENING_HOLD`] 之后响应头已经交出去了，它收到的只是保活注释（见
 //!   [`super::commit`]）。没有下一家了，回一个超时错误（504，见
 //!   [`crate::error::Source::Timeout`]），尝试链带着；响应头已经交出去的，在流里报这个错。
-//! - **最后一家的响应已经交出去了**（最后一家不压开头）、或者**已经有内容交给了客户端**：
+//! - **最后一家的响应已经交出去了**（最后一家不压开头时）、或者**已经有内容交给了客户端**：
 //!   换不了 —— 换一家会把开头再发一遍。回答按客户端的格式以一条错误收尾，请求记成失败
 //!   （见 `relay`）。还没有内容的照样记这一家一次失败；内容出到一半才停的不记，和流在半路
 //!   断了一样。
@@ -99,6 +99,8 @@ pub(super) fn abandoned(
         queued_ms: None,
         skipped: None,
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }
@@ -122,6 +124,8 @@ pub(super) fn aborted_hop(
         queued_ms: None,
         skipped: None,
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }

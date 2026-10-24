@@ -108,6 +108,8 @@ fn attempt(provider: &str, status: u16) -> tw_api::AttemptView {
         queued_ms: None,
         skipped: None,
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }
