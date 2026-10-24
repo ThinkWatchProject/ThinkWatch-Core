@@ -60,6 +60,7 @@ async fn gateway(cfg: Config) -> (SocketAddr, tokio::sync::broadcast::Receiver<E
     (addr, rx)
 }
 
+/// 不重试（`wait_secs: 0`）：失败的请求只走一遍候选，流量就是那几跳的（重试见 `retry.rs`）
 fn cfg(providers: Vec<Provider>) -> Config {
     Config {
         version: 1,
@@ -69,6 +70,10 @@ fn cfg(providers: Vec<Provider>) -> Config {
             ..Default::default()
         }],
         providers,
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

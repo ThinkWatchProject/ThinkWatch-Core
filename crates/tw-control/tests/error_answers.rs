@@ -89,10 +89,12 @@ struct World {
 async fn world() -> World {
     let up = upstream().await;
     let d = tempfile::tempdir().unwrap();
+    // 不等、不重试（`wait_secs: 0`）：唯一的上游不压开头，第三轮吐的那一帧当场交给客户端
     let yaml = format!(
         "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\n\
          clients:\n  - name: 我\n    key: tw-k\n\
-         providers:\n  - name: 中转\n    base_url: http://{up}\n    key: sk-upstream\n    protocol: anthropic\n"
+         providers:\n  - name: 中转\n    base_url: http://{up}\n    key: sk-upstream\n    protocol: anthropic\n\
+         failover:\n  wait_secs: 0\n"
     );
     let p = d.path().join("config.yaml");
     std::fs::write(&p, &yaml).unwrap();

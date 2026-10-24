@@ -346,6 +346,8 @@ async fn failover_never_reaches_a_pinned_model_the_key_may_not_use() {
                 rules,
             );
             cfg.clients[0].allow = Some(allow);
+            // 不重试：a 回的 500 当场交出去，这里只看 b 收没收到（重试见 `retry.rs`）
+            cfg.failover.wait_secs = 0;
             let (gw, rx) = serve(cfg).await;
             (gw, rx, a_seen, b_seen)
         }
@@ -391,6 +393,8 @@ async fn failover_never_reaches_a_phase_two_rename_the_key_may_not_use() {
 ",
     );
     cfg.clients[0].allow = Some(vec!["m-a".into()]);
+    // 不重试：a 回的 500 当场交出去，这里只看 b 收没收到（重试见 `retry.rs`）
+    cfg.failover.wait_secs = 0;
     let (gw, mut rx) = serve(cfg).await;
 
     let (status, body) = ask(gw, "m-a").await;

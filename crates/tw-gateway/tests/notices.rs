@@ -113,6 +113,7 @@ async fn proxy(broken: Arc<AtomicBool>) -> SocketAddr {
 
 // ---------------------------------------------------------------- 网关
 
+/// 不重试（`wait_secs: 0`）：连不上的那一次当场报出来（重试见 `retry.rs`）
 fn config(p: Provider) -> Config {
     Config {
         version: 1,
@@ -123,6 +124,10 @@ fn config(p: Provider) -> Config {
             ..Default::default()
         }],
         providers: vec![p],
+        failover: tw_config::Failover {
+            wait_secs: 0,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

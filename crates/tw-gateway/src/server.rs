@@ -387,6 +387,8 @@ pub(crate) fn hop(
         queued_ms: None,
         skipped: None,
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }
@@ -415,6 +417,8 @@ pub(crate) fn hop_busy(
         queued_ms,
         skipped: Some(tw_api::ServeSkip::Busy),
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }
@@ -465,6 +469,8 @@ pub(crate) fn hop_waiting(
         queued_ms,
         skipped: Some(skipped),
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }
@@ -494,6 +500,8 @@ pub(crate) fn hop_used_up(
         queued_ms: None,
         skipped: Some(tw_api::ServeSkip::PeriodUsedUp),
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }
@@ -516,6 +524,8 @@ pub(crate) fn hop_failed(
         queued_ms: None,
         skipped: None,
         pause_ms: None,
+        retry: None,
+        backoff_ms: None,
         proxy: None,
     }
 }

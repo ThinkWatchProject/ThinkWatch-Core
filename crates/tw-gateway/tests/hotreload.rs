@@ -335,6 +335,8 @@ async fn changing_the_proxy_does_rebuild_that_client() {
         addr: "127.0.0.1:17890".into(),
         auth: None,
     }];
+    // 不重试：连不上的那一次当场交出去
+    next.failover.wait_secs = 0;
     state.reload(next).unwrap();
     // 代理起不来，请求该失败 —— 这就是「真的换成新 Client 了」的证据
     let gw = serve(state.clone()).await;

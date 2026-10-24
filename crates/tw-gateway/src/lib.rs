@@ -50,6 +50,7 @@ pub mod probe;
 mod pulse;
 pub mod quota;
 pub mod quote;
+pub mod retry;
 pub mod seal;
 pub mod sent;
 pub mod server;
