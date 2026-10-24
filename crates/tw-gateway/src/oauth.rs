@@ -53,7 +53,7 @@ const EXPIRED_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 
 /// 换 access token 失败了。**英文只写一遍**：`Display` 就是 [`OauthError::msg`] 的原句，
 /// 界面拿码去翻；端点回的正文（已打码）和连接库的原话留在参数里。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum OauthError {
     /// 连不上 token 端点。`detail` 是连接库的原话
     #[error("{}", self.msg())]
@@ -133,6 +133,15 @@ fn fingerprint(cfg: &OAuth) -> u64 {
     cfg.client_id.hash(&mut h);
     cfg.client_secret.hash(&mut h);
     h.finish()
+}
+
+/// 交接时比的配置指纹（[`Cache::handover_export`]）。**和 [`fingerprint`] 管的是同几样**，但
+/// 要跨进程、跨版本比：std 的 hasher 不保证换个编译器版本还算出同一个数
+fn config_digest(cfg: &OAuth) -> String {
+    let parts = serde_json::json!([cfg.refresh, cfg.endpoint, cfg.client_id, cfg.client_secret]);
+    blake3::hash(parts.to_string().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 struct Live {
@@ -326,6 +335,86 @@ impl Cache {
             .failed
             .as_ref()?;
         Some((f.error().msg(), f.expired()))
+    }
+
+    /// 交接：每家手里能用的 access token（见 [`crate::handover`]），免得新 core 一起来就各换一次
+    /// —— 会轮换的服务器每换一次作废一个 refresh token，配置文件跟着写一次。**只交还认得这份
+    /// 配置的**（[`Live::usable_for`]）；时刻换成「还有多久」「多久之前」
+    pub(crate) fn handover_export(
+        &self,
+        providers: &[tw_config::Provider],
+    ) -> Vec<crate::handover::wire::OauthEntry> {
+        let now = Instant::now();
+        let ms = |d: Duration| d.as_millis().min(u128::from(u64::MAX)) as u64;
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter()
+            .filter_map(|(name, live)| {
+                let cfg = providers.iter().find(|p| &p.name == name)?.oauth.as_ref()?;
+                if !live.usable_for(cfg) {
+                    return None;
+                }
+                Some(crate::handover::wire::OauthEntry {
+                    upstream: name.clone(),
+                    cfg: config_digest(cfg),
+                    access: live.access.clone(),
+                    refresh: live.refresh.clone(),
+                    renew_in_ms: live.renew_at.map(|t| ms(t.saturating_duration_since(now))),
+                    age_ms: live.obtained.map(|t| ms(now.saturating_duration_since(t))),
+                    failed: live
+                        .failed
+                        .as_ref()
+                        .map(|f| crate::handover::wire::OauthFailed {
+                            cause: f.cause.clone(),
+                            retry_in_ms: ms(f.until.saturating_duration_since(now)),
+                        }),
+                })
+            })
+            .collect()
+    }
+
+    /// 交接：接进旧 core 手里的 token。这里的配置认得它才接：生成它的那份配置和这里的一样，
+    /// 或者它手里的 refresh 就是这里配置里的（轮换之后写回了）。这里已经有的那一家不动。
+    /// `lag_ms` 是快照导出到现在过了多久
+    pub(crate) fn handover_import(
+        &self,
+        entries: Vec<crate::handover::wire::OauthEntry>,
+        providers: &[tw_config::Provider],
+        lag_ms: u64,
+    ) {
+        let now = Instant::now();
+        let lag = Duration::from_millis(lag_ms);
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        for e in entries {
+            let Some(cfg) = providers
+                .iter()
+                .find(|p| p.name == e.upstream)
+                .and_then(|p| p.oauth.as_ref())
+            else {
+                continue;
+            };
+            if (e.cfg != config_digest(cfg) && e.refresh != cfg.refresh)
+                || g.contains_key(&e.upstream)
+            {
+                continue;
+            }
+            let after = |ms: u64| now + Duration::from_millis(ms).saturating_sub(lag);
+            g.insert(
+                e.upstream,
+                Live {
+                    fp: fingerprint(cfg),
+                    access: e.access,
+                    renew_at: e.renew_in_ms.map(after),
+                    refresh: e.refresh,
+                    obtained: e
+                        .age_ms
+                        .and_then(|ms| now.checked_sub(Duration::from_millis(ms) + lag)),
+                    failed: e.failed.map(|f| Failure {
+                        cause: f.cause,
+                        until: after(f.retry_in_ms),
+                    }),
+                },
+            );
+        }
     }
 
     fn flight(&self, provider: &str) -> Arc<tokio::sync::Mutex<()>> {

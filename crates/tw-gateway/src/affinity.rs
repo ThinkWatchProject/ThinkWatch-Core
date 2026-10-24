@@ -345,6 +345,65 @@ impl Affinity {
         f(e);
     }
 
+    /// 交接：每段对话上次由谁回答、封存的内容是谁的（见 [`crate::handover`]）。**这一轮沿用的
+    /// 路由决定不交**：它只在旧 core 那一份配置下有效，换了进程一定对不上 —— 同一轮里留在原来
+    /// 那一家靠的是回答它的那一家（[`Self::stay`]），规则重新求一次值
+    pub(crate) fn handover_export(&self) -> Vec<crate::handover::wire::AffinityEntry> {
+        use crate::handover::wire::{AffinityAnswer, AffinityEntry};
+        let mut out: Vec<AffinityEntry> = self
+            .lock()
+            .iter()
+            .map(|(key, e)| AffinityEntry {
+                key: key.clone(),
+                touched_ms: e.touched_ms,
+                answer: e.answer.as_ref().map(|a| AffinityAnswer {
+                    group: a.group.clone(),
+                    provider: a.provider.clone(),
+                    turn: a.turn,
+                    at_ms: a.at_ms,
+                    cache: a.cache,
+                }),
+                holder: e.holder.clone(),
+                sealed: e.sealed,
+            })
+            .collect();
+        // 最近动过的在前：接的那一边满了，丢的是最久没动静的
+        out.sort_by_key(|e| std::cmp::Reverse(e.touched_ms));
+        out
+    }
+
+    /// 交接：接进旧 core 记着的。这里已经记着、而且更新的那段对话不动
+    pub(crate) fn handover_import(&self, entries: Vec<crate::handover::wire::AffinityEntry>) {
+        let mut map = self.lock();
+        for e in entries {
+            if map
+                .get(&e.key)
+                .is_some_and(|m| m.touched_ms >= e.touched_ms)
+            {
+                continue;
+            }
+            if !map.contains_key(&e.key) && map.len() >= CAP {
+                continue;
+            }
+            map.insert(
+                e.key,
+                Entry {
+                    touched_ms: e.touched_ms,
+                    held: None,
+                    answer: e.answer.map(|a| Answer {
+                        group: a.group,
+                        provider: a.provider,
+                        turn: a.turn,
+                        at_ms: a.at_ms,
+                        cache: a.cache,
+                    }),
+                    holder: e.holder,
+                    sealed: e.sealed,
+                },
+            );
+        }
+    }
+
     #[cfg(test)]
     fn tracked(&self) -> usize {
         self.lock().len()

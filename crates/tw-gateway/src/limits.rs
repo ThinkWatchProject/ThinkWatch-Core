@@ -20,6 +20,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Default)]
 pub struct Gate {
     per_key: Mutex<HashMap<String, Arc<Key>>>,
+    /// 每把密钥此刻占着、等着的通行证有几张（交接时报给接替的 core，见 [`crate::handover`]）
+    pub(crate) claims: Arc<crate::handover::feed::Claims>,
 }
 
 /// 一把密钥的闸。
@@ -38,18 +40,42 @@ struct Books {
 /// 拿到的通行证。**Drop 时自动归还** —— 手工释放迟早会在某条错误路径上
 /// 漏掉，而漏掉的表现是并发数只减不增，最后这把密钥的请求一起卡死。
 pub struct Pass {
-    held: Option<(Arc<Key>, OwnedSemaphorePermit)>,
+    held: Option<(Arc<Key>, Hand)>,
+    /// 交接时数的那一张（见 [`crate::handover::feed::Claims`]）。排着队时就占上了
+    _claim: Option<crate::handover::feed::Claim>,
+}
+
+/// 通行证手里拿着的：信号量的一个位置，或者一笔欠账。
+///
+/// **欠账只有替旧 core 占的名额才有**（[`Gate::phantom`]）：交接时旧 core 占着的比这里此刻空着
+/// 的还多（它那边调小过上限、排着队的也算），多出来的那几个记成欠着 —— 和调小上限时还没收回的
+/// 那几个（`owed`）是同一本账：之后谁还回一个位置，先抵掉欠账。
+enum Hand {
+    Permit(OwnedSemaphorePermit),
+    Debt,
 }
 
 impl Drop for Pass {
     fn drop(&mut self) {
-        let Some((key, permit)) = self.held.take() else {
+        let Some((key, hand)) = self.held.take() else {
             return;
         };
         let mut books = key.books.lock().unwrap();
-        if books.owed > 0 {
-            books.owed -= 1;
-            permit.forget();
+        match hand {
+            Hand::Permit(permit) => {
+                if books.owed > 0 {
+                    books.owed -= 1;
+                    permit.forget();
+                }
+            }
+            // 欠着的那一个不用还了：还没抵掉就勾销，抵掉过（有人替它少还了一个位置）就补回去
+            Hand::Debt => {
+                if books.owed > 0 {
+                    books.owed -= 1;
+                } else {
+                    key.sem.add_permits(1);
+                }
+            }
         }
     }
 }
@@ -59,8 +85,28 @@ impl Gate {
     /// 没设就不等。
     pub async fn acquire(&self, key: &str, limit: Option<usize>) -> Pass {
         let Some(limit) = limit else {
-            return Pass { held: None };
+            return Pass {
+                held: None,
+                _claim: None,
+            };
         };
+        let k = self.key(key, limit);
+        // **排着队就算占上了**：交接时它排在接替的 core 的新请求前面（见 [`crate::handover`]）。
+        // 客户端走了、这一份等待被丢掉时跟着放掉
+        let claim = self.claims.begin(key);
+        let permit = k
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        Pass {
+            held: Some((k, Hand::Permit(permit))),
+            _claim: Some(claim),
+        }
+    }
+
+    fn key(&self, key: &str, limit: usize) -> Arc<Key> {
         let k = self
             .per_key
             .lock()
@@ -74,14 +120,25 @@ impl Gate {
             })
             .clone();
         k.resize(limit);
-        let permit = k
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the semaphore is never closed");
+        k
+    }
+
+    /// 替交接前的旧 core 占一张（见 [`crate::handover`]）：**不等**。有空位就占一个，没有就记一笔
+    /// 欠账 —— 旧 core 那个请求此刻确实在跑，这里新来的得等它结束，哪怕这样一来这一阵记着的
+    /// 比上限还多。丢掉就放掉，和别的通行证一样
+    pub(crate) fn phantom(&self, key: &str, limit: usize) -> Pass {
+        let k = self.key(key, limit);
+        let claim = self.claims.begin(key);
+        let hand = match k.sem.clone().try_acquire_owned() {
+            Ok(permit) => Hand::Permit(permit),
+            Err(_) => {
+                k.books.lock().unwrap().owed += 1;
+                Hand::Debt
+            }
+        };
         Pass {
-            held: Some((k, permit)),
+            held: Some((k, hand)),
+            _claim: Some(claim),
         }
     }
 }

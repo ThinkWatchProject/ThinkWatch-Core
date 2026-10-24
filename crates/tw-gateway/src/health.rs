@@ -295,6 +295,61 @@ impl Health {
         }
     }
 
+    /// 交接：每家的熔断和最近的成败（见 [`crate::handover`]）。时刻都是墙上的，原样交
+    pub(crate) fn handover_export(&self) -> crate::handover::wire::Health {
+        use crate::handover::wire::{HealthEntry, HealthRecent};
+        let entries = self
+            .map
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .map(|(name, e)| HealthEntry {
+                        name: name.clone(),
+                        breaker: e.breaker,
+                        trips: e.trips,
+                        held_until_ms: e.held_until_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let recent = self
+            .recent
+            .lock()
+            .map(|r| {
+                r.0.iter()
+                    .map(|(name, w)| HealthRecent {
+                        name: name.clone(),
+                        samples: w.iter().copied().collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::handover::wire::Health { entries, recent }
+    }
+
+    /// 交接：接进旧 core 的熔断和成败。这里已经有记录的那一家不动 —— 接进来之前它已经在这里
+    /// 成过败过，那是更新的事
+    pub(crate) fn handover_import(&self, h: crate::handover::wire::Health) {
+        if let Ok(mut m) = self.map.lock() {
+            for e in h.entries {
+                m.entry(e.name).or_insert(Entry {
+                    breaker: e.breaker,
+                    trips: e.trips,
+                    held_until_ms: e.held_until_ms,
+                });
+            }
+        }
+        if let Ok(mut r) = self.recent.lock() {
+            for w in h.recent {
+                let mut samples: VecDeque<(i64, bool)> = w.samples.into_iter().collect();
+                while samples.len() > RECENT_MAX {
+                    samples.pop_front();
+                }
+                r.0.entry(w.name).or_insert(samples);
+            }
+        }
+    }
+
     /// 从候选里挑出还能用的，**并说明是不是 fail-open**。
     ///
     /// 返回的第二个值为真时表示「全都熔断了，我们还是把原列表还给你」——
