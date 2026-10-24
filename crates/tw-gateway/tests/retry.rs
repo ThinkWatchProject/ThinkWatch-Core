@@ -488,26 +488,31 @@ async fn an_immediate_503_is_retried_until_it_answers() {
 async fn an_upstream_that_cannot_be_reached_yet_is_retried() {
     let port = common::spare_port();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let hits = Arc::new(Mutex::new(Vec::new()));
-    let later = hits.clone();
-    // 一开始没人听这个端口，过一阵才起来
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(450)).await;
-        let l = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(l, app(Vec::new(), ok(), later)).await.unwrap();
-    });
     let (gw, _state, log) = serve(config(&[(addr, "anthropic")], 10)).await;
-    let r = ask(gw, "连不上").send().await.unwrap();
+    let r = tokio::spawn(ask(gw, "连不上").send());
+    // 一开始没人听这个端口：连不上、开始退避之后才起来（Windows 上被拒的连接要重试一阵才报错，
+    // 不能按时间猜它什么时候失败）
+    let id = log.id("连不上").await;
+    log.until("退避", |evs| {
+        evs.iter()
+            .any(|e| matches!(e, Event::RequestRetrying { id: i, .. } if *i == id))
+            .then_some(())
+    })
+    .await;
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let l = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let up = app(Vec::new(), ok(), hits.clone());
+    tokio::spawn(async move { axum::serve(l, up).await.unwrap() });
+    let r = r.await.unwrap().unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(hits.lock().unwrap().len(), 1);
     let chain = log.attempts("连不上").await;
-    assert!(chain.len() >= 3, "{chain:#?}");
-    assert_eq!(chain.last().unwrap().outcome, AttemptOutcome::Served);
-    assert!(
-        chain[..chain.len() - 1]
-            .iter()
-            .all(|a| a.outcome == AttemptOutcome::Error),
-        "{chain:#?}"
+    assert_eq!(
+        shape(&chain),
+        [
+            (AttemptOutcome::Error, None, false),
+            (AttemptOutcome::Served, Some(1), true)
+        ]
     );
 }
 
