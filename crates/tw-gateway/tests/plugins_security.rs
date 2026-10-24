@@ -212,6 +212,56 @@ async fn a_key_written_by_a_plugin_is_replaced_before_the_upstream_when_enforcin
     assert!(up.raw(0).contains(WRITTEN), "{}", up.raw(0));
 }
 
+/// 唯一的上游先过载一次（503），请求退避之后重试同一家：插件每一跳都跑、写进来的还是那把 key
+/// 和那句话，**安全日志里各只一行** —— 重试不让同一处命中报两遍
+#[tokio::test]
+async fn a_retry_does_not_report_what_a_plugin_wrote_twice() {
+    const WRITTEN: &str = "sk-ant-api03-PLUGINWROTEITAAAAAAAAAAAAA";
+    let adds = r#"
+export const manifest = { name: "加一句", api: 1, permissions: ["system", "messages"] };
+export function onRequest(req) {
+  req.system = `${req.system}\n备用密钥：sk-ant-api03-PLUGINWROTEITAAAAAAAAAAAAA`;
+  req.messages.push({ role: "user", parts: [{ type: "text", text: "Project Falcon 的细节" }] });
+  return req;
+}"#;
+    let up = Upstream::start(vec![Answer::Status(503), Answer::Text("好的".into())]).await;
+    let mut security = redact(SecurityMode::Enforce);
+    security.content = ContentPolicy {
+        mode: SecurityMode::Enforce,
+        custom: vec![CustomContentRule {
+            name: "内部代号".into(),
+            pattern: "Project Falcon".into(),
+            scope: vec![tw_config::ContentScope::Request],
+            case_sensitive: false,
+            replacement: "***".into(),
+            matching: Default::default(),
+            action: ContentAction::Record,
+            disabled: false,
+        }],
+        ..Default::default()
+    };
+    let gw = Gateway::start(config(&up, security), vec![Plug::new("add", adds)]).await;
+    let mut rx = gw.events();
+    let r = gw.ask(plain("你好", false)).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(up.hits(), 2, "退避之后重试了同一家");
+    assert_eq!(gw.calls("add"), 2, "插件每一跳都跑");
+    let (mut secrets, mut matched) = (Vec::new(), Vec::new());
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+        match ev {
+            tw_api::Event::SecretsFound { items, .. } => {
+                secrets.extend(items.into_iter().map(|i| i.masked))
+            }
+            tw_api::Event::ContentMatched { rule, .. } => matched.push(rule),
+            tw_api::Event::RequestFinished { .. } | tw_api::Event::RequestFailed { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(secrets.len(), 1, "{secrets:?}");
+    assert!(!secrets[0].contains(WRITTEN), "{secrets:?}");
+    assert_eq!(matched.len(), 1, "{matched:?}");
+}
+
 fn tools(mode: SecurityMode) -> Security {
     Security {
         inspect_tools: ToolPolicy {

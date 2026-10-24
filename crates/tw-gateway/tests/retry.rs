@@ -29,6 +29,8 @@ struct Reply {
     /// 给完 `chunks` 之后把连接断掉，不好好收尾
     broken: bool,
     content_type: &'static str,
+    /// 头一段之后每一段之前等多久
+    slow_ms: u64,
 }
 
 /// 整包地照常答
@@ -40,6 +42,7 @@ fn ok() -> Reply {
         chunks: Vec::new(),
         broken: false,
         content_type: "application/json",
+        slow_ms: 0,
     }
 }
 
@@ -149,9 +152,14 @@ fn app(script: Vec<Reply>, then: Reply, hits: Arc<Mutex<Vec<Instant>>>) -> Route
             if r.chunks.is_empty() {
                 return b.body(axum::body::Body::from(r.body)).unwrap();
             }
-            let broken = r.broken;
-            let chunks = futures::stream::iter(r.chunks)
-                .map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c)))
+            let (broken, slow) = (r.broken, r.slow_ms);
+            let chunks = futures::stream::iter(r.chunks.into_iter().enumerate())
+                .then(move |(i, c)| async move {
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_millis(slow)).await;
+                    }
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(c))
+                })
                 .chain(futures::stream::iter(
                     broken.then(|| Err(std::io::Error::other("cut"))),
                 ));
@@ -668,26 +676,40 @@ async fn wait_secs_zero_never_retries() {
 }
 
 #[tokio::test]
-async fn retry_after_from_the_upstream_replaces_the_backoff() {
+async fn a_retry_after_longer_than_the_backoff_is_waited_for() {
     let said = Reply {
-        headers: vec![("retry-after-ms", "300".into())],
+        headers: vec![("retry-after-ms", "700".into())],
         ..overloaded_503()
     };
     let up = upstream(vec![said], ok()).await;
-    // 退避的一秒是十秒：按退避算要等二十秒，比等待期限还长
-    let (gw, _state, log) = serve_with(
-        anthropic(&[&up], 10),
-        Duration::from_secs(10),
-        Duration::from_secs(10),
-    )
-    .await;
+    let (gw, _state, log) = serve(anthropic(&[&up], 10)).await;
     let t = Instant::now();
     let r = ask(gw, "上游说了等多久").send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(t.elapsed() >= Duration::from_millis(300));
-    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() >= Duration::from_millis(700),
+        "{:?}",
+        t.elapsed()
+    );
     let chain = log.attempts("上游说了等多久").await;
-    assert!(chain[1].backoff_ms.unwrap() >= 290, "{chain:#?}");
+    assert!(chain[1].backoff_ms.unwrap() >= 690, "{chain:#?}");
+}
+
+/// 上游说的比退避短：不算。回 `retry-after-ms: 5` 的中转不能让一个请求变成几千个
+#[tokio::test]
+async fn a_retry_after_shorter_than_the_backoff_does_not_shorten_it() {
+    let said = Reply {
+        headers: vec![("retry-after-ms", "5".into())],
+        ..overloaded_503()
+    };
+    let up = upstream(Vec::new(), said).await;
+    let (gw, _state, log) = serve(anthropic(&[&up], 1)).await;
+    let r = ask(gw, "上游说只等五毫秒").send().await.unwrap();
+    assert_eq!(r.status(), 502);
+    // 退避 200、400 毫秒，剩下的不够 800 毫秒：一共三次
+    assert_eq!(up.hits(), 3);
+    let chain = log.attempts("上游说只等五毫秒").await;
+    assert!(chain[1].backoff_ms.unwrap() >= 190, "{chain:#?}");
 }
 
 #[tokio::test]
@@ -812,7 +834,8 @@ async fn a_conversation_that_stays_on_an_upstream_retries_only_that_one() {
     assert_eq!(rounds, [vec!["乙".to_string()], vec!["乙".to_string()]]);
 }
 
-/// 压过了时限：客户端先拿到 `200` 和保活，重试到期限都没成，流里按它的格式报最后那个错误
+/// 压过了时限：客户端先拿到 `200` 和保活，重试到期限都没成。最后那一次再试不了，它的流原样
+/// 接在保活后面 —— 上游自己报的那个错就在流里
 #[tokio::test]
 async fn past_the_hold_the_retries_go_on_under_keepalives_and_the_last_error_ends_the_stream() {
     let up = upstream(Vec::new(), overloaded_in_the_stream()).await;
@@ -831,9 +854,10 @@ async fn past_the_hold_the_retries_go_on_under_keepalives_and_the_last_error_end
     assert!(body.matches(": keep-alive").count() >= 3, "{body}");
     let tail = &body[body.find("event: error").expect("流里报了错")..];
     assert!(tail.contains("overloaded_error"), "{tail}");
-    assert!(
-        !body.contains("message_start"),
-        "被放弃的开头一个字节都没交出去：{body}"
+    assert_eq!(
+        body.matches("event: message_start").count(),
+        1,
+        "被放弃的那几次的开头一个字节都没交出去：{body}"
     );
     // 退避 200、400、800 毫秒之后剩下的不够 1.6 秒
     assert_eq!(up.hits(), 4);
@@ -862,4 +886,140 @@ async fn past_the_hold_a_retry_that_answers_continues_the_stream() {
     assert!(!body.contains("overloaded_error"), "{body}");
     assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
     assert_eq!(up.hits(), 3);
+}
+
+/// 同一家再试只认 500、502、503、504、529：别的 5xx 和正文说是请求本身问题的 500 当场交出去
+#[tokio::test]
+async fn other_5xx_and_a_500_that_blames_the_request_are_not_retried() {
+    let cases = [
+        ("没实现", status(501, "not implemented")),
+        ("Cloudflare 超时", status(524, "a timeout occurred")),
+        (
+            "500 说请求错了",
+            status(
+                500,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+            ),
+        ),
+    ];
+    for (model, reply) in cases {
+        let up = upstream(Vec::new(), reply).await;
+        let (gw, _state, log) = serve(anthropic(&[&up], 10)).await;
+        let r = ask(gw, model).send().await.unwrap();
+        assert_eq!(r.status(), 502, "{model}");
+        assert_eq!(up.hits(), 1, "{model}");
+        assert!(log.waits(model).await.is_empty(), "{model}");
+    }
+}
+
+/// 不在名单里的码（图片解不开）：同一家不再试，原样交出去；有下一家时照旧换下一家
+#[tokio::test]
+async fn an_unlisted_error_in_the_stream_is_not_retried_but_still_fails_over() {
+    let image = || {
+        sse(vec![
+            event(
+                "response.created",
+                r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1"}}"#,
+            ),
+            event(
+                "response.failed",
+                r#"{"type":"response.failed","sequence_number":1,"response":{"id":"resp_1","error":{"code":"invalid_image","message":"The image could not be read."}}}"#,
+            ),
+        ])
+    };
+    let answered = sse(vec![
+        event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","sequence_number":0,"item_id":"m1","output_index":0,"content_index":0,"delta":"ok"}"#,
+        ),
+        event(
+            "response.completed",
+            r#"{"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","status":"completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}"#,
+        ),
+    ]);
+    let post = |gw: SocketAddr, model: &str| {
+        client()
+            .post(format!("http://{gw}/v1/responses"))
+            .header("authorization", "Bearer tw-k")
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"model":"{model}","stream":true,"input":"hi"}}"#
+            ))
+            .send()
+    };
+    let only = upstream(Vec::new(), image()).await;
+    let (gw, _state, log) = serve(config(&[(only.addr, "openai-responses")], 10)).await;
+    let body = post(gw, "图片解不开").await.unwrap().text().await.unwrap();
+    assert!(body.contains("invalid_image"), "{body}");
+    assert_eq!(only.hits(), 1);
+    assert!(log.waits("图片解不开").await.is_empty());
+
+    let a = upstream(Vec::new(), image()).await;
+    let b = upstream(Vec::new(), answered).await;
+    let (gw, _state, log) = serve(config(
+        &[(a.addr, "openai-responses"), (b.addr, "openai-responses")],
+        10,
+    ))
+    .await;
+    let body = post(gw, "换一家").await.unwrap().text().await.unwrap();
+    assert!(body.contains("\"delta\":\"ok\""), "{body}");
+    assert_eq!((a.hits(), b.hits()), (1, 1));
+    let chain = log.attempts("换一家").await;
+    assert!(chain.iter().all(|a| a.retry.is_none()), "{chain:#?}");
+}
+
+#[tokio::test]
+async fn a_stream_that_ends_after_its_opening_is_retried() {
+    let up = upstream(vec![sse(vec![message_start()])], streamed()).await;
+    let (gw, _state, log) = serve(anthropic(&[&up], 10)).await;
+    let r = ask_stream(gw, "开了头就收尾").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("\"ok\""));
+    assert_eq!(up.hits(), 2);
+    let chain = log.attempts("开了头就收尾").await;
+    assert_eq!(
+        chain[0].error.as_ref().unwrap().code,
+        "gw.upstream.stream_ended_early"
+    );
+    assert_eq!(chain[1].retry, Some(1));
+}
+
+/// 最后一家报的暂时的错再试不了（上游要等的比剩下的时间长）：**上游自己的那句话原样交出去**，
+/// 不换成网关的 502
+#[tokio::test]
+async fn an_error_that_cannot_be_retried_in_time_is_handed_over_as_the_upstream_said_it() {
+    let said = Reply {
+        headers: vec![("retry-after", "5".into())],
+        ..overloaded_in_the_stream()
+    };
+    let up = upstream(Vec::new(), said).await;
+    let (gw, _state, log) = serve(anthropic(&[&up], 2)).await;
+    let r = ask_stream(gw, "来不及再试").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("message_start"), "上游的原话：{body}");
+    assert!(body.contains("overloaded_error"), "{body}");
+    assert_eq!(up.hits(), 1);
+    assert!(log.waits("来不及再试").await.is_empty());
+}
+
+/// 最后一家整包的回答不压：响应头当场交出去，中转站先发的空格保活照样到客户端
+#[tokio::test]
+async fn the_last_whole_answer_is_not_held() {
+    let whole = Reply {
+        chunks: vec![" ".into(), ok().body],
+        slow_ms: 800,
+        ..ok()
+    };
+    let up = upstream(Vec::new(), whole).await;
+    let (gw, _state, _log) = serve(anthropic(&[&up], 10)).await;
+    let t = Instant::now();
+    let r = ask(gw, "整包").send().await.unwrap();
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "响应头等到了正文：{:?}",
+        t.elapsed()
+    );
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("\"ok\""));
 }

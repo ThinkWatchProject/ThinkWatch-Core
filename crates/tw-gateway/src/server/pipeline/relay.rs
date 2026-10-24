@@ -216,7 +216,7 @@ pub(super) fn respond(
         let mut said = false;
         // 被手动中止了（结局报手动中止，不说「流断了」）
         let mut aborted = false;
-        // 这一家的成败还没记（等不起了的最后一家不压开头，见 `hop`）：第一段真内容到了记成功
+        // 这一家的成败还没记（最后一家不压开头时，见 `hop`）：第一段真内容到了记成功
         let mut unconfirmed = unconfirmed;
         loop {
             // 补心跳的那一刻。不补的格式给一个不会用到的时刻，那一支不参与

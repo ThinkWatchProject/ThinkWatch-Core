@@ -83,6 +83,7 @@ pub(super) async fn attempt(
     provider: &tw_config::Provider,
     model: &str,
     attempt: usize,
+    reported: &mut crate::guard::Reported,
 ) -> Result<Plugged, Stop> {
     let to = crate::plugin::request::Target {
         upstream: &provider.name,
@@ -114,7 +115,7 @@ pub(super) async fn attempt(
         None => None,
     };
     // 内容过滤：只报插件加进来的。处置档下删过的话，后面一律用删过的那一份
-    let (body, value) = rescreen(state, rt, req, started, &provider.name, &c)?;
+    let (body, value) = rescreen(state, rt, req, started, &provider.name, &c, reported)?;
     // 生成回答的请求重新解码：格式转换用改过的这一份。数 token、压缩这些不转换（只发给
     // 同格式的上游），不用解
     let decoded = req.api.filter(|_| reading.generates).map(|api| {
@@ -132,9 +133,11 @@ pub(super) async fn attempt(
     let shape = crate::client_api::ClientApi::written(&c.path);
     let look = crate::guard::look_hits_from(mode, &rt.redact, &body, shape, seed);
     let (found, ledger) = (look.found, look.ledger);
-    let more = crate::guard::more_found(&started.found, found);
-    // 和开头那一条加起来，一个请求报的有上限（见 `crate::guard::REPORTED_MAX`）。位置是插件
-    // 改过的这一份里的
+    // 先前几跳报过的不再报（重试、故障转移时插件写进来的还是那几个，见 `crate::guard::Reported`）
+    let already = started.found.len() + reported.secrets();
+    let more = reported.fresh_secrets(crate::guard::more_found(&started.found, found));
+    // 和开头那一条、先前几跳的加起来，一个请求报的有上限（见 `crate::guard::REPORTED_MAX`）。
+    // 位置是插件改过的这一份里的
     let redaction = super::redaction(rt, ledger.clone());
     let seen = crate::guard::detail::Seen {
         body: &body,
@@ -143,7 +146,7 @@ pub(super) async fn attempt(
         redaction: &redaction,
         replaced: mode.acts(),
     };
-    let items = crate::guard::items(&more, started.found.len(), &seen);
+    let items = crate::guard::items(&more, already, &seen);
     if !items.is_empty() {
         state.bus.emit(tw_api::Event::SecretsFound {
             id: started.id,
@@ -181,6 +184,7 @@ fn rescreen(
     started: &Started,
     provider: &str,
     c: &crate::plugin::request::Changed,
+    reported: &mut crate::guard::Reported,
 ) -> Result<(Bytes, Result<Value, tw_dialect::ir::Rejection>), Msg> {
     let screen = crate::guard::Screen::of(rt);
     let unchanged = || Ok((c.body.clone(), Ok(c.value.clone())));
@@ -188,7 +192,7 @@ fn rescreen(
         return unchanged();
     }
     if let Some(inputs) = &c.inputs {
-        return rescreen_inputs(state, rt, &screen, started, provider, c, inputs);
+        return rescreen_inputs(state, rt, &screen, started, provider, c, inputs, reported);
     }
     let screened = crate::client_api::ClientApi::screened(req.uri.path());
     let Some(api) = req.api.filter(|_| screened) else {
@@ -202,7 +206,14 @@ fn rescreen(
         rules: &screen.rules,
         redaction: &redaction,
     };
-    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &sc, &src) {
+    let details = if sc.hits.is_empty() {
+        Vec::new()
+    } else {
+        crate::guard::detail::content(&src, &sc)
+    };
+    let refused =
+        crate::guard::report_once(&state.bus, started.id, provider, &sc, details, reported);
+    if let Some(why) = refused {
         return Err(why);
     }
     Ok(match sc.body {
@@ -221,6 +232,7 @@ fn rescreen(
 ///
 /// 改过的每一项写成一条调用方的消息（一段 Chat 格式的对话），改前、改后各查一遍，只报、
 /// 只按插件加进来的拒绝；删过的话，删过的文字写回原文的那几项
+#[allow(clippy::too_many_arguments)]
 fn rescreen_inputs(
     state: &AppState,
     rt: &Runtime,
@@ -229,6 +241,7 @@ fn rescreen_inputs(
     provider: &str,
     c: &crate::plugin::request::Changed,
     inputs: &crate::plugin::request::Inputs,
+    reported: &mut crate::guard::Reported,
 ) -> Result<(Bytes, Result<Value, tw_dialect::ir::Rejection>), Msg> {
     use crate::plugin::view::inputs::{rewrite_texts, texts};
     let as_chat = |texts: &[&String]| {
@@ -286,7 +299,9 @@ fn rescreen_inputs(
             _ => key.to_string(),
         };
     }
-    if let Some(why) = crate::guard::report_with(&state.bus, started.id, provider, &sc, details) {
+    let refused =
+        crate::guard::report_once(&state.bus, started.id, provider, &sc, details, reported);
+    if let Some(why) = refused {
         return Err(why);
     }
     let Some(stripped) = sc.body else {

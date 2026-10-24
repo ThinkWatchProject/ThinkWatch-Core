@@ -1071,7 +1071,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 连不上、流断了，请求在等待期限（`wait_secs`，等上游和重试共用）之内退避一阵，把暂时出错的
 /// 那几家再试一轮。新事件 [`Event::RequestRetrying`]（开始退避：再试哪几家、第几次、什么时候
 /// 发出去），退避结束发 [`Event::RequestDequeued`]，两条都在 `InFlightRequest::events` 里。
-/// [`AttemptView`] 多了 `retry`（这一跳是第几次重试）和 `backoff_ms`（发出之前退避了多久）
+/// [`AttemptView`] 多了 `retry`（这一跳是第几次重试）和 `backoff_ms`（发出之前退避了多久）。
+/// 新码：`gw.upstream.stream_ended_early`（流只发了开头的例行事件就收了尾，算在
+/// [`FAILED_AFTER_SENDING`] 里）
 pub const CONTROL_API_VERSION: u32 = 53;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
@@ -2024,6 +2026,7 @@ pub const FAILED_AFTER_SENDING: &[&str] = &[
     "gw.upstream.forward_failed",
     "gw.upstream.body_broken",
     "gw.upstream.stream_opening_error",
+    "gw.upstream.stream_ended_early",
 ];
 
 /// 手动中止的请求报的码（[`FailureSource::Aborted`] 的 `message`，尝试链上 `aborted` 那一跳的

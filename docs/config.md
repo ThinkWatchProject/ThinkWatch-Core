@@ -1135,18 +1135,20 @@ the upstream sends in the stream moves the request to the next candidate,
 the same as an error status would.
 
 When every candidate has been tried and the last one failed temporarily
-before any content reached the client — overloaded (503, 529, or an overload
-error in the stream), another 5xx, unreachable, or its stream broke — the
-request is retried after a pause instead of passing the error on. The pause
-is 2, 4 and 8 seconds, then 16 seconds each time, varied by up to a fifth, or
-as long as the upstream says (`retry-after-ms`, `Retry-After`). Each retry
+before any content reached the client — 500, 502, 503, 504 or 529, an
+overload or server error reported in a streamed answer, unreachable, or its
+stream broke or ended before any content — the request is retried after a
+pause instead of passing the error on. The pause is 2, 4 and 8 seconds, then
+16 seconds each time, varied by up to a fifth; when the upstream asks for a
+longer one (`retry-after-ms`, `Retry-After`), it is used instead. Each retry
 goes again to the candidates that failed temporarily, in order, skipping those
 set aside unless all of them are; a conversation that stays on an upstream
 retries only that one. Retrying stops when the next pause would end after
 `wait_secs`, the time a request may wait in all; the client then gets the last
 error. Rate limits, used-up quotas, an insufficient balance, rejected
-credentials, missing models, errors in the request itself and idle timeouts
-are not retried. Each retry appears among the request's attempts with its
+credentials, missing models, errors in the request itself, other errors
+reported in the stream, other 5xx statuses and idle timeouts are not retried;
+they still move the request to the next candidate as before. Each retry appears among the request's attempts with its
 number and the pause before it. `wait_secs: 0` turns retrying off.
 
 An upstream can also go quiet: it accepts the request and then sends nothing,
@@ -1164,10 +1166,12 @@ to the complete answer.
   outcome `idle_timeout`, and the request moves to the next candidate. Until
   then an upstream's answer is held back from the client, so the next upstream
   starts it afresh. With no candidate left, the client gets a timeout error
-  (504) in its own format. The last candidate's answer is held the same way
-  while the request can still be retried within `wait_secs`; otherwise its
-  stream is passed on as it arrives, and once its response has started, a
-  timeout there ends it with an error event instead.
+  (504) in its own format. When the client receives a stream, the last
+  candidate's stream is held the same way while the request can still be
+  retried within `wait_secs`; otherwise it is passed on as it arrives, and
+  once its response has started, a timeout there ends it with an error event
+  instead. A non-streamed answer from the last candidate is always passed on
+  as it arrives.
 - A streamed answer is held for at most 15 seconds. If no content has
   arrived by then, the client receives `200` and the streaming headers, so
   that its own wait for headers does not run out, followed by an SSE comment
@@ -1235,7 +1239,7 @@ receive the request and failed, the client gets that failure instead.
 | `quota_pause_secs` | integer | `3600` | Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then. |
 | `rate_limit_max_pause_secs` | integer | `3600` | Longest pause, in seconds, after an upstream answers 429 (rate limited). The pause lasts as long as the upstream says (`retry-after-ms`, `Retry-After`, or a delay in the error body); when it says nothing, it backs off by the upstream's consecutive 429s: 5, 10, 20 and 40 seconds, then 60 seconds each time. A pause is not a failure: requests wait for the upstream within `wait_secs`, and the circuit breaker does not count it. |
 | `idle_timeout_secs` | integer | `300` | Seconds an upstream may go without sending content before the gateway stops waiting for it. Counted from the moment the request is sent and started again by every piece of content: text, reasoning and tool calls count, keep-alives do not. A whole (non-streamed) answer counts from sending to the complete answer. Before any content has reached the client, the upstream counts as failed and the request moves to the next one; with none left, the client gets a timeout error. After content has reached the client, the answer ends with an error. From 30 to 3600. |
-| `wait_secs` | integer | `120` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, for an upstream that cannot take it yet — at its `max_concurrent`, paused after answering 429, or at one of its `minute` or `hour` usage limits — and before retrying upstreams that failed temporarily before any content (overloaded, another 5xx, unreachable). A key limit that does not free up in time refuses the request. An upstream that cannot take it is skipped for the next one, and when none is left the request waits for the first to become available; a conversation that stays on an upstream waits for it. When nothing became available in time, the client gets 429 with `Retry-After`; when retries did not succeed in time, it gets the last upstream error. `0`: never wait or retry. From 0 to 600. |
+| `wait_secs` | integer | `120` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, for an upstream that cannot take it yet — at its `max_concurrent`, paused after answering 429, or at one of its `minute` or `hour` usage limits — and before retrying upstreams that failed temporarily before any content (overloaded, a server error, unreachable). A key limit that does not free up in time refuses the request. An upstream that cannot take it is skipped for the next one, and when none is left the request waits for the first to become available; a conversation that stays on an upstream waits for it. When nothing became available in time, the client gets 429 with `Retry-After`; when retries did not succeed in time, it gets the last upstream error. `0`: never wait or retry. From 0 to 600. |
 <!-- /generated -->
 
 ### `aliases`
