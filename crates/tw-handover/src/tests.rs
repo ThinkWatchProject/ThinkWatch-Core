@@ -428,3 +428,137 @@ fn send_with_is_send(link: &mut Link, s: &Socket) {
     fn send<T: Send>(_: T) {}
     send(link.send_with(&Message::Bye, &[s], 0));
 }
+
+/// 连上端点但什么都不说：只是一条原始连接。
+#[cfg(unix)]
+async fn raw_connect(dir: &Path) -> tokio::net::UnixStream {
+    tokio::net::UnixStream::connect(dir.join(ENDPOINT_FILE))
+        .await
+        .unwrap()
+}
+
+#[cfg(windows)]
+async fn raw_connect(dir: &Path) -> tokio::net::TcpStream {
+    let port: u16 = std::fs::read_to_string(dir.join(ENDPOINT_FILE))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap()
+}
+
+fn frame(body: &[u8]) -> Vec<u8> {
+    let mut f = (body.len() as u32).to_be_bytes().to_vec();
+    f.extend_from_slice(body);
+    f
+}
+
+/// 口令门**并发**核对：一堆连上来不说话的（比同时核对的上限还多）、一个交错口令的，
+/// 都挡不住随后交对口令的那一个，也不会被错放进来。Windows 的门就是这个，这里在
+/// 各个平台上都用它跑一遍。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_gate_is_not_held_up() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempdir();
+    let ep = std::sync::Arc::new(Endpoint::bind(dir.path()).await.unwrap());
+    let gate = Gate::Token {
+        token: std::sync::Arc::from(&b"secret"[..]),
+        wait: Duration::from_secs(5),
+    };
+    let start = Instant::now();
+    let admitted = tokio::spawn({
+        let ep = ep.clone();
+        async move { ep.admit(gate).await }
+    });
+
+    let mut silent = Vec::new();
+    for _ in 0..(MAX_CHECKS + 36) {
+        silent.push(raw_connect(dir.path()).await);
+    }
+    let mut wrong = raw_connect(dir.path()).await;
+    wrong.write_all(&frame(b"guess!")).await.unwrap();
+    wrong
+        .write_all(&frame(br#"{"m":{"t":"fallback"}}"#))
+        .await
+        .unwrap();
+
+    let mut right = raw_connect(dir.path()).await;
+    right.write_all(&frame(b"secret")).await.unwrap();
+    right
+        .write_all(&frame(br#"{"m":{"t":"bye"}}"#))
+        .await
+        .unwrap();
+
+    let mut link = tokio::time::timeout(Duration::from_secs(3), admitted)
+        .await
+        .expect("held up by silent connections")
+        .unwrap()
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_secs(3));
+    // 放进来的是交对口令的那一个
+    assert_eq!(link.recv().await.unwrap().0, Message::Bye);
+    drop((silent, wrong));
+}
+
+/// 真端点上的同一件事：Windows 上门是口令，unix 上门由内核当场判定。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_is_not_held_up_by_silent_connections() {
+    let dir = tempdir();
+    let ep = std::sync::Arc::new(Endpoint::bind(dir.path()).await.unwrap());
+    let accepted = tokio::spawn({
+        let ep = ep.clone();
+        async move { ep.accept().await }
+    });
+    #[cfg(windows)]
+    let silent = {
+        let mut v = Vec::new();
+        for _ in 0..(MAX_CHECKS + 36) {
+            v.push(raw_connect(dir.path()).await);
+        }
+        v
+    };
+    let mut new = connect(dir.path()).await.unwrap().expect("armed");
+    new.send(&hello()).await.unwrap();
+    let mut old = tokio::time::timeout(Duration::from_secs(3), accepted)
+        .await
+        .expect("held up")
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.recv().await.unwrap().0, hello());
+    #[cfg(windows)]
+    drop(silent);
+}
+
+/// Windows：端点的监听、还原出来的监听都不能被子进程继承。
+#[cfg(windows)]
+#[tokio::test]
+async fn sockets_are_not_inheritable() {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+
+    fn inheritable(raw: std::os::windows::io::RawSocket) -> bool {
+        let mut flags = 0u32;
+        // SAFETY: raw 是有效的套接字句柄，出参是本地变量
+        assert_ne!(
+            unsafe { GetHandleInformation(raw as HANDLE, &mut flags) },
+            0
+        );
+        flags & HANDLE_FLAG_INHERIT != 0
+    }
+
+    let dir = tempdir();
+    let (ep, mut old, mut new) = pair(dir.path()).await;
+    assert!(!inheritable(ep.listener.raw()));
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let socket = Socket::Tcp(listener);
+    old.send_with(&Message::Commit, &[&socket], me())
+        .await
+        .unwrap();
+    let (_, mut sockets) = new.recv().await.unwrap();
+    let received = into_tcp(sockets.pop().unwrap());
+    assert!(!inheritable(received.as_raw_socket()));
+}

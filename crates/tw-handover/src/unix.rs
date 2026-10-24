@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::Interest;
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::{ENDPOINT_FILE, Error, MAX_SOCKETS, Result, Socket};
+use crate::{ENDPOINT_FILE, Error, Gate, MAX_SOCKETS, Result, Socket};
 
 /// 一次 `recvmsg` 最多读这么多正文。
 const CHUNK: usize = 64 * 1024;
@@ -25,6 +25,12 @@ const SEND_FLAGS: libc::c_int = 0;
 
 /// Linux 能让内核直接给收到的句柄打上 close-on-exec；macOS 没有这个标志，
 /// 收到后补一次 `fcntl`（两边都补，不差这一次系统调用）。
+///
+/// **macOS 上因此有一个窗口**：`recvmsg` 返回到 `fcntl` 之间，别的线程如果恰好
+/// fork + exec，子进程会带走一份监听，我们退出后它还占着端口。没有干净的修法
+/// （macOS 既没有 `MSG_CMSG_CLOEXEC`，也不能让 fork 等这里），而这个窗口可以接受：
+/// 它只在交接时打开一次、只有几条指令长；core 平时几乎不起子进程，接管阶段
+/// （读配置、建运行时）更不会。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -53,6 +59,11 @@ impl Listener {
             .ok()
             .map(|m| (m.dev(), m.ino()));
         Ok(Listener { listener, path, id })
+    }
+
+    /// 内核已经在 `accept` 里核对过用户了，门是开的。
+    pub(crate) fn gate(&self) -> Gate {
+        Gate::Open
     }
 
     /// `Ok(None)` = 连上来的不是同一个用户，已经断开。
