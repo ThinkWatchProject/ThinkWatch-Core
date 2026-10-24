@@ -135,21 +135,75 @@ pub enum Message {
     Fallback,
 }
 
+/// 单帧上限。快照可能较大（几千条亲和、限额计数），但不该没有边：长度前缀
+/// 读错了时宁可报错，也别照着一个 4 GiB 的数去分配。
+const MAX_FRAME: usize = 16 << 20;
+
+/// 一帧最多附几个套接字。网关每张网卡一个、再加远程控制端口，远远够了；
+/// 也在 Linux 一条辅助消息的上限（`SCM_MAX_FD` = 253）之内。
+const MAX_SOCKETS: usize = 64;
+
+/// 线上的一帧：消息外面包一层，带上套接字的附件信息。两端都在本 crate，
+/// 不对外。
+#[derive(serde::Serialize)]
+struct EnvelopeOut<'a> {
+    m: &'a Message,
+    /// 随这一帧走的套接字个数（unix：`SCM_RIGHTS` 里的句柄数）
+    #[serde(skip_serializing_if = "is_zero")]
+    n: usize,
+    /// Windows：每个套接字的 `WSAPROTOCOL_INFOW`，十六进制
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    w: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct EnvelopeIn {
+    m: Message,
+    #[serde(default)]
+    n: usize,
+    #[serde(default)]
+    w: Vec<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// 旧 core 那一头：arm 之后开着，等接替者连上来。
 pub struct Endpoint {
-    _todo: (),
+    listener: sys::Listener,
 }
 
 impl Endpoint {
     /// 在数据目录里开交接端点。已有的同名文件（上次没退干净）先删掉。
-    pub async fn bind(_dir: &Path) -> Result<Endpoint> {
-        todo!("C1")
+    pub async fn bind(dir: &Path) -> Result<Endpoint> {
+        Ok(Endpoint {
+            listener: sys::Listener::bind(dir).await?,
+        })
     }
 
     /// 等一个接替者。**核对过身份才交出 [`Link`]**（unix：同一用户；Windows：口令）；
     /// 不对的连接直接断开，接着等下一个。
     pub async fn accept(&self) -> Result<Link> {
-        todo!("C1")
+        loop {
+            let Some((io, pid)) = self.listener.accept().await? else {
+                continue;
+            };
+            #[allow(unused_mut)] // Windows 上要先在它上面读口令
+            let mut link = Link::new(io, pid);
+            #[cfg(windows)]
+            {
+                // 口令是连上之后的第一帧。**限时**：一个连上来不说话的进程
+                // 不能把门一直堵着；口令帧也不许长 —— 没过门的不配让我们分配 16 MiB
+                let frame = link.read_frame(sys::TOKEN_FRAME_MAX);
+                let token = tokio::time::timeout(sys::TOKEN_WAIT, frame).await;
+                match token {
+                    Ok(Ok(t)) if token::eq(&t, self.listener.token()) => {}
+                    _ => continue,
+                }
+            }
+            return Ok(link);
+        }
     }
 
     /// 关掉端点，删掉文件。被丢掉时也做同一件事。
@@ -158,24 +212,45 @@ impl Endpoint {
 
 /// 新 core 那一头：去连锁的持有者。**`Ok(None)` = 它没有 arm**（端点不存在或连不上），
 /// 调用方照旧报「已有实例在运行」。
-pub async fn connect(_dir: &Path) -> Result<Option<Link>> {
-    todo!("C1")
+pub async fn connect(dir: &Path) -> Result<Option<Link>> {
+    let Some((io, pid)) = sys::connect(dir).await? else {
+        return Ok(None);
+    };
+    #[allow(unused_mut)] // Windows 上要先在它上面交口令
+    let mut link = Link::new(io, pid);
+    #[cfg(windows)]
+    {
+        let token = sys::read_token(dir)?;
+        link.write_frame(token.as_bytes(), &[]).await?;
+    }
+    Ok(Some(link))
 }
 
 /// 一条交接连接。
 pub struct Link {
-    _todo: (),
+    io: sys::Stream,
+    /// 读进来、还没拼成整帧的字节
+    rbuf: Vec<u8>,
+    peer_pid: Option<u32>,
 }
 
 impl Link {
+    fn new(io: sys::Stream, peer_pid: Option<u32>) -> Link {
+        Link {
+            io,
+            rbuf: Vec::new(),
+            peer_pid,
+        }
+    }
+
     /// 对端的 pid（unix 上从内核问到的；Windows 上取 `Hello` 里报的）。
     pub fn peer_pid(&self) -> Option<u32> {
-        todo!("C1")
+        self.peer_pid
     }
 
     /// 发一条不带套接字的消息。
-    pub async fn send(&mut self, _m: &Message) -> Result<()> {
-        todo!("C1")
+    pub async fn send(&mut self, m: &Message) -> Result<()> {
+        self.send_with(m, &[], 0).await
     }
 
     /// 发一条消息，附带这几个套接字（顺序即 `infos` 的顺序）。`peer_pid` 只在
@@ -183,15 +258,95 @@ impl Link {
     /// 照样能 accept，直到它自己关掉。
     pub async fn send_with(
         &mut self,
-        _m: &Message,
-        _sockets: &[&Socket],
-        _peer_pid: u32,
+        m: &Message,
+        sockets: &[&Socket],
+        peer_pid: u32,
     ) -> Result<()> {
-        todo!("C1")
+        if sockets.len() > MAX_SOCKETS {
+            return Err(Error::Transfer(format!(
+                "{} sockets in one message, at most {MAX_SOCKETS}",
+                sockets.len()
+            )));
+        }
+        let env = EnvelopeOut {
+            m,
+            n: sockets.len(),
+            w: sys::export(sockets, peer_pid)?,
+        };
+        let body = serde_json::to_vec(&env).map_err(|e| Error::Malformed(e.to_string()))?;
+        self.write_frame(&body, sockets).await
     }
 
     /// 收一条消息和它附带的套接字。对端关闭连接时返回 `Io(UnexpectedEof)`。
     pub async fn recv(&mut self) -> Result<(Message, Vec<Socket>)> {
-        todo!("C1")
+        let body = self.read_frame(MAX_FRAME).await?;
+        let env: EnvelopeIn =
+            serde_json::from_slice(&body).map_err(|e| Error::Malformed(e.to_string()))?;
+        if env.n > MAX_SOCKETS {
+            return Err(Error::Malformed(format!(
+                "{} sockets in one message",
+                env.n
+            )));
+        }
+        let sockets = self.io.import(env.n, &env.w)?;
+        #[cfg(windows)]
+        if let Message::Hello { pid, .. } = &env.m {
+            // Windows 问不到对端 pid，只能信它自己报的 —— 对端已经交过口令，
+            // 是同一个用户；报错了 pid 也只是复制不出套接字
+            self.peer_pid = Some(*pid);
+        }
+        Ok((env.m, sockets))
+    }
+
+    /// 写一帧：4 字节大端长度 + 正文。unix 上套接字附在这一帧的第一个字节上。
+    async fn write_frame(&mut self, body: &[u8], sockets: &[&Socket]) -> Result<()> {
+        if body.len() > MAX_FRAME {
+            return Err(Error::Malformed(format!(
+                "a message of {} bytes is over the {MAX_FRAME}-byte limit",
+                body.len()
+            )));
+        }
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        self.io.write_frame(&frame, sockets).await
+    }
+
+    /// 读一整帧的正文，长于 `max` 的报 `Malformed`。
+    async fn read_frame(&mut self, max: usize) -> Result<Vec<u8>> {
+        loop {
+            if self.rbuf.len() >= 4 {
+                let len = u32::from_be_bytes(self.rbuf[..4].try_into().expect("4 bytes")) as usize;
+                if len > max {
+                    return Err(Error::Malformed(format!(
+                        "a message of {len} bytes is over the {max}-byte limit"
+                    )));
+                }
+                if self.rbuf.len() >= 4 + len {
+                    let body = self.rbuf[4..4 + len].to_vec();
+                    self.rbuf.drain(..4 + len);
+                    return Ok(body);
+                }
+                // 知道要多长了，一次留够，别边读边翻倍
+                self.rbuf.reserve(4 + len - self.rbuf.len());
+            }
+            if self.io.read_some(&mut self.rbuf).await? == 0 {
+                return Err(Error::Io(std::io::ErrorKind::UnexpectedEof.into()));
+            }
+        }
     }
 }
+
+#[cfg(any(windows, test))]
+mod token;
+
+#[cfg(unix)]
+#[path = "unix.rs"]
+mod sys;
+
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod sys;
+
+#[cfg(test)]
+mod tests;
