@@ -25,7 +25,7 @@ pub(crate) fn calendar_index(per: LimitPer) -> usize {
 }
 
 /// 一份用量。四样分开记，各条上限各取各的。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Amount {
     pub requests: i64,
     /// 没走缓存的输入 + 写进缓存的 + 输出
@@ -53,7 +53,7 @@ impl Amount {
 }
 
 /// 一期（天、周、月）的合计。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Period {
     pub start: i64,
     pub end: i64,
@@ -346,4 +346,86 @@ pub(crate) fn take_moved(
         })
         .filter(|m| asked.insert(m.clone()))
         .collect()
+}
+
+// ------------------------------------------------------------ 交接（见 `crate::handover`）
+
+/// 一份预留写成交接连接上的样子。`seq` 是这里给它的号
+pub(crate) fn held_wire(seq: u64, r: &Reservation) -> crate::handover::wire::Held {
+    crate::handover::wire::Held {
+        seq,
+        key: r.key.clone(),
+        at_ms: r.at_ms,
+        tokens: r.tokens,
+        cost: r.cost,
+    }
+}
+
+/// 旧 core 的一份预留，在这里替它记着。**没有请求号**：它不会被当成「结束了太久」放掉（这里
+/// 的事件总线上没有那个请求），只等旧 core 的结算
+pub(crate) fn held_reservation(h: &crate::handover::wire::Held) -> Reservation {
+    Reservation {
+        key: h.key.clone(),
+        at_ms: h.at_ms,
+        tokens: h.tokens,
+        cost: h.cost.max(0),
+        request: None,
+        closed_since: None,
+    }
+}
+
+/// 在滚动窗口里记上 `at_ms` 那一刻的一个请求（旧 core 记的那一个，见 [`record_request`]）
+pub(crate) fn record_at(books: &mut HashMap<String, Books>, key: &str, at_ms: i64) {
+    books.entry(key.to_string()).or_default().recent.push_back((
+        at_ms,
+        Amount {
+            requests: 1,
+            ..Default::default()
+        },
+    ));
+}
+
+/// 账和预留写成交接连接上的样子
+pub(crate) fn export(
+    books: &HashMap<String, Books>,
+    held: &HashMap<u64, Reservation>,
+) -> crate::handover::wire::LimitBooks {
+    let mut held: Vec<_> = held.iter().map(|(s, r)| held_wire(*s, r)).collect();
+    held.sort_by_key(|h| h.seq);
+    crate::handover::wire::LimitBooks {
+        books: books
+            .iter()
+            .map(|(name, b)| crate::handover::wire::NamedBooks {
+                name: name.clone(),
+                periods: b.periods,
+                recent: b.recent.iter().copied().collect(),
+            })
+            .collect(),
+        held,
+    }
+}
+
+/// 把旧 core 的账并进来。**并，不是换**：这里已经记着的（多半什么都没有 —— 新 core 接进快照
+/// 时还没转发过）照样算。同一期的合计相加，滚动窗口里的每一笔按时刻排进去；开头不一样的
+/// 一期（交接正好跨过零点）留这里的
+pub(crate) fn import(
+    books: &mut HashMap<String, Books>,
+    theirs: Vec<crate::handover::wire::NamedBooks>,
+) {
+    for nb in theirs {
+        let b = books.entry(nb.name).or_default();
+        for (mine, theirs) in b.periods.iter_mut().zip(nb.periods) {
+            let Some(theirs) = theirs else { continue };
+            match mine {
+                Some(p) if p.start == theirs.start => p.sum.add(&theirs.sum),
+                Some(_) => {}
+                None => *mine = Some(theirs),
+            }
+        }
+        if !nb.recent.is_empty() {
+            let mut all: Vec<(i64, Amount)> = b.recent.drain(..).chain(nb.recent).collect();
+            all.sort_by_key(|(t, _)| *t);
+            b.recent = all.into();
+        }
+    }
 }

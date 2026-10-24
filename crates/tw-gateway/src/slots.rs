@@ -28,15 +28,30 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
 
-#[derive(Default)]
 pub struct Slots {
     per_upstream: Mutex<HashMap<String, Arc<Pool>>>,
+    /// 每家此刻占着几个位置（交接时报给接替的 core，见 [`crate::handover`]）
+    pub(crate) claims: Arc<crate::handover::feed::Claims>,
+}
+
+impl Default for Slots {
+    fn default() -> Self {
+        Self {
+            per_upstream: Mutex::default(),
+            claims: Arc::new(crate::handover::feed::Claims::new(
+                crate::handover::feed::Kind::Slot,
+            )),
+        }
+    }
 }
 
 /// 一家上游的位置。
 struct Pool {
+    /// 这家的名字：交接时按它数（[`Slot`] 的 `claim`）
+    name: String,
     sem: Arc<Semaphore>,
     books: Mutex<Books>,
+    claims: Arc<crate::handover::feed::Claims>,
 }
 
 struct Books {
@@ -49,31 +64,56 @@ struct Books {
 /// 占着的一个位置。**Drop 时自动归还** —— 手工释放迟早会在某条错误路径上漏掉，漏掉的
 /// 表现是这家的位置只减不增，最后发给它的请求全都在等。没设上限的上游给的是空的一个。
 pub struct Slot {
-    held: Option<(Arc<Pool>, OwnedSemaphorePermit)>,
+    held: Option<(Arc<Pool>, Hand)>,
+    /// 交接时数的那一个（见 [`crate::handover::feed::Claims`]）
+    _claim: Option<crate::handover::feed::Claim>,
+}
+
+/// 占着的：信号量的一个位置，或者一笔欠账（替旧 core 占的、这里此刻没空着的那几个，见
+/// [`Slots::phantom`]；和密钥的闸里的是同一回事，见 [`crate::limits`]）
+enum Hand {
+    Permit(OwnedSemaphorePermit),
+    Debt,
 }
 
 impl Slot {
     /// 这家不限并发：什么都不占
     pub fn free() -> Self {
-        Self { held: None }
+        Self {
+            held: None,
+            _claim: None,
+        }
     }
 
     fn of(pool: Arc<Pool>, permit: OwnedSemaphorePermit) -> Self {
+        let claim = pool.claims.begin(&pool.name);
         Self {
-            held: Some((pool, permit)),
+            held: Some((pool, Hand::Permit(permit))),
+            _claim: Some(claim),
         }
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let Some((pool, permit)) = self.held.take() else {
+        let Some((pool, hand)) = self.held.take() else {
             return;
         };
         let mut books = pool.books.lock().unwrap_or_else(|p| p.into_inner());
-        if books.owed > 0 {
-            books.owed -= 1;
-            permit.forget();
+        match hand {
+            Hand::Permit(permit) => {
+                if books.owed > 0 {
+                    books.owed -= 1;
+                    permit.forget();
+                }
+            }
+            Hand::Debt => {
+                if books.owed > 0 {
+                    books.owed -= 1;
+                } else if !pool.sem.is_closed() {
+                    pool.sem.add_permits(1);
+                }
+            }
         }
     }
 }
@@ -117,8 +157,10 @@ impl Slots {
                     per.insert(
                         p.name.clone(),
                         Arc::new(Pool {
+                            name: p.name.clone(),
                             sem: Arc::new(Semaphore::new(limit)),
                             books: Mutex::new(Books { limit, owed: 0 }),
+                            claims: self.claims.clone(),
                         }),
                     );
                 }
@@ -152,6 +194,27 @@ impl Slots {
             Err(TryAcquireError::Closed) => Some(Slot::free()),
             Err(TryAcquireError::NoPermits) => None,
         }
+    }
+
+    /// 替交接前的旧 core 占一个（见 [`crate::handover`]）：**不等**。有空位就占，没有就记一笔欠账
+    /// —— 旧 core 发给这家的那一跳此刻确实在路上。这家不限并发是 None：什么都不用占
+    pub(crate) fn phantom(&self, name: &str) -> Option<Slot> {
+        let pool = self.pool(name)?;
+        if pool.sem.is_closed() {
+            return None;
+        }
+        let hand = match pool.sem.clone().try_acquire_owned() {
+            Ok(permit) => Hand::Permit(permit),
+            Err(_) => {
+                pool.books.lock().unwrap_or_else(|p| p.into_inner()).owed += 1;
+                Hand::Debt
+            }
+        };
+        let claim = pool.claims.begin(&pool.name);
+        Some(Slot {
+            held: Some((pool, hand)),
+            _claim: Some(claim),
+        })
     }
 
     /// 等这一家空出一个位置，最多等到 `until`。到点还满着是 `None`。

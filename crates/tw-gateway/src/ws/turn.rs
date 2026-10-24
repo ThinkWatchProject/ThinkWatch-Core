@@ -187,6 +187,11 @@ impl Turns {
         self.queue.front_mut()
     }
 
+    /// 一轮都没有在跑
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     pub(crate) fn front_id(&self) -> Option<u64> {
         self.queue.front().map(|t| t.id)
     }

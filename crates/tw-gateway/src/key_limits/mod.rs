@@ -101,6 +101,12 @@ struct Inner {
     /// 已经要过、还没读回来的几期。**一期只要一次**：读回来之前每个请求都会看到同一个开头，
     /// 不该每个请求去库里查一遍
     asked: HashSet<Moved>,
+    /// 交接：预留和结算往哪儿报（旧 core，见 [`crate::handover`]）。**在这把锁里报**：快照和之后
+    /// 的变化前后接得上
+    feed: Option<Arc<crate::handover::feed::Feed>>,
+    /// 交接：替旧 core 记着的预留，旧 core 那边的号 → 这里的号（新 core）。它们没有请求号，不会
+    /// 被当成「结束了太久」放掉，只等旧 core 的结算
+    imported: HashMap<u64, u64>,
 }
 
 /// 准入时一个请求要占的：输入 token 的估算，和按头一个候选算的输入费用。
@@ -111,7 +117,7 @@ pub struct Ask {
 }
 
 /// 存储层记下的一行（结算），或者库里加起来的一组（重建）：算不算、算多少，看的是这几样。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Recorded {
     /// 密钥的名字
     pub client: String,
@@ -541,42 +547,66 @@ impl KeyLimits {
         let now = self.clock.now_ms();
         let (events, moved) = {
             let mut g = self.lock();
-            let held = g.by_request.remove(&id).and_then(|s| g.held.remove(&s));
-            if !rec.counts() {
-                if let Some(r) = held {
-                    books::unrecord(&mut g.books, &r);
-                }
-                return;
-            }
-            let key = held.map_or_else(|| rec.client.clone(), |r| r.key);
-            let amount = rec.amount();
-            let rolling = g
-                .limits
-                .get(&key)
-                .and_then(|ls| longest_window(ls))
-                .is_some();
-            let clock = self.clock.as_ref();
-            let books = g.books.entry(key.clone()).or_default();
-            for per in CALENDAR {
-                let p = books.period(clock, per, now);
-                if at_ms >= p.start && at_ms < p.end {
-                    p.sum.add(&amount);
-                }
-            }
-            // 请求数在准入时已经进了滚动窗口
-            if rolling {
-                books.recent.push_back((
-                    now,
-                    Amount {
-                        requests: 0,
-                        ..amount
-                    },
-                ));
-            }
-            (self.alerts(&mut g, &key, now), self.moved(&mut g, &key))
+            let held = g
+                .by_request
+                .remove(&id)
+                .and_then(|s| g.held.remove(&s).map(|r| (s, r)));
+            self.settle_locked(&mut g, held, at_ms, rec, now)
         };
         self.emit(events);
         self.ask_reread(moved);
+    }
+
+    /// 结算一行：`held` 是它占着的预留和预留的号。交回要报的提醒和换了新一期的那几期
+    fn settle_locked(
+        &self,
+        g: &mut Inner,
+        held: Option<(u64, Reservation)>,
+        at_ms: i64,
+        rec: &Recorded,
+        now: i64,
+    ) -> (Vec<tw_api::Event>, Vec<Moved>) {
+        if held.is_some() || rec.counts() {
+            let seq = held.as_ref().map(|(s, _)| *s);
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::KeySettle {
+                seq,
+                at_ms,
+                rec: rec.clone(),
+            });
+        }
+        let held = held.map(|(_, r)| r);
+        if !rec.counts() {
+            if let Some(r) = held {
+                books::unrecord(&mut g.books, &r);
+            }
+            return (Vec::new(), Vec::new());
+        }
+        let key = held.map_or_else(|| rec.client.clone(), |r| r.key);
+        let amount = rec.amount();
+        let rolling = g
+            .limits
+            .get(&key)
+            .and_then(|ls| longest_window(ls))
+            .is_some();
+        let clock = self.clock.as_ref();
+        let books = g.books.entry(key.clone()).or_default();
+        for per in CALENDAR {
+            let p = books.period(clock, per, now);
+            if at_ms >= p.start && at_ms < p.end {
+                p.sum.add(&amount);
+            }
+        }
+        // 请求数在准入时已经进了滚动窗口
+        if rolling {
+            books.recent.push_back((
+                now,
+                Amount {
+                    requests: 0,
+                    ..amount
+                },
+            ));
+        }
+        (self.alerts(g, &key, now), self.moved(g, &key))
     }
 
     /// 重启之后把天、周、月的数从请求记录里加回来。`since(t)` 给出从 `t` 起每把密钥
@@ -650,6 +680,130 @@ impl KeyLimits {
         view
     }
 
+    // ------------------------------------------------------------ 交接
+
+    /// 旧 core：此刻的账和在跑的预留（替更早的 core 记着的也在里面），之后的变化报给 `feed`。
+    /// 两件事在同一把锁里做：快照之后的每一次变化都在 `feed` 上，一次不漏、一次不重
+    pub(crate) fn handover_export(
+        &self,
+        feed: Option<Arc<crate::handover::feed::Feed>>,
+    ) -> crate::handover::wire::LimitBooks {
+        let mut g = self.lock();
+        let out = books::export(&g.books, &g.held);
+        g.feed = feed;
+        out
+    }
+
+    /// 旧 core：排空开始。报一份此刻在跑的全部预留，之后的变化接着报
+    pub(crate) fn handover_drain(&self, feed: Arc<crate::handover::feed::Feed>) {
+        let mut g = self.lock();
+        feed.send(&crate::handover::wire::Event::KeyHolds {
+            held: books::export(&HashMap::new(), &g.held).held,
+        });
+        g.feed = Some(feed);
+    }
+
+    /// 新 core：接进旧 core 的账。天、周、月和滚动窗口并进来，在跑的预留记成替它占着的
+    pub(crate) fn handover_import(&self, b: crate::handover::wire::LimitBooks) {
+        let mut g = self.lock();
+        let g = &mut *g;
+        books::import(&mut g.books, b.books);
+        for h in &b.held {
+            Self::phantom(g, h, false);
+        }
+    }
+
+    /// 替旧 core 记上一份预留。`windowed`：旧 core 占上它时滚动窗口里记了一个请求，这里也记上
+    fn phantom(g: &mut Inner, h: &crate::handover::wire::Held, windowed: bool) {
+        if g.imported.contains_key(&h.seq) {
+            return;
+        }
+        g.seq += 1;
+        let seq = g.seq;
+        let r = books::held_reservation(h);
+        if windowed {
+            books::record_at(&mut g.books, &r.key, r.at_ms);
+        }
+        crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::KeyReserve {
+            held: books::held_wire(seq, &r),
+            windowed,
+        });
+        g.held.insert(seq, r);
+        g.imported.insert(h.seq, seq);
+    }
+
+    /// 替旧 core 记着的这一份不用再记了：作废，不撤滚动窗口里那一个请求（它确实发生过）
+    fn drop_phantom(g: &mut Inner, theirs: u64) {
+        if let Some(seq) = g.imported.remove(&theirs)
+            && g.held.remove(&seq).is_some()
+        {
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::KeyDrop { seq });
+        }
+    }
+
+    /// 新 core：旧 core 报来一条变化（[`crate::handover::wire::Event`] 里 `key_*` 那几种）。别的
+    /// 不认，交回 false
+    pub(crate) fn handover_apply(&self, ev: &crate::handover::wire::Event) -> bool {
+        use crate::handover::wire::Event;
+        let now = self.clock.now_ms();
+        let (events, moved) = {
+            let mut g = self.lock();
+            let g = &mut *g;
+            match ev {
+                Event::KeyHolds { held } => {
+                    let want: HashSet<u64> = held.iter().map(|h| h.seq).collect();
+                    let stale: Vec<u64> = g
+                        .imported
+                        .keys()
+                        .filter(|s| !want.contains(s))
+                        .copied()
+                        .collect();
+                    for s in stale {
+                        Self::drop_phantom(g, s);
+                    }
+                    for h in held {
+                        Self::phantom(g, h, false);
+                    }
+                    (Vec::new(), Vec::new())
+                }
+                Event::KeyReserve { held, windowed } => {
+                    Self::phantom(g, held, *windowed);
+                    (Vec::new(), Vec::new())
+                }
+                Event::KeySettle { seq, at_ms, rec } => {
+                    let held = seq
+                        .and_then(|s| g.imported.remove(&s))
+                        .and_then(|s| g.held.remove(&s).map(|r| (s, r)));
+                    self.settle_locked(g, held, *at_ms, rec, now)
+                }
+                Event::KeyRelease { seq } => {
+                    if let Some(s) = g.imported.remove(seq) {
+                        Self::release_locked(g, s);
+                    }
+                    (Vec::new(), Vec::new())
+                }
+                Event::KeyDrop { seq } => {
+                    Self::drop_phantom(g, *seq);
+                    (Vec::new(), Vec::new())
+                }
+                _ => return false,
+            }
+        };
+        self.emit(events);
+        self.ask_reread(moved);
+        true
+    }
+
+    /// 新 core：交接连接断了。替旧 core 记着的预留全部作废；它的请求用了多少，等请求库打开后
+    /// 从记录里重建
+    pub(crate) fn handover_release_all(&self) {
+        let mut g = self.lock();
+        let theirs: Vec<u64> = g.imported.keys().copied().collect();
+        for s in theirs {
+            Self::drop_phantom(&mut g, s);
+        }
+    }
+
     // ------------------------------------------------------------ 锁里面的
 
     /// 一条上限此刻用了多少：记下的，加上在跑的请求的预留
@@ -714,8 +868,12 @@ impl KeyLimits {
         books::record_request(&mut g.books, key, limits, now);
         g.seq += 1;
         let seq = g.seq;
-        g.held
-            .insert(seq, Reservation::new(key, now, ask.tokens, ask.cost_micros));
+        let r = Reservation::new(key, now, ask.tokens, ask.cost_micros);
+        crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::KeyReserve {
+            held: books::held_wire(seq, &r),
+            windowed: longest_window(limits).is_some(),
+        });
+        g.held.insert(seq, r);
         seq
     }
 
@@ -731,19 +889,27 @@ impl KeyLimits {
     /// 滚动窗口里的那一个请求都还回去
     fn release(&self, seq: u64) {
         let mut g = self.lock();
+        Self::release_locked(&mut g, seq);
+    }
+
+    fn release_locked(g: &mut Inner, seq: u64) {
         if let Some(r) = g.held.remove(&seq) {
             if let Some(id) = r.request {
                 g.by_request.remove(&id);
             }
             books::unrecord(&mut g.books, &r);
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::KeyRelease {
+                seq,
+            });
         }
     }
 
     /// 放掉结束了太久、存储层却一直没交来那一行的预留（见 [`books::GRACE_MS`]）。顺手把滚动
     /// 窗口里滑出去的扔掉
     fn sweep(&self, g: &mut Inner, now: i64) {
-        for (_, id) in books::sweep_held(&mut g.held, &self.bus, now) {
+        for (seq, id) in books::sweep_held(&mut g.held, &self.bus, now) {
             g.by_request.remove(&id);
+            crate::handover::feed::send(&g.feed, || crate::handover::wire::Event::KeyDrop { seq });
         }
         books::trim_windows(&mut g.books, &g.limits, now);
     }
