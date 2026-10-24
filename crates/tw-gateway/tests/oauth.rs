@@ -553,3 +553,66 @@ async fn renewals_held_during_a_handover_never_reach_the_token_endpoint() {
     assert_eq!(ask(gw).await, 200);
     assert_eq!(t.calls.load(Ordering::SeqCst), 1);
 }
+
+/// 交出 access token 之前（升级不断线）：暂停续期**并等正在换的那一次换完**。暂停之前已经
+/// 发出去的那次换回来的才是旧 core 手上最新的，要等它；暂停之后进来的一次都不去换。
+#[tokio::test]
+async fn pausing_renewals_waits_for_the_renewal_already_in_flight() {
+    // 慢的 token 端点：一次要 600 毫秒
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let app = axum::Router::new().route(
+        "/token",
+        axum::routing::post(move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                axum::Json(serde_json::json!({
+                    "access_token": "at-slow",
+                    "expires_in": 3600,
+                }))
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let cache = Arc::new(tw_gateway::oauth::Cache::new());
+    let cfg = OAuth {
+        access: None,
+        expires_at: None,
+        refresh: "rt".into(),
+        endpoint: format!("http://{addr}/token"),
+        client_id: None,
+        client_secret: None,
+        refresh_before: None,
+    };
+    let renewing = {
+        let (cache, cfg) = (cache.clone(), cfg.clone());
+        tokio::spawn(async move { cache.token("p", &cfg, &reqwest::Client::new()).await })
+    };
+    // 等它真的发出去
+    while calls.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let t0 = std::time::Instant::now();
+    cache
+        .hold_renewals_settled(std::time::Duration::from_secs(5))
+        .await;
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(300),
+        "没等正在换的那一次就交出去了"
+    );
+    let (token, _) = renewing.await.unwrap().unwrap();
+    assert_eq!(token, "at-slow");
+    // 暂停之后：手上那个照用，不再去换
+    let (token, renewed) = cache
+        .token("p", &cfg, &reqwest::Client::new())
+        .await
+        .unwrap();
+    assert_eq!(token, "at-slow");
+    assert!(renewed.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "暂停之后又去换了");
+}

@@ -552,12 +552,12 @@ async fn accept_loop(
             stream,
             app.clone(),
             gate.clone(),
-            Some(crate::RemoteConn {
+            crate::RemoteConn {
                 on_failure: Box::new(move || remote.strike(ip, Instant::now())),
                 closed: stopped.clone(),
                 revoked: Box::pin(revoked(state.clone(), reloads, ip)),
                 _slot: slot,
-            }),
+            },
         );
     }
 }

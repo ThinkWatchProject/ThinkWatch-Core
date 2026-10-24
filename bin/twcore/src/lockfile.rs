@@ -4,8 +4,10 @@
 //! 会表现为启动失败，而错误信息必须能说清是这个原因 —— 否则用户会以为
 //! 自己电脑坏了。
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// 锁文件的名字。
+pub const LOCK_FILE: &str = "twcore.lock";
 
 #[derive(Debug)]
 pub struct LockFile {
@@ -27,7 +29,7 @@ impl LockFile {
     /// 尝试拿锁。发现陈旧的锁文件（进程已经没了）就接管它。
     pub fn acquire(dir: &Path) -> std::io::Result<LockOutcome> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join("twcore.lock");
+        let path = dir.join(LOCK_FILE);
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(pid) = text.trim().parse::<u32>()
             && pid != std::process::id()
@@ -46,7 +48,7 @@ impl LockFile {
     /// [`LockFile::disown`]）。
     pub fn claim(dir: &Path) -> std::io::Result<LockFile> {
         std::fs::create_dir_all(dir)?;
-        Self::write(dir.join("twcore.lock"))
+        Self::write(dir.join(LOCK_FILE))
     }
 
     /// 放弃锁：退出时不删文件（交接提交之后，文件里马上会是接替者的 pid）。
@@ -54,17 +56,26 @@ impl LockFile {
         self.owned = false;
     }
 
+    /// **先写临时文件再改名**：改名是原子的，读锁的那一方看到的要么是旧的、要么是新的，
+    /// 不会读到写了一半的（空的）—— 空的会被当成「上次没退干净」直接覆盖
     fn write(path: PathBuf) -> std::io::Result<LockFile> {
-        let mut f = std::fs::File::create(&path)?;
-        write!(f, "{}", std::process::id())?;
+        write_atomic(&path, std::process::id().to_string().as_bytes())?;
         Ok(LockFile { path, owned: true })
     }
 }
 
+/// 先写同目录下的临时文件，再改名盖过去。
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// 锁文件里此刻写的 pid（读不到、不是数字是 `None`）。
-#[cfg(test)]
 pub fn holder(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(dir.join("twcore.lock"))
+    std::fs::read_to_string(dir.join(LOCK_FILE))
         .ok()
         .and_then(|t| t.trim().parse().ok())
 }
@@ -74,9 +85,106 @@ impl Drop for LockFile {
         if !self.owned {
             return;
         }
+        let Some(dir) = self.path.parent() else {
+            return;
+        };
+        // **只删自己的**：文件里已经是别人的 pid（交接提交了、接替者写上了自己），删了它
+        // 下一个起来的就看不见锁
+        if holder(dir) != Some(std::process::id()) {
+            return;
+        }
+        // **还有前任在排空就不删**（它还在写请求库）：留下这个锁（进程没了就是陈旧的），
+        // 下一个起来的照常拿到锁，再从排空标记看见前任，等它退了才开库
+        if !draining(dir).is_empty() {
+            return;
+        }
         // 尽力而为。删不掉也无所谓 —— 下次启动的僵尸检测会认出它。
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+// ─────────────────────────────────────────────────────────── 排空中的前任
+
+/// 排空标记的文件名：交接之后还在排空的旧 core。
+pub const DRAINING_FILE: &str = "twcore.draining";
+
+/// 标记多老就不认了（旧 core 最多排空 30 分钟，加点余量）：pid 被系统回收给了别的进程时，
+/// 不至于一直等下去
+const DRAINING_STALE_MS: u64 = 35 * 60 * 1000;
+
+/// 一个交接之后还在排空的旧 core。
+///
+/// **为什么要记**：接替者在它排空完之前退出（关掉、崩溃、跟着父进程退）时，下一个起来的
+/// 看不见交接连接，只看得见锁。不记的话，它以为没有别人、马上开请求库 —— 和还在写库的旧 core
+/// 一起写，请求号互相覆盖。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Draining {
+    pub pid: u32,
+    /// 它（和它之前的）用的请求号都在这之下
+    pub ids_below: u64,
+    /// 记下的时刻，Unix 毫秒
+    pub since_ms: u64,
+}
+
+impl Draining {
+    /// 此刻记下的
+    pub fn new(pid: u32, ids_below: u64) -> Self {
+        Self {
+            pid,
+            ids_below,
+            since_ms: now_ms(),
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn read_draining(dir: &Path) -> Vec<Draining> {
+    std::fs::read(dir.join(DRAINING_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// 此刻还在排空的前任（进程活着、标记不太老）。
+pub fn draining(dir: &Path) -> Vec<Draining> {
+    let now = now_ms();
+    read_draining(dir)
+        .into_iter()
+        .filter(|d| d.pid != std::process::id())
+        .filter(|d| now.saturating_sub(d.since_ms) < DRAINING_STALE_MS && crate::proc::alive(d.pid))
+        .collect()
+}
+
+/// 记下一个刚交出去、开始排空的前任（同一个 pid 的旧记录换掉）。不在了的顺手清掉
+pub fn mark_draining(dir: &Path, d: Draining) -> std::io::Result<()> {
+    let mut all = draining(dir);
+    all.retain(|x| x.pid != d.pid);
+    all.push(d);
+    write_draining(dir, &all)
+}
+
+/// 清掉已经不在了的。一个都不剩就删文件
+pub fn prune_draining(dir: &Path) {
+    let all = draining(dir);
+    let _ = write_draining(dir, &all);
+}
+
+fn write_draining(dir: &Path, all: &[Draining]) -> std::io::Result<()> {
+    let path = dir.join(DRAINING_FILE);
+    if all.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let bytes = serde_json::to_vec(all).map_err(std::io::Error::other)?;
+    write_atomic(&path, &bytes)
 }
 
 #[cfg(test)]
@@ -168,7 +276,7 @@ mod tests {
     fn a_disowned_lock_leaves_the_file_for_the_successor() {
         // 交接提交之后旧 core 放弃锁：它退出时文件里写的已经是接替者，不能删
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("twcore.lock");
+        let p = d.path().join(LOCK_FILE);
         let LockOutcome::Acquired(l) = LockFile::acquire(d.path()).unwrap() else {
             panic!("应该拿到锁");
         };
@@ -186,12 +294,79 @@ mod tests {
         let _ = child.wait();
         let _l = claimed.unwrap();
         assert_eq!(holder(d.path()), Some(std::process::id()));
+        // 先写临时文件再改名：临时文件不留下
+        let left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_lock_rewritten_by_someone_else_is_not_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(LOCK_FILE);
+        let LockOutcome::Acquired(l) = LockFile::acquire(d.path()).unwrap() else {
+            panic!("应该拿到锁");
+        };
+        // 交接提交了、接替者写上了它自己
+        std::fs::write(&p, "4242").unwrap();
+        drop(l);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "4242", "删了别人的锁");
+    }
+
+    #[test]
+    fn a_lock_is_kept_while_a_predecessor_is_still_draining() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(LOCK_FILE);
+        let mut child = sleeping_child();
+        mark_draining(d.path(), Draining::new(child.id(), 123)).unwrap();
+        let LockOutcome::Acquired(l) = LockFile::acquire(d.path()).unwrap() else {
+            panic!("应该拿到锁");
+        };
+        drop(l);
+        let kept = p.exists();
+        let seen = draining(d.path());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(kept, "前任还在排空，锁被删了");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].ids_below, 123);
+        // 前任没了：标记清掉，锁照常删
+        prune_draining(d.path());
+        assert!(!d.path().join(DRAINING_FILE).exists());
+        let LockOutcome::Acquired(l) = LockFile::acquire(d.path()).unwrap() else {
+            panic!("应该拿到锁");
+        };
+        drop(l);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn dead_or_stale_draining_marks_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let dead = {
+            let mut c = sleeping_child();
+            let pid = c.id();
+            c.kill().unwrap();
+            c.wait().unwrap();
+            pid
+        };
+        mark_draining(d.path(), Draining::new(dead, 1)).unwrap();
+        assert!(draining(d.path()).is_empty(), "进程没了还算在排空");
+        let mut old = Draining::new(std::process::id() + 1, 1);
+        old.pid = 1; // 一个一定活着、又不是我们的进程
+        old.since_ms = 0;
+        mark_draining(d.path(), old).unwrap();
+        assert!(draining(d.path()).is_empty(), "很久以前的标记还在算");
     }
 
     #[test]
     fn dropping_the_lock_removes_the_file() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("twcore.lock");
+        let p = d.path().join(LOCK_FILE);
         {
             let _l = LockFile::acquire(d.path()).unwrap();
             assert!(p.exists());

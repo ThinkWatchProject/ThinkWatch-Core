@@ -70,17 +70,27 @@ pub fn open_now(dir: &Path, w: Wiring) -> Option<Store> {
     Some(recorder)
 }
 
-/// 接替者：旧 core（`predecessor`）的进程没了才打开请求库，之间的记录排队。
+/// 接替者：旧 core（`predecessors`，交接链上可能不止一个）的进程都没了才打开请求库，之间的
+/// 记录排队。
 ///
 /// 交出去的是占位的那一份（内存库）；打开之后**原地换成真的**，控制面拿着的还是同一个
-/// `Arc`。`on_open` 在真的库打开、排队的记录写进去之前调一次（密钥用量从记录重建，和
-/// 平常启动时同一个时机：在这个进程自己的记录进库之前）。返回的 `watch` 在打开之后
-/// （或者打开失败、不再等之后）变成 `true`。
+/// `Arc`。返回的 `watch` 在打开之后（或者打开失败、不再等之后）变成 `true`。
+///
+/// # 排队期间的结算
+///
+/// 用量上限要靠「记下一行就结算」（`settled`）把预留换成实数；不结算的预留过一会儿会被当成
+/// 走丢的放掉，这一期的用量里就少了这个进程自己的请求。所以**占位的那一份照样结算**：事件
+/// 先交给它（它记进内存库、按同一套价目表算钱、调同一个结算），再排进队列。
+///
+/// 真的库打开时**不重复算**：排着的事件交给一份**不结算、不报价钱**的新记录器写进库，写完
+/// 再从库里重建用量（`on_open`，库里这时有旧 core 的和这边排着的全部），最后才给它接上结算
+/// 和总线。重建是换掉而不是加上，排队期间结算进内存的那些被库里的同一批行换掉，一笔不多。
 pub fn open_later(
     dir: &Path,
     w: Wiring,
-    predecessor: u32,
+    predecessors: Vec<u32>,
     on_open: Box<dyn FnOnce(&tw_store::Db) + Send>,
+    pending: Pending,
 ) -> (Option<Store>, watch::Receiver<bool>) {
     let (opened_tx, opened) = watch::channel(false);
     let Some(mut events) = w.bus.record_feed() else {
@@ -95,7 +105,9 @@ pub fn open_later(
             db,
             tw_store::Blobs::new(dir.join("blobs")),
             w.pricing.clone(),
-        ),
+        )
+        .reporting_to(w.bus.clone())
+        .settling_to(w.settled.clone()),
         Err(e) => {
             tracing::warn!(
                 "request recording could not start, so nothing is recorded this run; forwarding is unaffected: {e}"
@@ -114,27 +126,22 @@ pub fn open_later(
         .name("tw-recorder".into())
         .spawn(move || {
             let mut queue = Queue::default();
-            wait_for_exit(predecessor, &mut events, &mut queue);
+            wait_for_exit(&predecessors, &mut events, &mut queue, &shared, &pending);
             let (db, blobs) = match tw_store::open(&dir) {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(
                         "request recording could not start, so nothing is recorded this run; forwarding is unaffected: {e}"
                     );
+                    pending.set(0);
                     opened_tx.send_replace(true);
-                    // 通道要有人收，否则总线那一头一直记「丢了」
-                    while events.blocking_recv().is_some() {}
+                    // 通道要有人收，否则总线那一头一直记「丢了」。占位的那一份照样结算
+                    record_loop(&shared, &mut events);
                     return;
                 }
             };
             resume_ids(&w.bus, &db);
-            on_open(&db);
             let blobs_root = blobs.root().to_path_buf();
-            *shared.blocking_lock() = tw_store::Recorder::new(db, blobs, w.pricing)
-                .reporting_to(w.bus)
-                .settling_to(w.settled);
-            spawn_body_writer(blobs_root, body_rx);
-            tw_store::task::record_plugin_runs(shared.clone(), run_rx);
             let (n, dropped) = (queue.len(), queue.dropped);
             if dropped > 0 {
                 tracing::warn!(
@@ -142,12 +149,18 @@ pub fn open_later(
                     "the request records queued while the previous core drained overflowed; the oldest {dropped} events were not recorded"
                 );
             }
-            {
-                let mut g = shared.blocking_lock();
-                for ev in queue.drain() {
-                    g.on_event(&ev);
-                }
+            // 排着的写进库：**不结算、不报价钱**（占位的那一份已经做过了）
+            let mut real = tw_store::Recorder::new(db, blobs, w.pricing);
+            for ev in queue.drain() {
+                real.on_event(&ev);
             }
+            // 用量以库为准：旧 core 的、这边排着的都在里面了
+            on_open(real.db());
+            let real = real.reporting_to(w.bus).settling_to(w.settled);
+            *shared.blocking_lock() = real;
+            pending.set(0);
+            spawn_body_writer(blobs_root, body_rx);
+            tw_store::task::record_plugin_runs(shared.clone(), run_rx);
             tracing::info!(queued = n, "the previous core has exited; request recording is open");
             opened_tx.send_replace(true);
             record_loop(&shared, &mut events);
@@ -159,26 +172,58 @@ pub fn open_later(
     (Some(store), opened)
 }
 
+/// 还排着、没进库的记录有几条（事件数）。**进程在库打开之前退出时**照它说一声丢了多少：
+/// 前任还在写库，这时候不能开库
+#[derive(Clone, Default)]
+pub struct Pending(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Pending {
+    pub fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set(&self, n: usize) {
+        self.0.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// 旧 core 最多排空这么久（`handover::DRAIN_LIMIT` 加一点余量）。到了还没退，照样打开
 const PREDECESSOR_WAIT: Duration = Duration::from_secs(35 * 60);
 
-/// 等旧 core 的进程没了，之间把记录收进队列。
-fn wait_for_exit(pid: u32, events: &mut tw_observe::RecordFeed, queue: &mut Queue) {
+/// 等前任的进程都没了，之间把记录交给占位的那一份（结算）、收进队列。
+fn wait_for_exit(
+    pids: &[u32],
+    events: &mut tw_observe::RecordFeed,
+    queue: &mut Queue,
+    placeholder: &Store,
+    pending: &Pending,
+) {
     let started = Instant::now();
     let mut last_check = Instant::now() - Duration::from_secs(1);
     loop {
+        let mut got = Vec::new();
         while let Some(ev) = events.try_recv() {
+            got.push(ev);
+        }
+        if !got.is_empty() {
+            let mut g = placeholder.blocking_lock();
+            for ev in &got {
+                g.on_event(ev);
+            }
+        }
+        for ev in got {
             queue.push(ev);
         }
         queue.dropped += events.take_dropped();
+        pending.set(queue.len());
         if last_check.elapsed() >= Duration::from_millis(500) {
             last_check = Instant::now();
-            if !crate::proc::alive(pid) {
+            if pids.iter().all(|p| !crate::proc::alive(*p)) {
                 return;
             }
             if started.elapsed() >= PREDECESSOR_WAIT {
                 tracing::warn!(
-                    pid,
+                    ?pids,
                     "the previous core is still running long past its drain limit; opening the request history anyway"
                 );
                 return;

@@ -385,8 +385,12 @@ impl Cache {
     }
 
     /// 交接：接进旧 core 手里的 token。这里的配置认得它才接：生成它的那份配置和这里的一样，
-    /// 或者它手里的 refresh 就是这里配置里的（轮换之后写回了）。这里已经有的那一家不动。
-    /// `lag_ms` 是快照导出到现在过了多久
+    /// 或者它手里的 refresh 就是这里配置里的（轮换之后写回了）。`lag_ms` 是快照导出到现在
+    /// 过了多久。
+    ///
+    /// **这里已经有的那一家换掉**：提交之前续期归旧 core（这边暂停着），旧 core 手里的才是
+    /// 准的。快照会来两份（交出监听之前再导出一次，那时旧 core 已经暂停续期），后一份要盖掉
+    /// 前一份；这边从配置里读进来的那个也一样
     pub(crate) fn handover_import(
         &self,
         entries: Vec<crate::handover::wire::OauthEntry>,
@@ -404,9 +408,7 @@ impl Cache {
             else {
                 continue;
             };
-            if (e.cfg != config_digest(cfg) && e.refresh != cfg.refresh)
-                || g.contains_key(&e.upstream)
-            {
+            if e.cfg != config_digest(cfg) && e.refresh != cfg.refresh {
                 continue;
             }
             let after = |ms: u64| now + Duration::from_millis(ms).saturating_sub(lag);
@@ -490,6 +492,30 @@ impl Cache {
     /// —— 比把整个登录弄丢好得多，而这只发生在令牌恰好在交接那几十秒里到期的时候
     pub fn hold_renewals(&self, hold: bool) {
         self.held.store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 暂停续期，**并等正在换的那几家换完**：每家的刷新锁都拿一下再放。暂停之后进来的
+    /// 换不了（拿到锁时看见暂停着），暂停之前已经在换的拿着锁 —— 等它回来，它换到的
+    /// access token 和新 refresh token 才在手里、才交得出去。最多等 `within`
+    pub async fn hold_renewals_settled(&self, within: Duration) {
+        self.hold_renewals(true);
+        let flights: Vec<Arc<tokio::sync::Mutex<()>>> = self
+            .flights
+            .lock()
+            .expect("lock not poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let all = async {
+            for f in flights {
+                drop(f.lock().await);
+            }
+        };
+        if tokio::time::timeout(within, all).await.is_err() {
+            tracing::warn!(
+                "a sign-in token renewal was still running when renewals were paused for the handover"
+            );
+        }
     }
 
     /// 真的去换。**调用方持有这家的刷新锁**，所以这里不会有并发的第二次。
