@@ -97,12 +97,22 @@ pub fn apply_set(
     }
     let mut v = before.clone();
     set_params(&mut v, set, client);
-    match crate::splice::rewrite(body, &before, &v) {
+    rewritten(body, &before, &v)
+}
+
+/// 请求体 `body`（解出来是 `before`）改成了 `after`：只动改了的那几个字段，别的字节一个不动
+/// （见 [`crate::splice`]）。一样的原样交回
+pub(crate) fn rewritten(
+    body: &Bytes,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Bytes {
+    match crate::splice::rewrite(body, before, after) {
         crate::splice::Rewrite::Changed(b) => return Bytes::from(b),
         crate::splice::Rewrite::Same => return body.clone(),
         crate::splice::Rewrite::Unusual => {}
     }
-    match serde_json::to_vec(&v) {
+    match serde_json::to_vec(after) {
         Ok(b) => Bytes::from(b),
         // 序列化不该失败，但真失败了宁可发原文也不要发半个 body
         Err(e) => {

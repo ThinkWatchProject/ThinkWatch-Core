@@ -1089,6 +1089,10 @@ routes:
 
 `set.model` 可以写别名，每家上游收到各自对它的叫法。和别名一样，回答里的模型名写成客户端请求的名称。
 
+`set.reasoning` 按客户端的格式写推理强度：`output_config.effort`、`reasoning_effort`、`reasoning.effort`、Gemini 的 `thinkingLevel`；客户端给的是思考预算时改预算。
+
+上游因为推理强度回 400 时（无论这一档是客户端写的还是规则改的），请求在同一家上游再发一次：改用上游原话里列出的、离原来那一档最近的一档，原话给了上限的用上限，一档都没列的去掉推理强度。重发在请求详情里是新的一跳，不算重试。重发成功后，这一档按上游和模型记 7 天，存在数据目录的 `effort-memory.json` 里，之后的请求直接发可用的那一档。上游的地址、密钥或协议变了，或者上游被删除，它的记录随之作废。
+
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
 
