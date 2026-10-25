@@ -1502,12 +1502,16 @@ it. Answers carry the name the client asked for, as with aliases.
 
 `set.reasoning` writes the effort where the client's format keeps it
 (`output_config.effort`, `reasoning_effort`, `reasoning.effort`, Gemini's
-`thinkingLevel`, or the thinking budget when the client gave a budget).
+`thinkingLevel`, or the thinking budget when the client gave a budget). A
+request converted for an upstream of another format carries it the way that
+format writes it: `off` sent to an OpenAI Chat or Responses upstream is
+`none` there, and sent to Gemini 2.5 Flash it is a thinking budget of 0.
 
 When an upstream answers 400 because of the reasoning effort, whether the
 client or a rule chose it, the request is sent once more to the same upstream
 with a level the upstream named (the nearest one, or the ceiling it gave), or
-without an effort when it named none. The resend is a new attempt in the
+without an effort when it named none. A refused `none` is replaced by the
+lowest level the upstream named, so reasoning stays as low as it allows. The resend is a new attempt in the
 request details and does not count as a retry. If it succeeds, the level is
 remembered for that upstream and model for 7 days in `effort-memory.json` in
 the data directory, so later requests send the working level directly. The

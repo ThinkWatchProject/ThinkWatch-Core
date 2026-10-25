@@ -199,8 +199,10 @@ pub fn set_model(dialect: Dialect, body: &mut Value, model: &str) {
 /// **OpenAI 的两种格式写 `none`，不是去掉**：GPT-5 这类模型没写强度时按默认的那一档想，去掉
 /// 等于没关。Chat 的 `reasoning_effort`、Responses 的 `reasoning.effort`（连同对话中途的
 /// `configuration_update`）写成 `none`；Chat 里 DeepSeek、GLM、Kimi 那种 `thinking.type: enabled`
-/// 的开关整个去掉，连同强度。上游不认 `none` 的由网关去掉再发（见
-/// [`think::none_rejection`]）
+/// 的开关整个去掉，连同强度。上游不认 `none` 的由网关改成它认的最低一档再发，没说认哪几档的去掉
+/// 再发（见 [`think::none_fix`]）。
+///
+/// 转换过格式的请求在转换出来的那一份上写 `none`，见 [`write_reasoning_none`]
 pub fn disable_thinking(dialect: Dialect, body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -252,6 +254,37 @@ pub fn disable_thinking(dialect: Dialect, body: &mut Value) {
                 remove_output_effort(f);
             }
         }
+    }
+}
+
+/// 写明 OpenAI 的 `none`（关掉推理）：Chat 的 `reasoning_effort`、Responses 的 `reasoning.effort`
+/// （连同对话中途的 `configuration_update`），没写的补上。别的格式没有 `none`，什么都不做。返回
+/// 改没改。
+///
+/// 给转换过格式的请求用：客户端那一份开着推理、要关掉时，去掉推理配置之后转换出来的那一份不带
+/// 强度，GPT-5 这类模型没写强度时按默认的那一档想，等于没关。同格式的请求用 [`disable_thinking`]
+pub fn write_reasoning_none(dialect: Dialect, body: &mut Value) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    match dialect {
+        Dialect::Chat => put(obj, "reasoning_effort", "none"),
+        Dialect::Responses => {
+            let mut changed = match obj.get_mut("reasoning") {
+                Some(Value::Object(r)) => put(r, "effort", "none"),
+                _ => {
+                    obj.insert("reasoning".into(), serde_json::json!({ "effort": "none" }));
+                    true
+                }
+            };
+            for r in responses_updates(obj) {
+                if r.contains_key("effort") {
+                    changed |= put(r, "effort", "none");
+                }
+            }
+            changed
+        }
+        Dialect::Anthropic | Dialect::Gemini | Dialect::Bedrock => false,
     }
 }
 
@@ -1220,6 +1253,33 @@ mod tests {
             v,
             json!({"reasoning": {"summary": "auto", "effort": "none"}})
         );
+    }
+
+    /// 转换出来的那一份：没写强度的补上 `none`
+    #[test]
+    fn writing_none_fills_in_the_openai_effort() {
+        let mut v = json!({"model": "m"});
+        assert!(write_reasoning_none(Dialect::Chat, &mut v));
+        assert_eq!(v, json!({"model": "m", "reasoning_effort": "none"}));
+        assert!(!write_reasoning_none(Dialect::Chat, &mut v));
+        let mut v = json!({"reasoning_effort": "high"});
+        assert!(write_reasoning_none(Dialect::Chat, &mut v));
+        assert_eq!(written_effort(Dialect::Chat, &v), Some(WrittenEffort::Off));
+        let mut v = json!({"model": "m"});
+        assert!(write_reasoning_none(Dialect::Responses, &mut v));
+        assert_eq!(v, json!({"model": "m", "reasoning": {"effort": "none"}}));
+        let mut v = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        assert!(write_reasoning_none(Dialect::Responses, &mut v));
+        assert_eq!(
+            v,
+            json!({"reasoning": {"effort": "none", "summary": "auto"}})
+        );
+        assert!(!reasoning_on(Dialect::Responses, &v));
+        for d in [Dialect::Anthropic, Dialect::Gemini, Dialect::Bedrock] {
+            let mut v = json!({"model": "m"});
+            assert!(!write_reasoning_none(d, &mut v));
+            assert_eq!(v, json!({"model": "m"}));
+        }
     }
 
     #[test]
