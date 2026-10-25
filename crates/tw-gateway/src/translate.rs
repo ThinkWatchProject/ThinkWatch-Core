@@ -49,24 +49,59 @@ pub fn required_headers(target: Dialect) -> &'static [(&'static str, &'static st
     }
 }
 
-/// 规则里的参数改写，改在中间表示上：转换出去的请求四种格式一样生效。
-pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction) {
+/// 规则里的参数改写，改在中间表示上：转换出去的请求四种格式一样生效。`target` 是要转成的格式。
+///
+/// 返回推理是不是这里关掉的：是的话，转成 OpenAI 的两种格式之后还要在转换出来的那一份上写明
+/// `none`（[`reasoning_off`]）
+pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction, target: Dialect) -> bool {
     if let Some(m) = &set.model {
         r.model = m.clone();
     }
     if let Some(t) = set.max_tokens {
         r.max_tokens = Some(t);
     }
-    // 和直通时一样只改开着推理的请求：关掉是去掉推理配置；改一档是改强度，预算跟着强度
-    // 由编码器折算（客户端写的预算不再作数）
+    // 和直通时一样只改开着推理的请求：改一档是改强度，预算跟着强度由编码器折算（客户端写的
+    // 预算不再作数），写成目标格式的那种写法
     match (set.reasoning, r.reasoning.as_mut()) {
-        (Some(tw_engine::SetReasoning::Off), Some(re)) if re.enabled => r.reasoning = None,
+        (Some(tw_engine::SetReasoning::Off), Some(re)) if re.enabled => {
+            // 关掉是去掉推理配置。Gemini 2.5 不写思考配置时照样想：写成明确关掉，编码器在关得掉的
+            // 模型上写预算 0，关不掉的照实报丢了。OpenAI 的两种格式没写强度时按默认的那一档想，
+            // 由调用方补上 `none`
+            if target == Dialect::Gemini {
+                *re = tw_dialect::ir::Reasoning {
+                    enabled: false,
+                    effort: None,
+                    budget: None,
+                    summary: false,
+                };
+            } else {
+                r.reasoning = None;
+            }
+            return true;
+        }
         (Some(tw_engine::SetReasoning::Level(e)), Some(re)) if re.enabled => {
             re.effort = Some(e);
             re.budget = None;
         }
         _ => {}
     }
+    false
+}
+
+/// 规则关掉了推理（[`apply_set`]）、转换出来的这一份（`target` 格式）：OpenAI 的两种格式写明
+/// `none`（[`tw_dialect::params::write_reasoning_none`]），别的格式原样交回。不写的话转换出来的这
+/// 一份不带强度，GPT-5 这类模型按默认的那一档想，等于没关
+pub fn reasoning_off(target: Dialect, body: Vec<u8>) -> Vec<u8> {
+    if !matches!(target, Dialect::Chat | Dialect::Responses) {
+        return body;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if !tw_dialect::params::write_reasoning_none(target, &mut v) {
+        return body;
+    }
+    serde_json::to_vec(&v).unwrap_or(body)
 }
 
 /// 客户端没写最大输出、目标格式又必须写（Anthropic）时用多少。

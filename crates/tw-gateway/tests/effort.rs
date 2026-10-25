@@ -614,9 +614,10 @@ routes:
 }
 
 /// `off` 在 OpenAI 的格式里写 `none`（去掉的话 GPT-5 这类按默认的那一档想）；上游不认 `none`
-/// 的去掉再发，记下来，往后直接去掉
+/// 的改用它列出的最低一档再发（去掉的话按默认的 medium 想，反倒想得更多），记下来，往后直接发
+/// 那一档。一档都没列的去掉再发
 #[tokio::test]
-async fn off_writes_none_and_an_upstream_that_refuses_it_gets_the_field_removed() {
+async fn off_writes_none_and_an_upstream_that_refuses_it_gets_its_lowest_level() {
     let refusal = json!({"error": {"message": "Unsupported value: 'none' is not supported with this model for reasoning_effort. Supported values are: 'low', 'medium', and 'high'.",
         "type": "invalid_request_error", "param": "reasoning_effort", "code": "unsupported_value"}});
     let (up, seen) = upstream(vec![(400, refusal), (200, chat_ok())]).await;
@@ -631,7 +632,7 @@ async fn off_writes_none_and_an_upstream_that_refuses_it_gets_the_field_removed(
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0]["reasoning_effort"], "none");
-        assert!(seen[1].get("reasoning_effort").is_none(), "{}", seen[1]);
+        assert_eq!(seen[1]["reasoning_effort"], "low");
     }
     let chain = attempts(&mut gw.rx).await;
     assert_eq!(
@@ -640,12 +641,191 @@ async fn off_writes_none_and_an_upstream_that_refuses_it_gets_the_field_removed(
     );
     assert_eq!(
         chain[1].effort,
-        change("none", None, tw_api::EffortReason::Rejected)
+        change("none", Some("low"), tw_api::EffortReason::Rejected)
     );
     post(&gw, "/v1/chat/completions", ask).await;
-    assert!(seen.lock().unwrap()[2].get("reasoning_effort").is_none());
+    assert_eq!(seen.lock().unwrap()[2]["reasoning_effort"], "low");
     assert_eq!(
         attempts(&mut gw.rx).await[0].effort,
-        change("none", None, tw_api::EffortReason::Remembered)
+        change("none", Some("low"), tw_api::EffortReason::Remembered)
+    );
+
+    // 没列档位的：去掉再发
+    let refusal = json!({"error": {"message": "reasoning_effort 'none' is not supported by this model",
+        "type": "invalid_request_error"}});
+    let (up, seen) = upstream(vec![(400, refusal), (200, chat_ok())]).await;
+    let mut gw = gateway(config(up, "openai-chat", rules), None).await;
+    let ask = json!({"model": "o3-mini", "reasoning_effort": "high",
+                     "messages": [{"role": "user", "content": "hi"}]});
+    let (status, body) = post(&gw, "/v1/chat/completions", ask).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(seen.lock().unwrap()[1].get("reasoning_effort").is_none());
+    assert_eq!(
+        attempts(&mut gw.rx).await[1].effort,
+        change("none", None, tw_api::EffortReason::Rejected)
+    );
+}
+
+fn responses_ok() -> Value {
+    json!({"id": "resp_1", "object": "response", "status": "completed", "model": "gpt-5",
+           "output": [{"type": "message", "role": "assistant",
+                       "content": [{"type": "output_text", "text": "好"}]}],
+           "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}})
+}
+
+fn gemini_ok() -> Value {
+    json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "好"}]},
+                           "finishReason": "STOP", "index": 0}],
+           "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}})
+}
+
+const OFF: &str = "      - { name: 别想, set: { reasoning: off } }
+      - { name: 兜底, to: relay }
+";
+
+const HIGH: &str = "      - { name: 想多点, set: { reasoning: high } }
+      - { name: 兜底, to: relay }
+";
+
+/// 跨格式的 `off`：Anthropic 的客户端发给 OpenAI Chat 的上游，转换出来的那一份写明 `none`。只去掉
+/// 推理配置的话转换出来的不带强度，上游按默认的那一档想。尝试链记的是真正发出去的 `none`；
+/// 上游不认 `none` 的照样改用最低一档再发
+#[tokio::test]
+async fn off_across_a_conversion_writes_none_in_the_upstream_format() {
+    let refusal = json!({"error": {"message": "Unsupported value: 'none' is not supported with this model for reasoning_effort. Supported values are: 'minimal', 'low', 'medium', and 'high'.",
+        "type": "invalid_request_error", "param": "reasoning_effort", "code": "unsupported_value"}});
+    let (up, seen) = upstream(vec![(200, chat_ok()), (400, refusal), (200, chat_ok())]).await;
+    let mut gw = gateway(config(up, "openai-chat", OFF), None).await;
+    let mut ask = claude("high");
+    ask["model"] = json!("gpt-5");
+    let (status, body) = post(&gw, "/v1/messages", ask.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(seen.lock().unwrap()[0]["reasoning_effort"], "none");
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("high", Some("none"), tw_api::EffortReason::Rule)
+    );
+    // 自适应、没写强度的也关：转换出来的那一份本来就不带强度
+    let mut adaptive = ask.clone();
+    adaptive.as_object_mut().unwrap().remove("output_config");
+    post(&gw, "/v1/messages", adaptive).await;
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1]["reasoning_effort"], "none");
+        assert_eq!(seen[2]["reasoning_effort"], "minimal");
+    }
+    let chain = attempts(&mut gw.rx).await;
+    assert_eq!(
+        chain[1].effort,
+        change("none", Some("minimal"), tw_api::EffortReason::Rejected)
+    );
+}
+
+/// 跨格式的 `off`，发给 Responses 的上游：`reasoning.effort` 写 `none`
+#[tokio::test]
+async fn off_across_a_conversion_to_responses_writes_none() {
+    let (up, seen) = upstream(vec![(200, responses_ok())]).await;
+    let mut gw = gateway(config(up, "openai-responses", OFF), None).await;
+    let mut ask = claude("high");
+    ask["model"] = json!("gpt-5");
+    let (status, body) = post(&gw, "/v1/messages", ask).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        seen.lock().unwrap()[0].pointer("/reasoning/effort"),
+        Some(&json!("none"))
+    );
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("high", Some("none"), tw_api::EffortReason::Rule)
+    );
+}
+
+/// 跨格式的 `off`，发给 Anthropic 的上游：不带思考配置和强度
+#[tokio::test]
+async fn off_across_a_conversion_to_anthropic_sends_no_thinking() {
+    let (up, seen) = upstream(vec![(200, anthropic_ok())]).await;
+    let mut gw = gateway(config(up, "anthropic", OFF), None).await;
+    let (status, body) = post(
+        &gw,
+        "/v1/chat/completions",
+        json!({"model": "claude-opus-4-6", "reasoning_effort": "high",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    {
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].get("thinking").is_none(), "{}", seen[0]);
+        assert!(seen[0].get("output_config").is_none(), "{}", seen[0]);
+    }
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("high", None, tw_api::EffortReason::Rule)
+    );
+}
+
+/// 跨格式的 `off`，发给 Gemini 2.5 Flash：不写思考配置时它照样想，写明预算 0
+#[tokio::test]
+async fn off_across_a_conversion_to_gemini_flash_writes_a_zero_budget() {
+    let (up, seen) = upstream(vec![(200, gemini_ok())]).await;
+    let mut gw = gateway(config(up, "gemini", OFF), None).await;
+    let mut ask = claude("high");
+    ask["model"] = json!("gemini-2.5-flash");
+    let (status, body) = post(&gw, "/v1/messages", ask).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        seen.lock().unwrap()[0].pointer("/generationConfig/thinkingConfig"),
+        Some(&json!({"thinkingBudget": 0}))
+    );
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("high", None, tw_api::EffortReason::Rule)
+    );
+}
+
+/// 跨格式改一档：写成上游那种格式的写法，尝试链记的是发出去的那一档
+#[tokio::test]
+async fn a_level_across_a_conversion_is_written_in_the_upstream_format() {
+    let mut ask = claude("low");
+    ask["model"] = json!("gpt-5");
+
+    let (up, seen) = upstream(vec![(200, chat_ok())]).await;
+    let mut gw = gateway(config(up, "openai-chat", HIGH), None).await;
+    post(&gw, "/v1/messages", ask.clone()).await;
+    assert_eq!(seen.lock().unwrap()[0]["reasoning_effort"], "high");
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("low", Some("high"), tw_api::EffortReason::Rule)
+    );
+
+    let (up, seen) = upstream(vec![(200, responses_ok())]).await;
+    let mut gw = gateway(config(up, "openai-responses", HIGH), None).await;
+    post(&gw, "/v1/messages", ask).await;
+    assert_eq!(
+        seen.lock().unwrap()[0].pointer("/reasoning/effort"),
+        Some(&json!("high"))
+    );
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("low", Some("high"), tw_api::EffortReason::Rule)
+    );
+
+    let (up, seen) = upstream(vec![(200, anthropic_ok())]).await;
+    let mut gw = gateway(config(up, "anthropic", HIGH), None).await;
+    post(
+        &gw,
+        "/v1/chat/completions",
+        json!({"model": "claude-opus-4-6", "reasoning_effort": "low",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(effort_of(&seen[0]), Some("high"));
+        assert_eq!(seen[0]["thinking"]["type"], "adaptive");
+    }
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("low", Some("high"), tw_api::EffortReason::Rule)
     );
 }
