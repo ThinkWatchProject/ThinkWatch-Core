@@ -664,7 +664,7 @@ fn create_reasoning(model: &str) -> WsMsg {
 }
 
 /// 规则的参数改写每一帧照 HTTP 那条路改（Responses 的字段名）：`set.max_tokens` 写成
-/// `max_output_tokens`，`set.reasoning: off` 去掉 `reasoning`。条件按这一帧求 —— 按模型附加的
+/// `max_output_tokens`，`set.reasoning: off` 把强度写成 `none`。条件按这一帧求 —— 按模型附加的
 /// 改写、按模型拒绝的规则，升级时还不知道模型，每一帧照样生效
 #[tokio::test]
 async fn rule_parameter_rewrites_and_model_conditions_apply_to_each_frame() {
@@ -695,7 +695,12 @@ async fn rule_parameter_rewrites_and_model_conditions_apply_to_each_frame() {
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen[1]["max_output_tokens"], 99, "{:?}", seen[1]);
-        assert!(seen[1].get("reasoning").is_none(), "{:?}", seen[1]);
+        assert_eq!(
+            seen[1]["reasoning"],
+            json!({"effort": "none"}),
+            "{:?}",
+            seen[1]
+        );
         assert_eq!(seen[1]["model"], "gpt-5.1-codex-max");
     }
 

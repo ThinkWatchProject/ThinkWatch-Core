@@ -1512,7 +1512,10 @@ request details and does not count as a retry. If it succeeds, the level is
 remembered for that upstream and model for 7 days in `effort-memory.json` in
 the data directory, so later requests send the working level directly. The
 entries of an upstream are forgotten when its address, key or protocol
-changes, or when it is removed.
+changes, or when it is removed. Requests that only give a thinking budget are
+not resent. On WebSocket connections (Codex), a turn refused for its effort is
+not resent and nothing is remembered: the refusal reaches the client as it
+is.
 
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
@@ -1521,7 +1524,7 @@ changes, or when it is removed.
 |---|---|---|---|
 | `model` | string | — | Send a different model. The prompt cache of the session is lost. |
 | `max_tokens` | integer | — | Replace `max_tokens`. |
-| `reasoning` | `off` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | — | Reasoning. `off` turns it off and removes the reasoning effort; a level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are. |
+| `reasoning` | `off` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | — | Reasoning. `off` turns it off: the reasoning settings and the effort are removed, and in the OpenAI formats the effort is set to `none`. A level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are. |
 | `only_at_session_start` | bool | `false` | Apply only when a session starts. Recorded and shown; not in effect yet. |
 <!-- /generated -->
 

@@ -651,7 +651,7 @@ impl AppState {
     /// 路径时调；目录变了就把插件重读一遍
     pub fn set_config_dir(&self, dir: std::path::PathBuf) {
         // 记着的推理强度也存在这个目录里（见 `crate::effort_memory`）
-        self.effort_memory.set_dir(dir.clone(), &self.config());
+        self.effort_memory.set_dir(dir.clone());
         if self.plugins.set_dir(dir) {
             self.reload_plugins();
         }

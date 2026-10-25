@@ -1906,8 +1906,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(set_reasonings),
                     Def::Unset,
                     t(
-                        "Reasoning. `off` turns it off and removes the reasoning effort; a level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are.",
-                        "推理。`off` 关闭推理，连同推理强度一起去掉；写一档则改为该档强度。只改写已开启推理的请求，未开启推理的请求（如生成标题）保持不变。",
+                        "Reasoning. `off` turns it off: the reasoning settings and the effort are removed, and in the OpenAI formats the effort is set to `none`. A level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are.",
+                        "推理。`off` 关闭推理：去掉推理设置和推理强度，OpenAI 的格式改为写 `none`。写一档则改为该档强度。只改写已开启推理的请求，未开启推理的请求（如生成标题）保持不变。",
                     ),
                 ),
                 row(

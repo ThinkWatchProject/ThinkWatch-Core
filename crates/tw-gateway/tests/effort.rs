@@ -291,11 +291,12 @@ async fn another_400_is_not_sent_again() {
     assert_eq!(chain[0].outcome, tw_api::AttemptOutcome::Served);
 }
 
-/// 原话里碰巧有发出去的那一档的名字（「max context length」）：照规矩重发一次，再被拒就把那个
+/// 原话里碰巧有发出去的那一档的名字（「max context length」），又说到了思考：照规矩重发一次，再被拒就把那个
 /// 错误交给客户端，**而且不记**：下一个请求照样发 max
 #[tokio::test]
 async fn a_resend_refused_again_is_handed_on_and_not_remembered() {
-    let reply = anthropic_error("prompt is too long: max context length exceeded");
+    let reply =
+        anthropic_error("prompt is too long for extended thinking: max context length exceeded");
     let (up, seen) = upstream(vec![(400, reply.clone())]).await;
     let mut gw = gateway(config(up, "anthropic", ""), None).await;
     let (status, body) = post(&gw, "/v1/messages", claude("max")).await;
@@ -314,7 +315,11 @@ async fn a_resend_refused_again_is_handed_on_and_not_remembered() {
         chain[1].effort,
         change("max", None, tw_api::EffortReason::Rejected)
     );
-    assert!(!gw.state.effort_memory.has("relay", "claude-opus-4-6"));
+    assert!(!gw.state.effort_memory.has(
+        "relay",
+        "claude-opus-4-6",
+        tw_dialect::ir::Dialect::Anthropic
+    ));
     post(&gw, "/v1/messages", claude("max")).await;
     let seen = seen.lock().unwrap();
     assert_eq!(effort_of(&seen[2]), Some("max"), "没有记住");
@@ -384,7 +389,8 @@ async fn a_level_set_by_a_rule_is_fixed_like_any_other() {
     );
     assert_eq!(
         chain[1].effort,
-        change("low", Some("max"), tw_api::EffortReason::Rejected)
+        change("xhigh", Some("max"), tw_api::EffortReason::Rejected),
+        "被拒的是规则改出来的 xhigh"
     );
 }
 
@@ -414,5 +420,232 @@ async fn a_converted_request_is_fixed_in_the_upstream_format() {
     assert_eq!(
         chain[1].effort,
         change("xhigh", Some("max"), tw_api::EffortReason::Rejected)
+    );
+}
+
+/// 关着思考、写着强度的请求（Anthropic 说「关着思考时不认 xhigh，用 high 或以下」）：按写着的
+/// 字段认，照样改一档重发
+#[tokio::test]
+async fn an_effort_written_with_thinking_off_is_fixed_too() {
+    let (up, seen) = upstream(vec![
+        (
+            400,
+            anthropic_error(
+                "output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.",
+            ),
+        ),
+        (200, anthropic_ok()),
+    ])
+    .await;
+    let mut gw = gateway(config(up, "anthropic", ""), None).await;
+    let mut body = claude("xhigh");
+    body["thinking"] = json!({"type": "disabled"});
+    let (status, text) = post(&gw, "/v1/messages", body).await;
+    assert_eq!(status, 200, "{text}");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(effort_of(&seen[1]), Some("high"));
+        assert_eq!(seen[1]["thinking"], json!({"type": "disabled"}));
+    }
+    let chain = attempts(&mut gw.rx).await;
+    assert_eq!(
+        chain[1].effort,
+        change("xhigh", Some("high"), tw_api::EffortReason::Rejected)
+    );
+}
+
+/// 记着的改法自己被拒了：那一条删掉，照新的原话再改一次，成了记新的；重发成了用的正是原来那一档
+/// 的（上游又认了）：删掉，往后照原样发
+#[tokio::test]
+async fn a_remembered_fix_that_is_refused_is_replaced_or_forgotten() {
+    let ceiling = anthropic_error(
+        "effort 'max' is not supported when thinking is disabled. Use effort 'high' or below.",
+    );
+    let back = anthropic_error("effort 'max' is not available for this model: use xhigh");
+    let (up, seen) = upstream(vec![
+        (400, anthropic_error(NOT_VALID)),
+        (200, anthropic_ok()),
+        (400, ceiling),
+        (200, anthropic_ok()),
+        (200, anthropic_ok()),
+    ])
+    .await;
+    let mut gw = gateway(config(up, "anthropic", ""), None).await;
+    let e = |i: usize| effort_of(&seen.lock().unwrap()[i]).map(str::to_string);
+    // 记下 xhigh → max
+    post(&gw, "/v1/messages", claude("xhigh")).await;
+    attempts(&mut gw.rx).await;
+    // max 自己被拒，上限 high：改记 xhigh → high
+    let (status, _) = post(&gw, "/v1/messages", claude("xhigh")).await;
+    assert_eq!(status, 200);
+    assert_eq!((e(2), e(3)), (Some("max".into()), Some("high".into())));
+    let chain = attempts(&mut gw.rx).await;
+    assert_eq!(
+        chain[0].effort,
+        change("xhigh", Some("max"), tw_api::EffortReason::Remembered)
+    );
+    assert_eq!(
+        chain[1].effort,
+        change("xhigh", Some("high"), tw_api::EffortReason::Rejected),
+        "asked 是改之前写明的那一档"
+    );
+    post(&gw, "/v1/messages", claude("xhigh")).await;
+    assert_eq!(e(4), Some("high".into()));
+    attempts(&mut gw.rx).await;
+
+    // 另一家：记着 xhigh → max，max 被拒、原话让用 xhigh，重发 xhigh 成了 —— 删掉
+    let (up, seen) = upstream(vec![
+        (400, anthropic_error(NOT_VALID)),
+        (200, anthropic_ok()),
+        (400, back),
+        (200, anthropic_ok()),
+    ])
+    .await;
+    let mut gw = gateway(config(up, "anthropic", ""), None).await;
+    let e = |i: usize| effort_of(&seen.lock().unwrap()[i]).map(str::to_string);
+    post(&gw, "/v1/messages", claude("xhigh")).await;
+    attempts(&mut gw.rx).await;
+    post(&gw, "/v1/messages", claude("xhigh")).await;
+    assert_eq!((e(2), e(3)), (Some("max".into()), Some("xhigh".into())));
+    attempts(&mut gw.rx).await;
+    assert!(!gw.state.effort_memory.has(
+        "relay",
+        "claude-opus-4-6",
+        tw_dialect::ir::Dialect::Anthropic
+    ));
+    post(&gw, "/v1/messages", claude("xhigh")).await;
+    assert_eq!(e(4), Some("xhigh".into()));
+}
+
+/// 只写了预算的请求没有写明的强度：上游的 400 说到了思考和档位名也不重发、不记
+#[tokio::test]
+async fn a_budget_only_request_is_not_an_effort_rejection() {
+    let reply = anthropic_error(
+        "thinking.budget_tokens: the max is lower for this model; use low, medium or high effort instead",
+    );
+    let (up, seen) = upstream(vec![(400, reply.clone()), (200, anthropic_ok())]).await;
+    let gw = gateway(config(up, "anthropic", ""), None).await;
+    let (status, _) = post(
+        &gw,
+        "/v1/messages",
+        json!({"model": "claude-sonnet-4-5", "max_tokens": 64000,
+               "thinking": {"type": "enabled", "budget_tokens": 50000},
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(!gw.state.effort_memory.has(
+        "relay",
+        "claude-sonnet-4-5",
+        tw_dialect::ir::Dialect::Anthropic
+    ));
+    // 记着这个模型不认 xhigh，预算折算出来正是 xhigh 的请求也不改：预算不是写明的强度
+    let p = gw.state.config().providers[0].clone();
+    gw.state.effort_memory.note(
+        &p,
+        "claude-sonnet-4-5",
+        tw_dialect::ir::Dialect::Anthropic,
+        tw_dialect::params::WrittenEffort::Level(tw_dialect::ir::Effort::XHigh),
+        tw_dialect::think::EffortFix::Use(tw_dialect::ir::Effort::Low),
+        tw_gateway::effort_memory::now_secs(),
+    );
+    post(
+        &gw,
+        "/v1/messages",
+        json!({"model": "claude-sonnet-4-5", "max_tokens": 64000,
+               "thinking": {"type": "enabled", "budget_tokens": 50000},
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(seen.lock().unwrap()[1]["thinking"]["budget_tokens"], 50000);
+}
+
+/// 重发马上发给同一家：排在它后面的候选一个都不碰，这家只许一个并发也不用等
+#[tokio::test]
+async fn the_resend_goes_to_the_same_upstream_at_once() {
+    let (up, seen) = upstream(vec![
+        (400, anthropic_error(NOT_VALID)),
+        (200, anthropic_ok()),
+    ])
+    .await;
+    let (backup, backup_seen) = upstream(vec![(200, anthropic_ok())]).await;
+    let cfg: tw_config::Config = serde_yaml_ng::from_str(&format!(
+        "version: 1
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: relay
+    base_url: http://{up}
+    key: sk-upstream
+    protocol: anthropic
+    max_concurrent: 1
+  - name: backup
+    base_url: http://{backup}
+    key: sk-backup
+    protocol: anthropic
+groups:
+  - name: both
+    type: fallback
+    providers: [relay, backup]
+routes:
+  - name: default
+    rules:
+      - {{ name: 兜底, to: both }}
+"
+    ))
+    .unwrap();
+    let mut gw = gateway(cfg, None).await;
+    let (status, body) = post(&gw, "/v1/messages", claude("xhigh")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(backup_seen.lock().unwrap().is_empty());
+    let chain = attempts(&mut gw.rx).await;
+    assert_eq!(
+        chain
+            .iter()
+            .map(|a| a.provider.as_str())
+            .collect::<Vec<_>>(),
+        ["relay", "relay"]
+    );
+    assert_eq!(chain[1].queued_ms, None, "没有排队");
+}
+
+/// `off` 在 OpenAI 的格式里写 `none`（去掉的话 GPT-5 这类按默认的那一档想）；上游不认 `none`
+/// 的去掉再发，记下来，往后直接去掉
+#[tokio::test]
+async fn off_writes_none_and_an_upstream_that_refuses_it_gets_the_field_removed() {
+    let refusal = json!({"error": {"message": "Unsupported value: 'none' is not supported with this model for reasoning_effort. Supported values are: 'low', 'medium', and 'high'.",
+        "type": "invalid_request_error", "param": "reasoning_effort", "code": "unsupported_value"}});
+    let (up, seen) = upstream(vec![(400, refusal), (200, chat_ok())]).await;
+    let rules = "      - { name: 别想, set: { reasoning: off } }
+      - { name: 兜底, to: relay }
+";
+    let mut gw = gateway(config(up, "openai-chat", rules), None).await;
+    let ask = json!({"model": "o3-mini", "reasoning_effort": "high",
+                     "messages": [{"role": "user", "content": "hi"}]});
+    let (status, body) = post(&gw, "/v1/chat/completions", ask.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["reasoning_effort"], "none");
+        assert!(seen[1].get("reasoning_effort").is_none(), "{}", seen[1]);
+    }
+    let chain = attempts(&mut gw.rx).await;
+    assert_eq!(
+        chain[0].effort,
+        change("high", Some("none"), tw_api::EffortReason::Rule)
+    );
+    assert_eq!(
+        chain[1].effort,
+        change("none", None, tw_api::EffortReason::Rejected)
+    );
+    post(&gw, "/v1/chat/completions", ask).await;
+    assert!(seen.lock().unwrap()[2].get("reasoning_effort").is_none());
+    assert_eq!(
+        attempts(&mut gw.rx).await[0].effort,
+        change("none", None, tw_api::EffortReason::Remembered)
     );
 }

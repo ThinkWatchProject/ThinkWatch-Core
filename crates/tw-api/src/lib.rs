@@ -2018,9 +2018,9 @@ pub struct AttemptView {
     /// 这一跳发出去之前退避了多少毫秒：一轮重试的头一跳带着。不算在 `ms` 里。别的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_ms: Option<u64>,
-    /// 这一跳发出去的推理强度和客户端要的不一样：规则改写的、上游拒收了改用别的一档重发的、
-    /// 记得这个模型不认那一档直接改了的（见 [`EffortChange`]）。一样的没有。被拒收的那一跳
-    /// 自己是一跳普通的 `status`（400），重发的那一跳带着 `rejected`
+    /// 这一跳改了推理强度：规则改写的、上游拒收了改用别的一档重发的、记得这个模型不认那一档直接
+    /// 改了的（见 [`EffortChange`]）。改了也和原来一样的没有。被拒收的那一跳自己是一跳普通的
+    /// `status`（400），重发的那一跳带着 `rejected`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortChange>,
     /// 这一跳走的代理：这家上游配置的代理名（跟随系统的是 `system`），直连是 None。没发出去
@@ -2030,13 +2030,17 @@ pub struct AttemptView {
     pub proxy: Option<String>,
 }
 
-/// 一跳发出去的推理强度和客户端要的不一样（[`AttemptView::effort`]）。
+/// 一跳改了推理强度（[`AttemptView::effort`]）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EffortChange {
-    /// 客户端要的那一档：`minimal` / `low` / `medium` / `high` / `xhigh` / `max`
+    /// 这一次改之前要发的那一档：`rule` 是客户端要的；`rejected`、`remembered` 是被拒收、被换掉的
+    /// 那一档（规则改过之后的）—— 客户端要 high、规则改成 xhigh、被拒后改用 max，这一项是
+    /// `xhigh`。词表：`none`（OpenAI 的「关掉推理」）/ `minimal` / `low` / `medium` / `high` /
+    /// `xhigh` / `max`
     pub asked: String,
-    /// 发出去的那一档，同一个词表。null 是去掉了推理强度，按模型的默认
+    /// 发出去的那一档，同一个词表（规则 `off` 在 OpenAI 的格式里是 `none`）。null 是去掉了推理
+    /// 强度，按模型的默认
     pub sent: Option<String>,
     pub reason: EffortReason,
 }
