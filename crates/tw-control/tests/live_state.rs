@@ -161,6 +161,7 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
                 pause_ms: None,
                 retry: None,
                 backoff_ms: None,
+                effort: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,

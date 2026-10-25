@@ -262,6 +262,9 @@ pub struct AppState {
     /// 哪些（上游，模型）拒过转换时自动标的提示缓存断点（见 [`crate::cache_marks`]）。
     /// **跨重载存活**
     pub cache_marks: Arc<crate::cache_marks::Refused>,
+    /// 哪些（上游，模型）不认哪一档推理强度、改用什么（见 [`crate::effort_memory`]）。
+    /// **跨重载存活**，存在数据目录里
+    pub effort_memory: Arc<crate::effort_memory::EffortMemory>,
     /// 脚本插件里跨重载存活的那一半：运行时、插件文件在哪儿、计数和日志、编译缓存
     /// （见 [`crate::plugin::Plugins`]）。跟着配置换的那一半在 `Runtime::plugins`
     pub plugins: Arc<crate::plugin::Plugins>,
@@ -367,6 +370,7 @@ impl AppState {
             balance: Default::default(),
             seals: Default::default(),
             cache_marks: Default::default(),
+            effort_memory: Default::default(),
             plugins,
             swap: Default::default(),
             ping_every: crate::PING_EVERY,
@@ -608,6 +612,8 @@ impl AppState {
         self.key_limits.configure(&next.config);
         self.upstream_limits.configure(&next.config);
         self.throttles.configure(&next.config);
+        // 删掉的、地址密钥协议变了的上游，记着的推理强度作废
+        self.effort_memory.reconcile(&next.config);
         self.rt.store(Arc::new(next));
         self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表
@@ -644,6 +650,8 @@ impl AppState {
     /// 告诉网关配置文件在哪个目录：**插件文件的路径相对它**。控制面拿到配置文件的
     /// 路径时调；目录变了就把插件重读一遍
     pub fn set_config_dir(&self, dir: std::path::PathBuf) {
+        // 记着的推理强度也存在这个目录里（见 `crate::effort_memory`）
+        self.effort_memory.set_dir(dir.clone());
         if self.plugins.set_dir(dir) {
             self.reload_plugins();
         }

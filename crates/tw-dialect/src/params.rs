@@ -13,7 +13,8 @@
 
 use serde_json::{Map, Value};
 
-use crate::ir::Dialect;
+use crate::ir::{Dialect, Effort};
+use crate::think;
 
 /// 客户端写的最大输出 token 数。没写（或者写的不是一个非负整数）是 `None`。
 pub fn max_output_tokens(dialect: Dialect, body: &Value) -> Option<u64> {
@@ -188,9 +189,18 @@ pub fn set_model(dialect: Dialect, body: &mut Value, model: &str) {
     }
 }
 
-/// 关掉推理：去掉开推理的那个字段。
+/// 关掉推理：去掉开推理的那个字段，连同推理强度。
 ///
 /// **只做「关掉」这一个方向**：开启要一个预算，而这一层没有一个说得过去的值可以编。
+/// Anthropic 的强度（`output_config.effort`）单独写在思考开关外面，只去掉开关的话自适应的
+/// 模型照样按那一档想，要一起去掉；`output_config` 去空了的整个去掉。Converse 的透传口袋里
+/// 同理。
+///
+/// **OpenAI 的两种格式写 `none`，不是去掉**：GPT-5 这类模型没写强度时按默认的那一档想，去掉
+/// 等于没关。Chat 的 `reasoning_effort`、Responses 的 `reasoning.effort`（连同对话中途的
+/// `configuration_update`）写成 `none`；Chat 里 DeepSeek、GLM、Kimi 那种 `thinking.type: enabled`
+/// 的开关整个去掉，连同强度。上游不认 `none` 的由网关去掉再发（见
+/// [`think::none_rejection`]）
 pub fn disable_thinking(dialect: Dialect, body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -198,12 +208,31 @@ pub fn disable_thinking(dialect: Dialect, body: &mut Value) {
     match dialect {
         Dialect::Anthropic => {
             obj.remove("thinking");
+            remove_output_effort(obj);
         }
+        // DeepSeek、GLM、Kimi 的 `thinking.type: enabled` 也是开关：只去掉强度的话推理照样开着
         Dialect::Chat => {
-            obj.remove("reasoning_effort");
+            if obj
+                .get("thinking")
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str)
+                == Some("enabled")
+            {
+                obj.remove("thinking");
+                obj.remove("reasoning_effort");
+            } else if obj.contains_key("reasoning_effort") {
+                put(obj, "reasoning_effort", "none");
+            }
         }
         Dialect::Responses => {
-            obj.remove("reasoning");
+            if let Some(Value::Object(r)) = obj.get_mut("reasoning") {
+                put(r, "effort", "none");
+            }
+            for r in responses_updates(obj) {
+                if r.contains_key("effort") {
+                    put(r, "effort", "none");
+                }
+            }
         }
         Dialect::Gemini => {
             for config in ["generationConfig", "generation_config"] {
@@ -220,9 +249,472 @@ pub fn disable_thinking(dialect: Dialect, body: &mut Value) {
                 .and_then(Value::as_object_mut)
             {
                 f.remove("thinking");
+                remove_output_effort(f);
             }
         }
     }
+}
+
+/// 去掉 `output_config.effort`；`output_config` 去空了的整个去掉。返回去没去掉
+fn remove_output_effort(holder: &mut Map<String, Value>) -> bool {
+    let Some(o) = holder
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let removed = o.remove("effort").is_some();
+    if o.is_empty() {
+        holder.remove("output_config");
+    }
+    removed
+}
+
+// ───────────────────────────────────────────────────────── 推理强度
+//
+// 「推理开着」和解码器的判据一样：Anthropic 的 `thinking.type` 是 `enabled` / `adaptive`，或者
+// 只写了 `output_config.effort`；Chat 的 `reasoning_effort` 不是 `none`，或者 GLM 那种
+// `thinking.type: enabled`；Responses 写了 `reasoning`、强度不是 `none`（对话中途的
+// `configuration_update` 最后一个说了算）；Gemini 写了 `thinkingConfig`、预算不是 0；Converse
+// 的透传口袋里和 Anthropic 一样。明确关掉的（`disabled`、`none`、预算 0）不算开着。
+//
+// 强度写在哪儿：Anthropic 是 `output_config.effort`，按预算思考的（`enabled` +
+// `budget_tokens`、没写强度）是预算；Chat 是 `reasoning_effort`；Responses 是
+// `reasoning.effort`；Gemini 写了等级的是 `thinkingLevel`、写了预算的是 `thinkingBudget`；
+// Converse 和 Anthropic 一样，在 `additionalModelRequestFields` 里。预算按
+// [`think::effort_of_budget`] 读成一档、按 [`think::budget_of_effort`] 写回去。
+//
+// **写明的强度**（[`written_effort`]）只算强度字段本身，不管推理开没开、不算预算：上游因为强度
+// 拒收时认的是发出去的那个字段 —— Anthropic「关着思考时不认 `xhigh`」那种 400，`thinking` 是
+// `disabled`、强度照样写着。改它、去掉它（[`replace_reasoning_effort`]、
+// [`remove_reasoning_effort`]）也按字段在不在，用来照上游的话重发。路由规则改推理按「推理开着」
+// 走（[`set_reasoning_effort`]、[`disable_thinking`]）。
+
+/// 请求体里写明的推理强度（[`written_effort`]）：一档，或者 OpenAI 的 `none`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WrittenEffort {
+    /// `none`：OpenAI 的「关掉推理」
+    Off,
+    Level(Effort),
+}
+
+impl WrittenEffort {
+    /// 写在请求体里的那个词，按 OpenAI 的写法：`none`、`minimal` … `max`
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Off => "none",
+            Self::Level(e) => think::openai(e),
+        }
+    }
+
+    /// 反过来。不认识的词是 `None`
+    pub fn parse(s: &str) -> Option<Self> {
+        think::parse_openai(s).map(|e| e.map_or(Self::Off, Self::Level))
+    }
+}
+
+/// 请求体里写明的推理强度：Anthropic 的 `output_config.effort`、Chat 的 `reasoning_effort`、
+/// Responses 的 `reasoning.effort`（对话中途的 `configuration_update` 最后一个说了算）、Gemini 的
+/// `thinkingLevel`、Converse 透传口袋里的 `output_config.effort`。**按字段在不在**，不看推理开没
+/// 开；只写了预算的不算。认不出的值是 `None`
+pub fn written_effort(dialect: Dialect, body: &Value) -> Option<WrittenEffort> {
+    let obj = body.as_object()?;
+    match dialect {
+        Dialect::Anthropic => output_effort(obj).map(WrittenEffort::Level),
+        Dialect::Chat => str_at(obj, "reasoning_effort").and_then(WrittenEffort::parse),
+        Dialect::Responses => responses_update(obj)
+            .or_else(|| obj.get("reasoning").and_then(|r| r.get("effort"))?.as_str())
+            .and_then(WrittenEffort::parse),
+        Dialect::Gemini => gemini_thinking(obj)
+            .and_then(|t| either_ref(t, "thinkingLevel", "thinking_level"))
+            .and_then(Value::as_str)
+            .and_then(think::parse_gemini_level)
+            .map(WrittenEffort::Level),
+        Dialect::Bedrock => obj
+            .get("additionalModelRequestFields")
+            .and_then(Value::as_object)
+            .and_then(output_effort)
+            .map(WrittenEffort::Level),
+    }
+}
+
+/// 把写明的推理强度（[`written_effort`]）改成 `e`：**只改已经写着的那个字段**，不看推理开没开，
+/// 不补字段、不碰预算。返回改没改
+pub fn replace_reasoning_effort(dialect: Dialect, body: &mut Value, e: Effort) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    let in_output = |holder: &mut Map<String, Value>| match holder
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+    {
+        Some(o) if o.contains_key("effort") => put(o, "effort", think::anthropic(e)),
+        _ => false,
+    };
+    match dialect {
+        Dialect::Anthropic => in_output(obj),
+        Dialect::Chat => {
+            obj.contains_key("reasoning_effort") && put(obj, "reasoning_effort", think::openai(e))
+        }
+        Dialect::Responses => {
+            let mut changed = match obj.get_mut("reasoning") {
+                Some(Value::Object(r)) if r.contains_key("effort") => {
+                    put(r, "effort", think::openai(e))
+                }
+                _ => false,
+            };
+            for r in responses_updates(obj) {
+                if r.contains_key("effort") {
+                    changed |= put(r, "effort", think::openai(e));
+                }
+            }
+            changed
+        }
+        Dialect::Gemini => match gemini_thinking_mut(obj) {
+            Some(t) => match key_of(t, "thinkingLevel", "thinking_level") {
+                Some(k) => put(t, k, think::gemini_level(e)),
+                None => false,
+            },
+            None => false,
+        },
+        Dialect::Bedrock => obj
+            .get_mut("additionalModelRequestFields")
+            .and_then(Value::as_object_mut)
+            .is_some_and(in_output),
+    }
+}
+
+/// 客户端开着推理吗（判据见上）
+pub fn reasoning_on(dialect: Dialect, body: &Value) -> bool {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    match dialect {
+        Dialect::Anthropic => claude_on(obj),
+        // 和解码器一样：`thinking` 说关掉的以它为准，`reasoning_effort` 认得出的看它，都没有再看
+        // `thinking` 是不是开着
+        Dialect::Chat => {
+            let switch = obj
+                .get("thinking")
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str);
+            match str_at(obj, "reasoning_effort").and_then(think::parse_openai) {
+                _ if switch == Some("disabled") => false,
+                Some(e) => e.is_some(),
+                None => switch == Some("enabled"),
+            }
+        }
+        Dialect::Responses => match responses_update(obj).and_then(think::parse_openai) {
+            Some(e) => e.is_some(),
+            None => obj
+                .get("reasoning")
+                .filter(|r| r.is_object())
+                .is_some_and(|r| r.get("effort").and_then(Value::as_str) != Some("none")),
+        },
+        Dialect::Gemini => gemini_thinking(obj).is_some_and(|t| {
+            either_ref(t, "thinkingBudget", "thinking_budget").and_then(Value::as_i64) != Some(0)
+        }),
+        Dialect::Bedrock => obj
+            .get("additionalModelRequestFields")
+            .and_then(Value::as_object)
+            .is_some_and(claude_on),
+    }
+}
+
+/// 客户端要的推理强度。推理没开、开着却没说强度（自适应的、Gemini 让模型自己定的）是 `None`
+pub fn reasoning_effort(dialect: Dialect, body: &Value) -> Option<Effort> {
+    if !reasoning_on(dialect, body) {
+        return None;
+    }
+    let obj = body.as_object()?;
+    match dialect {
+        Dialect::Anthropic => claude_effort(obj),
+        Dialect::Chat => str_at(obj, "reasoning_effort")
+            .and_then(think::parse_openai)
+            .flatten(),
+        Dialect::Responses => responses_update(obj)
+            .or_else(|| obj.get("reasoning").and_then(|r| r.get("effort"))?.as_str())
+            .and_then(think::parse_openai)
+            .flatten(),
+        Dialect::Gemini => {
+            let t = gemini_thinking(obj)?;
+            match either_ref(t, "thinkingLevel", "thinking_level").and_then(Value::as_str) {
+                Some(l) => think::parse_gemini_level(l),
+                None => either_ref(t, "thinkingBudget", "thinking_budget")
+                    .and_then(Value::as_i64)
+                    .filter(|b| *b > 0)
+                    .map(|b| think::effort_of_budget(b as u64)),
+            }
+        }
+        Dialect::Bedrock => obj
+            .get("additionalModelRequestFields")
+            .and_then(Value::as_object)
+            .and_then(claude_effort),
+    }
+}
+
+/// 把推理强度改成 `e`。**只改开着推理的请求**：没开的（生成标题这类辅助请求、明确关掉的）
+/// 原样不动，不替客户端打开推理。返回改没改。
+///
+/// 客户端写了强度的改强度；按预算思考的改预算（Anthropic 和 Converse 的预算还要小于最大输出，
+/// 压不到 1024 以上的不改）；Gemini 等级、预算都没写的（让模型自己定）不改 —— 不知道这个模型
+/// 认哪一个。Anthropic 自适应、没写强度的补上 `output_config.effort`。Responses 对话中途的
+/// `configuration_update` 一起改：最后一个盖过顶层的。
+///
+/// `model` 是发给上游的模型名，Gemini 的预算按它压在上限以内（[`think::gemini_budget_cap`]）：
+/// 超过了整个请求 400。Converse 没写最大输出（`inferenceConfig.maxTokens`）的不改预算：不知道
+/// 压到多少才合法
+pub fn set_reasoning_effort(dialect: Dialect, body: &mut Value, e: Effort, model: &str) -> bool {
+    if !reasoning_on(dialect, body) {
+        return false;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    match dialect {
+        Dialect::Anthropic => {
+            let max = obj.get("max_tokens").and_then(Value::as_u64);
+            set_claude_effort(obj, e, max, false)
+        }
+        Dialect::Chat => put(obj, "reasoning_effort", think::openai(e)),
+        Dialect::Responses => {
+            let mut changed = match obj.get_mut("reasoning") {
+                Some(Value::Object(r)) => put(r, "effort", think::openai(e)),
+                Some(_) => false,
+                None => {
+                    obj.insert("reasoning".into(), serde_json::json!({}));
+                    match obj.get_mut("reasoning") {
+                        Some(Value::Object(r)) => put(r, "effort", think::openai(e)),
+                        _ => false,
+                    }
+                }
+            };
+            for r in responses_updates(obj) {
+                if r.contains_key("effort") {
+                    changed |= put(r, "effort", think::openai(e));
+                }
+            }
+            changed
+        }
+        Dialect::Gemini => {
+            let Some(t) = gemini_thinking_mut(obj) else {
+                return false;
+            };
+            if let Some(k) = key_of(t, "thinkingLevel", "thinking_level") {
+                put(t, k, think::gemini_level(e))
+            } else if let Some(k) = key_of(t, "thinkingBudget", "thinking_budget") {
+                let budget = think::budget_of_effort(e).min(think::gemini_budget_cap(model));
+                let before = t.get(k).cloned();
+                t.insert(k.into(), Value::from(budget));
+                before.as_ref() != t.get(k)
+            } else {
+                false
+            }
+        }
+        Dialect::Bedrock => {
+            let max = obj
+                .get("inferenceConfig")
+                .and_then(|c| c.get("maxTokens"))
+                .and_then(Value::as_u64);
+            match obj
+                .get_mut("additionalModelRequestFields")
+                .and_then(Value::as_object_mut)
+            {
+                Some(f) => set_claude_effort(f, e, max, true),
+                None => false,
+            }
+        }
+    }
+}
+
+/// 去掉写明的推理强度（[`written_effort`]，`none` 也算），按模型的默认想。**按字段在不在**，不看
+/// 推理开没开；预算不动（按预算思考的 Anthropic 和 Converse 去掉预算整个请求不合法）。返回去没
+/// 去掉。
+///
+/// Responses 对话中途的 `configuration_update` 里的也去掉，只剩个空壳的整条去掉。
+pub fn remove_reasoning_effort(dialect: Dialect, body: &mut Value) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    match dialect {
+        Dialect::Anthropic => remove_output_effort(obj),
+        Dialect::Chat => obj.remove("reasoning_effort").is_some(),
+        Dialect::Responses => {
+            let mut removed = obj
+                .get_mut("reasoning")
+                .and_then(Value::as_object_mut)
+                .is_some_and(|r| r.remove("effort").is_some());
+            if let Some(Value::Array(items)) = obj.get_mut("input") {
+                let before = items.len();
+                for item in items.iter_mut() {
+                    if let Some(r) = update_reasoning(item) {
+                        removed |= r.remove("effort").is_some();
+                    }
+                }
+                // 只剩 `type`（和 `id`）的一条没有意思了
+                items.retain(|item| {
+                    !(is_update(item)
+                        && item
+                            .get("reasoning")
+                            .is_some_and(|r| r.as_object().is_some_and(Map::is_empty))
+                        && item.as_object().is_some_and(|o| {
+                            o.keys()
+                                .all(|k| matches!(k.as_str(), "type" | "id" | "reasoning"))
+                        }))
+                });
+                removed |= items.len() != before;
+            }
+            removed
+        }
+        Dialect::Gemini => {
+            let Some(t) = gemini_thinking_mut(obj) else {
+                return false;
+            };
+            let mut removed = false;
+            for k in ["thinkingLevel", "thinking_level"] {
+                removed |= t.remove(k).is_some();
+            }
+            removed
+        }
+        Dialect::Bedrock => obj
+            .get_mut("additionalModelRequestFields")
+            .and_then(Value::as_object_mut)
+            .is_some_and(remove_output_effort),
+    }
+}
+
+/// Anthropic（和 Converse 背后的 Claude）开着思考吗。`holder` 是装着 `thinking` 的那个对象
+fn claude_on(holder: &Map<String, Value>) -> bool {
+    match holder
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("enabled" | "adaptive") => true,
+        Some(_) => false,
+        None => output_effort(holder).is_some(),
+    }
+}
+
+fn output_effort(holder: &Map<String, Value>) -> Option<Effort> {
+    holder
+        .get("output_config")
+        .and_then(|o| o.get("effort"))
+        .and_then(Value::as_str)
+        .and_then(think::parse_anthropic)
+}
+
+/// 按预算思考的预算。`thinking.type` 是 `enabled` 才有
+fn claude_budget(holder: &Map<String, Value>) -> Option<u64> {
+    let t = holder.get("thinking")?;
+    (t.get("type").and_then(Value::as_str) == Some("enabled"))
+        .then(|| t.get("budget_tokens").and_then(Value::as_u64))
+        .flatten()
+}
+
+fn claude_effort(holder: &Map<String, Value>) -> Option<Effort> {
+    output_effort(holder).or_else(|| claude_budget(holder).map(think::effort_of_budget))
+}
+
+/// 见 [`set_reasoning_effort`]。`max` 是最大输出：预算要小于它。`need_max`：没写最大输出的不改预算
+fn set_claude_effort(
+    holder: &mut Map<String, Value>,
+    e: Effort,
+    max: Option<u64>,
+    need_max: bool,
+) -> bool {
+    /// Anthropic 允许的最小思考预算
+    const BUDGET_MIN: u64 = 1024;
+    let effort_written = holder
+        .get("output_config")
+        .is_some_and(|o| o.get("effort").is_some());
+    if !effort_written && let Some(before) = claude_budget(holder) {
+        if need_max && max.is_none() {
+            return false;
+        }
+        let budget = max.map_or(think::budget_of_effort(e), |m| {
+            think::budget_of_effort(e).min(m.saturating_sub(1))
+        });
+        if budget < BUDGET_MIN || budget == before {
+            return false;
+        }
+        if let Some(t) = holder.get_mut("thinking").and_then(Value::as_object_mut) {
+            t.insert("budget_tokens".into(), Value::from(budget));
+            return true;
+        }
+        return false;
+    }
+    match section(holder, "output_config") {
+        Some(o) => put(o, "effort", think::anthropic(e)),
+        None => false,
+    }
+}
+
+/// 把 `obj[key]` 写成字符串 `value`。返回值变没变
+fn put(obj: &mut Map<String, Value>, key: &str, value: &str) -> bool {
+    if obj.get(key).and_then(Value::as_str) == Some(value) {
+        return false;
+    }
+    obj.insert(key.into(), Value::String(value.to_string()));
+    true
+}
+
+fn str_at<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    obj.get(key).and_then(Value::as_str)
+}
+
+fn is_update(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("configuration_update")
+}
+
+/// 一条 `configuration_update` 里的 `reasoning`
+fn update_reasoning(item: &mut Value) -> Option<&mut Map<String, Value>> {
+    if !is_update(item) {
+        return None;
+    }
+    item.get_mut("reasoning").and_then(Value::as_object_mut)
+}
+
+/// Responses 对话中途最后一次改的推理强度（`input` 里最后一条带着强度的
+/// `configuration_update`），和解码器一样它盖过顶层的
+fn responses_update(obj: &Map<String, Value>) -> Option<&str> {
+    obj.get("input")?
+        .as_array()?
+        .iter()
+        .filter(|i| is_update(i))
+        .filter_map(|i| i.get("reasoning")?.get("effort")?.as_str())
+        .next_back()
+}
+
+/// 每一条 `configuration_update` 里的 `reasoning`
+fn responses_updates(obj: &mut Map<String, Value>) -> Vec<&mut Map<String, Value>> {
+    match obj.get_mut("input") {
+        Some(Value::Array(items)) => items.iter_mut().filter_map(update_reasoning).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Gemini 的思考配置：生成参数里的 `thinkingConfig`，两层都认下划线的写法（先认驼峰）
+fn gemini_thinking(obj: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    let g = either_ref(obj, "generationConfig", "generation_config")?;
+    either(g, "thinkingConfig", "thinking_config")?.as_object()
+}
+
+fn gemini_thinking_mut(obj: &mut Map<String, Value>) -> Option<&mut Map<String, Value>> {
+    let g = key_of(obj, "generationConfig", "generation_config")?;
+    let g = obj.get_mut(g)?.as_object_mut()?;
+    let t = key_of(g, "thinkingConfig", "thinking_config")?;
+    g.get_mut(t)?.as_object_mut()
+}
+
+/// [`either`] 的对象版
+fn either_ref<'a>(obj: &'a Map<String, Value>, camel: &str, snake: &str) -> Option<&'a Value> {
+    obj.get(camel).or_else(|| obj.get(snake))
+}
+
+/// 两个写法里客户端用的那一个键，先认驼峰
+fn key_of<'k>(obj: &Map<String, Value>, camel: &'k str, snake: &'k str) -> Option<&'k str> {
+    [camel, snake].into_iter().find(|k| obj.contains_key(*k))
 }
 
 /// Gemini 的一个字段：驼峰的在就是它，否则是下划线写法的
@@ -681,11 +1173,6 @@ mod tests {
                 Dialect::Anthropic,
                 json!({"thinking": {"type": "enabled"}, "x": 1}),
             ),
-            (Dialect::Chat, json!({"reasoning_effort": "high", "x": 1})),
-            (
-                Dialect::Responses,
-                json!({"reasoning": {"effort": "high"}, "x": 1}),
-            ),
             (
                 Dialect::Gemini,
                 json!({"generationConfig": {"thinkingConfig": {}}, "x": 1}),
@@ -704,5 +1191,578 @@ mod tests {
             );
             assert_eq!(v["x"], 1);
         }
+    }
+
+    /// OpenAI 的两种格式写 `none`：去掉的话 GPT-5 这类模型按默认的那一档想，等于没关
+    #[test]
+    fn turning_thinking_off_in_openai_formats_writes_none() {
+        let mut v = json!({"reasoning_effort": "high", "x": 1});
+        disable_thinking(Dialect::Chat, &mut v);
+        assert_eq!(v, json!({"reasoning_effort": "none", "x": 1}));
+        assert!(!reasoning_on(Dialect::Chat, &v));
+        let mut v = json!({"reasoning": {"effort": "high", "summary": "auto"},
+            "input": [{"type": "configuration_update", "reasoning": {"effort": "xhigh"}}]});
+        disable_thinking(Dialect::Responses, &mut v);
+        assert_eq!(
+            v,
+            json!({"reasoning": {"effort": "none", "summary": "auto"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "none"}}]})
+        );
+        assert!(!reasoning_on(Dialect::Responses, &v));
+        assert_eq!(
+            written_effort(Dialect::Responses, &v),
+            Some(WrittenEffort::Off)
+        );
+        // 没写强度、只写了摘要的：照样关
+        let mut v = json!({"reasoning": {"summary": "auto"}});
+        disable_thinking(Dialect::Responses, &mut v);
+        assert_eq!(
+            v,
+            json!({"reasoning": {"summary": "auto", "effort": "none"}})
+        );
+    }
+
+    #[test]
+    fn turning_thinking_off_takes_the_effort_with_it() {
+        // 自适应的 Claude 只去掉开关的话，照样按 `output_config.effort` 那一档想
+        let mut v = json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}});
+        disable_thinking(Dialect::Anthropic, &mut v);
+        assert_eq!(v, json!({}));
+        let mut v = json!({"thinking": {"type": "adaptive"},
+                           "output_config": {"effort": "high", "format": {"type": "json_schema"}}});
+        disable_thinking(Dialect::Anthropic, &mut v);
+        assert_eq!(
+            v,
+            json!({"output_config": {"format": {"type": "json_schema"}}})
+        );
+        let mut v = json!({"additionalModelRequestFields": {
+            "thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}, "top_k": 3}});
+        disable_thinking(Dialect::Bedrock, &mut v);
+        assert_eq!(v, json!({"additionalModelRequestFields": {"top_k": 3}}));
+    }
+
+    #[test]
+    fn turning_thinking_off_in_chat_takes_the_glm_switch_too() {
+        // DeepSeek、GLM、Kimi 的写法：开关在 `thinking`，强度在 `reasoning_effort`
+        let mut v = json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high", "x": 1});
+        disable_thinking(Dialect::Chat, &mut v);
+        assert_eq!(v, json!({"x": 1}));
+        let mut v = json!({"thinking": {"type": "enabled"}, "x": 1});
+        assert!(reasoning_on(Dialect::Chat, &v));
+        disable_thinking(Dialect::Chat, &mut v);
+        assert_eq!(v, json!({"x": 1}));
+        assert!(!reasoning_on(Dialect::Chat, &v));
+    }
+
+    #[test]
+    fn reasoning_is_on_where_the_decoder_says_it_is() {
+        let on = [
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}),
+            ),
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}}),
+            ),
+            (
+                Dialect::Anthropic,
+                json!({"output_config": {"effort": "low"}}),
+            ),
+            (Dialect::Chat, json!({"reasoning_effort": "high"})),
+            (Dialect::Chat, json!({"thinking": {"type": "enabled"}})),
+            (
+                Dialect::Responses,
+                json!({"reasoning": {"summary": "auto"}}),
+            ),
+            (
+                Dialect::Responses,
+                json!({"reasoning": {"effort": "none"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "high"}}]}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": -1}}}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generation_config": {"thinking_config": {"thinking_level": "low"}}}),
+            ),
+            (
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {"thinking": {"type": "adaptive"}}}),
+            ),
+        ];
+        for (d, v) in on {
+            assert!(reasoning_on(d, &v), "{d:?}: {v}");
+        }
+        let off = [
+            (Dialect::Anthropic, json!({})),
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}),
+            ),
+            (Dialect::Chat, json!({"reasoning_effort": "none"})),
+            (
+                Dialect::Chat,
+                json!({"thinking": {"type": "disabled"}, "reasoning_effort": "high"}),
+            ),
+            (
+                Dialect::Chat,
+                json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none"}),
+            ),
+            (Dialect::Responses, json!({"reasoning": {"effort": "none"}})),
+            (
+                Dialect::Responses,
+                json!({"reasoning": {"effort": "high"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "none"}}]}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"temperature": 1}}),
+            ),
+            (
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {"top_k": 3}}),
+            ),
+            (Dialect::Chat, json!([1])),
+        ];
+        for (d, v) in off {
+            assert!(!reasoning_on(d, &v), "{d:?}: {v}");
+            assert_eq!(reasoning_effort(d, &v), None, "{d:?}: {v}");
+        }
+    }
+
+    #[test]
+    fn the_effort_is_read_from_where_each_format_writes_it() {
+        let cases = [
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}),
+                Some(Effort::XHigh),
+            ),
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}}),
+                None,
+            ),
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "enabled", "budget_tokens": 10000}}),
+                Some(Effort::Medium),
+            ),
+            (
+                Dialect::Chat,
+                json!({"reasoning_effort": "minimal"}),
+                Some(Effort::Minimal),
+            ),
+            (
+                Dialect::Chat,
+                json!({"thinking": {"type": "enabled"}}),
+                None,
+            ),
+            (
+                Dialect::Responses,
+                json!({"reasoning": {"effort": "medium"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "high"}}]}),
+                Some(Effort::High),
+            ),
+            (
+                Dialect::Responses,
+                json!({"reasoning": {"effort": "max"}}),
+                Some(Effort::Max),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingLevel": "HIGH"}}}),
+                Some(Effort::High),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4000}}}),
+                Some(Effort::Low),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": -1}}}),
+                None,
+            ),
+            (
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {
+                "thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}}),
+                Some(Effort::Low),
+            ),
+        ];
+        for (d, v, want) in cases {
+            assert_eq!(reasoning_effort(d, &v), want, "{d:?}: {v}");
+        }
+    }
+
+    #[test]
+    fn setting_the_effort_writes_the_field_the_client_wrote() {
+        let set = |d, mut v: Value, e| {
+            let changed = set_reasoning_effort(d, &mut v, e, "gemini-2.5-pro");
+            (changed, v)
+        };
+        assert_eq!(
+            set(
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}),
+                Effort::Max
+            ),
+            (
+                true,
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}})
+            )
+        );
+        // 自适应、没写强度：补上
+        assert_eq!(
+            set(
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}}),
+                Effort::High
+            ),
+            (
+                true,
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}})
+            )
+        );
+        // 按预算的改预算，要小于最大输出
+        assert_eq!(
+            set(
+                Dialect::Anthropic,
+                json!({"max_tokens": 20000, "thinking": {"type": "enabled", "budget_tokens": 4000}}),
+                Effort::Max
+            ),
+            (
+                true,
+                json!({"max_tokens": 20000, "thinking": {"type": "enabled", "budget_tokens": 19999}})
+            )
+        );
+        let tiny =
+            json!({"max_tokens": 1000, "thinking": {"type": "enabled", "budget_tokens": 1024}});
+        assert_eq!(
+            set(Dialect::Anthropic, tiny.clone(), Effort::Max),
+            (false, tiny)
+        );
+        // 已经是这一档：没改
+        let same = json!({"reasoning_effort": "high"});
+        assert_eq!(
+            set(Dialect::Chat, same.clone(), Effort::High),
+            (false, same)
+        );
+        assert_eq!(
+            set(
+                Dialect::Chat,
+                json!({"thinking": {"type": "enabled"}}),
+                Effort::Low
+            ),
+            (
+                true,
+                json!({"thinking": {"type": "enabled"}, "reasoning_effort": "low"})
+            )
+        );
+        assert_eq!(
+            set(
+                Dialect::Responses,
+                json!({"reasoning": {"effort": "xhigh", "summary": "auto"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "medium"}}, {"type": "message"}]}),
+                Effort::Max
+            ),
+            (
+                true,
+                json!({"reasoning": {"effort": "max", "summary": "auto"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "max"}}, {"type": "message"}]})
+            )
+        );
+        assert_eq!(
+            set(
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingLevel": "low"}}}),
+                Effort::Max
+            ),
+            (
+                true,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingLevel": "HIGH"}}})
+            )
+        );
+        assert_eq!(
+            set(
+                Dialect::Gemini,
+                json!({"generation_config": {"thinking_config": {"thinking_budget": 1024}}}),
+                Effort::High
+            ),
+            (
+                true,
+                json!({"generation_config": {"thinking_config": {"thinking_budget": 32000}}})
+            )
+        );
+        // Gemini 让模型自己定的：不知道它认等级还是预算，不改
+        let dynamic = json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}});
+        assert_eq!(
+            set(Dialect::Gemini, dynamic.clone(), Effort::High),
+            (false, dynamic)
+        );
+        assert_eq!(
+            set(
+                Dialect::Bedrock,
+                json!({"inferenceConfig": {"maxTokens": 9000},
+                "additionalModelRequestFields": {"thinking": {"type": "enabled", "budget_tokens": 2000}}}),
+                Effort::High
+            ),
+            (
+                true,
+                json!({"inferenceConfig": {"maxTokens": 9000},
+                "additionalModelRequestFields": {"thinking": {"type": "enabled", "budget_tokens": 8999}}})
+            )
+        );
+        assert_eq!(
+            set(
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {
+                "thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}}),
+                Effort::High
+            ),
+            (
+                true,
+                json!({"additionalModelRequestFields": {
+                "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}})
+            )
+        );
+    }
+
+    #[test]
+    fn a_request_without_reasoning_is_never_given_any() {
+        for (d, v) in [
+            (Dialect::Anthropic, json!({"max_tokens": 10})),
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "disabled"}}),
+            ),
+            (Dialect::Chat, json!({"reasoning_effort": "none"})),
+            (Dialect::Responses, json!({"input": "hi"})),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}),
+            ),
+            (
+                Dialect::Bedrock,
+                json!({"inferenceConfig": {"maxTokens": 10}}),
+            ),
+        ] {
+            let mut w = v.clone();
+            assert!(!set_reasoning_effort(d, &mut w, Effort::Max, "m"), "{d:?}");
+            assert_eq!(w, v, "{d:?}");
+        }
+    }
+
+    #[test]
+    fn removing_the_effort_leaves_reasoning_on() {
+        let remove = |d, mut v: Value| {
+            let changed = remove_reasoning_effort(d, &mut v);
+            (changed, v)
+        };
+        assert_eq!(
+            remove(
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}})
+            ),
+            (true, json!({"thinking": {"type": "adaptive"}}))
+        );
+        // 预算是开思考必须的：不动
+        let budget = json!({"thinking": {"type": "enabled", "budget_tokens": 4000}});
+        assert_eq!(remove(Dialect::Anthropic, budget.clone()), (false, budget));
+        assert_eq!(
+            remove(
+                Dialect::Chat,
+                json!({"thinking": {"type": "enabled"}, "reasoning_effort": "max"})
+            ),
+            (true, json!({"thinking": {"type": "enabled"}}))
+        );
+        assert_eq!(
+            remove(
+                Dialect::Responses,
+                json!({"reasoning": {"effort": "xhigh", "summary": "auto"},
+                "input": [{"type": "configuration_update", "reasoning": {"effort": "high"}}, {"type": "message"}]})
+            ),
+            (
+                true,
+                json!({"reasoning": {"summary": "auto"}, "input": [{"type": "message"}]})
+            )
+        );
+        assert_eq!(
+            remove(
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingLevel": "LOW", "includeThoughts": true}}})
+            ),
+            (
+                true,
+                json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}})
+            )
+        );
+        assert_eq!(
+            remove(
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {
+                "thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}})
+            ),
+            (
+                true,
+                json!({"additionalModelRequestFields": {"thinking": {"type": "adaptive"}}})
+            )
+        );
+    }
+
+    #[test]
+    fn what_is_set_is_what_is_read_back() {
+        let bodies = [
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "adaptive"}}),
+            ),
+            (Dialect::Chat, json!({"reasoning_effort": "low"})),
+            (Dialect::Responses, json!({"reasoning": {}})),
+            (
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {"thinking": {"type": "adaptive"}}}),
+            ),
+        ];
+        for (d, v) in bodies {
+            for e in [
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::XHigh,
+                Effort::Max,
+            ] {
+                let mut w = v.clone();
+                set_reasoning_effort(d, &mut w, e, "m");
+                assert_eq!(reasoning_effort(d, &w), Some(e), "{d:?}: {w}");
+            }
+        }
+    }
+
+    /// 写明的强度按字段在不在：关着思考也照样写着（上游正是为它拒收的）；只写了预算的不算
+    #[test]
+    fn the_written_effort_is_the_field_itself() {
+        let disabled =
+            json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "xhigh"}});
+        assert!(!reasoning_on(Dialect::Anthropic, &disabled));
+        assert_eq!(reasoning_effort(Dialect::Anthropic, &disabled), None);
+        assert_eq!(
+            written_effort(Dialect::Anthropic, &disabled),
+            Some(WrittenEffort::Level(Effort::XHigh))
+        );
+        let mut v = disabled.clone();
+        assert!(replace_reasoning_effort(
+            Dialect::Anthropic,
+            &mut v,
+            Effort::High
+        ));
+        assert_eq!(v["output_config"]["effort"], "high");
+        let mut v = disabled.clone();
+        assert!(remove_reasoning_effort(Dialect::Anthropic, &mut v));
+        assert_eq!(v, json!({"thinking": {"type": "disabled"}}));
+        let bedrock = json!({"additionalModelRequestFields": {
+            "thinking": {"type": "disabled"}, "output_config": {"effort": "max"}}});
+        assert_eq!(
+            written_effort(Dialect::Bedrock, &bedrock),
+            Some(WrittenEffort::Level(Effort::Max))
+        );
+        let mut v = bedrock.clone();
+        assert!(replace_reasoning_effort(
+            Dialect::Bedrock,
+            &mut v,
+            Effort::High
+        ));
+        assert_eq!(
+            v["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
+        // 只写了预算：不是写明的强度，改它、去掉它都不动
+        for (d, budget) in [
+            (
+                Dialect::Anthropic,
+                json!({"thinking": {"type": "enabled", "budget_tokens": 4000}}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4000}}}),
+            ),
+            (
+                Dialect::Bedrock,
+                json!({"additionalModelRequestFields": {"thinking": {"type": "enabled", "budget_tokens": 4000}}}),
+            ),
+        ] {
+            assert_eq!(written_effort(d, &budget), None, "{d:?}");
+            assert!(reasoning_effort(d, &budget).is_some(), "{d:?}");
+            let mut v = budget.clone();
+            assert!(!replace_reasoning_effort(d, &mut v, Effort::Max), "{d:?}");
+            assert!(!remove_reasoning_effort(d, &mut v), "{d:?}");
+            assert_eq!(v, budget, "{d:?}");
+        }
+        // `none` 也是写明的
+        let none = json!({"reasoning_effort": "none"});
+        assert_eq!(
+            written_effort(Dialect::Chat, &none),
+            Some(WrittenEffort::Off)
+        );
+        let mut v = none.clone();
+        assert!(remove_reasoning_effort(Dialect::Chat, &mut v));
+        assert_eq!(v, json!({}));
+        assert_eq!(WrittenEffort::Off.slug(), "none");
+        assert_eq!(WrittenEffort::parse("none"), Some(WrittenEffort::Off));
+        assert_eq!(
+            WrittenEffort::parse("max"),
+            Some(WrittenEffort::Level(Effort::Max))
+        );
+        // 改只改写着的字段，不补
+        let mut v = json!({"thinking": {"type": "adaptive"}});
+        assert!(!replace_reasoning_effort(
+            Dialect::Anthropic,
+            &mut v,
+            Effort::Max
+        ));
+        assert_eq!(v, json!({"thinking": {"type": "adaptive"}}));
+        let mut v = json!({"thinking": {"type": "enabled"}});
+        assert!(!replace_reasoning_effort(
+            Dialect::Chat,
+            &mut v,
+            Effort::Max
+        ));
+    }
+
+    /// Gemini 2.5 的预算有上限：Pro 32768，Flash 24576。Converse 没写最大输出的不改预算
+    #[test]
+    fn budgets_stay_within_what_the_model_takes() {
+        let gemini = json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 1024}}});
+        for (model, e, want) in [
+            ("gemini-2.5-pro", Effort::Max, 32768),
+            ("gemini-2.5-flash", Effort::Max, 24576),
+            ("gemini-2.5-flash-lite", Effort::XHigh, 24576),
+            ("gemini-2.5-flash", Effort::Medium, 10000),
+        ] {
+            let mut v = gemini.clone();
+            assert!(set_reasoning_effort(Dialect::Gemini, &mut v, e, model));
+            assert_eq!(
+                v["generationConfig"]["thinkingConfig"]["thinkingBudget"], want,
+                "{model}"
+            );
+        }
+        let bedrock = json!({"additionalModelRequestFields": {
+            "thinking": {"type": "enabled", "budget_tokens": 2000}}});
+        let mut v = bedrock.clone();
+        assert!(!set_reasoning_effort(
+            Dialect::Bedrock,
+            &mut v,
+            Effort::Max,
+            "m"
+        ));
+        assert_eq!(v, bedrock);
     }
 }

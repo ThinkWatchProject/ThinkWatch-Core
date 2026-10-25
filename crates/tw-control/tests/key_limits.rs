@@ -147,6 +147,7 @@ fn request(id: u64, key: &str, at: i64, input: u64) -> Vec<Event> {
                 pause_ms: None,
                 retry: None,
                 backoff_ms: None,
+                effort: None,
                 proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
@@ -460,6 +461,7 @@ fn hop(outcome: tw_api::AttemptOutcome, code: &str, busy: bool) -> tw_api::Attem
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }

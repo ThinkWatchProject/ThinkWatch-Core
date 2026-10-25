@@ -502,7 +502,8 @@ slug_enum! {
         /// 换模型，整个 prompt cache 作废
         Model = "model",
         MaxTokens = "max_tokens",
-        Thinking = "thinking",
+        /// 推理：值是 [`RuleReasoning`] 的那个词
+        Reasoning = "reasoning",
         /// 以上改写只在新会话开始时应用
         OnlyAtSessionStart = "only_at_session_start",
     }
@@ -1074,7 +1075,16 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`AttemptView`] 多了 `retry`（这一跳是第几次重试）和 `backoff_ms`（发出之前退避了多久）。
 /// 新码：`gw.upstream.stream_ended_early`（流只发了开头的例行事件就收了尾，算在
 /// [`FAILED_AFTER_SENDING`] 里）
-pub const CONTROL_API_VERSION: u32 = 53;
+///
+/// **54 起路由规则改的是推理，不再是扩展思考**：[`RuleRewrite`] 的 `thinking`（布尔）换成
+/// `reasoning`（[`RuleReasoning`]：`off` 关掉推理，或者改成 `low` / `medium` / `high` / `xhigh` /
+/// `max` 一档，只改开着推理的请求），[`SetField`] 的 `thinking` 换成 `reasoning`（[`SetView`] 的
+/// 值是那个词）。配置里的 `set.thinking` 不认了。[`AttemptView`] 多了 `effort`（[`EffortChange`]：
+/// 这一跳发出去的推理强度和客户端要的不一样，`reason` 是 [`EffortReason`] 的 `rule` / `rejected` /
+/// `remembered`）：上游因为推理强度回 400 时，同一家改一档（或者去掉强度）再发一次，是尝试链上
+/// 新的一跳，不算退避重试；记下这一家的这个模型不认那一档，7 天之内直接改。照 53 写的界面
+/// 保存规则时带的 `thinking` 不起作用
+pub const CONTROL_API_VERSION: u32 = 54;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -2008,11 +2018,43 @@ pub struct AttemptView {
     /// 这一跳发出去之前退避了多少毫秒：一轮重试的头一跳带着。不算在 `ms` 里。别的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_ms: Option<u64>,
+    /// 这一跳改了推理强度：规则改写的、上游拒收了改用别的一档重发的、记得这个模型不认那一档直接
+    /// 改了的（见 [`EffortChange`]）。改了也和原来一样的没有。被拒收的那一跳自己是一跳普通的
+    /// `status`（400），重发的那一跳带着 `rejected`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortChange>,
     /// 这一跳走的代理：这家上游配置的代理名（跟随系统的是 `system`），直连是 None。没发出去
     /// 的一跳（满着、被拒、转换不了……）是它要走的那个 —— 连不上的那一跳，问题可能就出在
     /// 这个代理上。WebSocket 只连直连的上游，一律是 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+}
+
+/// 一跳改了推理强度（[`AttemptView::effort`]）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EffortChange {
+    /// 这一次改之前要发的那一档：`rule` 是客户端要的；`rejected`、`remembered` 是被拒收、被换掉的
+    /// 那一档（规则改过之后的）—— 客户端要 high、规则改成 xhigh、被拒后改用 max，这一项是
+    /// `xhigh`。词表：`none`（OpenAI 的「关掉推理」）/ `minimal` / `low` / `medium` / `high` /
+    /// `xhigh` / `max`
+    pub asked: String,
+    /// 发出去的那一档，同一个词表（规则 `off` 在 OpenAI 的格式里是 `none`）。null 是去掉了推理
+    /// 强度，按模型的默认
+    pub sent: Option<String>,
+    pub reason: EffortReason,
+}
+
+slug_enum! {
+    /// 推理强度为什么改了（[`EffortChange::reason`]）。
+    pub enum EffortReason {
+        /// 路由规则改写（`set.reasoning`）
+        Rule = "rule",
+        /// 上游拒收了上一跳的那一档（400），同一家改用这一档重发了一次
+        Rejected = "rejected",
+        /// 这一家的这个模型拒收过那一档，记着（7 天），直接改了
+        Remembered = "remembered",
+    }
 }
 
 /// 发出去之后才失败的一跳报的码（见 [`AttemptView::sent`]）：上游没在时限内回话、请求在路上
@@ -2807,9 +2849,22 @@ pub struct RuleRewrite {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    /// 打开或关闭扩展思考
+    /// 推理：关掉，或者改成一档。**只改开着推理的请求**，没开推理的（生成标题这类）原样不动
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<bool>,
+    pub reasoning: Option<RuleReasoning>,
+}
+
+slug_enum! {
+    /// 规则改写的推理（[`RuleRewrite::reasoning`]）。没有 `minimal`
+    pub enum RuleReasoning {
+        /// 关掉推理，连同推理强度
+        Off = "off",
+        Low = "low",
+        Medium = "medium",
+        High = "high",
+        XHigh = "xhigh",
+        Max = "max",
+    }
 }
 
 /// 规则里的一个条件。
@@ -5949,8 +6004,9 @@ pub struct MismatchView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SetView {
-    /// `model`（换模型，整个 prompt cache 作废）/ `max_tokens` / `thinking` /
-    /// `only_at_session_start`（以上改写只在新会话开始时应用，值是 `true`）
+    /// `model`（换模型，整个 prompt cache 作废）/ `max_tokens` / `reasoning`（值是
+    /// [`RuleReasoning`] 的那个词）/ `only_at_session_start`（以上改写只在新会话开始时应用，
+    /// 值是 `true`）
     pub field: SetField,
     pub value: String,
 }
@@ -6929,6 +6985,7 @@ mod tests {
             pause_ms: None,
             retry: None,
             backoff_ms: None,
+            effort: None,
             proxy: None,
         }
     }
