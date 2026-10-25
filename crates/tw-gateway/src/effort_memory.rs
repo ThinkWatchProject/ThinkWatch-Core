@@ -3,7 +3,7 @@
 //! 各家认的档位不一样：Claude 的有的模型没有 `xhigh`，关着思考的不收 `high` 以上，GLM 这类
 //! 始终思考的模型不收 `medium`，有的 OpenAI 兼容接口不收 `none`。请求体里写明的那一档（见
 //! [`tw_dialect::params::written_effort`]，客户端写的或者路由规则改的）被上游拒了（400，原话说的是
-//! 推理强度，见 [`tw_dialect::think::effort_rejection`]、[`tw_dialect::think::none_rejection`]），
+//! 推理强度，见 [`tw_dialect::think::effort_rejection`]、[`tw_dialect::think::none_fix`]），
 //! 同一家改一档、或者去掉强度马上再发一次。**重发成了才记**：（上游，发给它的模型名，发出去的
 //! 格式）不认哪一档、改用什么。往后发给它的请求要是还写着那一档，发之前直接改，不用每次都先被
 //! 拒一次。重发又被拒了的不记；记着的改法自己被拒了、重发成了用的正是原来那一档的，那一条删掉。

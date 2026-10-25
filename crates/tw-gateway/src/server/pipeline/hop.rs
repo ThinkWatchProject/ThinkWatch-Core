@@ -2177,7 +2177,7 @@ fn prepare(
                 }
             };
             let mut d = d.clone();
-            crate::translate::apply_set(&mut d.request, effective_set);
+            let reasoning_off = crate::translate::apply_set(&mut d.request, effective_set, dialect);
             // Codex 后端不认输出上限：带着它发过去是一个 400
             let limit = if chatgpt {
                 crate::chatgpt::drop_output_limit(&mut d.request, d.client)
@@ -2214,6 +2214,10 @@ fn prepare(
             // 客户端一个断点都没标：请求体里的断点是编码器自动标的。这一家的这个模型拒过的话
             // 先去掉，不用再被拒一次（见 `crate::cache_marks`）
             let mut encoded = p.body.clone();
+            // 规则关掉了推理：OpenAI 的两种格式写明 `none`（见 `translate::reasoning_off`）
+            if reasoning_off {
+                encoded = crate::translate::reasoning_off(dialect, encoded);
+            }
             if d.request.cache.is_empty() && tw_dialect::cache::may_have_marks(dialect, &encoded) {
                 let model = &d.request.model;
                 if !state.cache_marks.refused(&provider.name, model) {
@@ -2396,7 +2400,7 @@ fn apply_fix(wire: tw_dialect::ir::Dialect, v: &mut serde_json::Value, fix: Effo
 }
 
 /// 上游回的这个 400 是不是因为写明的推理强度（[`tw_dialect::think::effort_rejection`]，发出去的
-/// 是 `none` 的看 [`tw_dialect::think::none_rejection`]，那时去掉它）：是的话，交回发出去的格式、
+/// 是 `none` 的看 [`tw_dialect::think::none_fix`]）：是的话，交回发出去的格式、
 /// 记的时候按哪一档记（这一跳改强度之前写明的那一档；没算过的就是发出去的那一档）和重发时怎么
 /// 改。只写了预算的不算；照着改了也和发出去的一样的不算：重发一遍还是被拒
 fn effort_refused(
@@ -2411,9 +2415,7 @@ fn effort_refused(
     let said = String::from_utf8_lossy(said);
     let fix = match sent {
         WrittenEffort::Level(e) => tw_dialect::think::effort_rejection(400, &said, e)?,
-        WrittenEffort::Off => {
-            tw_dialect::think::none_rejection(400, &said).then_some(EffortFix::Drop)?
-        }
+        WrittenEffort::Off => tw_dialect::think::none_fix(400, &said)?,
     };
     let mut tried = v;
     apply_fix(wire, &mut tried, fix).then_some((wire, hop.pre.unwrap_or(sent), fix))

@@ -229,11 +229,28 @@ pub fn effort_rejection(status: u16, error_body: &str, sent: Effort) -> Option<E
 }
 
 /// 发出去的是 `none`（OpenAI 的「关掉推理」，见 [`crate::params::disable_thinking`]），上游这个
-/// 错误是不是因为它：判据和 [`effort_rejection`] 一样，`none` 当作发出去的那一档。是的话重发时
-/// 去掉这个字段
+/// 错误是不是因为它：判据和 [`effort_rejection`] 一样，`none` 当作发出去的那一档。重发时怎么写
+/// 见 [`none_fix`]
 pub fn none_rejection(status: u16, error_body: &str) -> bool {
     let text = error_body.to_lowercase();
     about_effort(status, &text, "none", &levels_in(&text))
+}
+
+/// 发出去的 `none` 被上游拒了（[`none_rejection`]）之后，重发时怎么写：原话里列了档位的，用其中
+/// 最低的那一档 —— 要的是少想，去掉强度的话模型按默认的那一档（通常是 medium）想，反倒想得更多；
+/// 一档都没说的，去掉强度。不是因为 `none` 的是 `None`
+pub fn none_fix(status: u16, error_body: &str) -> Option<EffortFix> {
+    if !none_rejection(status, error_body) {
+        return None;
+    }
+    let lowest = levels_in(&error_body.to_lowercase())
+        .into_iter()
+        .map(|(_, e)| e)
+        .min();
+    Some(match lowest {
+        Some(e) => EffortFix::Use(e),
+        None => EffortFix::Drop,
+    })
 }
 
 /// 见 [`effort_rejection`]。`text` 是小写的原话，`sent` 是发出去的那个词，`found` 是原话里的档位
@@ -458,6 +475,44 @@ mod tests {
             "reasoning_effort none is not supported"
         ));
         assert!(!none_rejection(400, "messages: field required"));
+    }
+
+    #[test]
+    fn a_refused_none_takes_the_lowest_level_named() {
+        use Effort::*;
+        assert_eq!(
+            none_fix(
+                400,
+                "Unsupported value: 'none' is not supported with this model for reasoning.effort. Supported values are: 'minimal', 'low', 'medium', and 'high'."
+            ),
+            Some(EffortFix::Use(Minimal))
+        );
+        assert_eq!(
+            none_fix(
+                400,
+                "Unsupported value: 'none' is not supported with this model for reasoning.effort. Supported values are: 'low', 'medium', and 'high'."
+            ),
+            Some(EffortFix::Use(Low))
+        );
+        assert_eq!(
+            none_fix(
+                400,
+                "该模型始终思考，不支持关闭思考；请使用 low、high 或 max。"
+            ),
+            Some(EffortFix::Use(Low))
+        );
+        // 没列档位的：去掉强度
+        assert_eq!(
+            none_fix(400, "reasoning_effort none is not supported by this model"),
+            Some(EffortFix::Drop)
+        );
+        // 不是因为 `none` 的
+        assert_eq!(none_fix(400, "Unsupported value: 'none'"), None);
+        assert_eq!(
+            none_fix(500, "reasoning_effort none is not supported"),
+            None
+        );
+        assert_eq!(none_fix(400, "messages: field required"), None);
     }
 
     #[test]
