@@ -282,7 +282,7 @@ pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Res
                 .filter(|m| !m.is_empty())
                 .map(str::to_string),
             max_tokens: s.max_tokens,
-            thinking: s.thinking,
+            reasoning: s.reasoning.map(set_reasoning),
             only_at_session_start: false,
         };
         (!a.is_empty()).then_some(a)
@@ -811,12 +811,32 @@ pub(crate) fn rule_view(r: &Rule, n: tw_engine::RuleNotes) -> tw_api::RuleView {
             .map(|s| tw_api::RuleRewrite {
                 model: s.model.clone(),
                 max_tokens: s.max_tokens,
-                thinking: s.thinking,
+                reasoning: s.reasoning.map(rule_reasoning),
             }),
         catch_all: n.catch_all,
         phase_two: n.phase_two,
         shadowed: n.shadowed,
     }
+}
+
+/// 规则改写的推理：界面的词 → 配置里的
+fn set_reasoning(r: tw_api::RuleReasoning) -> tw_engine::SetReasoning {
+    use tw_api::RuleReasoning as R;
+    use tw_dialect::ir::Effort;
+    use tw_engine::SetReasoning as S;
+    match r {
+        R::Off => S::Off,
+        R::Low => S::Level(Effort::Low),
+        R::Medium => S::Level(Effort::Medium),
+        R::High => S::Level(Effort::High),
+        R::XHigh => S::Level(Effort::XHigh),
+        R::Max => S::Level(Effort::Max),
+    }
+}
+
+/// 反过来。两边的词是同一张表（[`tw_engine::SetReasoning::slug`]）
+fn rule_reasoning(r: tw_engine::SetReasoning) -> tw_api::RuleReasoning {
+    tw_api::RuleReasoning::from_slug(r.slug()).unwrap_or(tw_api::RuleReasoning::Low)
 }
 
 // ─────────────────────────────────────────────────────────── 共用

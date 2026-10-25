@@ -191,7 +191,7 @@ fn renamed(row: &tw_store::db::RequestRow, raw: Vec<u8>, model: &str) -> (bytes:
                 ..Default::default()
             };
             (
-                tw_gateway::forward::apply_set(&raw, &set, Some(api.dialect())),
+                tw_gateway::forward::apply_set(&raw, &set, Some(api.dialect()), model),
                 row.path.clone(),
             )
         }

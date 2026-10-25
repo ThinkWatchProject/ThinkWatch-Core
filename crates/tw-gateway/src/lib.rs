@@ -20,6 +20,7 @@ pub mod client_api;
 pub mod clientprobe;
 pub mod content;
 pub mod count;
+pub mod effort_memory;
 pub mod egress;
 pub mod ending;
 pub mod error;

@@ -11,7 +11,9 @@ use super::{Def, Kind, Lang, Row, Section, T2, Ty};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
-use tw_engine::{BalanceBy, Group, GroupType, Member, Pinned, RouteSet, Rule, SetAction};
+use tw_engine::{
+    BalanceBy, Group, GroupType, Member, Pinned, RouteSet, Rule, SetAction, SetReasoning,
+};
 use tw_pricing::{PerMillion, PricingConfig, SheetDef};
 
 const fn t(en: &'static str, zh: &'static str) -> T2 {
@@ -85,6 +87,9 @@ fn balance_bys() -> Vec<&'static str> {
 }
 fn limit_pers() -> Vec<&'static str> {
     super::fields::<LimitPer>()
+}
+fn set_reasonings() -> Vec<&'static str> {
+    super::fields::<SetReasoning>()
 }
 
 /// 同步位置三种写法各自的字段。`target` 是按 `type` 分的枚举，问 serde 要字段的办法问不出
@@ -1897,10 +1902,13 @@ pub fn sections() -> Vec<Section> {
                     t("Replace `max_tokens`.", "替换 `max_tokens`。"),
                 ),
                 row(
-                    "thinking",
-                    Kind::Bool,
+                    "reasoning",
+                    Kind::Enum(set_reasonings),
                     Def::Unset,
-                    t("Turn extended thinking on or off.", "开启或关闭扩展思考。"),
+                    t(
+                        "Reasoning. `off` turns it off: the reasoning settings and the effort are removed, and in the OpenAI formats the effort is set to `none`. A level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are.",
+                        "推理。`off` 关闭推理：去掉推理设置和推理强度，OpenAI 的格式改为写 `none`。写一档则改为该档强度。只改写已开启推理的请求，未开启推理的请求（如生成标题）保持不变。",
+                    ),
                 ),
                 row(
                     "only_at_session_start",

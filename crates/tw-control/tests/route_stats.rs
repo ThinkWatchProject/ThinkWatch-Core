@@ -52,7 +52,7 @@ routes:
         deny: 这个项目不用 opus
       - name: 关掉思考
         when: {{ model: claude-sonnet-* }}
-        set: {{ thinking: false }}
+        set: {{ reasoning: off }}
       - name: 从没命中过
         when: {{ model: gpt-* }}
         to: up

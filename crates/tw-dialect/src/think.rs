@@ -163,6 +163,145 @@ pub(crate) fn continues_tool_turn_without_thinking(messages: &[crate::ir::Messag
     )
 }
 
+/// 由低到高的全部档位
+pub const LEVELS: [Effort; 6] = [
+    Effort::Minimal,
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::XHigh,
+    Effort::Max,
+];
+
+/// `levels` 里离 `want` 最近的那一档。一样近的取高的那一档：上游说「只有 high 和 max」时，
+/// 要 xhigh 的客户端要的是多想，不是少想。`levels` 是空的是 `None`
+pub fn nearest(levels: &[Effort], want: Effort) -> Option<Effort> {
+    let rank = |e: Effort| e as i32;
+    levels
+        .iter()
+        .copied()
+        .min_by_key(|e| ((rank(*e) - rank(want)).abs(), std::cmp::Reverse(rank(*e))))
+}
+
+/// 推理强度被上游拒了之后，重发时怎么写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortFix {
+    /// 改成这一档
+    Use(Effort),
+    /// 去掉强度，按模型的默认
+    Drop,
+}
+
+/// 上游这个错误是不是因为推理强度：是的话，重发时怎么写。`sent` 是这一跳发出去的那一档。
+///
+/// **只认 400**，原话（不分大小写）里要说到推理（`effort`、`reasoning`、`thinking`、「思考」
+/// 「推理」之一），而且说到 `effort`、或者整词说到发出去的那一档、或者整词说到另外至少两档 ——
+/// 「该模型始终思考……请使用 low、high 或 max」这样不提 `effort` 的也认得出；`text.verbosity`
+/// 的 low / medium / high、内容审查的 `severity` 不提推理，不算。
+///
+/// 重发写哪一档看原话里的档位（不算发出去的那一档）：恰好一档后面紧跟着「or below」「or
+/// lower」「以下」的，那一档是上限，就用它；不然取离发出去的那一档最近的（[`nearest`]）；
+/// 一档都没说的，去掉强度。
+pub fn effort_rejection(status: u16, error_body: &str, sent: Effort) -> Option<EffortFix> {
+    let text = error_body.to_lowercase();
+    let found = levels_in(&text);
+    if !about_effort(status, &text, openai(sent), &found) {
+        return None;
+    }
+    let others: Vec<(usize, Effort)> = found.iter().copied().filter(|(_, e)| *e != sent).collect();
+    let mut distinct: Vec<Effort> = others.iter().map(|(_, e)| *e).collect();
+    distinct.sort();
+    distinct.dedup();
+    let mut ceilings: Vec<Effort> = others
+        .iter()
+        .filter(|(end, _)| ceiling_after(&text[*end..]))
+        .map(|(_, e)| *e)
+        .collect();
+    ceilings.sort();
+    ceilings.dedup();
+    if let [only] = ceilings.as_slice() {
+        return Some(EffortFix::Use(*only));
+    }
+    Some(match nearest(&distinct, sent) {
+        Some(e) => EffortFix::Use(e),
+        None => EffortFix::Drop,
+    })
+}
+
+/// 发出去的是 `none`（OpenAI 的「关掉推理」，见 [`crate::params::disable_thinking`]），上游这个
+/// 错误是不是因为它：判据和 [`effort_rejection`] 一样，`none` 当作发出去的那一档。是的话重发时
+/// 去掉这个字段
+pub fn none_rejection(status: u16, error_body: &str) -> bool {
+    let text = error_body.to_lowercase();
+    about_effort(status, &text, "none", &levels_in(&text))
+}
+
+/// 见 [`effort_rejection`]。`text` 是小写的原话，`sent` 是发出去的那个词，`found` 是原话里的档位
+fn about_effort(status: u16, text: &str, sent: &str, found: &[(usize, Effort)]) -> bool {
+    if status != 400
+        || !["effort", "reasoning", "thinking", "思考", "推理"]
+            .iter()
+            .any(|w| text.contains(w))
+    {
+        return false;
+    }
+    let mut others: Vec<Effort> = found
+        .iter()
+        .map(|(_, e)| *e)
+        .filter(|e| openai(*e) != sent)
+        .collect();
+    others.sort();
+    others.dedup();
+    text.contains("effort") || whole_word(text, sent) || others.len() >= 2
+}
+
+/// `word` 在小写的 `text` 里整词出现过
+fn whole_word(text: &str, word: &str) -> bool {
+    let w = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(at, _)| {
+        let end = at + word.len();
+        !text[..at].chars().next_back().is_some_and(w) && !text[end..].chars().next().is_some_and(w)
+    })
+}
+
+/// 小写的 `text` 里整词出现的档位名：每一处的结尾位置和是哪一档
+fn levels_in(text: &str) -> Vec<(usize, Effort)> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    for e in LEVELS {
+        let name = openai(e);
+        for (at, _) in text.match_indices(name) {
+            let end = at + name.len();
+            let before = text[..at].chars().next_back();
+            let after = text[end..].chars().next();
+            if !before.is_some_and(word) && !after.is_some_and(word) {
+                out.push((end, e));
+            }
+        }
+    }
+    out.sort_by_key(|(end, _)| *end);
+    out
+}
+
+/// 档位名后面紧跟着的是不是「以下」：中间可以隔着引号、括号和空白
+fn ceiling_after(rest: &str) -> bool {
+    let rest = rest.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '’' | '”' | '」' | ')' | '）')
+    });
+    ["or below", "or lower", "以下"]
+        .iter()
+        .any(|p| rest.starts_with(p))
+}
+
+/// Gemini 2.5 的思考预算最多多少：Pro 是 32768，Flash、Flash-Lite 是 24576。超过了整个请求 400
+pub fn gemini_budget_cap(model: &str) -> u64 {
+    if model.to_ascii_lowercase().contains("pro") {
+        32768
+    } else {
+        24576
+    }
+}
+
 /// 这个 Gemini 模型用 `thinkingLevel` 而不是 `thinkingBudget`
 pub fn gemini_uses_level(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
@@ -224,6 +363,101 @@ mod tests {
         ] {
             assert_eq!(effort_of_budget(budget_of_effort(e)), e);
         }
+    }
+
+    #[test]
+    fn the_nearest_level_breaks_ties_upward() {
+        use Effort::*;
+        assert_eq!(nearest(&[Low, High, Max], Medium), Some(High));
+        assert_eq!(nearest(&[High, Max], XHigh), Some(Max));
+        assert_eq!(nearest(&[Low, Medium], Max), Some(Medium));
+        assert_eq!(nearest(&[Minimal], High), Some(Minimal));
+        assert_eq!(nearest(&[], High), None);
+    }
+
+    #[test]
+    fn an_effort_rejection_names_what_to_send_instead() {
+        use Effort::*;
+        // Anthropic：列出认的那几档 → 离 xhigh 最近的，high 和 max 一样近，取 max
+        let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"The parameter `output_config.effort` specified in the request are not valid: expected `low`, `medium`, `high` or `max`, but got `xhigh` instead."}}"#;
+        assert_eq!(
+            effort_rejection(400, anthropic, XHigh),
+            Some(EffortFix::Use(Max))
+        );
+        // 「high 或以下」：上限
+        let ceiling = "output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.";
+        assert_eq!(
+            effort_rejection(400, ceiling, XHigh),
+            Some(EffortFix::Use(High))
+        );
+        assert_eq!(
+            effort_rejection(400, "effort max is too high; use medium or lower", Max),
+            Some(EffortFix::Use(Medium))
+        );
+        // 不提 effort、也不提发出去的那一档，列了别的几档
+        let glm = r#"{"error":{"code":"1210","message":"该模型始终思考，不支持关闭思考；请使用 low、high 或 max。"}}"#;
+        assert_eq!(
+            effort_rejection(400, glm, Medium),
+            Some(EffortFix::Use(High))
+        );
+        // 说到了强度、没说用哪一档：去掉
+        assert_eq!(
+            effort_rejection(400, "reasoning_effort is not supported by this model", High),
+            Some(EffortFix::Drop)
+        );
+        assert_eq!(
+            effort_rejection(400, "Unsupported value: 'xhigh' for reasoning", XHigh),
+            Some(EffortFix::Drop)
+        );
+        // 不说到推理的：不算，哪怕列了好几档、说到了发出去的那一档
+        assert_eq!(
+            effort_rejection(400, "Unsupported value: 'xhigh'", XHigh),
+            None
+        );
+        assert_eq!(
+            effort_rejection(400, "prompt is too long: max context length exceeded", Max),
+            None
+        );
+        let verbosity = r#"{"error":{"message":"Unsupported value: 'low' is not supported with the 'gpt-5-codex' model. Supported values are: 'medium' and 'high'.","type":"invalid_request_error","param":"text.verbosity","code":"unsupported_value"}}"#;
+        assert_eq!(effort_rejection(400, verbosity, Medium), None);
+        assert_eq!(effort_rejection(400, verbosity, Low), None);
+        let azure = r#"{"error":{"message":"The response was filtered due to the prompt triggering Azure OpenAI's content management policy.","type":null,"param":"prompt","code":"content_filter","status":400,"innererror":{"code":"ResponsibleAIPolicyViolation","content_filter_result":{"hate":{"filtered":false,"severity":"safe"},"self_harm":{"filtered":false,"severity":"low"},"sexual":{"filtered":true,"severity":"medium"},"violence":{"filtered":false,"severity":"high"}}}}}"#;
+        assert_eq!(effort_rejection(400, azure, Medium), None);
+        assert_eq!(effort_rejection(400, azure, XHigh), None);
+        // 与强度无关的 400、不是 400 的：不管
+        assert_eq!(
+            effort_rejection(
+                400,
+                r#"{"error":{"message":"messages: field required"}}"#,
+                High
+            ),
+            None
+        );
+        assert_eq!(effort_rejection(500, anthropic, XHigh), None);
+        // 只说到一个别的档位、不是整词的不算
+        assert_eq!(
+            effort_rejection(400, "max_tokens must be at most 8192", High),
+            None
+        );
+        assert_eq!(effort_rejection(400, "xhighly unusual", High), None);
+    }
+
+    #[test]
+    fn a_refused_none_is_recognised_like_a_level() {
+        assert!(none_rejection(
+            400,
+            "Unsupported value: 'none' is not supported with this model for reasoning.effort. Supported values are: 'low', 'medium', and 'high'."
+        ));
+        assert!(none_rejection(
+            400,
+            "该模型始终思考，不支持关闭思考；请使用 low、high 或 max。"
+        ));
+        assert!(!none_rejection(400, "Unsupported value: 'none'"));
+        assert!(!none_rejection(
+            500,
+            "reasoning_effort none is not supported"
+        ));
+        assert!(!none_rejection(400, "messages: field required"));
     }
 
     #[test]

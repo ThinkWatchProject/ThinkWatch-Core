@@ -332,6 +332,27 @@ async fn a_set_only_rule_still_shows_up_as_matched_and_says_what_it_changes() {
     );
 }
 
+/// 推理改写在试算里是一项 `reasoning`，值是配置里的那个词
+#[tokio::test]
+async fn a_reasoning_rewrite_shows_as_its_word() {
+    let (_d, app) = app_with(&CFG.replace(
+        "        set: { model: claude-haiku-4-5 }",
+        "        set: { model: claude-haiku-4-5, reasoning: xhigh }",
+    ));
+    let r = run(
+        &app,
+        r#"{"model":"claude-sonnet-4-5","input_tokens":300000}"#,
+    )
+    .await;
+    assert!(
+        r.set
+            .iter()
+            .any(|s| s.field == tw_api::SetField::Reasoning && s.value == "xhigh"),
+        "{:?}",
+        r.set
+    );
+}
+
 #[tokio::test]
 async fn the_dry_run_changes_nothing_and_sends_nothing() {
     // 它只算。跑一百遍和跑零遍，对上游和配置文件来说没有区别。

@@ -57,9 +57,15 @@ pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction) {
     if let Some(t) = set.max_tokens {
         r.max_tokens = Some(t);
     }
-    // 和直通时一样只做「关掉」：去掉推理配置，按模型默认走
-    if set.thinking == Some(false) {
-        r.reasoning = None;
+    // 和直通时一样只改开着推理的请求：关掉是去掉推理配置；改一档是改强度，预算跟着强度
+    // 由编码器折算（客户端写的预算不再作数）
+    match (set.reasoning, r.reasoning.as_mut()) {
+        (Some(tw_engine::SetReasoning::Off), Some(re)) if re.enabled => r.reasoning = None,
+        (Some(tw_engine::SetReasoning::Level(e)), Some(re)) if re.enabled => {
+            re.effort = Some(e);
+            re.budget = None;
+        }
+        _ => {}
     }
 }
 

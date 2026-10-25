@@ -400,6 +400,50 @@ async fn a_rule_that_only_rewrites_can_be_saved() {
     assert!(codex["rules"][0].get("guard").is_none(), "{codex}");
 }
 
+/// 推理改写是一个词：存进配置写成 `reasoning: xhigh`，读回来还是那个词；不认识的词
+/// （`minimal` 也是）读不成请求体
+#[tokio::test]
+async fn a_reasoning_rewrite_is_saved_as_its_word() {
+    let b = bed(BASE);
+    for word in ["off", "xhigh"] {
+        let (st, v) = call(
+            &b.app,
+            "PUT",
+            "/routes/codex",
+            json!({ "route": { "name": "codex", "rules": [
+                { "name": "推理", "conditions": [], "set": { "reasoning": word } },
+                catch_all("主力"),
+            ]}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            b.file().contains(&format!("reasoning: {word}")),
+            "{}",
+            b.file()
+        );
+        let codex = find(&b.overview().await["routes"], "codex").clone();
+        assert_eq!(
+            codex["rules"][0]["set"],
+            json!({ "reasoning": word }),
+            "{codex}"
+        );
+    }
+    let before = b.file();
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/routes/codex",
+        json!({ "route": { "name": "codex", "rules": [
+            { "name": "推理", "conditions": [], "set": { "reasoning": "minimal" } },
+            catch_all("主力"),
+        ]}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(b.file(), before);
+}
+
 #[tokio::test]
 async fn deleting_a_route_sends_its_keys_where_the_user_chose() {
     let b = bed(BASE);

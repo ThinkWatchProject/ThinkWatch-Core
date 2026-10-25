@@ -3639,6 +3639,7 @@ mod cost_state_tests {
                     pause_ms: None,
                     retry: None,
                     backoff_ms: None,
+                    effort: None,
                     proxy: None,
                 }],
                 ..Default::default()
@@ -4151,6 +4152,7 @@ mod cost {
                     pause_ms: None,
                     retry: None,
                     backoff_ms: None,
+                    effort: None,
                     proxy: None,
                 }
             })

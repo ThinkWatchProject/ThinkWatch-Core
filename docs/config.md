@@ -1500,6 +1500,23 @@ read, naming the rule and the value.
 `set.model` may name an alias; each upstream then receives its own name for
 it. Answers carry the name the client asked for, as with aliases.
 
+`set.reasoning` writes the effort where the client's format keeps it
+(`output_config.effort`, `reasoning_effort`, `reasoning.effort`, Gemini's
+`thinkingLevel`, or the thinking budget when the client gave a budget).
+
+When an upstream answers 400 because of the reasoning effort, whether the
+client or a rule chose it, the request is sent once more to the same upstream
+with a level the upstream named (the nearest one, or the ceiling it gave), or
+without an effort when it named none. The resend is a new attempt in the
+request details and does not count as a retry. If it succeeds, the level is
+remembered for that upstream and model for 7 days in `effort-memory.json` in
+the data directory, so later requests send the working level directly. The
+entries of an upstream are forgotten when its address, key or protocol
+changes, or when it is removed. Requests that only give a thinking budget are
+not resent. On WebSocket connections (Codex), a turn refused for its effort is
+not resent and nothing is remembered: the refusal reaches the client as it
+is.
+
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
 
@@ -1507,7 +1524,7 @@ it. Answers carry the name the client asked for, as with aliases.
 |---|---|---|---|
 | `model` | string | — | Send a different model. The prompt cache of the session is lost. |
 | `max_tokens` | integer | — | Replace `max_tokens`. |
-| `thinking` | bool | — | Turn extended thinking on or off. |
+| `reasoning` | `off` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | — | Reasoning. `off` turns it off: the reasoning settings and the effort are removed, and in the OpenAI formats the effort is set to `none`. A level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are. |
 | `only_at_session_start` | bool | `false` | Apply only when a session starts. Recorded and shown; not in effect yet. |
 <!-- /generated -->
 

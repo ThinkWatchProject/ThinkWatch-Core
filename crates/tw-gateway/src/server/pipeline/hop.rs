@@ -24,6 +24,8 @@ use crate::failure::{Cause, Verdict};
 use crate::forward;
 use crate::server::{hop, hop_failed, note_health};
 use crate::state::{AppState, Runtime};
+use tw_dialect::params::WrittenEffort;
+use tw_dialect::think::EffortFix;
 use tw_types::msg;
 
 /// 接下了这个请求的那一家，和回程要用的东西。
@@ -199,9 +201,21 @@ pub(super) async fn try_upstreams<'a>(
     // 插件写进来的、这个请求已经报过的命中：每一跳再查一遍，同样的只报一次（见
     // `crate::guard::Reported`）
     let mut reported = crate::guard::Reported::default();
+    // 推理强度被上游拒了（见 `crate::effort_memory`）：同一家改一档再发的那一跳要用的 —— 发给
+    // 哪一家、被拒那一跳本来要发的那一档、改成什么。**是尝试链上新的一跳**，不算退避重试
+    let mut effort_resend: Option<(&String, WrittenEffort, EffortFix)> = None;
+    // 重发的那一跳接着用被拒那一跳在这家占着的位置（和探路的名额）：**马上发**，不排到别的
+    // 候选后面、不重新等空位
+    let mut effort_hold: Option<(&String, crate::slots::Slot, Option<crate::throttle::Probe>)> =
+        None;
+    // 为推理强度重发过的那几家：一家只重发一次
+    let mut effort_resent: Vec<&String> = Vec::new();
+    // 这一跳发出去的推理强度和客户端要的不一样：那一跳在尝试链上的位置和那一项
+    let mut effort_note: Option<(usize, tw_api::EffortChange)> = None;
 
     loop {
         stamp_queued(&mut chain, queued.take());
+        stamp_effort(&mut chain, effort_note.take());
         // 候选都试过了，最后一跳在内容之前暂时出错：等待期限之内退避一阵，把暂时出错的那几家再
         // 试一轮。不重试的，交出去的是最后那个错误
         if queue.is_empty() && waiting.is_empty() {
@@ -425,13 +439,18 @@ pub(super) async fn try_upstreams<'a>(
         // 数 token 不排队、不占位置：它不跑模型，一眨眼就回来；为它排在几个长回答后面等上半分钟、
         // 最后回一个 429，客户端连上下文还剩多少都看不到。这一家暂时发不出去的，由网关估
         let limits = crate::throttle::usage_limits(provider);
-        let (slot, mut probe) = match granted.take() {
-            Some((ready, waited)) => {
+        let held = match effort_hold.take() {
+            Some((n, slot, probe)) if n == name => Some((slot, probe)),
+            _ => None,
+        };
+        let (slot, mut probe) = match (held, granted.take()) {
+            (Some(held), _) => held,
+            (None, Some((ready, waited))) => {
                 queued = Some((chain.len(), waited.as_millis() as u64));
                 hop_started = std::time::Instant::now();
                 (ready.slot, ready.probe)
             }
-            None if counting => {
+            (None, None) if counting => {
                 if state.throttles.peek(&provider.name, limits) != crate::throttle::Peek::Open {
                     chain.push(estimated_hop(provider, None, None, hop_started));
                     estimated = Some(provider);
@@ -439,7 +458,7 @@ pub(super) async fn try_upstreams<'a>(
                 }
                 (crate::slots::Slot::free(), None)
             }
-            None => {
+            (None, None) => {
                 let model = Some(sent.clone()).filter(asked_other);
                 // 这段对话留在这家是为了它的缓存：等它，等不到再换下一家（缓存就丢在这家了）。
                 // 别的候选发不出去当场跳过，记下来，候选都看过之后再等
@@ -591,8 +610,33 @@ pub(super) async fn try_upstreams<'a>(
         let model = Some(plugged.model.clone().unwrap_or(sent)).filter(asked_other);
 
         let asked = Asked::of(req, reading, &plugged);
-        let out = match super::heavy(asked.body, || {
-            prepare(state, req, reading, &asked, provider, &effective_set, id)
+        // 发给这一家的模型名：推理强度按（上游，它）记（见 `crate::effort_memory`）
+        let sent_model = effective_set
+            .model
+            .clone()
+            .unwrap_or_else(|| reading.facts.model.clone());
+        // 这一跳是推理强度被拒之后的重发：用定好的那一档。**真的发出去了才算用掉**：发之前就失败了
+        // 的（取不到凭据、转换不了），下一次轮到这一家时照样用
+        let carried = match effort_resend {
+            Some((n, pre, fix)) if n == name => Some((pre, fix)),
+            _ => None,
+        };
+        // `hop_effort`：这一跳的推理强度改了什么（见 `adjust_effort`）
+        let (out, mut hop_effort) = match super::heavy(asked.body, || {
+            prepare(state, req, reading, &asked, provider, &effective_set, id).map(|mut out| {
+                let effort = adjust_effort(
+                    state,
+                    req,
+                    reading,
+                    &asked,
+                    provider,
+                    &sent_model,
+                    &effective_set,
+                    &mut out,
+                    carried.map(|(_, fix)| fix),
+                );
+                (out, effort)
+            })
         }) {
             Ok(out) => out,
             Err(err) => {
@@ -700,16 +744,18 @@ pub(super) async fn try_upstreams<'a>(
             attempt = attempts.len(),
             "forwarding"
         );
-        // 这一跳要发出去了：插件改过的话，它收到的就是改过的那一份
+        // 这一跳要发出去了：重发定好的那一档用掉了，推理强度改了什么记在这一跳上
+        if carried.is_some() {
+            effort_resend = None;
+        }
+        effort_note = hop_effort.change.take().map(|c| (chain.len(), c));
+        // 插件改过的话，上游收到的就是改过的那一份
         after_plugins = plugged
             .rewritten
             .as_ref()
             .map(|r| (r.body.clone(), ledger.clone()));
-        // 这一跳接下了的话，回答钩子要的
-        let sent_model = effective_set
-            .model
-            .clone()
-            .unwrap_or_else(|| reading.facts.model.clone());
+        // 这一跳接下了的话，回答钩子要的：插件改了名的是改过的
+        let sent_model = effective_set.model.clone().unwrap_or(sent_model);
         let (attempt, bridge) = (chain.len(), plugged.bridge);
         // 这一跳在报文记录里记到哪儿（见 `crate::content`）：尝试链上的第几跳，从 1 数
         let tap = crate::content::Tap::new(
@@ -861,6 +907,47 @@ pub(super) async fn try_upstreams<'a>(
                 let verdict = crate::failure::classify(status, &headers, &head, now_ms());
                 if !matches!(verdict, Verdict::Failed(Cause::RateLimited { .. })) {
                     to_throttle(state, &provider.name, sent_at, verdict);
+                }
+                // 上游因为推理强度拒了它（见 `crate::effort_memory`）：这一跳是一跳普通的 400，同一家
+                // 改一档（或者去掉强度）马上再发一次，是尝试链上新的一跳，接着用这一跳占着的位置。
+                // **一家只重发一次**，再被拒照常交给客户端。上游好好的，不算失败。记着的改法自己
+                // 被拒了：那一条删掉
+                if status == 400
+                    && reading.generates
+                    && !counting
+                    && !effort_resent.contains(&name)
+                    && let Some((wire, pre, fix)) = effort_refused(req, &out, &hop_effort, &head)
+                {
+                    if hop_effort.remembered {
+                        state
+                            .effort_memory
+                            .forget(&provider.name, &sent_model, wire, pre);
+                    }
+                    tap.said(&head);
+                    state.note_proxy_ok(&provider.proxy);
+                    note_health(
+                        &state.bus,
+                        &state.health,
+                        &provider.name,
+                        state.health.record_success(&provider.name),
+                    );
+                    tracing::info!(
+                        provider = %provider.name,
+                        model = %sent_model,
+                        "the upstream refused the reasoning effort; sending again with another one"
+                    );
+                    chain.push(hop(
+                        &provider.name,
+                        model.clone(),
+                        tw_api::AttemptOutcome::Status,
+                        status,
+                        hop_started,
+                    ));
+                    effort_resent.push(name);
+                    effort_resend = Some((name, pre, fix));
+                    effort_hold = Some((name, slot, probe.take()));
+                    queue.push_front(name);
+                    continue;
                 }
                 // **最后一家的 4xx 交给客户端**：没有下一家可换了，上游自己的原话
                 // （「invalid x-api-key」）比我们转述的一句「回了 401」有用得多。
@@ -1023,11 +1110,15 @@ pub(super) async fn try_upstreams<'a>(
                 });
                 // 不压开头的最后一家：它答没答上（成败的账）要等回程看到第一段内容才知道
                 let mut unconfirmed = last && hold.is_some() && !held;
+                // 这一家答上了：响应头是 2xx、不压开头的，或者压着开头等到了内容。推理强度改了一档
+                // 重发的，这时才记下这个模型不认原来那一档（见 `crate::effort_memory`）
+                let mut answered = false;
                 let r = match hold.filter(|_| held) {
                     None => {
                         // 不压开头：响应头就是它的答复，这一家没在限流（探路的过了，连续限流的次数
                         // 归零）
                         state.throttles.answered(&provider.name, sent_at);
+                        answered = true;
                         r
                     }
                     Some(hold) => {
@@ -1064,6 +1155,7 @@ pub(super) async fn try_upstreams<'a>(
                             // 上游，响应头不说明它好了
                             Some(super::opening::Opening::Go(r)) => {
                                 state.throttles.answered(&provider.name, sent_at);
+                                answered = true;
                                 r
                             }
                             // 到点了还没有内容：这一跳没有结论
@@ -1225,6 +1317,19 @@ pub(super) async fn try_upstreams<'a>(
                         state.health.record_success(&provider.name),
                     );
                 }
+                if answered
+                    && let Some((pre, fix)) = carried
+                    && let Some(wire) = wire(req, &out)
+                {
+                    state.effort_memory.note(
+                        provider,
+                        &sent_model,
+                        wire,
+                        pre,
+                        fix,
+                        crate::effort_memory::now_secs(),
+                    );
+                }
                 chain.push(hop(
                     &provider.name,
                     model.clone(),
@@ -1301,6 +1406,7 @@ pub(super) async fn try_upstreams<'a>(
     }
 
     stamp_queued(&mut chain, queued.take());
+    stamp_effort(&mut chain, effort_note.take());
     stamp_retries(&mut chain, &retries.rounds);
     // 尝试链走完了，两条路都要发 —— 挂在 RequestFinished 上的话，
     // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
@@ -1452,6 +1558,15 @@ fn stamp_queued(chain: &mut [tw_api::AttemptView], queued: Option<(usize, u64)>)
         && let Some(a) = chain.get_mut(at)
     {
         a.queued_ms = Some(ms);
+    }
+}
+
+/// 推理强度改过的那一跳：在尝试链上补上改了什么（见 [`tw_api::AttemptView::effort`]）
+fn stamp_effort(chain: &mut [tw_api::AttemptView], note: Option<(usize, tw_api::EffortChange)>) {
+    if let Some((at, change)) = note
+        && let Some(a) = chain.get_mut(at)
+    {
+        a.effort = Some(change);
     }
 }
 
@@ -1848,6 +1963,7 @@ fn estimated_hop(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }
@@ -1962,7 +2078,11 @@ fn prepare(
             // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
             // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
             // 一个用户显式要求的例外，不是默认行为。
-            let out = forward::apply_set(asked.body, effective_set, client_dialect);
+            let model = effective_set
+                .model
+                .as_deref()
+                .unwrap_or(&reading.facts.model);
+            let out = forward::apply_set(asked.body, effective_set, client_dialect, model);
             if let (Some(tw_dialect::ir::Dialect::Gemini), Some(m)) =
                 (client_dialect, &effective_set.model)
             {
@@ -2163,6 +2283,140 @@ fn prepare(
         auto_cache,
         reshaped,
     })
+}
+
+/// 一跳的推理强度改了什么（见 [`adjust_effort`]）。
+#[derive(Default)]
+struct HopEffort {
+    /// 这里改之前（规则改过之后）请求体里写明的那一档（[`tw_dialect::params::written_effort`]）。
+    /// 没算过、没写明的（只写了预算的也是）是 None
+    pre: Option<WrittenEffort>,
+    /// 用上了记着的改法
+    remembered: bool,
+    /// 尝试链上这一跳要记的那一项
+    change: Option<tw_api::EffortChange>,
+}
+
+/// 这一跳的推理强度（见 [`crate::effort_memory`]）：规则改过之后（`out` 是按规则改好、要发出去
+/// 的那一份），这一家的这个模型记着不认这一档的，或者这一跳是被拒之后的重发（`carried`），在
+/// 发出去的这一份上改掉写明的那一档。
+///
+/// 尝试链上记的（[`tw_api::EffortChange`]）：这里改了的，`asked` 是改之前写明的那一档；只有规则
+/// 改了的，`asked` 是客户端要的那一档。和发出去的一样的不记。
+///
+/// **用不着时不解请求体**：没有规则改推理、这一家的这个模型什么都没记着、也不是重发的，什么都
+/// 不做
+#[allow(clippy::too_many_arguments)]
+fn adjust_effort(
+    state: &AppState,
+    req: &Inbound,
+    reading: &crate::client_api::Reading,
+    asked: &Asked<'_>,
+    provider: &tw_config::Provider,
+    model: &str,
+    set: &tw_engine::SetAction,
+    out: &mut Outbound,
+    carried: Option<EffortFix>,
+) -> HopEffort {
+    use tw_dialect::params;
+    let rule = set.reasoning.is_some();
+    let Some(wire) = wire(req, out).filter(|_| reading.generates) else {
+        return HopEffort::default();
+    };
+    if !rule && carried.is_none() && !state.effort_memory.has(&provider.name, model, wire) {
+        return HopEffort::default();
+    }
+    let Ok(before) = serde_json::from_slice::<serde_json::Value>(&out.body) else {
+        return HopEffort::default();
+    };
+    let pre = params::written_effort(wire, &before);
+    let mut fixed = None;
+    let mut after = before.clone();
+    if let Some(p) = pre {
+        let fix = match carried {
+            Some(f) => Some((f, tw_api::EffortReason::Rejected)),
+            None => state
+                .effort_memory
+                .lookup(provider, model, wire, p, crate::effort_memory::now_secs())
+                .map(|f| (f, tw_api::EffortReason::Remembered)),
+        };
+        if let Some((f, why)) = fix
+            && apply_fix(wire, &mut after, f)
+        {
+            out.body = forward::rewritten(&out.body, &before, &after);
+            // 去掉、改掉了上游不认的值：发出去的不再是客户端那一份（报文记录另存它）
+            out.reshaped = true;
+            fixed = Some(why);
+        }
+    }
+    let shown = |v: &serde_json::Value| {
+        params::written_effort(wire, v)
+            .map(|w| w.slug())
+            .or_else(|| params::reasoning_effort(wire, v).map(tw_dialect::think::openai))
+    };
+    let sent = shown(&after);
+    let from = match fixed {
+        Some(_) => pre.map(|p| p.slug()),
+        None if rule => match asked.decoded {
+            Some(Ok(d)) => d
+                .request
+                .reasoning
+                .as_ref()
+                .filter(|r| r.enabled)
+                .and_then(tw_dialect::think::effort)
+                .map(tw_dialect::think::openai),
+            _ => req.api.and_then(|a| {
+                let v = serde_json::from_slice::<serde_json::Value>(asked.body).ok()?;
+                params::reasoning_effort(a.dialect(), &v).map(tw_dialect::think::openai)
+            }),
+        },
+        None => None,
+    };
+    let reason = fixed.unwrap_or(tw_api::EffortReason::Rule);
+    let change = from
+        .filter(|f| Some(*f) != sent)
+        .map(|f| tw_api::EffortChange {
+            asked: f.to_string(),
+            sent: sent.map(str::to_string),
+            reason,
+        });
+    HopEffort {
+        pre,
+        remembered: fixed == Some(tw_api::EffortReason::Remembered),
+        change,
+    }
+}
+
+/// 照 `fix` 改请求体 `v`（`wire` 格式）里写明的那一档。返回改没改
+fn apply_fix(wire: tw_dialect::ir::Dialect, v: &mut serde_json::Value, fix: EffortFix) -> bool {
+    match fix {
+        EffortFix::Use(e) => tw_dialect::params::replace_reasoning_effort(wire, v, e),
+        EffortFix::Drop => tw_dialect::params::remove_reasoning_effort(wire, v),
+    }
+}
+
+/// 上游回的这个 400 是不是因为写明的推理强度（[`tw_dialect::think::effort_rejection`]，发出去的
+/// 是 `none` 的看 [`tw_dialect::think::none_rejection`]，那时去掉它）：是的话，交回发出去的格式、
+/// 记的时候按哪一档记（这一跳改强度之前写明的那一档；没算过的就是发出去的那一档）和重发时怎么
+/// 改。只写了预算的不算；照着改了也和发出去的一样的不算：重发一遍还是被拒
+fn effort_refused(
+    req: &Inbound,
+    out: &Outbound,
+    hop: &HopEffort,
+    said: &[u8],
+) -> Option<(tw_dialect::ir::Dialect, WrittenEffort, EffortFix)> {
+    let wire = wire(req, out)?;
+    let v = serde_json::from_slice::<serde_json::Value>(&out.body).ok()?;
+    let sent = tw_dialect::params::written_effort(wire, &v)?;
+    let said = String::from_utf8_lossy(said);
+    let fix = match sent {
+        WrittenEffort::Level(e) => tw_dialect::think::effort_rejection(400, &said, e)?,
+        WrittenEffort::Off => {
+            tw_dialect::think::none_rejection(400, &said).then_some(EffortFix::Drop)?
+        }
+    };
+    let mut tried = v;
+    apply_fix(wire, &mut tried, fix).then_some((wire, hop.pre.unwrap_or(sent), fix))
 }
 
 /// 这一跳发出去的那一份是什么格式：转换过的是目标格式，直通的是客户端的

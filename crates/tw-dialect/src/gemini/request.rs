@@ -512,8 +512,10 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
                     t.insert("thinkingLevel".into(), json!(think::gemini_level(e)));
                 }
             } else {
-                // -1 是让模型自己决定
-                let budget = think::budget(re).map(|b| b as i64).unwrap_or(-1);
+                // -1 是让模型自己决定。超过这个模型的上限整个请求 400（Claude 那边的预算能到 64000）
+                let budget = think::budget(re)
+                    .map(|b| b.min(think::gemini_budget_cap(&r.model)) as i64)
+                    .unwrap_or(-1);
                 t.insert("thinkingBudget".into(), json!(budget));
             }
             if re.summary {
@@ -840,6 +842,39 @@ mod tests {
         let (v, dropped) = encode(&r, Dialect::Anthropic);
         assert!(v.get("generationConfig").is_none());
         assert_eq!(dropped, ["thinking"]);
+    }
+
+    /// Claude 那边的预算（最多 64000）转过来压在这个模型的上限以内，超过了整个请求 400
+    #[test]
+    fn a_budget_stays_within_the_model_limit() {
+        let mut r = Request {
+            model: "gemini-2.5-flash".into(),
+            reasoning: Some(Reasoning {
+                enabled: true,
+                effort: Some(Effort::Max),
+                budget: None,
+                summary: false,
+            }),
+            ..Default::default()
+        };
+        let (v, _) = encode(&r, Dialect::Anthropic);
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24576
+        );
+        r.model = "gemini-2.5-pro".into();
+        r.reasoning.as_mut().unwrap().budget = Some(48000);
+        let (v, _) = encode(&r, Dialect::Anthropic);
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            32768
+        );
+        r.reasoning.as_mut().unwrap().budget = Some(8192);
+        let (v, _) = encode(&r, Dialect::Anthropic);
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            8192
+        );
     }
 
     #[test]

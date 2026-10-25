@@ -389,6 +389,7 @@ pub(crate) fn hop(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }
@@ -419,6 +420,7 @@ pub(crate) fn hop_busy(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }
@@ -471,6 +473,7 @@ pub(crate) fn hop_waiting(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }
@@ -502,6 +505,7 @@ pub(crate) fn hop_used_up(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }
@@ -526,6 +530,7 @@ pub(crate) fn hop_failed(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }

@@ -101,6 +101,7 @@ pub(super) fn abandoned(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }
@@ -126,6 +127,7 @@ pub(super) fn aborted_hop(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }

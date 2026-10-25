@@ -1191,7 +1191,7 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
             when: serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap(),
             to: None,
             set: Some(tw_engine::SetAction {
-                thinking: Some(false),
+                reasoning: Some(tw_engine::SetReasoning::Off),
                 ..Default::default()
             }),
             deny: None,
