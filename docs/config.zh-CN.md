@@ -1096,7 +1096,7 @@ routes:
 |---|---|---|---|
 | `model` | 字符串 | — | 换成另一个模型发送。该会话的 prompt cache 随之失效。 |
 | `max_tokens` | 整数 | — | 替换 `max_tokens`。 |
-| `thinking` | 布尔 | — | 开启或关闭扩展思考。 |
+| `reasoning` | `off` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | — | 推理。`off` 关闭推理，连同推理强度一起去掉；写一档则改为该档强度。只改写已开启推理的请求，未开启推理的请求（如生成标题）保持不变。 |
 | `only_at_session_start` | 布尔 | `false` | 只在会话开始时应用。目前只记录和显示，尚未生效。 |
 <!-- /generated -->
 

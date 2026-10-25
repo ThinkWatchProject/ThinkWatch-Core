@@ -1848,6 +1848,7 @@ fn estimated_hop(
         pause_ms: None,
         retry: None,
         backoff_ms: None,
+        effort: None,
         proxy: None,
     }
 }

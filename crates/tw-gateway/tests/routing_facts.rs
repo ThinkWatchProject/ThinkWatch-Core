@@ -60,7 +60,7 @@ fn rule(
 
 fn thinking_off() -> Option<SetAction> {
     Some(SetAction {
-        thinking: Some(false),
+        reasoning: Some(tw_engine::SetReasoning::Off),
         ..Default::default()
     })
 }

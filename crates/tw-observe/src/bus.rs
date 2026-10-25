@@ -512,6 +512,7 @@ mod tests {
                     pause_ms: None,
                     retry: None,
                     backoff_ms: None,
+                    effort: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -527,6 +528,7 @@ mod tests {
                     pause_ms: None,
                     retry: None,
                     backoff_ms: None,
+                    effort: None,
                     proxy: None,
                 },
             ],

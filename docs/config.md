@@ -1507,7 +1507,7 @@ it. Answers carry the name the client asked for, as with aliases.
 |---|---|---|---|
 | `model` | string | — | Send a different model. The prompt cache of the session is lost. |
 | `max_tokens` | integer | — | Replace `max_tokens`. |
-| `thinking` | bool | — | Turn extended thinking on or off. |
+| `reasoning` | `off` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | — | Reasoning. `off` turns it off and removes the reasoning effort; a level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are. |
 | `only_at_session_start` | bool | `false` | Apply only when a session starts. Recorded and shown; not in effect yet. |
 <!-- /generated -->
 

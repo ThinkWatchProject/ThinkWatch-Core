@@ -664,14 +664,14 @@ fn create_reasoning(model: &str) -> WsMsg {
 }
 
 /// 规则的参数改写每一帧照 HTTP 那条路改（Responses 的字段名）：`set.max_tokens` 写成
-/// `max_output_tokens`，`set.thinking: false` 去掉 `reasoning`。条件按这一帧求 —— 按模型附加的
+/// `max_output_tokens`，`set.reasoning: off` 去掉 `reasoning`。条件按这一帧求 —— 按模型附加的
 /// 改写、按模型拒绝的规则，升级时还不知道模型，每一帧照样生效
 #[tokio::test]
 async fn rule_parameter_rewrites_and_model_conditions_apply_to_each_frame() {
     let (up, seen) = upstream().await;
     let rules = "
 - { name: Codex 限长, when: { client: codex }, set: { max_tokens: 1234 } }
-- { name: Max 不思考, when: { model: gpt-5.1-codex-max }, set: { thinking: false, max_tokens: 99 } }
+- { name: Max 不思考, when: { model: gpt-5.1-codex-max }, set: { reasoning: off, max_tokens: 99 } }
 - { name: 不给, when: { model: banned }, deny: 这个模型不走这里 }
 - { name: 兜底, to: __all__ }
 ";

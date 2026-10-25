@@ -104,6 +104,7 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
             pause_ms: None,
             retry: None,
             backoff_ms: None,
+            effort: None,
             proxy: None,
         }],
         billing: tw_api::Billing::PerToken,

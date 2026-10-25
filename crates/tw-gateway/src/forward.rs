@@ -128,14 +128,16 @@ fn set_params(
     if let Some(t) = set.max_tokens {
         params::set_max_output_tokens(client, v, t);
     }
-    match set.thinking {
-        // 开启思考需要一个 budget，而我们没有一个合理的值可以编。
-        // **只做「关掉」这一个方向** —— 那是降级场景真正需要的。
-        Some(true) => tracing::warn!(
-            "set.thinking: true is not supported yet (it needs budget_tokens); ignoring it"
-        ),
-        Some(false) => params::disable_thinking(client, v),
-        None => {}
+    // 推理只改开着推理的请求：没开的不替它打开（开推理要一个预算，也要多花钱），关掉的也
+    // 不动 —— 去掉 `reasoning_effort: "none"` 反倒让推理按模型的默认打开了
+    match set.reasoning {
+        Some(tw_engine::SetReasoning::Off) if params::reasoning_on(client, v) => {
+            params::disable_thinking(client, v)
+        }
+        Some(tw_engine::SetReasoning::Level(e)) => {
+            params::set_reasoning_effort(client, v, e);
+        }
+        _ => {}
     }
 }
 
@@ -266,7 +268,7 @@ mod tests {
         let out = apply_set(
             &b,
             &tw_engine::SetAction {
-                thinking: Some(false),
+                reasoning: Some(tw_engine::SetReasoning::Off),
                 ..Default::default()
             },
             None,
@@ -296,7 +298,7 @@ mod tests {
         let set = tw_engine::SetAction {
             model: Some("small".into()),
             max_tokens: Some(512),
-            thinking: Some(false),
+            reasoning: Some(tw_engine::SetReasoning::Off),
             ..Default::default()
         };
         let run = |body: &'static str, d| {
@@ -340,12 +342,12 @@ mod tests {
     fn set(
         model: Option<&str>,
         max_tokens: Option<u64>,
-        thinking: Option<bool>,
+        reasoning: Option<tw_engine::SetReasoning>,
     ) -> tw_engine::SetAction {
         tw_engine::SetAction {
             model: model.map(str::to_string),
             max_tokens,
-            thinking,
+            reasoning,
             ..Default::default()
         }
     }
@@ -369,7 +371,11 @@ mod tests {
         );
         let out = apply_set(
             &Bytes::from(body.clone()),
-            &set(Some("claude-haiku-5"), Some(4096), Some(false)),
+            &set(
+                Some("claude-haiku-5"),
+                Some(4096),
+                Some(tw_engine::SetReasoning::Off),
+            ),
             Some(Dialect::Anthropic),
         );
         assert_eq!(
@@ -394,7 +400,11 @@ mod tests {
         );
         let out = apply_set(
             &Bytes::from(gemini),
-            &set(Some("ignored"), Some(512), Some(false)),
+            &set(
+                Some("ignored"),
+                Some(512),
+                Some(tw_engine::SetReasoning::Off),
+            ),
             Some(Dialect::Gemini),
         );
         assert_eq!(
@@ -461,6 +471,7 @@ mod tests {
             "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":9}",
             "\"reasoning_effort\":\"high\"",
             "\"reasoning\":{\"effort\":\"low\"}",
+            "\"output_config\":{\"effort\":\"xhigh\"}",
             "\"inferenceConfig\":{\"temperature\":1,\"maxTokens\":3}",
             "\"additionalModelRequestFields\":{\"thinking\":{\"type\":\"enabled\"},\"k\":1}",
             "\"tools\":[{\"input_schema\":{\"type\":\"object\",\"properties\":{\"b\":{},\"a\":{}}}}]",
@@ -491,7 +502,11 @@ mod tests {
             let s = set(
                 [None, Some("small"), Some("big")][r.below(3)],
                 [None, Some(9), Some(512)][r.below(3)],
-                [None, Some(false), Some(true)][r.below(3)],
+                [
+                    None,
+                    Some(tw_engine::SetReasoning::Off),
+                    Some(tw_engine::SetReasoning::Level(tw_dialect::ir::Effort::Max)),
+                ][r.below(3)],
             );
             if s.is_empty() {
                 continue;
