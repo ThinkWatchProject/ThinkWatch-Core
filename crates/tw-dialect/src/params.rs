@@ -204,8 +204,17 @@ pub fn disable_thinking(dialect: Dialect, body: &mut Value) {
             obj.remove("thinking");
             remove_output_effort(obj);
         }
+        // DeepSeek、GLM、Kimi 的 `thinking.type: enabled` 也是开关：只去掉强度的话推理照样开着
         Dialect::Chat => {
             obj.remove("reasoning_effort");
+            if obj
+                .get("thinking")
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str)
+                == Some("enabled")
+            {
+                obj.remove("thinking");
+            }
         }
         Dialect::Responses => {
             obj.remove("reasoning");
@@ -1086,6 +1095,19 @@ mod tests {
             "thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}, "top_k": 3}});
         disable_thinking(Dialect::Bedrock, &mut v);
         assert_eq!(v, json!({"additionalModelRequestFields": {"top_k": 3}}));
+    }
+
+    #[test]
+    fn turning_thinking_off_in_chat_takes_the_glm_switch_too() {
+        // DeepSeek、GLM、Kimi 的写法：开关在 `thinking`，强度在 `reasoning_effort`
+        let mut v = json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high", "x": 1});
+        disable_thinking(Dialect::Chat, &mut v);
+        assert_eq!(v, json!({"x": 1}));
+        let mut v = json!({"thinking": {"type": "enabled"}, "x": 1});
+        assert!(reasoning_on(Dialect::Chat, &v));
+        disable_thinking(Dialect::Chat, &mut v);
+        assert_eq!(v, json!({"x": 1}));
+        assert!(!reasoning_on(Dialect::Chat, &v));
     }
 
     #[test]
