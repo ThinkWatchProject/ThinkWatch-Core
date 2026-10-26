@@ -208,25 +208,39 @@ fn served_by(o: &Outcome) -> Vec<(&str, AttemptOutcome)> {
 #[tokio::test]
 async fn sealed_agent_messages_go_back_to_the_account_that_sealed_them() {
     let (a, b) = (account("甲", false).await, account("乙", false).await);
-    let state = tw_gateway::AppState::new(cfg(&[("甲", &a), ("乙", &b)], "甲")).unwrap();
+    // 一个请求最多等一秒；退避的一秒是一百毫秒，不浮动
+    let waiting = |to: &str| {
+        let mut c = cfg(&[("甲", &a), ("乙", &b)], to);
+        c.failover.wait_secs = 1;
+        c
+    };
+    let mut state = tw_gateway::AppState::new(waiting("甲")).unwrap();
+    state.retry_backoff = tw_gateway::retry::Backoff {
+        tick: Duration::from_millis(100),
+        jitter: 0.0,
+    };
     let (gw, mut rx) = serve(state.clone()).await;
     let o = ask(gw, &mut rx, body(1, "甲", false)).await;
     assert_eq!(served_by(&o), [("甲", AttemptOutcome::Served)]);
 
     // 改了配置：规则现在送去乙。带着甲封存的、子代理交回来的话的这段对话照旧回甲，乙不做备选
-    state.reload(cfg(&[("甲", &a), ("乙", &b)], "乙")).unwrap();
+    state.reload(waiting("乙")).unwrap();
     let o = ask(gw, &mut rx, body(2, "甲", true)).await;
     assert_eq!(o.status, 200);
     assert_eq!(served_by(&o), [("甲", AttemptOutcome::Served)]);
     assert_eq!(o.stayed, Some(Stay::Sealed));
     assert_eq!(b.hits.load(Ordering::SeqCst), 0);
 
-    // 甲发不出去：报甲的错，不转给解不开的乙
+    // 甲发不出去：退避着重试的也只是甲，到期限了报甲的错，不转给解不开的乙
     a.down.store(true, Ordering::SeqCst);
     let o = ask(gw, &mut rx, body(3, "甲", true)).await;
     assert_ne!(o.status, 200);
-    assert_eq!(o.attempts.len(), 1, "{:#?}", o.attempts);
-    assert_eq!(o.attempts[0].provider, "甲");
+    assert!(o.attempts.len() > 1, "{:#?}", o.attempts);
+    assert!(
+        o.attempts.iter().all(|a| a.provider == "甲"),
+        "{:#?}",
+        o.attempts
+    );
     assert_eq!(b.hits.load(Ordering::SeqCst), 0);
 
     // 新的对话照新的规则走

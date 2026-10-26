@@ -1134,6 +1134,23 @@ Before the first content of a streamed answer reaches the client, an error
 the upstream sends in the stream moves the request to the next candidate,
 the same as an error status would.
 
+When every candidate has been tried and the last one failed temporarily
+before any content reached the client — 500, 502, 503, 504 or 529, an
+overload or server error reported in a streamed answer, unreachable, or its
+stream broke or ended before any content — the request is retried after a
+pause instead of passing the error on. The pause is 2, 4 and 8 seconds, then
+16 seconds each time, varied by up to a fifth; when the upstream asks for a
+longer one (`retry-after-ms`, `Retry-After`), it is used instead. Each retry
+goes again to the candidates that failed temporarily, in order, skipping those
+set aside unless all of them are; a conversation that stays on an upstream
+retries only that one. Retrying stops when the next pause would end after
+`wait_secs`, the time a request may wait in all; the client then gets the last
+error. Rate limits, used-up quotas, an insufficient balance, rejected
+credentials, missing models, errors in the request itself, other errors
+reported in the stream, other 5xx statuses and idle timeouts are not retried;
+they still move the request to the next candidate as before. Each retry appears among the request's attempts with its
+number and the pause before it. `wait_secs: 0` turns retrying off.
+
 An upstream can also go quiet: it accepts the request and then sends nothing,
 or stops partway through. After `idle_timeout_secs` (300 by default) without
 content, the gateway stops waiting for it. The time counts from the moment the
@@ -1149,9 +1166,12 @@ to the complete answer.
   outcome `idle_timeout`, and the request moves to the next candidate. Until
   then an upstream's answer is held back from the client, so the next upstream
   starts it afresh. With no candidate left, the client gets a timeout error
-  (504) in its own format. The last candidate's stream is passed on as it
-  arrives, so once its response has started, a timeout there ends it with an
-  error event instead.
+  (504) in its own format. When the client receives a stream, the last
+  candidate's stream is held the same way while the request can still be
+  retried within `wait_secs`; otherwise it is passed on as it arrives, and
+  once its response has started, a timeout there ends it with an error event
+  instead. A non-streamed answer from the last candidate is always passed on
+  as it arrives.
 - A streamed answer is held for at most 15 seconds. If no content has
   arrived by then, the client receives `200` and the streaming headers, so
   that its own wait for headers does not run out, followed by an SSE comment
@@ -1183,9 +1203,9 @@ pause is at most `rate_limit_max_pause_secs`, and the circuit breaker and
 `load-balance` do not count it as a failure. The request that got the 429
 moves to the next candidate, or waits for the pause to end; the client sees
 nothing of it. A streamed answer that reports a rate limit before any content
-counts as a 429 too; only on a request's last candidate that has not been rate
-limited in the last five minutes does the client get that error (the upstream
-is paused all the same). When the pause ends, one request goes first, and the
+counts as a 429 too; only on a request's last candidate, once the request can
+no longer wait (`wait_secs`), does the client get that error (the upstream is
+paused all the same). When the pause ends, one request goes first, and the
 others follow once the upstream has accepted it (for a streamed answer, once
 its content starts), or at once if that request gets no answer, times out or
 finds the upstream's quota used up. A pause lasts until twcore restarts at
@@ -1194,10 +1214,10 @@ most.
 A request waits for upstreams that cannot take it yet for at most `wait_secs`
 in all: an upstream at its `max_concurrent`, one paused after a 429, and one
 at its `minute` or `hour` usage limit. The same time also covers waiting for
-a key's `minute` or `hour` limit, so a request never waits longer than
-`wait_secs` for all of them together. An ongoing conversation waits for the
-upstream it stays on and, if it does not become available in time, moves on
-to the next one, where its cache starts over. A new conversation skips such an
+a key's `minute` or `hour` limit and the pauses before retries, so a request
+never waits longer than `wait_secs` for all of them together. An ongoing
+conversation waits for the upstream it stays on and, if it does not become
+available in time, moves on to the next one, where its cache starts over. A new conversation skips such an
 upstream at once. An upstream that has used up a day, week or month usage
 limit is skipped. When no candidate is left, the request waits for whichever
 becomes available first; streamed answers keep the client's connection open
@@ -1219,7 +1239,7 @@ receive the request and failed, the client gets that failure instead.
 | `quota_pause_secs` | integer | `3600` | Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then. |
 | `rate_limit_max_pause_secs` | integer | `3600` | Longest pause, in seconds, after an upstream answers 429 (rate limited). The pause lasts as long as the upstream says (`retry-after-ms`, `Retry-After`, or a delay in the error body); when it says nothing, it backs off by the upstream's consecutive 429s: 5, 10, 20 and 40 seconds, then 60 seconds each time. A pause is not a failure: requests wait for the upstream within `wait_secs`, and the circuit breaker does not count it. |
 | `idle_timeout_secs` | integer | `300` | Seconds an upstream may go without sending content before the gateway stops waiting for it. Counted from the moment the request is sent and started again by every piece of content: text, reasoning and tool calls count, keep-alives do not. A whole (non-streamed) answer counts from sending to the complete answer. Before any content has reached the client, the upstream counts as failed and the request moves to the next one; with none left, the client gets a timeout error. After content has reached the client, the answer ends with an error. From 30 to 3600. |
-| `wait_secs` | integer | `120` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for an upstream that cannot take it yet — at its `max_concurrent`, paused after answering 429, or at one of its `minute` or `hour` usage limits. A key limit that does not free up in time refuses the request. An upstream that cannot take it is skipped for the next one, and when none is left the request waits for the first to become available; a conversation that stays on an upstream waits for it. When nothing became available in time, the client gets 429 with `Retry-After`. `0`: never wait. From 0 to 600. |
+| `wait_secs` | integer | `120` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, for an upstream that cannot take it yet — at its `max_concurrent`, paused after answering 429, or at one of its `minute` or `hour` usage limits — and before retrying upstreams that failed temporarily before any content (overloaded, a server error, unreachable). A key limit that does not free up in time refuses the request. An upstream that cannot take it is skipped for the next one, and when none is left the request waits for the first to become available; a conversation that stays on an upstream waits for it. When nothing became available in time, the client gets 429 with `Retry-After`; when retries did not succeed in time, it gets the last upstream error. `0`: never wait or retry. From 0 to 600. |
 <!-- /generated -->
 
 ### `aliases`
@@ -1480,6 +1500,27 @@ read, naming the rule and the value.
 `set.model` may name an alias; each upstream then receives its own name for
 it. Answers carry the name the client asked for, as with aliases.
 
+`set.reasoning` writes the effort where the client's format keeps it
+(`output_config.effort`, `reasoning_effort`, `reasoning.effort`, Gemini's
+`thinkingLevel`, or the thinking budget when the client gave a budget). A
+request converted for an upstream of another format carries it the way that
+format writes it: `off` sent to an OpenAI Chat or Responses upstream is
+`none` there, and sent to Gemini 2.5 Flash it is a thinking budget of 0.
+
+When an upstream answers 400 because of the reasoning effort, whether the
+client or a rule chose it, the request is sent once more to the same upstream
+with a level the upstream named (the nearest one, or the ceiling it gave), or
+without an effort when it named none. A refused `none` is replaced by the
+lowest level the upstream named, so reasoning stays as low as it allows. The resend is a new attempt in the
+request details and does not count as a retry. If it succeeds, the level is
+remembered for that upstream and model for 7 days in `effort-memory.json` in
+the data directory, so later requests send the working level directly. The
+entries of an upstream are forgotten when its address, key or protocol
+changes, or when it is removed. Requests that only give a thinking budget are
+not resent. On WebSocket connections (Codex), a turn refused for its effort is
+not resent and nothing is remembered: the refusal reaches the client as it
+is.
+
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
 
@@ -1487,7 +1528,7 @@ it. Answers carry the name the client asked for, as with aliases.
 |---|---|---|---|
 | `model` | string | — | Send a different model. The prompt cache of the session is lost. |
 | `max_tokens` | integer | — | Replace `max_tokens`. |
-| `thinking` | bool | — | Turn extended thinking on or off. |
+| `reasoning` | `off` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | — | Reasoning. `off` turns it off: the reasoning settings and the effort are removed, and in the OpenAI formats the effort is set to `none`. A level changes the effort. Only requests that already have reasoning on are changed; requests without reasoning (such as title generation) are left as they are. |
 | `only_at_session_start` | bool | `false` | Apply only when a session starts. Recorded and shown; not in effect yet. |
 <!-- /generated -->
 

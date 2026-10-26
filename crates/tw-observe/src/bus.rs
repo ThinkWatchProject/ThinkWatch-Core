@@ -102,7 +102,9 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::ToolCallFlagged { .. }
         // 在排队：半路才来的一方要看得出它在等哪几家，和它是不是已经不排了
         | E::RequestQueued { .. }
-        | E::RequestDequeued { .. } => true,
+        | E::RequestDequeued { .. }
+        // 在退避、之后重试：同上
+        | E::RequestRetrying { .. } => true,
         // 开始和三种结局由 `track_at` 自己管
         E::RequestStarted { .. }
         | E::RequestFinished { .. }
@@ -508,6 +510,9 @@ mod tests {
                     queued_ms: None,
                     skipped: None,
                     pause_ms: None,
+                    retry: None,
+                    backoff_ms: None,
+                    effort: None,
                     proxy: None,
                 },
                 tw_api::AttemptView {
@@ -521,6 +526,9 @@ mod tests {
                     queued_ms: None,
                     skipped: None,
                     pause_ms: None,
+                    retry: None,
+                    backoff_ms: None,
+                    effort: None,
                     proxy: None,
                 },
             ],

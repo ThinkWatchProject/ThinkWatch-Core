@@ -405,8 +405,8 @@ fn describe(set: &tw_engine::SetAction) -> Vec<tw_api::SetView> {
     if let Some(t) = set.max_tokens {
         push(SetField::MaxTokens, t.to_string());
     }
-    if let Some(t) = set.thinking {
-        push(SetField::Thinking, t.to_string());
+    if let Some(r) = set.reasoning {
+        push(SetField::Reasoning, r.slug().to_string());
     }
     if set.only_at_session_start {
         push(SetField::OnlyAtSessionStart, "true".to_string());

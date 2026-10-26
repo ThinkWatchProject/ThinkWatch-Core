@@ -2212,7 +2212,8 @@ fn rewrite(text: String, model: &str, set: &tw_engine::SetAction) -> String {
         return text;
     }
     let body = bytes::Bytes::from(text);
-    let out = crate::forward::apply_set(&body, &set, Some(tw_dialect::ir::Dialect::Responses));
+    let out =
+        crate::forward::apply_set(&body, &set, Some(tw_dialect::ir::Dialect::Responses), model);
     String::from_utf8(Vec::from(out))
         .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned())
 }

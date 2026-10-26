@@ -62,7 +62,9 @@ Documentation: [configuration reference](docs/config.md) ·
   images, thinking and more, and send requests to an upstream or a group (in
   order, manual, rotation, lowest latency, lowest cost). Until the first byte
   of the response reaches the client, a failing upstream is replaced by the
-  next candidate and set aside for a time that depends on the reason it gives.
+  next candidate and set aside for a time that depends on the reason it gives;
+  when the last one is only overloaded or briefly unreachable, it is retried
+  after a pause.
 - **Many kinds of upstream.** Provider API keys, any compatible endpoint, relays
   such as OpenRouter, local models, Amazon Bedrock, and ChatGPT or Z.ai
   accounts. Health checks and warm-ups are answered locally by default, at no cost.

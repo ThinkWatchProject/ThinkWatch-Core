@@ -5,6 +5,7 @@
 //! 所以引擎只有一条代码路径，用户看到的却是零配置可用。
 
 use serde::{Deserialize, Serialize};
+use tw_dialect::ir::Effort;
 use tw_types::{Msg, msg};
 
 use crate::facts::RequestFacts;
@@ -320,8 +321,12 @@ pub struct SetAction {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// 推理：`off` 关掉，或者改成一档（`low` / `medium` / `high` / `xhigh` / `max`）。
+    ///
+    /// **只改开着推理的请求**：没开推理的（生成标题这类辅助请求）原样不动，改成一档也不替它
+    /// 打开 —— 开推理要多花钱，不该由一条规则悄悄替客户端决定。`off` 连同推理强度一起去掉
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<bool>,
+    pub reasoning: Option<SetReasoning>,
     /// 只在新会话开始时应用，跑到一半不动它。
     ///
     /// **长会话场景下这应该是默认值**，但会话识别是 M3 的事 ——
@@ -340,14 +345,86 @@ impl SetAction {
         if other.max_tokens.is_some() {
             self.max_tokens = other.max_tokens;
         }
-        if other.thinking.is_some() {
-            self.thinking = other.thinking;
+        if other.reasoning.is_some() {
+            self.reasoning = other.reasoning;
         }
         self.only_at_session_start |= other.only_at_session_start;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.model.is_none() && self.max_tokens.is_none() && self.thinking.is_none()
+        self.model.is_none() && self.max_tokens.is_none() && self.reasoning.is_none()
+    }
+}
+
+/// 规则改写的推理（[`SetAction::reasoning`]）。配置里写成一个词：`off`、`low`、`medium`、
+/// `high`、`xhigh`、`max`。**没有 `minimal`**：只有 OpenAI 认它，写给别家等于 `low`，规则里
+/// 写它只会让人以为比 `low` 还少
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ReasoningWord", into = "ReasoningWord")]
+pub enum SetReasoning {
+    /// 关掉推理
+    Off,
+    /// 改成这一档
+    Level(Effort),
+}
+
+impl SetReasoning {
+    /// 写在配置里的那个词
+    pub fn slug(self) -> &'static str {
+        ReasoningWord::from(self).slug()
+    }
+}
+
+/// [`SetReasoning`] 在配置里的写法。不认识的词（`minimal` 也是）读配置时报出来，列出认得的
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningWord {
+    Off,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl ReasoningWord {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl From<ReasoningWord> for SetReasoning {
+    fn from(w: ReasoningWord) -> Self {
+        match w {
+            ReasoningWord::Off => Self::Off,
+            ReasoningWord::Low => Self::Level(Effort::Low),
+            ReasoningWord::Medium => Self::Level(Effort::Medium),
+            ReasoningWord::High => Self::Level(Effort::High),
+            ReasoningWord::XHigh => Self::Level(Effort::XHigh),
+            ReasoningWord::Max => Self::Level(Effort::Max),
+        }
+    }
+}
+
+impl From<SetReasoning> for ReasoningWord {
+    fn from(r: SetReasoning) -> Self {
+        match r {
+            SetReasoning::Off => Self::Off,
+            // 构造不出 `minimal`（配置里不认它），真有的话按最接近的 `low` 写
+            SetReasoning::Level(Effort::Minimal | Effort::Low) => Self::Low,
+            SetReasoning::Level(Effort::Medium) => Self::Medium,
+            SetReasoning::Level(Effort::High) => Self::High,
+            SetReasoning::Level(Effort::XHigh) => Self::XHigh,
+            SetReasoning::Level(Effort::Max) => Self::Max,
+        }
     }
 }
 
@@ -1897,7 +1974,7 @@ mod tests {
                     "{}",
                     None,
                     Some(SetAction {
-                        thinking: Some(false),
+                        reasoning: Some(SetReasoning::Off),
                         ..Default::default()
                     }),
                     None,
@@ -1918,12 +1995,51 @@ mod tests {
         );
         let d = decision(&e, &facts("x"));
         assert_eq!(d.candidates, ["a"], "去向是第一条有 to 的");
-        assert_eq!(d.set.thinking, Some(false));
+        assert_eq!(d.set.reasoning, Some(SetReasoning::Off));
         assert_eq!(
             d.set.model.as_deref(),
             Some("cheap"),
             "后面的规则也累积进来了"
         );
+    }
+
+    /// `set.reasoning` 是一个词；`minimal` 和不认识的词读配置时就报出来，列出认得的。
+    /// 旧的 `thinking` 不认了
+    #[test]
+    fn a_reasoning_rewrite_is_one_word() {
+        let parse = |y: &str| serde_yaml_ng::from_str::<SetAction>(y);
+        for (word, want) in [
+            ("off", SetReasoning::Off),
+            ("low", SetReasoning::Level(Effort::Low)),
+            ("medium", SetReasoning::Level(Effort::Medium)),
+            ("high", SetReasoning::Level(Effort::High)),
+            ("xhigh", SetReasoning::Level(Effort::XHigh)),
+            ("max", SetReasoning::Level(Effort::Max)),
+        ] {
+            let s = parse(&format!("reasoning: {word}")).unwrap();
+            assert_eq!(s.reasoning, Some(want));
+            assert_eq!(want.slug(), word);
+            assert_eq!(
+                serde_yaml_ng::to_string(&s).unwrap().trim(),
+                format!("reasoning: {word}")
+            );
+        }
+        for bad in ["minimal", "none", "true", "XHIGH"] {
+            let e = parse(&format!("reasoning: {bad}")).unwrap_err().to_string();
+            assert!(
+                e.contains("reasoning") && e.contains("`xhigh`") && e.contains("`off`"),
+                "{bad}: {e}"
+            );
+        }
+        assert!(parse("thinking: false").is_err());
+        // 后面的规则盖过前面的
+        let mut a = parse("reasoning: off").unwrap();
+        a.merge(&parse("reasoning: max").unwrap());
+        assert_eq!(a.reasoning, Some(SetReasoning::Level(Effort::Max)));
+        a.merge(&parse("max_tokens: 9").unwrap());
+        assert_eq!(a.reasoning, Some(SetReasoning::Level(Effort::Max)));
+        assert!(!a.is_empty());
+        assert!(!parse("reasoning: off").unwrap().is_empty());
     }
 
     /// 改写是谁加的要记下来：命中了、真的改了东西的才算，没命中的、只写了
@@ -1932,7 +2048,7 @@ mod tests {
     fn the_decision_names_every_rule_that_added_a_rewrite() {
         let thinking_off = || {
             Some(SetAction {
-                thinking: Some(false),
+                reasoning: Some(SetReasoning::Off),
                 ..Default::default()
             })
         };
@@ -1988,7 +2104,7 @@ mod tests {
                     "{ provider_would_be: relay }",
                     None,
                     Some(SetAction {
-                        thinking: Some(false),
+                        reasoning: Some(SetReasoning::Off),
                         ..Default::default()
                     }),
                     None,
@@ -2082,7 +2198,7 @@ mod tests {
                     "{ provider_would_be: relay }",
                     None,
                     Some(SetAction {
-                        thinking: Some(false),
+                        reasoning: Some(SetReasoning::Off),
                         ..Default::default()
                     }),
                     None,
@@ -2092,7 +2208,7 @@ mod tests {
         );
         let d = decision(&e, &facts("x"));
         assert_eq!(d.matched_rule, "兜底");
-        assert_eq!(d.set.thinking, None, "阶段一不该看见阶段二的 set");
+        assert_eq!(d.set.reasoning, None, "阶段一不该看见阶段二的 set");
     }
 
     #[test]
@@ -2106,7 +2222,7 @@ mod tests {
                     "{ provider_would_be: relay }",
                     None,
                     Some(SetAction {
-                        thinking: Some(false),
+                        reasoning: Some(SetReasoning::Off),
                         ..Default::default()
                     }),
                     None,
@@ -2116,12 +2232,12 @@ mod tests {
         );
         let base = SetAction::default();
         match e.phase_two(&facts("x"), "relay", &base).unwrap() {
-            Outcome2::Proceed { set: s, .. } => assert_eq!(s.thinking, Some(false)),
+            Outcome2::Proceed { set: s, .. } => assert_eq!(s.reasoning, Some(SetReasoning::Off)),
             other => panic!("{other:?}"),
         }
         // 换一家就不该命中了 —— 这正是故障转移后必须重跑的理由
         match e.phase_two(&facts("x"), "official", &base).unwrap() {
-            Outcome2::Proceed { set: s, .. } => assert_eq!(s.thinking, None),
+            Outcome2::Proceed { set: s, .. } => assert_eq!(s.reasoning, None),
             other => panic!("{other:?}"),
         }
     }
@@ -2139,7 +2255,7 @@ mod tests {
                     "{ provider_would_be: [a, b] }",
                     None,
                     Some(SetAction {
-                        thinking: Some(false),
+                        reasoning: Some(SetReasoning::Off),
                         ..Default::default()
                     }),
                     None,
@@ -2148,9 +2264,13 @@ mod tests {
             ],
         );
         let base = SetAction::default();
-        for (p, want) in [("a", Some(false)), ("b", Some(false)), ("c", None)] {
+        for (p, want) in [
+            ("a", Some(SetReasoning::Off)),
+            ("b", Some(SetReasoning::Off)),
+            ("c", None),
+        ] {
             match e.phase_two(&facts("x"), p, &base).unwrap() {
-                Outcome2::Proceed { set: s, .. } => assert_eq!(s.thinking, want, "provider={p}"),
+                Outcome2::Proceed { set: s, .. } => assert_eq!(s.reasoning, want, "provider={p}"),
                 other => panic!("{other:?}"),
             }
         }
@@ -3012,7 +3132,7 @@ to:
 ",
             ),
             rule(
-                "{name: 阶段二, when: {provider_would_be: relay}, set: {model: x, thinking: false}}",
+                "{name: 阶段二, when: {provider_would_be: relay}, set: {model: x, reasoning: off}}",
             ),
             rule("{name: 兜底, to: __all__}"),
         ];
@@ -3040,7 +3160,10 @@ to:
             Outcome2::Proceed { model, set, .. } => {
                 let a = e.asked_of(&facts("opus"), &d, "relay", model.as_deref());
                 assert_eq!((a.model.as_str(), a.origin), ("opus", Origin::Pinned));
-                assert_eq!((set.thinking, set.max_tokens), (Some(false), Some(10)));
+                assert_eq!(
+                    (set.reasoning, set.max_tokens),
+                    (Some(SetReasoning::Off), Some(10))
+                );
             }
             other => panic!("{other:?}"),
         }

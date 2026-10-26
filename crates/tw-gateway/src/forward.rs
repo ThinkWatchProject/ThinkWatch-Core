@@ -79,10 +79,14 @@ pub fn gemini_path_with_model(path: &str, model: &str) -> String {
 /// **只动改了的那几个字段，别的字节一个不动**（见 [`crate::splice`]）：解析再写回的话，
 /// 每个对象的键都按字母重排了，工具定义、工具参数一起变了样。改出来和原来一样的（规则
 /// 写的值客户端本来就是这么写的）原样发。改到的对象里同一个键写了两遍的，才照旧写回。
+///
+/// `model` 是发给上游的模型名：Gemini 的思考预算按它压在上限以内（见
+/// [`tw_dialect::params::set_reasoning_effort`]）
 pub fn apply_set(
     body: &Bytes,
     set: &tw_engine::SetAction,
     client: Option<tw_dialect::ir::Dialect>,
+    model: &str,
 ) -> Bytes {
     if set.is_empty() {
         return body.clone();
@@ -96,13 +100,23 @@ pub fn apply_set(
         return body.clone();
     }
     let mut v = before.clone();
-    set_params(&mut v, set, client);
-    match crate::splice::rewrite(body, &before, &v) {
+    set_params(&mut v, set, client, model);
+    rewritten(body, &before, &v)
+}
+
+/// 请求体 `body`（解出来是 `before`）改成了 `after`：只动改了的那几个字段，别的字节一个不动
+/// （见 [`crate::splice`]）。一样的原样交回
+pub(crate) fn rewritten(
+    body: &Bytes,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Bytes {
+    match crate::splice::rewrite(body, before, after) {
         crate::splice::Rewrite::Changed(b) => return Bytes::from(b),
         crate::splice::Rewrite::Same => return body.clone(),
         crate::splice::Rewrite::Unusual => {}
     }
-    match serde_json::to_vec(&v) {
+    match serde_json::to_vec(after) {
         Ok(b) => Bytes::from(b),
         // 序列化不该失败，但真失败了宁可发原文也不要发半个 body
         Err(e) => {
@@ -119,6 +133,7 @@ fn set_params(
     v: &mut serde_json::Value,
     set: &tw_engine::SetAction,
     client: Option<tw_dialect::ir::Dialect>,
+    model: &str,
 ) {
     use tw_dialect::params;
     let client = client.unwrap_or(tw_dialect::ir::Dialect::Anthropic);
@@ -128,14 +143,16 @@ fn set_params(
     if let Some(t) = set.max_tokens {
         params::set_max_output_tokens(client, v, t);
     }
-    match set.thinking {
-        // 开启思考需要一个 budget，而我们没有一个合理的值可以编。
-        // **只做「关掉」这一个方向** —— 那是降级场景真正需要的。
-        Some(true) => tracing::warn!(
-            "set.thinking: true is not supported yet (it needs budget_tokens); ignoring it"
-        ),
-        Some(false) => params::disable_thinking(client, v),
-        None => {}
+    // 推理只改开着推理的请求：没开的不替它打开（开推理要一个预算，也要多花钱），关掉的也
+    // 不动 —— 去掉 `reasoning_effort: "none"` 反倒让推理按模型的默认打开了
+    match set.reasoning {
+        Some(tw_engine::SetReasoning::Off) if params::reasoning_on(client, v) => {
+            params::disable_thinking(client, v)
+        }
+        Some(tw_engine::SetReasoning::Level(e)) => {
+            params::set_reasoning_effort(client, v, e, model);
+        }
+        _ => {}
     }
 }
 
@@ -239,7 +256,10 @@ mod tests {
         // 出站直通。cc-switch 那次把缓存命中率从 99% 打到 20%，
         // 就是因为一个「看起来无害」的重写跑在了每个请求上。
         let b = Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        assert_eq!(apply_set(&b, &tw_engine::SetAction::default(), None), b);
+        assert_eq!(
+            apply_set(&b, &tw_engine::SetAction::default(), None, "m"),
+            b
+        );
     }
 
     #[test]
@@ -252,6 +272,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            "m",
         );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "haiku");
@@ -266,13 +287,34 @@ mod tests {
         let out = apply_set(
             &b,
             &tw_engine::SetAction {
-                thinking: Some(false),
+                reasoning: Some(tw_engine::SetReasoning::Off),
                 ..Default::default()
             },
             None,
+            "m",
         );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("thinking").is_none());
+    }
+
+    /// Gemini 的预算按发给它的模型压在上限以内：规则写 max 不能变成一个必然 400 的 64000
+    #[test]
+    fn a_gemini_budget_from_a_rule_stays_within_the_model_limit() {
+        let b = Bytes::from_static(
+            br#"{"contents":[],"generationConfig":{"thinkingConfig":{"thinkingBudget":2048}}}"#,
+        );
+        let s = tw_engine::SetAction {
+            reasoning: Some(tw_engine::SetReasoning::Level(tw_dialect::ir::Effort::Max)),
+            ..Default::default()
+        };
+        for (model, want) in [("gemini-2.5-flash", 24576), ("gemini-2.5-pro", 32768)] {
+            let out = apply_set(&b, &s, Some(tw_dialect::ir::Dialect::Gemini), model);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                v["generationConfig"]["thinkingConfig"]["thinkingBudget"], want,
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -286,6 +328,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            "m",
         );
         assert_eq!(out, b);
     }
@@ -296,7 +339,7 @@ mod tests {
         let set = tw_engine::SetAction {
             model: Some("small".into()),
             max_tokens: Some(512),
-            thinking: Some(false),
+            reasoning: Some(tw_engine::SetReasoning::Off),
             ..Default::default()
         };
         let run = |body: &'static str, d| {
@@ -304,6 +347,7 @@ mod tests {
                 &Bytes::from_static(body.as_bytes()),
                 &set,
                 Some(d),
+                "m",
             ))
             .unwrap()
         };
@@ -315,13 +359,15 @@ mod tests {
             (v["model"].as_str(), v["max_completion_tokens"].as_u64()),
             (Some("small"), Some(512))
         );
-        assert!(v.get("reasoning_effort").is_none() && v.get("max_tokens").is_none());
+        // OpenAI 的格式里 `off` 写 `none`：去掉的话按模型默认的那一档想
+        assert_eq!(v["reasoning_effort"], "none");
+        assert!(v.get("max_tokens").is_none());
         let v = run(
             r#"{"model":"big","reasoning":{"effort":"high"}}"#,
             Dialect::Responses,
         );
         assert_eq!(v["max_output_tokens"], 512);
-        assert!(v.get("reasoning").is_none());
+        assert_eq!(v["reasoning"], serde_json::json!({"effort": "none"}));
         let v = run(
             r#"{"contents":[],"generationConfig":{"thinkingConfig":{"thinkingBudget":9}}}"#,
             Dialect::Gemini,
@@ -340,12 +386,12 @@ mod tests {
     fn set(
         model: Option<&str>,
         max_tokens: Option<u64>,
-        thinking: Option<bool>,
+        reasoning: Option<tw_engine::SetReasoning>,
     ) -> tw_engine::SetAction {
         tw_engine::SetAction {
             model: model.map(str::to_string),
             max_tokens,
-            thinking,
+            reasoning,
             ..Default::default()
         }
     }
@@ -353,7 +399,7 @@ mod tests {
     /// 以前的写法：解析、改、整份写回（键按字母重排）
     fn whole(body: &[u8], s: &tw_engine::SetAction, d: Option<tw_dialect::ir::Dialect>) -> Bytes {
         let mut v: serde_json::Value = serde_json::from_slice(body).unwrap();
-        set_params(&mut v, s, d);
+        set_params(&mut v, s, d, "m");
         Bytes::from(serde_json::to_vec(&v).unwrap())
     }
 
@@ -369,8 +415,13 @@ mod tests {
         );
         let out = apply_set(
             &Bytes::from(body.clone()),
-            &set(Some("claude-haiku-5"), Some(4096), Some(false)),
+            &set(
+                Some("claude-haiku-5"),
+                Some(4096),
+                Some(tw_engine::SetReasoning::Off),
+            ),
             Some(Dialect::Anthropic),
+            "m",
         );
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
@@ -383,6 +434,7 @@ mod tests {
             &Bytes::from(format!(r#"{{"model":"m",{tools}}}"#)),
             &set(None, Some(10), None),
             Some(Dialect::Anthropic),
+            "m",
         );
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
@@ -394,8 +446,13 @@ mod tests {
         );
         let out = apply_set(
             &Bytes::from(gemini),
-            &set(Some("ignored"), Some(512), Some(false)),
+            &set(
+                Some("ignored"),
+                Some(512),
+                Some(tw_engine::SetReasoning::Off),
+            ),
             Some(Dialect::Gemini),
+            "m",
         );
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
@@ -409,7 +466,7 @@ mod tests {
     #[test]
     fn a_set_that_changes_nothing_sends_the_same_bytes() {
         let b = Bytes::from_static(br#"{ "max_tokens" : 100, "b":{"z":1,"a":2} }"#);
-        let out = apply_set(&b, &set(None, Some(100), None), None);
+        let out = apply_set(&b, &set(None, Some(100), None), None, "m");
         assert_eq!(out.as_ptr(), b.as_ptr());
     }
 
@@ -420,7 +477,7 @@ mod tests {
         let b = br#"{"model":"a","x":1,"model":"b"}"#;
         let s = set(Some("c"), None, None);
         assert_eq!(
-            apply_set(&Bytes::from_static(b), &s, None),
+            apply_set(&Bytes::from_static(b), &s, None, "m"),
             whole(b, &s, None)
         );
     }
@@ -461,6 +518,7 @@ mod tests {
             "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":9}",
             "\"reasoning_effort\":\"high\"",
             "\"reasoning\":{\"effort\":\"low\"}",
+            "\"output_config\":{\"effort\":\"xhigh\"}",
             "\"inferenceConfig\":{\"temperature\":1,\"maxTokens\":3}",
             "\"additionalModelRequestFields\":{\"thinking\":{\"type\":\"enabled\"},\"k\":1}",
             "\"tools\":[{\"input_schema\":{\"type\":\"object\",\"properties\":{\"b\":{},\"a\":{}}}}]",
@@ -491,13 +549,17 @@ mod tests {
             let s = set(
                 [None, Some("small"), Some("big")][r.below(3)],
                 [None, Some(9), Some(512)][r.below(3)],
-                [None, Some(false), Some(true)][r.below(3)],
+                [
+                    None,
+                    Some(tw_engine::SetReasoning::Off),
+                    Some(tw_engine::SetReasoning::Level(tw_dialect::ir::Effort::Max)),
+                ][r.below(3)],
             );
             if s.is_empty() {
                 continue;
             }
             let d = Some(dialects[r.below(dialects.len())]);
-            let out = apply_set(&Bytes::from(body.clone()), &s, d);
+            let out = apply_set(&Bytes::from(body.clone()), &s, d, "m");
             let value = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
             assert_eq!(
                 value(&out),
@@ -506,7 +568,7 @@ mod tests {
             );
             let before = value(body.as_bytes());
             let mut after = before.clone();
-            set_params(&mut after, &s, d);
+            set_params(&mut after, &s, d, "m");
             if crate::splice::rewrite(body.as_bytes(), &before, &after)
                 == crate::splice::Rewrite::Unusual
             {
