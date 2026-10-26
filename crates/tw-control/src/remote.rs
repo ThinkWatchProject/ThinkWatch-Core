@@ -519,6 +519,9 @@ async fn accept_loop(
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!("the remote control port could not accept a connection: {e}");
+                    if let Some(d) = crate::accept_backoff(&e) {
+                        tokio::time::sleep(d).await;
+                    }
                     continue;
                 }
             },
@@ -580,6 +583,23 @@ mod tests {
         // 绑 `::` 时 IPv4 的来源报成映射地址
         assert!(allowed(&l(&["10.0.0.0/8"]), ip("::ffff:10.1.2.3")));
         assert!(!allowed(&[], ip("10.1.2.3")), "空名单谁都不放");
+    }
+
+    #[test]
+    fn accept_errors_pause_unless_only_that_connection_went_away() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert_eq!(crate::accept_backoff(&Error::from(kind)), None, "{kind:?}");
+        }
+        // 打开的文件数到顶（EMFILE）报不出专门的 ErrorKind
+        assert_eq!(
+            crate::accept_backoff(&Error::other("too many open files")),
+            Some(Duration::from_secs(1))
+        );
     }
 
     #[test]
