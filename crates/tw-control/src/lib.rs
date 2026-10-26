@@ -2109,6 +2109,18 @@ impl Accept for tokio::net::UnixListener {
     }
 }
 
+/// accept 出错之后歇多久再接。对方在接之前就重置、中止的只是那一个连接，马上接下一个；别的错
+/// （打开的文件数到顶这类）立刻再 accept 还是同样的错，会原地空转、刷满日志 —— 和网关端口
+/// （axum）一样歇 1 秒
+pub(crate) fn accept_backoff(e: &std::io::Error) -> Option<std::time::Duration> {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    (!matches!(
+        e.kind(),
+        ConnectionRefused | ConnectionAborted | ConnectionReset
+    ))
+    .then_some(std::time::Duration::from_secs(1))
+}
+
 /// accept 循环。**交接时停下**（[`handover::ControlListener::pause`]）：停的时候不去接，
 /// 监听器本身留着，恢复了接着接 —— 见 [`handover`] 的模块文档。
 async fn accept_loop<L: Accept>(
@@ -2120,18 +2132,24 @@ async fn accept_loop<L: Accept>(
     let mut accepting = handover.control().accepting();
     loop {
         handover::until_accepting(&mut accepting).await;
-        tokio::select! {
-            r = listener.accept_one() => match r {
-                Ok(stream) => hand_off(
-                    stream,
-                    app.clone(),
-                    gate.clone(),
-                    Local(Some(handover.control().closing())),
-                ),
-                Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
-            },
+        let r = tokio::select! {
+            r = listener.accept_one() => r,
             // 停下的那一刻放下手里这次 accept：不然它还会再接一个
-            _ = accepting.wait_for(|on| !*on) => {}
+            _ = accepting.wait_for(|on| !*on) => continue,
+        };
+        match r {
+            Ok(stream) => hand_off(
+                stream,
+                app.clone(),
+                gate.clone(),
+                Local(Some(handover.control().closing())),
+            ),
+            Err(e) => {
+                tracing::warn!("the control plane could not accept a connection: {e}");
+                if let Some(d) = accept_backoff(&e) {
+                    tokio::time::sleep(d).await;
+                }
+            }
         }
     }
 }

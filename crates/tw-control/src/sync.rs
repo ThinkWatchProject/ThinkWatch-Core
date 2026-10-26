@@ -742,7 +742,7 @@ impl Sync {
     /// 同步一轮（顺带处理几处冲突），更新状态、发事件
     pub async fn round(&self, decisions: &[Decision]) -> Result<tw_api::SyncView, Fail> {
         let mut guard = self.run.lock().await;
-        // Consume this trigger before any early return, or an expired deadline spins the scheduler.
+        // 一开头就把到点的改动认领下来：下面几处提前返回要是把它留着，过了点的时刻会让调度原地空转
         if let Ok(mut d) = self.dirty.lock() {
             *d = None;
         }
@@ -1777,7 +1777,7 @@ mod tests {
             sync.paused
                 .store(expected == tw_api::SyncState::Paused, Ordering::Relaxed);
 
-            // An expired dirty deadline must not override the next periodic poll forever.
+            // 过了点的改动时刻不能一直压过下一次定时检查
             for _ in 0..2 {
                 sync.touch();
                 assert!(sync.dirty.lock().unwrap().is_some());
