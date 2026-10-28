@@ -85,6 +85,9 @@ const NO_BALANCE: &[&str] = &[
     "insufficient account balance",
     "credit balance is too low",
     "balance is too low",
+    "insufficient credit",
+    "not enough credit",
+    "have enough credit",
     "payment required",
     "billing_hard_limit",
     "arrearage",
@@ -236,6 +239,14 @@ mod tests {
                 r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
             ),
             (402, r#"{"error":{"message":"Insufficient Balance"}}"#),
+            (
+                400,
+                r#"{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error","code":"BAD_REQUEST"}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"message":"You don't have enough credits for this model."}}"#,
+            ),
             (403, r#"{"error":{"code":"Arrearage"}}"#),
             (
                 429,
