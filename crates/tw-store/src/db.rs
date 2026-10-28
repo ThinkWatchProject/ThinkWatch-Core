@@ -71,6 +71,51 @@ const DENIED_BY: &str = "json_extract(routing, '$.denied_by')";
 /// 也不该让它自己写不进去
 const ROUTED: &str = "local = 0 AND json_valid(routing)";
 
+/// 一格用量的那十二项，按请求行合计：请求、失败、费用三态、流量、四类 token，顺序同
+/// [`cost_bucket`] 读的。**`/summary/buckets` 和用量历史（[`crate::usage`]）用的是这一串**：
+/// 历史从结局那一行加进整点时就按它取数，两边的口径不会各写各的走开。口径同
+/// [`Db::summary`]：失败是 `error` 不空，没有价格、没有用量见 [`NO_PRICE`]、[`NO_USAGE`]。
+/// 哪些行算（本地应答不算）由用的一方写在条件里
+pub(crate) static TALLY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "COUNT(*),
+         COALESCE(SUM(error IS NOT NULL), 0),
+         COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
+         COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+         COALESCE(SUM({NO_PRICE}), 0),
+         COALESCE(SUM({NO_USAGE}), 0),
+         COALESCE(SUM(sent_bytes), 0),
+         COALESCE(SUM(received_bytes), 0),
+         COALESCE(SUM(input_tokens), 0),
+         COALESCE(SUM(output_tokens), 0),
+         COALESCE(SUM(cache_read_tokens), 0),
+         COALESCE(SUM(cache_write_tokens), 0)"
+    )
+});
+
+/// 读一格：第 1 到 12 列是 [`TALLY`] 那十二项（第 0 列留给格子的序号）。首 token 的三项
+/// 由调用方填
+pub(crate) fn cost_bucket(at_ms: i64, r: &rusqlite::Row) -> rusqlite::Result<tw_api::CostBucket> {
+    Ok(tw_api::CostBucket {
+        at_ms,
+        requests: r.get(1)?,
+        failed: r.get(2)?,
+        cost_micros_exact: r.get(3)?,
+        cost_micros_estimated: r.get(4)?,
+        unpriced_requests: r.get(5)?,
+        no_usage_requests: r.get(6)?,
+        sent_bytes: r.get(7)?,
+        received_bytes: r.get(8)?,
+        input_tokens: r.get(9)?,
+        output_tokens: r.get(10)?,
+        cache_read_tokens: r.get(11)?,
+        cache_write_tokens: r.get(12)?,
+        ttft_p50_ms: None,
+        ttft_p95_ms: None,
+        ttft_samples: 0,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("{path} could not be opened: {source}")]
@@ -82,6 +127,10 @@ pub enum DbError {
     /// 连同正文目录整个重建，更新的版本建的原样留着。
     #[error("the database is schema version {found}; this twcore reads only {supported}")]
     OtherVersion { found: i64, supported: i64 },
+    /// 用量历史（`usage.db`，见 [`crate::usage`]）这一次用不了：更新的版本建的，或者打不开。
+    /// **请求记录照常**，只有问历史的那一个查询报这个错
+    #[error("the usage history is unavailable: {0}")]
+    UsageUnavailable(String),
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
 }
@@ -233,10 +282,53 @@ fn register_reached(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// **先把空文件以 0600 建出来，再交给 SQLite。**让 SQLite 自己建的话，它按 umask 给 0644，
+/// [`restrict`] 之前别的用户已经能打开它。`-wal`、`-shm` 由 SQLite 照主库的权限位建，主库对了
+/// 它们就对了。请求库和用量历史都这么建
+pub(crate) fn create_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path);
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// **0600。**这两个库里有每一条请求的模型、上游、token 数和花费（用量历史里是每个小时的合计）
+/// —— 同一台机器上的别的用户不该能读走一份你的使用记录（那条「权限就是认证」的同一个道理）。
+/// 新库由 [`create_private`] 建对了，这里收的是已经存在的库；WAL 模式还会带出两个兄弟文件，
+/// 一起收。
+pub(crate) fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+            };
+            if p.exists() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[derive(Debug)]
 pub struct Db {
     /// 上游体检的查询在 `crate::health`，和这里共用一个连接
     pub(crate) conn: Connection,
+    /// 用量历史 ATTACH 在这条连接上（库名 `usage`），这一次用不用得了（见 [`crate::usage`]）
+    pub(crate) usage: crate::usage::Usage,
 }
 
 impl Db {
@@ -247,47 +339,19 @@ impl Db {
         {
             let _ = std::fs::create_dir_all(d);
         }
-        // **先把空文件以 0600 建出来，再交给 SQLite。**让 SQLite 自己建的话，
-        // 它按 umask 给 0644，下面的 `chmod` 之前别的用户已经能打开它。
-        // `-wal`、`-shm` 由 SQLite 照主库的权限位建，主库对了它们就对了
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path);
-        }
+        create_private(path);
         let conn = Connection::open(path).map_err(|source| DbError::Open {
             path: path.display().to_string(),
             source,
         })?;
-        // **0600。**这个库里有每一条请求的模型、上游、token 数和花费 ——
-        // 同一台机器上的别的用户不该能读走一份你的使用记录（那条
-        // 「权限就是认证」的同一个道理）。新库上面已经建对了，这里收的是
-        // 已经存在的库；WAL 模式还会带出两个兄弟文件，一起收。
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm"] {
-                let p = if suffix.is_empty() {
-                    path.to_path_buf()
-                } else {
-                    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
-                };
-                if p.exists() {
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-        }
-        Self::from_conn(conn)
+        restrict(path);
+        // 用量历史在同一个目录里另一个文件（为什么另一个文件见 [`crate::usage`]）
+        Self::from_conn(conn, Some(&path.with_file_name(crate::usage::FILE)))
     }
 
-    /// 内存库。测试用，也是「磁盘写不了」时的退路。
+    /// 内存库。测试用，也是「磁盘写不了」时的退路。用量历史也在内存里
     pub fn in_memory() -> Result<Self, DbError> {
-        Self::from_conn(Connection::open_in_memory()?)
+        Self::from_conn(Connection::open_in_memory()?, None)
     }
 
     /// 给同一个 crate 里另写在别处的查询用（搜索在 `crate::search`）
@@ -295,7 +359,8 @@ impl Db {
         &self.conn
     }
 
-    fn from_conn(conn: Connection) -> Result<Self, DbError> {
+    /// `usage`：用量历史那个库文件，None 是内存库
+    fn from_conn(conn: Connection, usage: Option<&Path>) -> Result<Self, DbError> {
         // WAL：读不挡写。**界面在查历史的同时数据面在写** —— 默认的
         // rollback journal 下那是互相阻塞的。
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -314,11 +379,17 @@ impl Db {
                 supported: SCHEMA,
             });
         }
-        let db = Self { conn };
+        let mut db = Self {
+            conn,
+            usage: crate::usage::Usage::Unavailable(String::new()),
+        };
         if found == 0 {
             db.create()?;
         }
         db.indexes();
+        // **请求库建好了才接上用量历史**：版本对不上的请求库在上面就返回了，这时候接上的话，
+        // 新建的用量历史会去补一张样子不对的表。用量历史出什么错都不让请求库打不开
+        db.usage = crate::usage::attach(&db.conn, usage);
         Ok(db)
     }
 
@@ -1345,42 +1416,14 @@ impl Db {
             return Ok(Vec::new());
         }
         let mut st = self.conn.prepare(&format!(
-            "SELECT ((at_ms - ?1) / ?3) AS b,
-                    COUNT(*),
-                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
-                    COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
-                    COALESCE(SUM({NO_PRICE}), 0),
-                    COALESCE(SUM({NO_USAGE}), 0),
-                    COALESCE(SUM(sent_bytes), 0),
-                    COALESCE(SUM(received_bytes), 0),
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_write_tokens), 0)
+            "SELECT ((at_ms - ?1) / ?3) AS b, {tally}
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
-             GROUP BY b ORDER BY b"
+             GROUP BY b ORDER BY b",
+            tally = *TALLY
         ))?;
         let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
-            Ok(tw_api::CostBucket {
-                at_ms: since_ms + r.get::<_, i64>(0)? * bucket_ms,
-                requests: r.get(1)?,
-                failed: r.get(2)?,
-                cost_micros_exact: r.get(3)?,
-                cost_micros_estimated: r.get(4)?,
-                unpriced_requests: r.get(5)?,
-                no_usage_requests: r.get(6)?,
-                sent_bytes: r.get(7)?,
-                received_bytes: r.get(8)?,
-                input_tokens: r.get(9)?,
-                output_tokens: r.get(10)?,
-                cache_read_tokens: r.get(11)?,
-                cache_write_tokens: r.get(12)?,
-                ttft_p50_ms: None,
-                ttft_p95_ms: None,
-                ttft_samples: 0,
-            })
+            cost_bucket(since_ms + r.get::<_, i64>(0)? * bucket_ms, r)
         })?;
         let mut buckets = rows.collect::<Result<Vec<_>, _>>()?;
         // 每一格的首 token 分位数：**样本和 `latency_by_model` 同一个口径**（有第一个 token 的、
@@ -3319,17 +3362,26 @@ mod permission_tests {
         {
             let db = Db::open(&p).unwrap();
             db.insert(&super::tests::row(1, 100)).unwrap();
+            db.add_to_usage(1).unwrap();
         }
         // 重新打开一次，让权限那一步也覆盖到 WAL（它是第一次写才出现的）
-        let _db = Db::open(&p).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            let f = std::path::PathBuf::from(format!("{}{suffix}", p.display()));
-            if !f.exists() {
-                continue;
+        let db = Db::open(&p).unwrap();
+        db.insert(&super::tests::row(2, 100)).unwrap();
+        db.add_to_usage(2).unwrap();
+        // 用量历史（`usage.db`）里是每个小时的合计，同样只给自己看
+        let mut seen = 0;
+        for base in [p.clone(), d.path().join(crate::usage::FILE)] {
+            for suffix in ["", "-wal", "-shm"] {
+                let f = std::path::PathBuf::from(format!("{}{suffix}", base.display()));
+                if !f.exists() {
+                    continue;
+                }
+                seen += 1;
+                let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} 的权限是 {mode:o}", f.display());
             }
-            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{} 的权限是 {mode:o}", f.display());
         }
+        assert!(seen >= 4, "两个库和它们的 WAL 都该在：{seen}");
     }
 }
 

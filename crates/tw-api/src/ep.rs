@@ -73,6 +73,9 @@ endpoints! {
     CostBuckets: GET "/summary/buckets", api::BucketQuery => Vec<api::CostBucket>;
     CostBucketsBy: GET "/summary/buckets/by", api::BucketGroupQuery => Vec<api::CostBucketGroup>;
     CostBy: GET "/summary/by", api::GroupQuery => Vec<api::CostGroup>;
+    /// 很长一段时间里的用量，按格合计（概览上的「最近一年」）。按整点另存，不随请求记录的
+    /// 保留期删除、不随请求库重建清空。参数同 `/summary/buckets`
+    UsageHistory: GET "/summary/history", api::BucketQuery => api::UsageHistory;
     /// 各条路由走了多少请求、各条规则命中了多少，记录从哪一刻起是全的
     RouteStats: GET "/summary/routes", api::Window => api::RouteStats;
     History: GET "/history", api::ListQuery => Vec<api::HistoryRow>;

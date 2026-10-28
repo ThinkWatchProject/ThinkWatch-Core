@@ -327,6 +327,9 @@ MODE=$(mode_of "$THINKWATCH_HOME/plugins/.defaults.json" || echo -)
 
 MODE=$(mode_of "$THINKWATCH_HOME/data.db" || echo -)
 [ "$MODE" = "600" ] && ok "data.db 是 0600" || bad "data.db 权限是 $MODE"
+# 用量历史另一个文件，同样只给自己看
+MODE=$(mode_of "$THINKWATCH_HOME/usage.db" || echo -)
+[ "$MODE" = "600" ] && ok "usage.db 是 0600" || bad "usage.db 权限是 $MODE"
 # 插件目录起来就在（盯它要它在），**只给自己看**：插件代码和它的底稿都在里面
 MODE=$(mode_of "$THINKWATCH_HOME/plugins" || echo -)
 [ "$MODE" = "700" ] && ok "plugins/ 是 0700" || bad "plugins/ 权限是 $MODE，该是 700"
@@ -518,7 +521,8 @@ NOW=$(python3 -c 'import time;print(int(time.time()*1000))')
 DAY=$((NOW - 86400000))
 for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=3600000" \
           "/summary/by?dim=model&from_ms=$DAY" "/summary/routes?from_ms=$DAY" \
-          "/history?limit=5&from_ms=$DAY" "/upstreams/health?from_ms=$DAY"; do
+          "/history?limit=5&from_ms=$DAY" "/upstreams/health?from_ms=$DAY" \
+          "/summary/history?from_ms=$DAY&bucket_ms=86400000"; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET ${ep%%\?*}（带时间窗）" || bad "GET $ep 返回 $C" "$(cat "$TMP/out" 2>/dev/null | head -c 200)"
 done
