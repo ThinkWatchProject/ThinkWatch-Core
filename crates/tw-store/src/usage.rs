@@ -219,9 +219,14 @@ impl Db {
             .conn
             .query_row("SELECT since_ms FROM usage.meta", [], |r| r.get(0))
             .optional()?;
+        // 逐条记录从哪一刻起有：口径同 `covered_since`，本地应答也算（那时候已经在记了）
+        let detail_since: Option<i64> =
+            self.conn
+                .query_row("SELECT MIN(at_ms) FROM main.requests", [], |r| r.get(0))?;
         if bucket_ms <= 0 {
             return Ok(tw_api::UsageHistory {
                 since_ms: since,
+                detail_since_ms: detail_since,
                 buckets: Vec::new(),
             });
         }
@@ -239,6 +244,7 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tw_api::UsageHistory {
             since_ms: since,
+            detail_since_ms: detail_since,
             buckets,
         })
     }
@@ -500,6 +506,47 @@ mod tests {
         settle(&db, &row(1, T0 + 1));
         assert_eq!(db.prune_before(T0 + HOUR_MS).unwrap(), 1);
         assert_eq!(hours(&db)[0].requests, 1);
+    }
+
+    /// 逐条记录从哪一刻起有（`detail_since_ms`）：请求库里最老那一行，本地应答也算；保留期删掉
+    /// 旧行后它跟着往后挪，「从什么时候起有记录」（`since_ms`）不动；请求库空了是 None
+    #[test]
+    fn the_detail_starts_at_the_oldest_request_row_and_moves_with_pruning() {
+        let db = Db::in_memory().unwrap();
+        let since = db.usage_history(0, i64::MAX, HOUR_MS).unwrap().since_ms;
+        assert_eq!(
+            db.usage_history(0, i64::MAX, HOUR_MS)
+                .unwrap()
+                .detail_since_ms,
+            None,
+            "请求库是空的"
+        );
+        let mut local = row(1, T0 + 1);
+        local.local = true;
+        settle(&db, &local);
+        settle(&db, &row(2, T0 + 2 * HOUR_MS));
+        settle(&db, &row(3, T0 + 5 * HOUR_MS));
+        let h = db.usage_history(0, i64::MAX, HOUR_MS).unwrap();
+        assert_eq!(h.detail_since_ms, Some(T0 + 1), "本地应答也算");
+        assert_eq!(db.prune_before(T0 + 3 * HOUR_MS).unwrap(), 2);
+        let h = db.usage_history(0, i64::MAX, HOUR_MS).unwrap();
+        assert_eq!(
+            h.detail_since_ms,
+            Some(T0 + 5 * HOUR_MS),
+            "删掉旧行后没有往后挪"
+        );
+        assert_eq!(h.since_ms, since, "用量历史的起点跟着动了");
+        assert_eq!(h.buckets.iter().map(|b| b.requests).sum::<i64>(), 2);
+        // 格宽不对、只要两个起点时也照给
+        let h = db.usage_history(0, i64::MAX, 0).unwrap();
+        assert_eq!(h.detail_since_ms, Some(T0 + 5 * HOUR_MS));
+        db.prune_before(i64::MAX).unwrap();
+        assert_eq!(
+            db.usage_history(0, i64::MAX, HOUR_MS)
+                .unwrap()
+                .detail_since_ms,
+            None
+        );
     }
 
     /// 更新的版本建的用量历史**不动它**：请求库照常打开、照常记，历史这一项报错；文件原样留着

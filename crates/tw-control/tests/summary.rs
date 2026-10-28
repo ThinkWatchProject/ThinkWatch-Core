@@ -273,6 +273,7 @@ async fn the_usage_history_answers_the_bucket_query_from_the_hours_it_kept() {
     )
     .await;
     assert_eq!(h["since_ms"], 1001, "{h}");
+    assert_eq!(h["detail_since_ms"], 1001, "{h}");
     let b = &h["buckets"];
     assert_eq!(b.as_array().unwrap().len(), 1, "{h}");
     assert_eq!(b[0]["at_ms"], 0, "{h}");
