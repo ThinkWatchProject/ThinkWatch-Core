@@ -19,7 +19,9 @@ when they disagree, so a field listed here is a field the binary reads.
 
 `THINKWATCH_HOME` replaces the directory, and `--config <path>` names the
 file for a single command. The directory holds everything else core keeps
-as well: the request database (`data.db`), the backups of the configuration
+as well: the request database (`data.db`), the hourly usage totals behind the
+overview's year (`usage.db`, kept when the request database is rebuilt and not
+trimmed by the retention period), the backups of the configuration
 (`history/`), the downloaded price table (`model_prices.json`) and the local
 control socket (`twcore.sock`; on Windows a loopback port recorded in
 `control.port`). The directory is private to its owner (`0700`), the file is

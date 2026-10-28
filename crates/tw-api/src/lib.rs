@@ -1084,7 +1084,11 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `remembered`）：上游因为推理强度回 400 时，同一家改一档（或者去掉强度）再发一次，是尝试链上
 /// 新的一跳，不算退避重试；记下这一家的这个模型不认那一档，7 天之内直接改。照 53 写的界面
 /// 保存规则时带的 `thinking` 不起作用
-pub const CONTROL_API_VERSION: u32 = 54;
+///
+/// **55 起有用量历史**：`GET /summary/history`（[`BucketQuery`] → [`UsageHistory`]），很长一段时间
+/// 里的用量按格合计，概览上「最近一年」用。按整点另存在数据目录的 `usage.db` 里，请求库重建、
+/// 请求记录过了保留期都不丢
+pub const CONTROL_API_VERSION: u32 = 55;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -4419,6 +4423,24 @@ pub struct CostBucket {
     pub ttft_p95_ms: Option<i64>,
     /// 上面两个数有几个样本
     pub ttft_samples: i64,
+}
+
+/// 很长一段时间里的用量，按格合计（`GET /summary/history`）。概览上「最近一年」那张热力图用。
+///
+/// **不从请求记录里数**：请求记录只留保留期那么多天，请求库换版本时还会整个重建。用量另按
+/// UTC 整点累加存着，这两样都不丢；口径和 [`Summary`] 一样（本地应答不算，费用三态分开）。
+/// 一个请求在它结束时加进它开始的那个整点，所以还在跑的不在里面。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct UsageHistory {
+    /// 从什么时候起有记录，Unix 毫秒：这一刻之前的格子是「没有记录」，不是「没有用量」。
+    /// 开始记用量历史时请求记录里已有的行补进来了，所以是那时最老那一行的时刻；那时一行都没有
+    /// 就是开始记的那一刻。从没记过是 None
+    pub since_ms: Option<i64>,
+    /// 按给的格宽分的格子，**稀疏**（没有用量的格子不在里面），分格算法同 `/summary/buckets`
+    /// （格子的起点是 `from + k × bucket`）。累加的单位是整点：起点不在整点上时，一个整点整个
+    /// 落在它开始的那一格。首 token 的三项不记（None、None、0）
+    pub buckets: Vec<CostBucket>,
 }
 
 /// 一个时间桶里，某一个模型（或上游）的那部分。

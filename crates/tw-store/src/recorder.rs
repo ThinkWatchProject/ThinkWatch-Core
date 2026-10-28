@@ -833,7 +833,7 @@ impl Recorder {
                 served: p.routing.served_by().map(str::to_string),
             });
         }
-        self.write(RequestRow {
+        let written = self.write(RequestRow {
             id: id as i64,
             at_ms: p.at_ms,
             client: p.client,
@@ -877,12 +877,26 @@ impl Recorder {
             translated: p.translated,
             session_log_bytes: p.session_log_bytes,
         });
+        // 结局这一行就是最终的：加进用量历史的那个整点。**每个请求只在这里加一次**（`inflight`
+        // 里取走了，同一个请求不会再走到这里）；本地应答、`local` 的在 SQL 里排除。这一行没写
+        // 进去的不加 —— 加的数是从这一行读的
+        if written && let Err(e) = self.db.add_to_usage(id as i64) {
+            tracing::debug!(
+                id,
+                "the request could not be added to the usage history: {e}"
+            );
+        }
     }
 
-    fn write(&self, r: RequestRow) {
-        if let Err(e) = self.db.insert(&r) {
-            // **不往回抛。**观测挂了，代理照跑。
-            tracing::debug!(id = r.id, "the request row could not be written: {e}");
+    /// 写一行，写进去了是 true。
+    fn write(&self, r: RequestRow) -> bool {
+        match self.db.insert(&r) {
+            Ok(()) => true,
+            Err(e) => {
+                // **不往回抛。**观测挂了，代理照跑。
+                tracing::debug!(id = r.id, "the request row could not be written: {e}");
+                false
+            }
         }
     }
 
@@ -940,6 +954,14 @@ mod tests {
             at_ms: 1_000_000,
             input_estimate: None,
         }
+    }
+
+    /// 用量历史里一小时一格
+    pub(super) fn usage_hours(r: &Recorder) -> Vec<tw_api::CostBucket> {
+        r.db()
+            .usage_history(0, i64::MAX, 3_600_000)
+            .unwrap()
+            .buckets
     }
 
     pub(super) fn finished(id: u64, usage: Option<tw_api::UsageView>) -> Event {
@@ -1626,6 +1648,7 @@ mod tests {
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.requests, 0, "本地应答混进了请求总数");
         assert_eq!(s.locally_answered, 1);
+        assert!(usage_hours(&r).is_empty(), "本地应答加进了用量历史");
     }
 
     /// 数 token 由网关估了数：这一行是网关自己答的，费用 0，不进汇总
@@ -1720,6 +1743,7 @@ mod tests {
         let row = r.db().get(4).unwrap().unwrap();
         assert!(row.local);
         assert_eq!((row.sent_bytes, row.received_bytes), (None, None));
+        assert!(usage_hours(&r).is_empty(), "估的数加进了用量历史");
     }
 
     #[test]
@@ -3030,6 +3054,39 @@ mod cancellation_tests {
 
         assert_eq!(r.db().count().unwrap(), 1);
         assert!(r.db().get(1).unwrap().unwrap().cancelled);
+        assert_eq!(
+            super::tests::usage_hours(&r)[0].requests,
+            1,
+            "第二个结局又加了一次"
+        );
+    }
+
+    /// 结局那一行加进它开始的那个整点，和汇总同一个数；开始的那一刻还没有
+    #[test]
+    fn the_ending_adds_the_request_to_the_usage_history_once() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        assert!(super::tests::usage_hours(&r).is_empty(), "开始时就加了");
+        r.on_event(&finished(
+            1,
+            Some(tw_api::UsageView {
+                input: 100,
+                output: 50,
+                ..Default::default()
+            }),
+        ));
+        let h = super::tests::usage_hours(&r);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].at_ms, 0, "started 的时刻（1_000_000）落在第 0 个整点");
+        assert_eq!(
+            (h[0].requests, h[0].input_tokens, h[0].output_tokens),
+            (1, 100, 50)
+        );
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(
+            (h[0].cost_micros_exact, h[0].sent_bytes, h[0].received_bytes),
+            (s.cost_micros_exact, s.sent_bytes, s.received_bytes)
+        );
     }
 }
 
