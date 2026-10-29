@@ -168,8 +168,11 @@ pub(super) fn after_name(
     use super::place::{quote_at, run, skip_blank};
     let b = text.as_bytes();
     let none = name.end;
-    // `$TOKEN = …`、`${TOKEN}` 是在用一个变量；`?token=` 是 URL 参数
-    if name.start > 0 && matches!(b[name.start - 1], b'$' | b'?' | b'&' | b'{') {
+    // `$TOKEN = …`、`${TOKEN}` 是在用一个变量；`?token=`、`&token=` 是 URL 参数（`&` 也可以是
+    // 转义过的 `\u0026`）
+    if name.start > 0 && matches!(b[name.start - 1], b'$' | b'?' | b'&' | b'{')
+        || super::place::amp_before(b, name.start)
+    {
         return none;
     }
     let mut i = name.end;

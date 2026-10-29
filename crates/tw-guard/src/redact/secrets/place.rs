@@ -555,21 +555,50 @@ fn env_password(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize 
 
 // ---------------------------------------------------------------- URL 参数
 
+/// `at` 前面紧挨着的是不是一个 JSON 的 `\uXXXX` 转义，四位十六进制是 `hex`（不分大小写）。
+/// Go 的 `encoding/json` 缺省把 `&`、`<`、`>` 写成 `\u0026`、`\u003c`、`\u003e`，合法的 JSON
+fn unicode_escape_before(b: &[u8], at: usize, hex: &[u8; 4]) -> bool {
+    at >= 6
+        && b[at - 6] == b'\\'
+        && b[at - 5] == b'u'
+        && b[at - 4..at].eq_ignore_ascii_case(hex)
+        && super::after_escape(b, at)
+}
+
+/// `at` 前面紧挨着一个 `&`：原样的，或者转义过的 `\u0026`
+pub(super) fn amp_before(b: &[u8], at: usize) -> bool {
+    (at > 0 && b[at - 1] == b'&') || unicode_escape_before(b, at, b"0026")
+}
+
+/// `i` 处是不是一个 `=`：原样的，或者转义过的 `\u003d`。返回它占几个字节
+fn eq_at(b: &[u8], i: usize) -> Option<usize> {
+    match b.get(i) {
+        Some(b'=') => Some(1),
+        Some(b'\\') if unicode_escape_before(b, i + 6, b"003d") => Some(6),
+        _ => None,
+    }
+}
+
 /// URL 里 `?access_token=…`、`&sig=…` 的值。参数名前面要是 `?`、`&` 或者 `#`（OAuth 的隐式
-/// 授权把令牌放在片段里）：光有 `api_key=` 的是一句赋值，归配置赋值那条
+/// 授权把令牌放在片段里）：光有 `api_key=` 的是一句赋值，归配置赋值那条。`&`、`=` 也可以是
+/// JSON 里转义过的 `\u0026`、`\u003d`（见 [`unicode_escape_before`]）
 fn url_param(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
-    if s == 0 || !matches!(b[s - 1], b'?' | b'&' | b'#') || b.get(e) != Some(&b'=') {
+    if s == 0 || !(matches!(b[s - 1], b'?' | b'#') || amp_before(b, s)) {
         return e;
     }
-    let end = run(b, e + 1, |c| {
+    let Some(n) = eq_at(b, e) else {
+        return e;
+    };
+    let from = e + n;
+    let end = run(b, from, |c| {
         c.is_ascii_graphic()
             && !matches!(
                 c,
                 b'&' | b'#' | b'"' | b'\'' | b'\\' | b'<' | b'>' | b')' | b']' | b'}' | b','
             )
     });
-    push_if(text, trimmed(b, e + 1, end), 8, "url-token", placed);
+    push_if(text, trimmed(b, from, end), 8, "url-token", placed);
     end
 }
 
