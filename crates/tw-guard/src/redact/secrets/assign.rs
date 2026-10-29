@@ -163,21 +163,26 @@ fn closes(b: &[u8], i: usize) -> bool {
 /// 名字（`name` 是它在原文里的区间）后面：可以先是引号（JSON 的键），然后是 `=`、`:`、
 /// `=>`、`:=`，然后是一个字面量值。找得到就把值记下来。返回往后看到了哪儿（值多长都看，
 /// 线性靠调用方跳过落在看过的那一段里的名字）。`env_seen` 是 `.env` 写法的宽扫描看到了哪儿，
-/// 见 [`env_value`]
+/// 见 [`env_value`]。`url_token`：「URL 中的令牌」那条开着没有
 pub(super) fn after_name(
     text: &str,
     name: Range<usize>,
     placed: &mut Vec<Hit>,
     env_seen: &mut usize,
+    url_token: bool,
 ) -> usize {
-    use super::place::{quote_at, run, skip_blank};
+    use super::place::{amp_before, quote_at, run, skip_blank};
     let b = text.as_bytes();
     let none = name.end;
-    // `$TOKEN = …`、`${TOKEN}` 是在用一个变量；`?token=`、`&token=` 是 URL 参数（`&` 也可以是
-    // 转义过的 `\u0026`）
-    if name.start > 0 && matches!(b[name.start - 1], b'$' | b'?' | b'&' | b'{')
-        || super::place::amp_before(b, name.start)
-    {
+    // `$TOKEN = …`、`${TOKEN}` 是在用一个变量
+    if name.start > 0 && matches!(b[name.start - 1], b'$' | b'{') {
+        return none;
+    }
+    // `?password=…`、`&token=…`（`&` 也可以是转义过的 `\u0026`）是 URL 参数。「URL 中的令牌」
+    // 认得的那几个名字（`access_token`、`api_key`……）让给它；别的名字它不认，这里照样认，值到
+    // 下一个 `&` 为止 —— 两边都让的话就谁都不认了
+    let url = (name.start > 0 && b[name.start - 1] == b'?') || amp_before(b, name.start);
+    if url && url_token && super::place::url_param_name(&text[name.clone()]) {
         return none;
     }
     let mut i = name.end;
@@ -193,7 +198,9 @@ pub(super) fn after_name(
     }
     // `.env`、shell 的写法：名字、`=`、值紧挨着（`DB_PASSWORD=…`）。这种写法里的值就是一个
     // 字面量，引号里可以有空格，不加引号的可以带着代码里才是分隔的标点，见 [`env_value`]
-    let env = b[name.end] == b'=' && i == name.end + 1 && skip_blank(b, i) == i;
+    let env = !url && b[name.end] == b'=' && i == name.end + 1 && skip_blank(b, i) == i;
+    // URL 参数的值到下一个参数（`&`、`\u0026`）为止
+    let closes = |b: &[u8], at: usize| closes(b, at) || (url && amp_at(b, at));
     i = skip_blank(b, i);
     // 宽扫描没认出来时，它看过的那一段**不算**看过：那一段里后面的名字（`f(token=x,password=…)`
     // 的 `password`）照样要按通常的写法看。它自己另记一份，同一段不再宽扫第二遍
@@ -221,6 +228,17 @@ pub(super) fn after_name(
         (i, to)
     };
     push(text, from, to, placed)
+}
+
+/// `at` 处是一个 `&`：原样的，或者转义过的 `\u0026`
+fn amp_at(b: &[u8], at: usize) -> bool {
+    match b.get(at) {
+        Some(b'&') => true,
+        Some(b'\\') => b
+            .get(at + 1..at + 6)
+            .is_some_and(|x| x.eq_ignore_ascii_case(b"u0026")),
+        _ => false,
+    }
 }
 
 /// 找到的值像不像口令，像就记下来。返回 `to`
@@ -251,19 +269,39 @@ fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usiz
     use super::place::{quote_at, run, skip_blank};
     if let Some((n, q)) = quote_at(b, i) {
         let from = i + n;
+        // 反斜杠**按一整串数一次**：在串里每隔一个字节问一次 `quote_at`（它把剩下的反斜杠再数一遍）
+        // 是平方级的，`TOKEN="` 后面跟着几百 KB 的反斜杠就要几秒
         let mut j = from;
         let mut closed = false;
         while j < b.len() {
-            if quote_at(b, j) == Some((n, q)) {
-                closed = true;
-                break;
-            }
             match b[j] {
+                b'\\' => {
+                    let k = run(b, j, |c| c == b'\\');
+                    let count = k - j;
+                    // 收尾的引号前面带着 n - 1 个反斜杠，再往前的成对，是正文里的反斜杠
+                    if b.get(k) == Some(&q) && count + 1 >= n && (count + 1 - n) % 2 == 0 {
+                        j = k + 1 - n;
+                        closed = true;
+                        break;
+                    }
+                    // 奇数个：最后一个转义了后面那个字符。转义的换行是这一行完了
+                    if count % 2 == 1 {
+                        if matches!(b.get(k), Some(b'n' | b'r')) {
+                            j = k;
+                            break;
+                        }
+                        j = k + 1;
+                    } else {
+                        j = k;
+                    }
+                }
+                c if c == q && n == 1 => {
+                    closed = true;
+                    break;
+                }
                 b'\n' | b'\r' => break,
                 // 转义过的引号收尾时，一个原样的 `"` 是装着这段话的 JSON 字符串结束了
                 b'"' if n > 1 => break,
-                b'\\' if matches!(b.get(j + 1), Some(b'n' | b'r')) => break,
-                b'\\' => j += 2,
                 _ => j += 1,
             }
         }
@@ -306,7 +344,7 @@ fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usiz
     Some((i, to, to))
 }
 
-/// `b` 以一个 shell 的关键字开头（后面不再接名字里的字符）：`TOKEN=abc;fi` 的 `fi`
+/// `b` 以一个 shell 的关键字开头，后面是结尾或者 `;`：`TOKEN=abc;fi` 的 `fi`
 fn shell_keyword(b: &[u8]) -> bool {
     const WORDS: &[&[u8]] = &[
         b"fi", b"done", b"then", b"do", b"else", b"elif", b"esac", b"export", b"echo", b"unset",
@@ -315,11 +353,14 @@ fn shell_keyword(b: &[u8]) -> bool {
         .iter()
         .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
         .count();
-    WORDS.contains(&&b[..n])
+    // 关键字后面是值的结尾或者下一个 `;`：`then#…`、`do!…` 是口令里的一段
+    WORDS.contains(&&b[..n]) && matches!(b.get(n), None | Some(b';'))
 }
 
 /// 一段带着括号、尖括号的值是不是一个字面量：不以括号开头，括号都配对，不像一次调用、一次
-/// 下标（`cfg[key2]`、`arr[i+1]`）或者一个泛型类型（`Map<String,V2>`）
+/// 下标（`cfg[key2]`、`arr[i+1]`）或者一个泛型类型（`Map<String,V2>`）。下标、泛型的前面是个
+/// 名字；那一段本身就像口令（`S3cret[2024]…`、`Xk9mQ2pLz7wR<3>`，字母数字都有）时拿不准，
+/// 当成字面量换掉 —— 宁可多换一处代码，不可漏掉一个口令
 fn literal(v: &[u8]) -> bool {
     if matches!(v.first(), Some(b'(' | b'[' | b'{' | b'<')) {
         return false;
@@ -328,11 +369,16 @@ fn literal(v: &[u8]) -> bool {
         .iter()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.'))
         .count();
-    if ident > 0
-        && (v[0].is_ascii_alphabetic() || v[0] == b'_')
-        && matches!(v.get(ident), Some(b'(' | b'[' | b'<'))
-    {
-        return false;
+    if ident > 0 && (v[0].is_ascii_alphabetic() || v[0] == b'_') {
+        match v.get(ident) {
+            Some(b'(') => return false,
+            Some(b'[' | b'<')
+                if !std::str::from_utf8(&v[..ident]).is_ok_and(|x| super::credible(x, 4)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
     }
     let mut depth = [0i32; 4];
     for &c in v {

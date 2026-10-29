@@ -730,3 +730,65 @@ fn a_long_jwt_in_a_header_is_replaced_even_if_jwt_only_records() {
         );
     }
 }
+
+/// `.env` 的值里一段像口令的字母数字后面跟着配对的 `[…]`、`<…>`：是口令，不是下标、泛型
+#[test]
+fn env_values_with_balanced_brackets_are_still_replaced() {
+    let set = RuleSet::defaults();
+    let mut leaked = Vec::new();
+    for (text, secret) in [
+        ("DB_PASSWORD=S3cret[2024]Xk9mQ2pLz7wR", "S3cret[2024]"),
+        ("DB_PASSWORD=Xk9mQ2pLz7wR[ab]", "Xk9mQ2pLz7wR"),
+        ("DB_PASSWORD=Xk9mQ2pLz7wR<3>", "Xk9mQ2pLz7wR"),
+    ] {
+        let out = sent(&set, text);
+        if out.contains(secret) {
+            leaked.push(text);
+        }
+    }
+    assert!(leaked.is_empty(), "{leaked:?}");
+}
+
+/// `;` 后面只是以 shell 关键字开头的一段（`then#`、`do!`）是口令的一部分，不是命令的分隔
+#[test]
+fn a_semicolon_ends_the_value_only_before_a_whole_shell_keyword() {
+    let set = RuleSet::defaults();
+    let mut leaked = Vec::new();
+    for (text, secret) in [
+        ("DB_PASSWORD=Xk9mQ2pLz7wR;then#Q2pL", "then#Q2pL"),
+        ("DB_PASSWORD=ab;do!Xk9mQ2pLz7wR", "Xk9mQ2pLz7wR"),
+    ] {
+        let out = sent(&set, text);
+        if out.contains(secret) {
+            leaked.push(text);
+        }
+    }
+    assert!(leaked.is_empty(), "{leaked:?}");
+}
+
+/// URL 参数（`?`、`&`、转义过的 `\u0026` 后面）：「URL 中的令牌」认得的名字归它，别的名字
+/// （`password`、`token`、`db_secret`）由配置赋值认，值到下一个 `&` 为止。曾经两边都让，谁都
+/// 不认
+#[test]
+fn names_after_an_ampersand_are_not_dropped() {
+    let mut leaked = Vec::new();
+    for amp in ["?", "&", "\\u0026"] {
+        for name in ["password", "token", "db_secret", "access_token"] {
+            for set in [RuleSet::defaults(), RuleSet::only(&["config-assignment"])] {
+                let body = format!(
+                    r#"{{"messages":[{{"role":"user","content":"https://x.example/cb?a=1{amp}{name}=Xk9mQ2pLz7wR&b=2"}}]}}"#
+                );
+                serde_json::from_str::<serde_json::Value>(&body).unwrap();
+                let hits = scan(&body, &set);
+                let p = body.find("Xk9mQ2pLz7wR").unwrap();
+                if !hits
+                    .iter()
+                    .any(|h| h.bytes.start == p && p + 12 == h.bytes.end)
+                {
+                    leaked.push(format!("{amp}{name}"));
+                }
+            }
+        }
+    }
+    assert!(leaked.is_empty(), "{leaked:?}");
+}

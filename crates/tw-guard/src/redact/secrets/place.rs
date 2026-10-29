@@ -111,6 +111,11 @@ fn by_len() -> &'static [Vec<(&'static str, Mark)>] {
     })
 }
 
+/// 这个名字是不是「URL 中的令牌」认的参数名之一（`access_token`、`api_key`……）
+pub(super) fn url_param_name(tok: &str) -> bool {
+    !tok.is_empty() && mark_of(tok) == Some(Mark::UrlParam)
+}
+
 #[inline]
 fn mark_of(tok: &str) -> Option<Mark> {
     let n = tok.len();
@@ -176,6 +181,11 @@ impl Want {
 
     pub(super) fn any(&self) -> bool {
         self.any
+    }
+
+    /// 「URL 中的令牌」开着没有
+    pub(super) fn url_on(&self) -> bool {
+        self.url
     }
 
     /// 每个 token 一次。`out` 收本身就是一种凭据的（Webhook、Telegram、Azure、千帆），
