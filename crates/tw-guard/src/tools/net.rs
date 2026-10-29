@@ -685,7 +685,7 @@ mod tests {
         let qianfan = format!(
             "bce-v3/ALTAK-{}/{}",
             "a1B2c".repeat(4) + "x",
-            "0123456789abcdef".repeat(3)[..40].to_string()
+            &"0123456789abcdef".repeat(3)[..40]
         );
         for (key, own, other) in [
             (
