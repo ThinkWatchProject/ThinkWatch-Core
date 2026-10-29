@@ -590,13 +590,15 @@ fn webhook_value(b: &[u8], e: usize, path: &[u8], min: usize, dash: bool, out: &
     }
 }
 
-/// URL 的路径在哪儿结束：空白、引号、反斜杠（转义过的 `\/` 除外）、尖括号、查询串
+/// Webhook 地址的路径在哪儿结束：空白、引号、反斜杠（转义过的 `\/` 除外）、尖括号、查询串，
+/// 和逗号 —— Webhook 的路径里没有逗号，逗号隔开的是下一个地址（`…/A,https://hooks…/B`），
+/// 并成一条的话前一条的令牌就漏了
 fn path_end(b: &[u8], from: usize) -> usize {
     let mut i = from;
     while i < b.len() {
         match b[i] {
             b'\\' if b.get(i + 1) == Some(&b'/') => i += 2,
-            b'"' | b'\'' | b'\\' | b'<' | b'>' | b'?' | b'#' | b')' => break,
+            b'"' | b'\'' | b'\\' | b'<' | b'>' | b'?' | b'#' | b')' | b',' => break,
             c if c.is_ascii_graphic() => i += 1,
             _ => break,
         }
