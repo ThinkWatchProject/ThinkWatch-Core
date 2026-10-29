@@ -10,7 +10,7 @@
 //! - **邮箱和中国大陆手机号**出厂关着：它们没有能核对的结构，只能按「长得像」认，
 //!   在代码和文档里误报得多。要的人（企业版的合规场景）自己打开。
 //!
-//! 个人信息自成一类（[`Kind::Personal`]），占位符写明是哪一种，报出去只留认得出是
+//! 个人信息自成几类（[`Kind::is_personal`]），占位符写明是哪一种，报出去只留认得出是
 //! 哪一个的最少部分（号码留最后四位，邮箱留第一个字和域名）。
 //!
 //! 贯穿全文件的一条：**宁可漏，不可吵。**一个天天误报的安全功能，用户
@@ -34,21 +34,47 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// 规则属于哪一类。**只用来分组和说明**，开关按条。
+/// 规则属于哪一类。**只用来分组和说明**，开关按条。界面上按这个顺序分组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
-    /// `sk-ant-`、`ghp_`、`AKIA` 这些前缀明确的
-    ApiKeys,
+    /// 用户在 ThinkWatch 里保存的凭据，按值认（上游密钥、访问密钥、代理口令……）
+    Saved,
+    /// AI 服务的 API 密钥（`sk-ant-`、`xai-`、`gsk_` …）
+    AiServices,
+    /// 代码托管与软件发布（GitHub、GitLab、npm、PyPI …）
+    DevPlatforms,
+    /// 云服务与基础设施（AWS、Google Cloud、阿里云、Vault …）
+    Cloud,
+    /// 支付、通信与协作（Stripe、Slack、Shopify、Notion …）
+    Business,
     /// `-----BEGIN ... PRIVATE KEY-----` 到 END 的整段
     PrivateKeys,
     /// 三段式 base64url，且首段解出来含 `"alg"`
     Jwt,
     /// `postgres://user:pass@` 这类带口令的 URI。**只换口令那一段**
     ConnStrings,
-    /// 身份证号、银行卡号、邮箱、手机号：个人信息，不是凭据。占位符写明是哪一种，
-    /// 报出去只留认得出是哪一个的最少部分
-    Personal,
+    /// 按出现的位置认的凭据：请求头、命令行、URL 参数、机器人 Webhook、配置赋值。
+    /// **只换值那一段**
+    InContext,
+    /// 加密货币的助记词、私钥
+    Crypto,
+    /// 证件号码（身份证、护照、港澳台证件……）
+    IdDocuments,
+    /// 境外证件号码，每国一条
+    ForeignIds,
+    /// 银行卡号、IBAN
+    Financial,
+    /// 手机号、固定电话、邮箱
+    Contact,
+    /// 详细地址、精确坐标
+    Location,
+    /// 车牌号、车辆识别代号
+    Vehicle,
+    /// IMEI、MAC 地址、公网 IP
+    Device,
+    /// 按字段名认的个人信息（姓名、住址、出生日期、账号、健康）
+    LabeledPersonal,
     /// RFC1918 地址、`.local` / `.internal` 域名
     Internal,
     /// 用户自己写的规则
@@ -58,14 +84,57 @@ pub enum Kind {
 impl Kind {
     pub fn slug(&self) -> &'static str {
         match self {
-            Kind::ApiKeys => "api-keys",
+            Kind::Saved => "saved",
+            Kind::AiServices => "ai-services",
+            Kind::DevPlatforms => "dev-platforms",
+            Kind::Cloud => "cloud",
+            Kind::Business => "business",
             Kind::PrivateKeys => "private-keys",
             Kind::Jwt => "jwt",
             Kind::ConnStrings => "conn-strings",
-            Kind::Personal => "personal",
+            Kind::InContext => "in-context",
+            Kind::Crypto => "crypto",
+            Kind::IdDocuments => "id-documents",
+            Kind::ForeignIds => "foreign-ids",
+            Kind::Financial => "financial",
+            Kind::Contact => "contact",
+            Kind::Location => "location",
+            Kind::Vehicle => "vehicle",
+            Kind::Device => "device",
+            Kind::LabeledPersonal => "labeled-personal",
             Kind::Internal => "internal",
             Kind::Custom => "custom",
         }
+    }
+
+    /// 个人信息，不是凭据：占位符写明是哪一种，报出去只留认得出是哪一个的最少部分
+    pub fn is_personal(&self) -> bool {
+        matches!(
+            self,
+            Kind::IdDocuments
+                | Kind::ForeignIds
+                | Kind::Financial
+                | Kind::Contact
+                | Kind::Location
+                | Kind::Vehicle
+                | Kind::Device
+                | Kind::LabeledPersonal
+        )
+    }
+
+    /// 拿到就能用的凭据：危险命令「凭据发往陌生主机」认的那几类。JWT、连接串、按位置认的
+    /// 不在里面（见 `tools::net::credentials`）
+    pub fn is_credential(&self) -> bool {
+        matches!(
+            self,
+            Kind::Saved
+                | Kind::AiServices
+                | Kind::DevPlatforms
+                | Kind::Cloud
+                | Kind::Business
+                | Kind::PrivateKeys
+                | Kind::Crypto
+        )
     }
 }
 
@@ -103,6 +172,36 @@ pub enum Matcher {
     Email,
     /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字
     CnMobilePhone,
+    /// 以其中任一个前缀开头，其后至少还有 `min_tail` 个字符，尾巴的字符按 `tail`。同一家
+    /// 服务的几种令牌写成一条
+    Prefixes { list: &'static [Pfx] },
+    /// 用户在 ThinkWatch 里保存的凭据，按值认，与格式无关
+    Saved,
+    /// 配置赋值：变量名以其中一个词结尾的字面量值
+    Assignment { suffixes: &'static [&'static str] },
+    /// 按字段名认的值：字段名是其中一个
+    Labeled { names: &'static [&'static str] },
+    /// 代码里实现的判据（校验位、词表、位置……），没有可展示的模式；界面按规则 id 给说明
+    Code,
+}
+
+/// [`Matcher::Prefixes`] 里的一个前缀。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pfx {
+    pub prefix: &'static str,
+    pub min_tail: usize,
+    pub tail: Tail,
+}
+
+/// 前缀后面那段允许哪些字符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tail {
+    /// token 里能有的都行（字母、数字、`-`、`_`、`.`）
+    Any,
+    /// 只有十六进制数字
+    Hex,
+    /// 只有字母和数字
+    Alnum,
 }
 
 /// 一家卡组织认哪些卡号。
@@ -136,13 +235,14 @@ pub struct Builtin {
 
 const fn prefix(
     id: &'static str,
+    kind: Kind,
     name: &'static str,
     prefix: &'static str,
     min_tail: usize,
 ) -> Builtin {
     Builtin {
         id,
-        kind: Kind::ApiKeys,
+        kind,
         name,
         on_by_default: true,
         matcher: Matcher::Prefix { prefix, min_tail },
@@ -202,16 +302,28 @@ pub const CARD_NETWORKS: &[CardNetwork] = &[
     },
 ];
 
-/// 全部内置规则，**按界面上的顺序**。
+/// 全部内置规则。界面上先按 [`Kind`] 的顺序分组，组内按这里的顺序（见 `view::redact`）。
 ///
 /// API 密钥那一段**只收前缀明确、长度有下限的**。代码里的 hash、base64 的
 /// 图片、UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
 pub const BUILTINS: &[Builtin] = &[
-    prefix("anthropic-api-key", "Anthropic API key", "sk-ant-", 20),
-    prefix("openai-project-key", "OpenAI project key", "sk-proj-", 20),
+    prefix(
+        "anthropic-api-key",
+        Kind::AiServices,
+        "Anthropic API key",
+        "sk-ant-",
+        20,
+    ),
+    prefix(
+        "openai-project-key",
+        Kind::AiServices,
+        "OpenAI project key",
+        "sk-proj-",
+        20,
+    ),
     Builtin {
         id: "openai-api-key",
-        kind: Kind::ApiKeys,
+        kind: Kind::AiServices,
         name: "OpenAI API key",
         on_by_default: true,
         matcher: Matcher::OpenaiLegacy {
@@ -221,42 +333,112 @@ pub const BUILTINS: &[Builtin] = &[
     },
     prefix(
         "github-personal-token",
+        Kind::DevPlatforms,
         "GitHub personal access token",
         "ghp_",
         30,
     ),
-    prefix("github-oauth-token", "GitHub OAuth token", "gho_", 30),
-    prefix("github-server-token", "GitHub server token", "ghs_", 30),
-    prefix("github-user-token", "GitHub user token", "ghu_", 30),
+    prefix(
+        "github-oauth-token",
+        Kind::DevPlatforms,
+        "GitHub OAuth token",
+        "gho_",
+        30,
+    ),
+    prefix(
+        "github-server-token",
+        Kind::DevPlatforms,
+        "GitHub server token",
+        "ghs_",
+        30,
+    ),
+    prefix(
+        "github-user-token",
+        Kind::DevPlatforms,
+        "GitHub user token",
+        "ghu_",
+        30,
+    ),
     prefix(
         "github-fine-grained-token",
+        Kind::DevPlatforms,
         "GitHub fine-grained token",
         "github_pat_",
         30,
     ),
-    prefix("slack-bot-token", "Slack bot token", "xoxb-", 20),
-    prefix("slack-user-token", "Slack user token", "xoxp-", 20),
-    prefix("slack-app-token", "Slack app token", "xoxa-", 20),
-    prefix("aws-access-key-id", "AWS access key ID", "AKIA", 12),
+    prefix(
+        "slack-bot-token",
+        Kind::Business,
+        "Slack bot token",
+        "xoxb-",
+        20,
+    ),
+    prefix(
+        "slack-user-token",
+        Kind::Business,
+        "Slack user token",
+        "xoxp-",
+        20,
+    ),
+    prefix(
+        "slack-app-token",
+        Kind::Business,
+        "Slack app token",
+        "xoxa-",
+        20,
+    ),
+    prefix(
+        "aws-access-key-id",
+        Kind::Cloud,
+        "AWS access key ID",
+        "AKIA",
+        12,
+    ),
     prefix(
         "aws-temporary-key-id",
+        Kind::Cloud,
         "AWS temporary access key ID",
         "ASIA",
         12,
     ),
-    prefix("google-api-key", "Google API key", "AIza", 30),
-    prefix("google-oauth-token", "Google OAuth token", "ya29.", 20),
-    prefix("gitlab-token", "GitLab token", "glpat-", 15),
-    prefix("stripe-live-key", "Stripe live key", "sk_live_", 20),
+    prefix("google-api-key", Kind::Cloud, "Google API key", "AIza", 30),
+    prefix(
+        "google-oauth-token",
+        Kind::Cloud,
+        "Google OAuth token",
+        "ya29.",
+        20,
+    ),
+    prefix(
+        "gitlab-token",
+        Kind::DevPlatforms,
+        "GitLab token",
+        "glpat-",
+        15,
+    ),
+    prefix(
+        "stripe-live-key",
+        Kind::Business,
+        "Stripe live key",
+        "sk_live_",
+        20,
+    ),
     prefix(
         "stripe-restricted-key",
+        Kind::Business,
         "Stripe restricted key",
         "rk_live_",
         20,
     ),
-    prefix("npm-token", "npm token", "npm_", 30),
-    prefix("digitalocean-token", "DigitalOcean token", "dop_v1_", 30),
-    prefix("sendgrid-key", "SendGrid key", "SG.", 30),
+    prefix("npm-token", Kind::DevPlatforms, "npm token", "npm_", 30),
+    prefix(
+        "digitalocean-token",
+        Kind::Cloud,
+        "DigitalOcean token",
+        "dop_v1_",
+        30,
+    ),
+    prefix("sendgrid-key", Kind::Business, "SendGrid key", "SG.", 30),
     Builtin {
         id: "private-key",
         kind: Kind::PrivateKeys,
@@ -283,7 +465,7 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         id: "cn-resident-id",
-        kind: Kind::Personal,
+        kind: Kind::IdDocuments,
         name: "Chinese resident ID number",
         on_by_default: true,
         matcher: Matcher::CnResidentId {
@@ -293,7 +475,7 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         id: "bank-card",
-        kind: Kind::Personal,
+        kind: Kind::Financial,
         name: "Bank card number",
         on_by_default: true,
         matcher: Matcher::BankCard {
@@ -303,7 +485,7 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         id: "email",
-        kind: Kind::Personal,
+        kind: Kind::Contact,
         name: "Email address",
         on_by_default: false,
         matcher: Matcher::Email,
@@ -311,7 +493,7 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         id: "cn-mobile-phone",
-        kind: Kind::Personal,
+        kind: Kind::Contact,
         name: "Chinese mainland mobile number",
         on_by_default: false,
         matcher: Matcher::CnMobilePhone,
@@ -335,6 +517,8 @@ pub const BUILTINS: &[Builtin] = &[
         },
         label: None,
     },
+    // ===== 扩充的凭据规则（secrets.rs 的判据）：只往这一段里加 =====
+    // ===== 扩充的个人信息规则（personal.rs 的判据）：只往这一段里加 =====
 ];
 
 pub fn builtin(id: &str) -> Option<&'static Builtin> {
@@ -342,7 +526,7 @@ pub fn builtin(id: &str) -> Option<&'static Builtin> {
 }
 
 /// 内置规则的一处命中。**标签照规则表上写的**，不在各个找的地方各写一遍。
-fn builtin_hit(id: &'static str, bytes: Range<usize>) -> Hit {
+pub(super) fn builtin_hit(id: &'static str, bytes: Range<usize>) -> Hit {
     Hit {
         bytes,
         rule: Rule::Builtin(id),
@@ -371,7 +555,7 @@ impl Rule {
     }
     pub fn kind(&self) -> Kind {
         match self {
-            Rule::Builtin(id) => builtin(id).map_or(Kind::ApiKeys, |b| b.kind),
+            Rule::Builtin(id) => builtin(id).map_or(Kind::Custom, |b| b.kind),
             Rule::Custom(_) => Kind::Custom,
         }
     }
@@ -1548,7 +1732,14 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     // 不出东西，号码规则却认得出 —— 而把一个数值换成占位符，整个请求体就不是
     // JSON 了
     let mut spaced = Spaced::default();
+    // 扩充的两组规则各有自己的一份「开没开、扫到哪了」，见各自的模块
+    let mut secrets = super::secrets::Want::new(set);
+    let mut personal = super::personal::Want::new(set);
+    secrets.text(text, json, &mut out);
+    personal.text(text, json, &mut out);
     for_each_token(text, |tok, span, quoted| {
+        secrets.token(text, tok, span.clone(), quoted, json, &mut out);
+        personal.token(text, tok, span.clone(), quoted, json, &mut out);
         if want_phone && (quoted || !json) {
             mobile_phones(tok, span.start, &mut out);
         }
@@ -1576,6 +1767,8 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
         }
     });
     spaced.finish(text, &mut out);
+    secrets.finish(text, &mut out);
+    personal.finish(text, &mut out);
     custom_hits(text, set, json, &mut out);
     out
 }
@@ -1737,7 +1930,7 @@ pub fn masked(rule: &Rule, value: &str) -> String {
     }
     match rule.kind() {
         Kind::Internal => value.to_string(),
-        Kind::Personal => last_four(value),
+        k if k.is_personal() => last_four(value),
         _ => mask(value),
     }
 }
@@ -2884,7 +3077,7 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].masked, "…7894");
         assert_eq!(f[0].count, 2);
-        assert_eq!(f[0].rule.kind(), Kind::Personal);
+        assert!(f[0].rule.kind().is_personal());
     }
 
     #[test]
@@ -2950,7 +3143,7 @@ mod tests {
         assert!(scan(t, &RuleSet::defaults()).is_empty());
         for id in ["email", "cn-mobile-phone"] {
             let b = builtin(id).unwrap();
-            assert!(!b.on_by_default && b.kind == Kind::Personal, "{id}");
+            assert!(!b.on_by_default && b.kind.is_personal(), "{id}");
         }
         assert_eq!(builtin("email").unwrap().label, Some("TW_EMAIL"));
         assert_eq!(builtin("cn-mobile-phone").unwrap().label, Some("TW_PHONE"));

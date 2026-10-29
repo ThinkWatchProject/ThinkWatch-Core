@@ -373,7 +373,7 @@ async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
     assert!(replaced);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].rule, "anthropic-api-key");
-    assert_eq!(items[0].kind, "api-keys");
+    assert_eq!(items[0].kind, "ai-services");
     assert_eq!(items[0].count, 1);
     let dump = format!("{items:?}");
     assert!(!dump.contains("USERSOWNKEY"), "事件里带出了原值：{dump}");
@@ -526,8 +526,8 @@ async fn id_and_card_numbers_leave_as_named_placeholders_and_come_back_whole() {
     assert_eq!(
         reported,
         vec![
-            ("bank-card", "personal".to_string(), "…7894"),
-            ("cn-resident-id", "personal".to_string(), "…002X"),
+            ("bank-card", "financial".to_string(), "…7894"),
+            ("cn-resident-id", "id-documents".to_string(), "…002X"),
         ]
     );
 }

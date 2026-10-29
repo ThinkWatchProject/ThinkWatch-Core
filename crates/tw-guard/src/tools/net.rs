@@ -16,7 +16,7 @@
 use std::ops::Range;
 use std::sync::OnceLock;
 
-use crate::redact::rules::{BUILTINS, Kind, RuleSet, scan};
+use crate::redact::rules::{BUILTINS, RuleSet, scan};
 
 /// 一条代码实现的检查。对应 [`super::rules::RuleSpec`] 里的 `check` 字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +78,7 @@ fn credentials() -> &'static RuleSet {
     S.get_or_init(|| {
         let ids: Vec<&str> = BUILTINS
             .iter()
-            .filter(|b| matches!(b.kind, Kind::ApiKeys | Kind::PrivateKeys))
+            .filter(|b| b.kind.is_credential())
             .map(|b| b.id)
             .collect();
         RuleSet::only(&ids)

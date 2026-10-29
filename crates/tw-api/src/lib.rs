@@ -292,12 +292,27 @@ slug_enum! {
 slug_enum! {
     /// 出站脱敏找到的东西属于哪一类。
     pub enum SecretKind {
-        ApiKeys = "api-keys",
+        /// 用户在 ThinkWatch 里保存的凭据，按值认
+        Saved = "saved",
+        AiServices = "ai-services",
+        DevPlatforms = "dev-platforms",
+        Cloud = "cloud",
+        Business = "business",
         PrivateKeys = "private-keys",
         Jwt = "jwt",
         ConnStrings = "conn-strings",
-        /// 身份证号、银行卡号、邮箱、手机号：个人信息，不是凭据
-        Personal = "personal",
+        /// 请求头、命令行、URL 参数、机器人 Webhook、配置赋值里按位置认的凭据
+        InContext = "in-context",
+        Crypto = "crypto",
+        /// 以下八类是个人信息，不是凭据
+        IdDocuments = "id-documents",
+        ForeignIds = "foreign-ids",
+        Financial = "financial",
+        Contact = "contact",
+        Location = "location",
+        Vehicle = "vehicle",
+        Device = "device",
+        LabeledPersonal = "labeled-personal",
         /// 内网地址
         Internal = "internal",
         /// 自定义规则找到的

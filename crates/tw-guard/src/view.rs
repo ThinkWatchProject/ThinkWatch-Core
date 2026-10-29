@@ -135,6 +135,15 @@ pub enum Matcher {
     Email,
     /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字
     CnMobilePhone,
+    /// 以其中任一个前缀开头，其后至少还有 `min_tail` 个字符；`tail` 是尾巴允许的字符
+    /// （`any` / `hex` / `alnum`）
+    Prefixes { prefixes: Vec<PrefixView> },
+    /// 用户在 ThinkWatch 里保存的凭据，按值认，与格式无关
+    Saved,
+    /// 配置赋值：变量名以其中一个词结尾的字面量值
+    Assignment { suffixes: Vec<String> },
+    /// 按字段名认的值
+    Labeled { names: Vec<String> },
     /// 正则表达式：工具调用审查的全部规则，和各项防护的自定义规则
     Regex {
         pattern: String,
@@ -154,9 +163,20 @@ pub enum Matcher {
     /// 自定义规则是它存着的写法（各项用 `, ` 连起来就是存着的那一份的意思）
     Codepoints { ranges: Vec<String> },
     /// 代码里实现的内置检查，没有可展示的模式：工具调用审查的「凭据发往陌生主机」
-    /// （`credential-to-network`）、「上传本地文件到外部主机」（`file-to-network`）。
+    /// （`credential-to-network`）、「上传本地文件到外部主机」（`file-to-network`）；
+    /// 出站脱敏里按校验位、词表、位置认的那些（`check` 就是规则 id）。
     /// `check` 是稳定的检查名，界面按它给出说明
     Builtin { check: String },
+}
+
+/// [`Matcher::Prefixes`] 里的一个前缀。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PrefixView {
+    pub prefix: String,
+    pub min_tail: usize,
+    /// `any` / `hex` / `alnum`
+    pub tail: String,
 }
 
 /// 一家卡组织认哪些卡号：以哪几段开头、一共几位。
@@ -249,9 +269,9 @@ pub fn detail(s: &Security) -> SecurityDetail {
 }
 
 /// 一条内置脱敏规则按什么认
-pub fn matcher(m: &redact_rules::Matcher) -> Matcher {
+pub fn matcher(b: &redact_rules::Builtin) -> Matcher {
     use redact_rules::Matcher as M;
-    match *m {
+    match b.matcher {
         M::Prefix { prefix, min_tail } => Matcher::Prefix {
             prefix: prefix.to_string(),
             min_tail,
@@ -263,6 +283,28 @@ pub fn matcher(m: &redact_rules::Matcher) -> Matcher {
         M::PrivateIp => Matcher::PrivateIp,
         M::DomainSuffix { suffixes } => Matcher::DomainSuffix {
             suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
+        },
+        M::Prefixes { list } => Matcher::Prefixes {
+            prefixes: list
+                .iter()
+                .map(|p| PrefixView {
+                    prefix: p.prefix.to_string(),
+                    min_tail: p.min_tail,
+                    tail: match p.tail {
+                        redact_rules::Tail::Any => "any",
+                        redact_rules::Tail::Hex => "hex",
+                        redact_rules::Tail::Alnum => "alnum",
+                    }
+                    .to_string(),
+                })
+                .collect(),
+        },
+        M::Saved => Matcher::Saved,
+        M::Assignment { suffixes } => Matcher::Assignment {
+            suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
+        },
+        M::Labeled { names } => Matcher::Labeled {
+            names: names.iter().map(|s| s.to_string()).collect(),
         },
         M::CnResidentId { born_since } => Matcher::CnResidentId { born_since },
         M::BankCard { networks } => Matcher::BankCard {
@@ -281,6 +323,9 @@ pub fn matcher(m: &redact_rules::Matcher) -> Matcher {
         },
         M::Email => Matcher::Email,
         M::CnMobilePhone => Matcher::CnMobilePhone,
+        M::Code => Matcher::Builtin {
+            check: b.id.to_string(),
+        },
     }
 }
 
@@ -295,15 +340,18 @@ fn builtin_label(b: &redact_rules::Builtin) -> String {
 
 /// 出站脱敏：全部内置规则（按界面上的顺序）和自定义规则。
 pub fn redact(p: &RedactPolicy) -> GuardDetail {
-    let mut rules: Vec<RuleView> = redact_rules::BUILTINS
-        .iter()
+    // 按类别的顺序排（稳定排序，组内照目录里的顺序）：界面按类别分组
+    let mut builtins: Vec<&redact_rules::Builtin> = redact_rules::BUILTINS.iter().collect();
+    builtins.sort_by_key(|b| b.kind);
+    let mut rules: Vec<RuleView> = builtins
+        .into_iter()
         .map(|b| RuleView {
             id: b.id.to_string(),
             custom: false,
             name: b.name.to_string(),
             why: String::new(),
             kind: b.kind.slug().to_string(),
-            matcher: matcher(&b.matcher),
+            matcher: matcher(b),
             enabled: p.builtin_on(b),
             on_by_default: b.on_by_default,
             action: Some(p.builtin_action(b).into()),
@@ -507,7 +555,7 @@ mod tests {
         );
         let id = v.rules.iter().find(|r| r.id == "cn-resident-id").unwrap();
         assert!(id.enabled && id.on_by_default);
-        assert_eq!(id.kind, "personal");
+        assert_eq!(id.kind, "id-documents");
         assert_eq!(id.label.as_deref(), Some("ID_NUMBER"));
         assert_eq!(id.matcher, Matcher::CnResidentId { born_since: 1900 });
         let card = v.rules.iter().find(|r| r.id == "bank-card").unwrap();
@@ -533,7 +581,7 @@ mod tests {
         ] {
             let r = v.rules.iter().find(|r| r.id == rule).unwrap();
             assert!(
-                !r.enabled && !r.on_by_default && r.kind == "personal",
+                !r.enabled && !r.on_by_default && r.kind == "contact",
                 "{rule}"
             );
             assert_eq!(r.label.as_deref(), Some(label));

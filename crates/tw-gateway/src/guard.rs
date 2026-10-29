@@ -731,7 +731,7 @@ mod tests {
             &body(),
         );
         assert_eq!(it[0].rule, "anthropic-api-key");
-        assert_eq!(it[0].kind, tw_api::SecretKind::ApiKeys);
+        assert_eq!(it[0].kind, tw_api::SecretKind::AiServices);
         assert!(!it[0].custom);
         assert!(!it[0].masked.contains("AAAAAAAAAAAA"), "{}", it[0].masked);
     }

@@ -2098,7 +2098,7 @@ mod security_tests {
                 tw_api::SecretItem {
                     rule: "anthropic-api-key".into(),
                     custom: false,
-                    kind: tw_api::SecretKind::ApiKeys,
+                    kind: tw_api::SecretKind::AiServices,
                     masked: "sk-an…AAAA".into(),
                     count: 2,
                     replaced,
