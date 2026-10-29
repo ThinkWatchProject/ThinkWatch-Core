@@ -25,7 +25,15 @@
 # - `about` / `about_zh`：认什么，给人看的一句话。按位置认的写明只换哪一段。反引号括起来的
 #   一段界面按代码样式显示；
 # - `hosts`：这把凭据正当地会送往哪些服务商域名（后缀匹配，含子域）。危险命令「凭据发往
-#   陌生主机」用它：没写的（私钥、加密货币私钥）送往任何非本机地址都算外传；
+#   陌生主机」用它：没写的（私钥、加密货币私钥）送往任何非本机地址都算外传。**别写人人都能
+#   开一个子域的共享域名**（对象存储的 bucket、云函数、Webhook 都在服务商的大域名下）：写了
+#   就等于放行发往别人的 bucket。有专门 API 主机的写那个主机；
+#   **仍按大域名放行、尚未收窄的**（服务本身就用到大域名下的各个产品，或者正当的去处就是
+#   用户自己的子域，收窄了天天误切）：`amazonaws.com`（S3、API Gateway）、`aliyuncs.com`
+#   （阿里云 AccessKey，OSS）、`googleapis.com` / `google.com`（Cloud Storage、Apps Script）、
+#   `slack.com`（hooks.slack.com 的 Webhook）、`myshopify.com`、`atlassian.net`、
+#   `supabase.co`、`grafana.net`、`jfrog.io`、`sentry.io`、`databricks.com` /
+#   `azuredatabricks.net`、`hashicorp.cloud`（每个用户一个子域）；
 # - 判据，三选一：
 #   - `prefix: { prefix, min_tail }`：以 `prefix` 开头、其后至少 `min_tail` 个字符；
 #   - `prefixes: [{ prefix, min_tail, tail }]`：以其中任一个开头，`tail` 是尾巴允许的字符，
@@ -464,9 +472,13 @@ rules:
     name_zh: 百度千帆 API 密钥
     about: 'Starts with `bce-v3/ALTAK-`, followed by 21 letters or digits, `/` and 40 hex characters, as a whole'
     about_zh: '`bce-v3/ALTAK-` 开头，其后为 21 个字母或数字、`/` 与 40 个十六进制字符，整段'
-    hosts: [baidubce.com]
+    # 只发往千帆的 API 主机：`baidubce.com` 下还有人人可开的云函数（`*.cfc-execute.*.baidubce.com`）
+    hosts: [qianfan.baidubce.com]
 
-  # 兼容格式的几家各有各的域名，按格式猜不出是哪家：发往这几家都算正当
+  # 兼容格式的几家各有各的域名，按格式猜不出是哪家：发往这几家的 API 主机都算正当 ——
+  # DeepSeek（api.deepseek.com）、阿里云百炼 / DashScope（国内、国际、美国三个地域）、硅基流动
+  # （国内、国际）。**只写 API 主机，不写 `aliyuncs.com`**：那下面有人人可开的 OSS bucket，写了
+  # 就等于放行把密钥传进别人的 bucket。中转站的密钥同一个形状，保存过的按它自己的上游主机放行
   - id: sk-compat-key
     kind: ai-services
     on_by_default: true
@@ -474,7 +486,13 @@ rules:
     name_zh: OpenAI 兼容格式 API 密钥
     about: 'Starts with `sk-`, followed by exactly 32 letters and digits (both present) or exactly 48 lowercase letters'
     about_zh: '`sk-` 开头，其后恰为 32 个字母和数字（两者都有），或恰为 48 个小写字母'
-    hosts: [deepseek.com, aliyuncs.com, siliconflow.cn, siliconflow.com]
+    hosts:
+      - api.deepseek.com
+      - dashscope.aliyuncs.com
+      - dashscope-intl.aliyuncs.com
+      - dashscope-us.aliyuncs.com
+      - api.siliconflow.cn
+      - api.siliconflow.com
 
   # 代码托管与软件发布
   - id: github-refresh-token
