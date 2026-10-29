@@ -1,5 +1,5 @@
 # IBAN 国家代码、总长、BBAN 结构（F 数字、A 大写字母或数字、U 大写字母，后跟位数）。
-# 来源：iban.js 0.0.14 的国家表，按 SWIFT IBAN Registry 补齐 2021 年后新增与改动的国家（BI DJ FK HN LY MN NI OM RU SD SO YE）。2026-10 整理
+# 来源：iban.js 0.0.14（MIT License）的国家表，按 SWIFT IBAN Registry 补齐 2021 年后新增与改动的国家（BI DJ FK HN LY MN NI OM RU SD SO YE）。2026-10 整理
 AD 24 F04F04A12
 AE 23 F03F16
 AL 28 F08A16

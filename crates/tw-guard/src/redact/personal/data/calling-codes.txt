@@ -1,4 +1,4 @@
-# 国际电话国家码 → 国内号码可能的位数（各地区并集）。来源：libphonenumber-js 1.11.18 metadata.min.json（Google libphonenumber 元数据），2026-10 整理
+# 国际电话国家码 → 国内号码可能的位数（各地区并集）。来源：libphonenumber-js 1.11.18 metadata.min.json（Google libphonenumber 元数据，Apache License 2.0），2026-10 整理
 1 7,10
 7 10,14
 20 8,9,10
