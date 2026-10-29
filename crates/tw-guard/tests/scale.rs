@@ -202,6 +202,8 @@ fn repeated_markers(len: usize) -> Duration {
         "api-key=",
         "x-api-key: ",
         "TOKEN=",
+        "f(token=t1,",
+        "SECRET=\"",
         "\"apiKey\": \"",
         "?sig=",
         "&access_token=",

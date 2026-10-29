@@ -156,10 +156,16 @@ fn closes(b: &[u8], i: usize) -> bool {
 }
 
 /// 名字（`name` 是它在原文里的区间）后面：可以先是引号（JSON 的键），然后是 `=`、`:`、
-/// `=>`、`:=`，然后是一个字面量值。找得到就把值记下来。返回往后看到了哪儿（值最多看
-/// [`super::place::MAX_SPAN`] 个字节，见那里）
-pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) -> usize {
-    use super::place::{quote_at, skip_blank, value_run};
+/// `=>`、`:=`，然后是一个字面量值。找得到就把值记下来。返回往后看到了哪儿（值多长都看，
+/// 线性靠调用方跳过落在看过的那一段里的名字）。`env_seen` 是 `.env` 写法的宽扫描看到了哪儿，
+/// 见 [`env_value`]
+pub(super) fn after_name(
+    text: &str,
+    name: Range<usize>,
+    placed: &mut Vec<Hit>,
+    env_seen: &mut usize,
+) -> usize {
+    use super::place::{quote_at, run, skip_blank};
     let b = text.as_bytes();
     let none = name.end;
     // `$TOKEN = …`、`${TOKEN}` 是在用一个变量；`?token=` 是 URL 参数
@@ -181,34 +187,32 @@ pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) 
     // 字面量，引号里可以有空格，不加引号的可以带着代码里才是分隔的标点，见 [`env_value`]
     let env = b[name.end] == b'=' && i == name.end + 1 && skip_blank(b, i) == i;
     i = skip_blank(b, i);
-    let mut seen = i;
-    if env && let Some((from, to, end)) = env_value(b, i, &mut seen) {
+    // 宽扫描没认出来时，它看过的那一段**不算**看过：那一段里后面的名字（`f(token=x,password=…)`
+    // 的 `password`）照样要按通常的写法看。它自己另记一份，同一段不再宽扫第二遍
+    if env
+        && i >= *env_seen
+        && let Some((from, to, end)) = env_value(b, i, env_seen)
+    {
         return push(text, from, to, placed).max(end);
     }
     let (from, to) = if let Some((n, q)) = quote_at(b, i) {
         let from = i + n;
-        let (to, seen) = value_run(b, from, |c| {
+        let to = run(b, from, |c| {
             c.is_ascii_graphic() && !matches!(c, b'"' | b'\'' | b'`' | b'\\')
         });
-        let Some(to) = to else {
-            return seen;
-        };
         // 同一种引号收尾，后面这一句就完了：`"…" + x`、`"…" % x` 是一段表达式
         if quote_at(b, to) != Some((n, q)) || !closes(b, skip_blank(b, to + n)) {
             return to;
         }
         (from, to)
     } else {
-        let (to, seen) = value_run(b, i, bare);
-        let Some(to) = to else {
-            return seen;
-        };
+        let to = run(b, i, bare);
         if !closes(b, skip_blank(b, to)) {
-            return to.max(seen);
+            return to;
         }
         (i, to)
     };
-    push(text, from, to, placed).max(seen)
+    push(text, from, to, placed)
 }
 
 /// 找到的值像不像口令，像就记下来。返回 `to`
@@ -228,7 +232,7 @@ fn push(text: &str, from: usize, to: usize, placed: &mut Vec<Hit>) -> usize {
 }
 
 /// `.env` 写法（`NAME=值`）的值，`i` 是 `=` 后面。返回 (值的起点, 终点, 引号收尾之后)，
-/// `seen` 记下看到了哪儿。
+/// `seen` 记下宽扫描看到了哪儿（认没认出来都记：同一段不宽扫第二遍，整遍扫描是线性的）。
 ///
 /// - 引号里的：到**同一行**里同一种引号为止，中间可以有空格（`"correct horse battery 9"`）；
 /// - 不加引号的：到空白、行尾为止，`&,;()[]{}<>` 都算值里的（`Tr0ub4dor&3xyz`）。但下面这几种
@@ -236,35 +240,35 @@ fn push(text: &str, from: usize, to: usize, placed: &mut Vec<Hit>) -> usize {
 ///   的 `)`）、以括号开头（数组、对象、模板）、像一次调用（`make_token(1)`）；`&名字=` 是
 ///   表单编码里的下一个参数，值在它前面截断
 fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usize)> {
-    use super::place::{MAX_SPAN, quote_at, skip_blank, value_run};
+    use super::place::{quote_at, run, skip_blank};
     if let Some((n, q)) = quote_at(b, i) {
         let from = i + n;
-        let lim = (from + MAX_SPAN + 1).min(b.len());
         let mut j = from;
-        while j < lim {
+        let mut closed = false;
+        while j < b.len() {
             if quote_at(b, j) == Some((n, q)) {
+                closed = true;
                 break;
             }
             match b[j] {
-                b'\n' | b'\r' => return None,
+                b'\n' | b'\r' => break,
                 // 转义过的引号收尾时，一个原样的 `"` 是装着这段话的 JSON 字符串结束了
-                b'"' if n > 1 => return None,
-                b'\\' if matches!(b.get(j + 1), Some(b'n' | b'r')) => return None,
+                b'"' if n > 1 => break,
+                b'\\' if matches!(b.get(j + 1), Some(b'n' | b'r')) => break,
                 b'\\' => j += 2,
                 _ => j += 1,
             }
         }
         *seen = (*seen).max(j);
-        if j >= lim || j - from > MAX_SPAN || !closes(b, skip_blank(b, j + n)) {
+        if !closed || !closes(b, skip_blank(b, j + n)) {
             return None;
         }
         return Some((from, j, j + n));
     }
-    let (to, end) = value_run(b, i, |c| {
+    let mut to = run(b, i, |c| {
         c.is_ascii_graphic() && !matches!(c, b'"' | b'\'' | b'`' | b'\\')
     });
-    *seen = (*seen).max(end);
-    let mut to = to?;
+    *seen = (*seen).max(to);
     // 表单编码：`token=abc123&state=xyz` 的值到 `&` 为止，后面是下一个参数
     if let Some(amp) = b[i..to].iter().position(|&c| c == b'&') {
         let rest = &b[i + amp + 1..to];

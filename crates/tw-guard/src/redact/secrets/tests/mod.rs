@@ -312,11 +312,12 @@ fn placed_values_are_replaced_whole_unless_a_replacing_rule_covers_all_of_them()
     assert_eq!(got[0].rule.id(), "jwt");
 }
 
-/// 值最多看 4 KB：几 KB 的令牌（Azure AD 的访问令牌）照样认，再长的一段是数据，不是凭据
+/// 值多长都整段认：几 KB 的令牌（Azure AD 的访问令牌）和更长的一串都整段换掉，不是超过某个
+/// 长度就原样放过
 #[test]
-fn placed_values_up_to_a_few_kilobytes_are_found_and_longer_runs_are_not() {
+fn placed_values_of_any_length_are_found_whole() {
     let set = RuleSet::only(&["auth-header-credential", "url-token", "config-assignment"]);
-    for n in [3000, 4096] {
+    for n in [3000, 4096, 4097, 20_000] {
         let tok = rnd(7, n, ALNUM);
         for text in [
             format!("Authorization: Bearer {tok}"),
@@ -328,8 +329,6 @@ fn placed_values_up_to_a_few_kilobytes_are_found_and_longer_runs_are_not() {
             assert_eq!(&text[got[0].bytes.clone()], tok);
         }
     }
-    let tok = rnd(7, 4097, ALNUM);
-    assert!(scan(&format!("Authorization: Bearer {tok}"), &set).is_empty());
 }
 
 /// PHP 的 `json_encode` 缺省把 `/` 写成 `\/`：这样的请求体里，按路径认的几条（千帆、各家

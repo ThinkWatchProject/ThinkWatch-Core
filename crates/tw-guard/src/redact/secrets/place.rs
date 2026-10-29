@@ -127,14 +127,6 @@ fn mark_of(tok: &str) -> Option<Mark> {
         .map(|&(_, m)| m)
 }
 
-/// 一个值、一条命令最多看多长。
-///
-/// 最长的真凭据是放进请求头、URL 里的 JWT（Azure AD、Google 的 ID 令牌）和签名，两三 KB；
-/// 再长的是一段数据，不是凭据。不设上限的话，`api-key=api-key=…`、`curl curl …` 这样的一串
-/// 里每个标记都要把后面整段看一遍，几百 KB 就是几十秒（平方级）。有了上限，再加上「落在已经
-/// 看过的那一段里的标记不再看」（[`Want::seen`]），整遍扫描是线性的
-pub(super) const MAX_SPAN: usize = 4096;
-
 /// 按位置认的几种各自看到了哪儿（[`Want::seen`] 的下标）
 const HEADER: usize = 0;
 const CURL: usize = 1;
@@ -154,7 +146,13 @@ pub(super) struct Want {
     qianfan: bool,
     any: bool,
     /// 每一种上一回往后看到了哪儿：标记落在这之前的，它的值就在上一回看过的那一段里，不再
-    /// 看一遍（见 [`MAX_SPAN`]）
+    /// 看一遍。
+    ///
+    /// **值、命令都不设长度上限，靠的是这个保持线性。**每个标记都往后找值、找命令的结尾，
+    /// `api-key=api-key=…`、`curl curl …` 这样不断开的一串里每个都把后面整段看一遍，几百 KB
+    /// 就是几十秒（平方级）。而值一长就不看（设上限）的话，超长的值原样发出去、长数据后面的
+    /// 选项（`curl -d '<5 KB>' -u 用户:口令`）认不出。每一种每个字节只看一遍，整遍扫描是
+    /// 线性的，值多长都整段换掉
     seen: [usize; 6],
 }
 
@@ -336,13 +334,6 @@ pub(super) fn run_to(b: &[u8], mut i: usize, lim: usize, ok: impl Fn(u8) -> bool
     i
 }
 
-/// 从 `i` 起一个值：一段 `ok` 的字节，最多看 [`MAX_SPAN`] 个。返回终点，超长的是 `None`
-/// （第二项总是看到了哪儿）
-pub(super) fn value_run(b: &[u8], i: usize, ok: impl Fn(u8) -> bool) -> (Option<usize>, usize) {
-    let end = run_to(b, i, i + MAX_SPAN + 1, ok);
-    ((end - i <= MAX_SPAN).then_some(end), end)
-}
-
 /// token68（RFC 7235）：Bearer、Basic 后面那一段能有的字符
 fn token68(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
@@ -422,10 +413,7 @@ fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
             }
         }
     }
-    let (end, seen) = value_run(b, i, token68);
-    let Some(end) = end else {
-        return seen;
-    };
+    let end = run(b, i, token68);
     // 后面紧跟着模板、调用、下标的是一段表达式的开头，不是一个值
     if matches!(b.get(end), Some(b'{' | b'(' | b'$' | b'[')) {
         return end;
@@ -450,11 +438,10 @@ fn command_word(b: &[u8], e: usize) -> bool {
 }
 
 /// 从 `from` 起这条命令在哪儿结束：`;`、`|`、`&`、`)`、反引号、换行，和字符串里转义的
-/// 换行（JSON 和代码里的 `\n`）。最多看 [`MAX_SPAN`] 个字节：再往后的选项不看了
+/// 换行（JSON 和代码里的 `\n`）
 fn command_end(b: &[u8], from: usize) -> usize {
-    let lim = (from + MAX_SPAN).min(b.len());
     let mut i = from;
-    while i < lim {
+    while i < b.len() {
         match b[i] {
             b';' | b'|' | b'&' | b')' | b'`' | b'\n' | b'\r' => return i,
             b'\\' if b.get(i + 1) == Some(&b'\\') => i += 2,
@@ -462,7 +449,7 @@ fn command_end(b: &[u8], from: usize) -> usize {
             _ => i += 1,
         }
     }
-    lim
+    b.len()
 }
 
 /// 一个选项的开头：`-` 前面是空白或者引号（`"-u"` 是数组里的一项）
@@ -556,11 +543,9 @@ fn env_password(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize 
     if let Some((n, _)) = quote_at(b, i) {
         i += n;
     }
-    let (end, seen) = value_run(b, i, arg_char);
-    if let Some(end) = end {
-        push_if(text, i..end, 4, "command-line-password", placed);
-    }
-    seen
+    let end = run(b, i, arg_char);
+    push_if(text, i..end, 4, "command-line-password", placed);
+    end
 }
 
 // ---------------------------------------------------------------- URL 参数
@@ -572,17 +557,15 @@ fn url_param(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
     if s == 0 || !matches!(b[s - 1], b'?' | b'&' | b'#') || b.get(e) != Some(&b'=') {
         return e;
     }
-    let (end, seen) = value_run(b, e + 1, |c| {
+    let end = run(b, e + 1, |c| {
         c.is_ascii_graphic()
             && !matches!(
                 c,
                 b'&' | b'#' | b'"' | b'\'' | b'\\' | b'<' | b'>' | b')' | b']' | b'}' | b','
             )
     });
-    if let Some(end) = end {
-        push_if(text, trimmed(b, e + 1, end), 8, "url-token", placed);
-    }
-    seen
+    push_if(text, trimmed(b, e + 1, end), 8, "url-token", placed);
+    end
 }
 
 // ---------------------------------------------------------------- 机器人 Webhook
@@ -607,12 +590,10 @@ fn webhook_value(b: &[u8], e: usize, path: &[u8], min: usize, dash: bool, out: &
     }
 }
 
-/// URL 的路径在哪儿结束：空白、引号、反斜杠（转义过的 `\/` 除外）、尖括号、查询串。超过
-/// [`MAX_SPAN`] 的不算路径（第二项是看到了哪儿）
-fn path_end(b: &[u8], from: usize) -> (Option<usize>, usize) {
-    let lim = (from + MAX_SPAN + 1).min(b.len());
+/// URL 的路径在哪儿结束：空白、引号、反斜杠（转义过的 `\/` 除外）、尖括号、查询串
+fn path_end(b: &[u8], from: usize) -> usize {
     let mut i = from;
-    while i < lim {
+    while i < b.len() {
         match b[i] {
             b'\\' if b.get(i + 1) == Some(&b'/') => i += 2,
             b'"' | b'\'' | b'\\' | b'<' | b'>' | b'?' | b'#' | b')' => break,
@@ -620,7 +601,7 @@ fn path_end(b: &[u8], from: usize) -> (Option<usize>, usize) {
             _ => break,
         }
     }
-    ((i - from <= MAX_SPAN).then_some(i), i)
+    i
 }
 
 /// `hooks.slack.com/services/T…/B…/令牌`（`workflows`、`triggers` 同理）：最后一段开头的那串
@@ -630,10 +611,7 @@ fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
     if slash_at(b, e).is_none() {
         return e;
     }
-    let (end, seen) = path_end(b, e);
-    let Some(end) = end else {
-        return seen;
-    };
+    let end = path_end(b, e);
     let mut stop = end;
     // 路径里的反斜杠只会是 `\/` 的前一半：结尾的 `\/` 一起去掉
     while stop > e && matches!(b[stop - 1], b'.' | b',' | b';' | b':' | b'!' | b'/' | b'\\') {
@@ -688,10 +666,7 @@ fn teams(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
     if slash_at(b, e).is_none() {
         return e;
     }
-    let (end, seen) = path_end(b, e);
-    let Some(end) = end else {
-        return seen;
-    };
+    let end = path_end(b, e);
     // 前后都是 `/`（或者 `\/`）的那一段
     let Some(from) = memchr::memmem::find_iter(&b[e..end], SEG)
         .map(|p| e + p)
