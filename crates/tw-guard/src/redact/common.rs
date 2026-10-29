@@ -34,13 +34,14 @@ pub(super) fn placeholder_value(v: &str) -> bool {
         "your-",
         "yourkey",
         "xxx",
-        "***",
         "todo",
         "dummy",
         "sample",
         "test123",
     ];
-    WORDS.iter().any(|w| lower.contains(w))
+    // 三个星号连着（`sk-***abc`）。不写成字符串：产品文字里不许出现 Markdown 的加粗记号
+    // （`twcore` 的 `copy` 测试）
+    WORDS.iter().any(|w| lower.contains(w)) || b.windows(3).any(|w| w == [b'*'; 3])
 }
 
 /// `at` 前面 `window` 个字符（按字符数，不是字节）里有没有其中一个关键词，不分大小写。

@@ -673,6 +673,33 @@ pricing:
 | `cn-mobile-phone` | Chinese mainland mobile number | 关 |
 | `internal-ip` | Internal IP address | 关 |
 | `internal-domain` | Internal domain | 关 |
+| `cn-resident-id-15` | Chinese resident ID number (15-digit) | 关 |
+| `passport-mrz` | Passport machine-readable zone | 开 |
+| `cn-passport` | Chinese passport number | 关 |
+| `hk-macau-taiwan-id` | Hong Kong, Macao or Taiwan ID card number | 关 |
+| `mainland-travel-permit` | Mainland travel permit number | 关 |
+| `us-ssn` | US Social Security number | 关 |
+| `uk-nino` | UK National Insurance number | 关 |
+| `sg-nric` | Singapore NRIC / FIN | 关 |
+| `kr-rrn` | Korean resident registration number | 关 |
+| `jp-my-number` | Japanese My Number | 关 |
+| `in-aadhaar` | Indian Aadhaar number | 关 |
+| `br-cpf` | Brazilian CPF number | 关 |
+| `iban` | IBAN | 开 |
+| `cn-landline` | Chinese mainland landline number | 关 |
+| `intl-phone` | International phone number | 关 |
+| `cn-address` | Chinese mainland street address | 关 |
+| `geo-coordinates` | Precise coordinates | 关 |
+| `cn-license-plate` | Chinese licence plate number | 关 |
+| `vin` | Vehicle identification number | 关 |
+| `imei` | IMEI | 关 |
+| `mac-address` | MAC address | 关 |
+| `public-ip` | Public IP address | 关 |
+| `labeled-name` | Name (by field name) | 关 |
+| `labeled-address` | Address (by field name) | 关 |
+| `labeled-birth-date` | Date of birth (by field name) | 关 |
+| `labeled-account` | Account number (by field name) | 关 |
+| `labeled-health` | Health information (by field name) | 关 |
 <!-- /generated -->
 
 `cn-resident-id`、`bank-card`、`email`、`cn-mobile-phone` 查找的是个人信息而不是凭据。前两条出厂开启，只认结构上核对得上的：
