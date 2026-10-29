@@ -160,13 +160,15 @@ pub enum Matcher {
     Jwt,
     /// `协议://用户:口令@主机` 里的口令
     ConnString,
-    /// RFC1918 私有地址，不含回环
+    /// 内网地址：RFC1918 私有地址、运营商级 NAT（`100.64.0.0/10`）、IPv6 唯一本地地址
+    /// （`fc00::/7`），不含回环
     PrivateIp,
     /// 以这几个后缀结尾的域名
     DomainSuffix { suffixes: &'static [&'static str] },
-    /// 18 位的中华人民共和国居民身份证号码：头两位是省级行政区划代码，第 7–14 位
-    /// 是 `born_since` 年 1 月 1 日到今天之间的真实日期，末位是对得上的
-    /// ISO 7064 MOD 11-2 校验码（`0`–`9` 或 `X`）。15 位的老号码不认
+    /// 18 位的中华人民共和国居民身份证号码：头两位是省级行政区划代码（含港澳台居民居住证的
+    /// `81`、`82`、`83`；新版外国人永久居留身份证首位是 `9`、第 2–3 位是省级代码、第 4–6 位是
+    /// 国籍代码），第 7–14 位是 `born_since` 年 1 月 1 日到今天之间的真实日期，末位是对得上的
+    /// ISO 7064 MOD 11-2 校验码（`0`–`9` 或 `X`）。15 位的老号码另有一条规则
     CnResidentId { born_since: u16 },
     /// 卡号：开头和位数属于其中一家卡组织，并且通过 Luhn 校验。连着写的，或者
     /// 四位一组、用一个空格或一个连字符隔开的（最后一组可以不足四位；American
@@ -175,7 +177,8 @@ pub enum Matcher {
     /// 邮箱地址：`本地部分@域名`，域名至少两段、最后一段是两个以上的字母。URL 里的
     /// 用户名（`https://user@host`、`user:pass@host`）和 `icon@2x.png` 这类文件名不算
     Email,
-    /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字
+    /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字；也认
+    /// `+86` / `0086` / `86-` 前缀，和 3-4-4 用空格或连字符分组的写法
     CnMobilePhone,
     /// 以其中任一个前缀开头，其后至少还有 `min_tail` 个字符，尾巴的字符按 `tail`。同一家
     /// 服务的几种令牌写成一条
@@ -260,7 +263,14 @@ const fn prefix(
 /// 前缀太短，**要靠长度把它和 `sk-test`、`sk-xxx` 这种占位符分开**。
 const OPENAI_MIN: usize = 40;
 
-const INTERNAL_SUFFIXES: &[&str] = &[".local", ".internal", ".lan"];
+const INTERNAL_SUFFIXES: &[&str] = &[
+    ".local",
+    ".internal",
+    ".lan",
+    ".corp",
+    ".home.arpa",
+    ".intranet",
+];
 
 /// 18 位身份证号码的出生日期最早到哪一年。
 const BORN_SINCE: u16 = 1900;
@@ -907,6 +917,178 @@ pub const BUILTINS: &[Builtin] = &[
         "Extended private key (xprv)",
     ),
     // ===== 扩充的个人信息规则（personal.rs 的判据）：只往这一段里加 =====
+    super::personal::code(
+        "cn-resident-id-15",
+        Kind::IdDocuments,
+        "Chinese resident ID number (15-digit)",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "passport-mrz",
+        Kind::IdDocuments,
+        "Passport machine-readable zone",
+        true,
+        "TW_PASSPORT",
+    ),
+    super::personal::code(
+        "cn-passport",
+        Kind::IdDocuments,
+        "Chinese passport number",
+        false,
+        "TW_PASSPORT",
+    ),
+    super::personal::code(
+        "hk-macau-taiwan-id",
+        Kind::IdDocuments,
+        "Hong Kong, Macao or Taiwan ID card number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "mainland-travel-permit",
+        Kind::IdDocuments,
+        "Mainland travel permit number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "us-ssn",
+        Kind::ForeignIds,
+        "US Social Security number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "uk-nino",
+        Kind::ForeignIds,
+        "UK National Insurance number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "sg-nric",
+        Kind::ForeignIds,
+        "Singapore NRIC / FIN",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "kr-rrn",
+        Kind::ForeignIds,
+        "Korean resident registration number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "jp-my-number",
+        Kind::ForeignIds,
+        "Japanese My Number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "in-aadhaar",
+        Kind::ForeignIds,
+        "Indian Aadhaar number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code(
+        "br-cpf",
+        Kind::ForeignIds,
+        "Brazilian CPF number",
+        false,
+        "TW_ID_NUMBER",
+    ),
+    super::personal::code("iban", Kind::Financial, "IBAN", true, "TW_ACCOUNT_NUMBER"),
+    super::personal::code(
+        "cn-landline",
+        Kind::Contact,
+        "Chinese mainland landline number",
+        false,
+        "TW_PHONE",
+    ),
+    super::personal::code(
+        "intl-phone",
+        Kind::Contact,
+        "International phone number",
+        false,
+        "TW_PHONE",
+    ),
+    super::personal::code(
+        "cn-address",
+        Kind::Location,
+        "Chinese mainland street address",
+        false,
+        "TW_ADDRESS",
+    ),
+    super::personal::code(
+        "geo-coordinates",
+        Kind::Location,
+        "Precise coordinates",
+        false,
+        "TW_LOCATION",
+    ),
+    super::personal::code(
+        "cn-license-plate",
+        Kind::Vehicle,
+        "Chinese licence plate number",
+        false,
+        "TW_PLATE",
+    ),
+    super::personal::code(
+        "vin",
+        Kind::Vehicle,
+        "Vehicle identification number",
+        false,
+        "TW_VIN",
+    ),
+    super::personal::code("imei", Kind::Device, "IMEI", false, "TW_DEVICE_ID"),
+    super::personal::code(
+        "mac-address",
+        Kind::Device,
+        "MAC address",
+        false,
+        "TW_DEVICE_ID",
+    ),
+    super::personal::code(
+        "public-ip",
+        Kind::Device,
+        "Public IP address",
+        false,
+        "TW_IP",
+    ),
+    super::personal::labeled(
+        "labeled-name",
+        "Name (by field name)",
+        super::personal::NAME_FIELDS,
+        "TW_NAME",
+    ),
+    super::personal::labeled(
+        "labeled-address",
+        "Address (by field name)",
+        super::personal::ADDRESS_FIELDS,
+        "TW_ADDRESS",
+    ),
+    super::personal::labeled(
+        "labeled-birth-date",
+        "Date of birth (by field name)",
+        super::personal::BIRTH_FIELDS,
+        "TW_BIRTH_DATE",
+    ),
+    super::personal::labeled(
+        "labeled-account",
+        "Account number (by field name)",
+        super::personal::ACCOUNT_FIELDS,
+        "TW_ACCOUNT_NUMBER",
+    ),
+    super::personal::labeled(
+        "labeled-health",
+        "Health information (by field name)",
+        super::personal::HEALTH_FIELDS,
+        "TW_HEALTH",
+    ),
 ];
 
 pub fn builtin(id: &str) -> Option<&'static Builtin> {
@@ -1600,6 +1782,8 @@ fn is_rfc1918(tok: &str) -> bool {
         (10, _) => true,
         (172, b) if (16..=31).contains(&b) => true,
         (192, 168) => true,
+        // 运营商级 NAT：Tailscale 等组网工具给每台机器发的就是这一段
+        (100, b) if (64..=127).contains(&b) => true,
         _ => false,
     }
 }
@@ -1621,8 +1805,9 @@ fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
     if domain
         && t.len() > 7
         && t.contains(&b'.')
+        // 后缀前面得有一段主机名：光秃秃的 `.internal`、`.home.arpa` 是在讲这个后缀
         && INTERNAL_SUFFIXES.iter().any(|s| {
-            t.len() >= s.len() && t[t.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes())
+            t.len() > s.len() && t[t.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes())
         })
     {
         return Some("internal-domain");
@@ -1632,16 +1817,20 @@ fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
 
 // ---------------------------------------------------------------- 个人号码
 
-/// 省级行政区划代码（GB/T 2260），身份证号码的头两位。
-const PROVINCES: [u8; 34] = [
+/// 省级行政区划代码（GB/T 2260），身份证号码的头两位。`83` 是台湾居民居住证（港澳的居住证
+/// 用 `81`、`82`）。
+const PROVINCES: [u8; 35] = [
     11, 12, 13, 14, 15, // 华北
     21, 22, 23, // 东北
     31, 32, 33, 34, 35, 36, 37, // 华东
     41, 42, 43, 44, 45, 46, // 中南
     50, 51, 52, 53, 54, // 西南
     61, 62, 63, 64, 65, // 西北
-    71, 81, 82, // 台湾、香港、澳门
+    71, 81, 82, 83, // 台湾、香港、澳门、台湾居民居住证
 ];
+
+/// [`PROVINCES`] 里大陆的那几个（前 31 个）：新版外国人永久居留身份证第 2–3 位的受理地
+const MAINLAND: usize = 31;
 
 /// ISO 7064 MOD 11-2：前 17 位各乘对应的权重，加起来除以 11 的余数在
 /// [`ID_CHECK`] 里查出校验码。
@@ -1659,7 +1848,15 @@ fn resident_id(s: &[u8], today: u32) -> bool {
     }
     let d = |i: usize| u32::from(s[i] - b'0');
     let num = |r: Range<usize>| r.fold(0, |v, i| v * 10 + d(i));
-    if !PROVINCES.contains(&(num(0..2) as u8)) {
+    // 新版外国人永久居留身份证（2023 起）：首位 `9`，第 2–3 位是受理地的省级代码，第 4–6 位是
+    // 持证人国籍的 ISO 3166-1 数字代码。其余结构和校验与身份证相同
+    let region = if s[0] == b'9' {
+        PROVINCES[..MAINLAND].contains(&(num(1..3) as u8))
+            && super::personal::nationality(num(3..6))
+    } else {
+        PROVINCES.contains(&(num(0..2) as u8))
+    };
+    if !region {
         return false;
     }
     let (year, month, day) = (num(6..10), num(10..12), num(12..14));
@@ -1678,7 +1875,7 @@ fn resident_id(s: &[u8], today: u32) -> bool {
 
 /// 某年某月有几天。闰年是能被 4 整除而不能被 100 整除的，或者能被 400 整除的
 /// —— 1900 年没有 2 月 29 日，2000 年有。
-fn days_in(year: u32, month: u32) -> u32 {
+pub(super) fn days_in(year: u32, month: u32) -> u32 {
     match month {
         2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
         2 => 28,
@@ -1688,7 +1885,7 @@ fn days_in(year: u32, month: u32) -> u32 {
 }
 
 /// 今天，写成 `YYYYMMDD`。**按北京时间**：身份证上的出生日期是按它记的。
-fn today_ymd() -> u32 {
+pub(super) fn today_ymd() -> u32 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1814,7 +2011,7 @@ fn card_network(d: &[u8]) -> Option<&'static CardNetwork> {
 }
 
 /// Luhn 校验：从右数第二位起每隔一位乘 2（超过 9 的减 9），总和是 10 的倍数。
-fn luhn(d: &[u8]) -> bool {
+pub(super) fn luhn(d: &[u8]) -> bool {
     let sum: u32 = d
         .iter()
         .rev()
@@ -2415,6 +2612,12 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
 /// 身份证号、卡号、手机号只留最后四位：「留头 5」留下的正好是身份证号的地区码、
 /// 卡号的发卡行，而认出是哪一个号码，看最后四位就够了。邮箱留第一个字和域名。
 pub fn masked(rule: &Rule, value: &str) -> String {
+    // 住址留到区县、姓名留第一个字、坐标留两位小数……（见 `personal::masked`）
+    if let Rule::Builtin(id) = rule
+        && let Some(m) = super::personal::masked(id, value)
+    {
+        return m;
+    }
     if matches!(rule, Rule::Builtin(id) if builtin(id).is_some_and(|b| b.matcher == Matcher::Email))
     {
         return mask_email(value);
@@ -2781,7 +2984,9 @@ mod tests {
         let got = found("内网 10.1.2.3 和 192.168.0.5，还有 172.20.1.1");
         assert_eq!(got.len(), 3, "{got:?}");
         assert!(got.iter().all(|(k, _)| k == "internal-ip"));
-        assert!(found("127.0.0.1 和 8.8.8.8 和 172.32.0.1").is_empty());
+        // 172.32.0.1 是公网地址：所有规则都开着时归「公网 IP」那条
+        let internal = RuleSet::only(&["internal-ip"]);
+        assert!(scan("127.0.0.1 和 8.8.8.8 和 172.32.0.1", &internal).is_empty());
     }
 
     #[test]
@@ -3084,6 +3289,53 @@ mod tests {
                     assert_eq!(hits.len(), 1, "{} 认不出它的样本 {text}", b.id);
                     assert_eq!(&text[hits[0].bytes.clone()], value);
                 }
+                Matcher::Labeled { names } => {
+                    // 每个字段名都认（裸的 `name`、`address` 要有旁证），值是占位写法的不认
+                    for n in names {
+                        let value = match b.id {
+                            "labeled-name" => "张三",
+                            "labeled-address" => "北京市朝阳区建国路88号",
+                            "labeled-birth-date" => "1990-01-01",
+                            "labeled-account" => "6217000012345678",
+                            _ => "高血压",
+                        };
+                        let text = format!(r#"{{"{n}": "{value}", "email": "z@example.com"}}"#);
+                        let got: Vec<String> = scan_plain(&text, &only)
+                            .into_iter()
+                            .map(|h| text[h.bytes].to_string())
+                            .collect();
+                        assert_eq!(got, [value], "{} 不认字段名 {n}", b.id);
+                        let text = format!(r#"{{"{n}": "${{VALUE}}", "email": "z@example.com"}}"#);
+                        assert!(scan_plain(&text, &only).is_empty(), "{} 认了占位写法", b.id);
+                    }
+                }
+                Matcher::Code if b.kind.is_personal() => {
+                    let text = super::super::personal::tests::sample(b.id)
+                        .unwrap_or_else(|| panic!("{} 没有样本", b.id));
+                    let hits = scan_plain(&text, &only);
+                    assert!(!hits.is_empty(), "{} 认不出自己的样本：{text}", b.id);
+                    assert!(hits.iter().all(|h| h.rule.id() == b.id));
+                }
+                Matcher::DomainSuffix { suffixes } => {
+                    for s in suffixes {
+                        let host = format!("server01{s}");
+                        assert_eq!(scan(&host, &only).len(), 1, "{host}");
+                    }
+                }
+                Matcher::PrivateIp => {
+                    for ip in [
+                        "10.1.2.3",
+                        "172.16.0.1",
+                        "192.168.1.1",
+                        "100.64.0.1",
+                        "fd00::1",
+                    ] {
+                        assert_eq!(scan_plain(ip, &only).len(), 1, "{ip}");
+                    }
+                    for ip in ["127.0.0.1", "100.128.0.1", "fe80::1"] {
+                        assert!(scan_plain(ip, &only).is_empty(), "{ip}");
+                    }
+                }
                 _ => {}
             }
         }
@@ -3216,7 +3468,7 @@ mod tests {
         }
         // 地区码不在 GB/T 2260 的省级名单里 —— 其余几样都对
         for code in [
-            10, 16, 20, 30, 38, 40, 47, 55, 60, 66, 70, 72, 80, 83, 90, 91, 99,
+            10, 16, 20, 30, 38, 40, 47, 55, 60, 66, 70, 72, 80, 84, 90, 91, 99,
         ] {
             let id = id_done(&format!("{code}010519900307123"));
             assert!(personal_found(&id).is_empty(), "地区码 {code}：{id}");

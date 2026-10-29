@@ -39,8 +39,9 @@ pub(super) fn placeholder_value(v: &str) -> bool {
         "sample",
         "test123",
     ];
-    // 三个星号连写是打过码的样子（写成 `repeat`：字面量里的连续星号会被当成 Markdown 加粗）
-    WORDS.iter().any(|w| lower.contains(w)) || lower.contains(&"*".repeat(3))
+    // 三个星号连着（`sk-***abc`）。不写成字符串：产品文字里不许出现 Markdown 的加粗记号
+    // （`twcore` 的 `copy` 测试）
+    WORDS.iter().any(|w| lower.contains(w)) || b.windows(3).any(|w| w == [b'*'; 3])
 }
 
 /// `at` 前面 `window` 个字符（按字符数，不是字节）里有没有其中一个关键词，不分大小写。

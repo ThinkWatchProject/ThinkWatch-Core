@@ -965,6 +965,33 @@ Built-in rules:
 | `crypto-mnemonic` | Wallet recovery phrase | on |
 | `crypto-wif-key` | Bitcoin private key (WIF) | on |
 | `crypto-extended-key` | Extended private key (xprv) | on |
+| `cn-resident-id-15` | Chinese resident ID number (15-digit) | off |
+| `passport-mrz` | Passport machine-readable zone | on |
+| `cn-passport` | Chinese passport number | off |
+| `hk-macau-taiwan-id` | Hong Kong, Macao or Taiwan ID card number | off |
+| `mainland-travel-permit` | Mainland travel permit number | off |
+| `us-ssn` | US Social Security number | off |
+| `uk-nino` | UK National Insurance number | off |
+| `sg-nric` | Singapore NRIC / FIN | off |
+| `kr-rrn` | Korean resident registration number | off |
+| `jp-my-number` | Japanese My Number | off |
+| `in-aadhaar` | Indian Aadhaar number | off |
+| `br-cpf` | Brazilian CPF number | off |
+| `iban` | IBAN | on |
+| `cn-landline` | Chinese mainland landline number | off |
+| `intl-phone` | International phone number | off |
+| `cn-address` | Chinese mainland street address | off |
+| `geo-coordinates` | Precise coordinates | off |
+| `cn-license-plate` | Chinese licence plate number | off |
+| `vin` | Vehicle identification number | off |
+| `imei` | IMEI | off |
+| `mac-address` | MAC address | off |
+| `public-ip` | Public IP address | off |
+| `labeled-name` | Name (by field name) | off |
+| `labeled-address` | Address (by field name) | off |
+| `labeled-birth-date` | Date of birth (by field name) | off |
+| `labeled-account` | Account number (by field name) | off |
+| `labeled-health` | Health information (by field name) | off |
 <!-- /generated -->
 
 `cn-resident-id`, `bank-card`, `email` and `cn-mobile-phone` look for
