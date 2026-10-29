@@ -35,8 +35,8 @@ pub use tw_guard::trial::{
     TrialResult as SecurityTestResult,
 };
 pub use tw_guard::view::{
-    CardNetwork, CardPrefix, GuardDetail, Matcher, RuleAction, RuleView as SecurityRuleView,
-    SecurityDetail,
+    CardNetwork, CardPrefix, GuardDetail, KindView as SecurityKindView, Matcher, RuleAction,
+    RuleView as SecurityRuleView, SecurityDetail,
 };
 
 /// 取值是一个固定集合的字段：线上是 slug，类型是枚举。
@@ -6382,7 +6382,7 @@ pub struct RuleSnapshot {
     pub builtin: bool,
     /// 内置规则的 id，或者自定义规则的名字
     pub id: String,
-    /// 显示的名字：内置规则的英文名（界面按 id 查自己的名称表），自定义规则就是它的名字
+    /// 显示的名字：内置规则的英文名（中文名按 id 在规则视图里取 `name_zh`），自定义规则就是它的名字
     pub name: String,
     /// 自定义规则写的样子，原样（正则、关键词、码位）。内置规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]

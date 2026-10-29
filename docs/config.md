@@ -902,13 +902,13 @@ Built-in rules:
 | `cn-mobile-phone` | Chinese mainland mobile number | off |
 | `internal-ip` | Internal IP address | off |
 | `internal-domain` | Internal domain | off |
-| `thinkwatch-saved-secret` | Secret saved in ThinkWatch | on |
+| `thinkwatch-saved-secret` | Credentials saved in ThinkWatch | on |
 | `openai-service-key` | OpenAI service account or admin key | on |
 | `openrouter-key` | OpenRouter API key | on |
 | `xai-key` | xAI API key | on |
 | `groq-key` | Groq API key | on |
 | `huggingface-token` | Hugging Face token | on |
-| `replicate-token` | Replicate API token | on |
+| `replicate-token` | Replicate token | on |
 | `perplexity-key` | Perplexity API key | on |
 | `bedrock-api-key` | Amazon Bedrock API key | on |
 | `fireworks-key` | Fireworks AI API key | on |
@@ -918,31 +918,31 @@ Built-in rules:
 | `pinecone-key` | Pinecone API key | on |
 | `tavily-key` | Tavily API key | on |
 | `minimax-key` | MiniMax API key | on |
-| `zhipu-api-key` | Zhipu AI API key | on |
+| `zhipu-api-key` | Zhipu API key | on |
 | `qianfan-api-key` | Baidu Qianfan API key | on |
 | `sk-compat-key` | OpenAI-compatible API key | on |
 | `github-refresh-token` | GitHub refresh token | on |
-| `gitlab-other-token` | GitLab token (other kinds) | on |
-| `pypi-token` | PyPI API token | on |
-| `rubygems-token` | RubyGems API key | on |
-| `clojars-token` | Clojars deploy token | on |
-| `docker-hub-token` | Docker Hub access token | on |
-| `artifactory-key` | JFrog Artifactory API key | on |
-| `databricks-token` | Databricks access token | on |
-| `sentry-token` | Sentry auth token | on |
+| `gitlab-other-token` | Other GitLab token | on |
+| `pypi-token` | PyPI token | on |
+| `rubygems-token` | RubyGems token | on |
+| `clojars-token` | Clojars token | on |
+| `docker-hub-token` | Docker Hub token | on |
+| `artifactory-key` | JFrog Artifactory key | on |
+| `databricks-token` | Databricks token | on |
+| `sentry-token` | Sentry token | on |
 | `grafana-token` | Grafana token | on |
 | `postman-key` | Postman API key | on |
-| `aws-other-key-id` | AWS access key ID (other kinds) | on |
+| `aws-other-key-id` | Other AWS access key ID | on |
 | `alibaba-access-key-id` | Alibaba Cloud AccessKey ID | on |
 | `tencent-secret-id` | Tencent Cloud SecretId | on |
 | `volcengine-access-key-id` | Volcengine AccessKey ID | on |
 | `azure-ad-client-secret` | Azure AD client secret | on |
-| `digitalocean-other-token` | DigitalOcean token (other kinds) | on |
+| `digitalocean-other-token` | Other DigitalOcean token | on |
 | `cloudflare-origin-ca-key` | Cloudflare Origin CA key | on |
 | `vault-token` | HashiCorp Vault token | on |
 | `terraform-token` | Terraform Cloud token | on |
 | `doppler-token` | Doppler token | on |
-| `pulumi-token` | Pulumi access token | on |
+| `pulumi-token` | Pulumi token | on |
 | `heroku-key` | Heroku API key | on |
 | `flyio-token` | Fly.io token | on |
 | `supabase-key` | Supabase key | on |
@@ -952,23 +952,23 @@ Built-in rules:
 | `shopify-token` | Shopify token | on |
 | `twilio-api-key` | Twilio API key | on |
 | `brevo-key` | Brevo API key | on |
-| `slack-other-token` | Slack token (other kinds) | on |
+| `slack-other-token` | Other Slack token | on |
 | `linear-key` | Linear API key | on |
 | `notion-token` | Notion token | on |
 | `atlassian-token` | Atlassian API token | on |
 | `auth-header-credential` | Credential in a request header | on |
 | `command-line-password` | Password on a command line | on |
 | `url-token` | Token in a URL | on |
-| `bot-webhook` | Chat bot webhook token | on |
+| `bot-webhook` | Bot webhook | on |
 | `telegram-bot-token` | Telegram bot token | on |
 | `config-assignment` | Secret assigned in a config file | on |
-| `crypto-mnemonic` | Wallet recovery phrase | on |
-| `crypto-wif-key` | Bitcoin private key (WIF) | on |
-| `crypto-extended-key` | Extended private key (xprv) | on |
-| `cn-resident-id-15` | Chinese resident ID number (15-digit) | off |
+| `crypto-mnemonic` | Recovery phrase | on |
+| `crypto-wif-key` | WIF private key | on |
+| `crypto-extended-key` | Extended private key | on |
+| `cn-resident-id-15` | 15-digit legacy resident ID number | off |
 | `passport-mrz` | Passport machine-readable zone | on |
 | `cn-passport` | Chinese passport number | off |
-| `hk-macau-taiwan-id` | Hong Kong, Macao or Taiwan ID card number | off |
+| `hk-macau-taiwan-id` | Hong Kong, Macau or Taiwan ID number | off |
 | `mainland-travel-permit` | Mainland travel permit number | off |
 | `us-ssn` | US Social Security number | off |
 | `uk-nino` | UK National Insurance number | off |
@@ -976,22 +976,22 @@ Built-in rules:
 | `kr-rrn` | Korean resident registration number | off |
 | `jp-my-number` | Japanese My Number | off |
 | `in-aadhaar` | Indian Aadhaar number | off |
-| `br-cpf` | Brazilian CPF number | off |
+| `br-cpf` | Brazilian CPF | off |
 | `iban` | IBAN | on |
 | `cn-landline` | Chinese mainland landline number | off |
 | `intl-phone` | International phone number | off |
 | `cn-address` | Chinese mainland street address | off |
 | `geo-coordinates` | Precise coordinates | off |
-| `cn-license-plate` | Chinese licence plate number | off |
-| `vin` | Vehicle identification number | off |
+| `cn-license-plate` | Chinese mainland license plate | off |
+| `vin` | Vehicle identification number (VIN) | off |
 | `imei` | IMEI | off |
 | `mac-address` | MAC address | off |
 | `public-ip` | Public IP address | off |
-| `labeled-name` | Name (by field name) | off |
-| `labeled-address` | Address (by field name) | off |
-| `labeled-birth-date` | Date of birth (by field name) | off |
-| `labeled-account` | Account number (by field name) | off |
-| `labeled-health` | Health information (by field name) | off |
+| `labeled-name` | Name by field name | off |
+| `labeled-address` | Address by field name | off |
+| `labeled-birth-date` | Birth date by field name | off |
+| `labeled-account` | Bank account by field name | off |
+| `labeled-health` | Health information by field name | off |
 <!-- /generated -->
 
 `cn-resident-id`, `bank-card`, `email` and `cn-mobile-phone` look for

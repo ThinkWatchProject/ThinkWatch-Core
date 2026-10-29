@@ -25,47 +25,12 @@ mod place;
 use std::ops::Range;
 
 use super::common;
-use super::rules::{Builtin, Hit, Kind, Matcher, RuleSet, builtin_hit};
+use super::rules::{Hit, RuleSet, builtin_hit};
 
 pub(super) use data::nationality;
 pub(super) use labeled::{
     ACCOUNT_FIELDS, ADDRESS_FIELDS, BIRTH_FIELDS, HEALTH_FIELDS, NAME_FIELDS,
 };
-
-/// 一条代码里实现判据的个人信息规则（[`Matcher::Code`]）
-pub(super) const fn code(
-    id: &'static str,
-    kind: Kind,
-    name: &'static str,
-    on_by_default: bool,
-    label: &'static str,
-) -> Builtin {
-    Builtin {
-        id,
-        kind,
-        name,
-        on_by_default,
-        matcher: Matcher::Code,
-        label: Some(label),
-    }
-}
-
-/// 一条按字段名认的规则（[`Matcher::Labeled`]）。出厂都关着
-pub(super) const fn labeled(
-    id: &'static str,
-    name: &'static str,
-    names: &'static [&'static str],
-    label: &'static str,
-) -> Builtin {
-    Builtin {
-        id,
-        kind: Kind::LabeledPersonal,
-        name,
-        on_by_default: false,
-        matcher: Matcher::Labeled { names },
-        label: Some(label),
-    }
-}
 
 /// 扫之前问一次哪几条开着：每个 token 上查一遍表太贵（见 `rules::scan_unresolved`）
 #[derive(Default, Clone, Copy)]

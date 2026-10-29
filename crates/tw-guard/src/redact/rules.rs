@@ -34,10 +34,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use super::secrets::ASSIGNMENT_SUFFIXES;
 pub use super::secrets::saved::{
     SAVED_MIN_CHARS, Saved, SavedSecret, SavedSource, SavedSourceKind,
 };
-use super::secrets::{ASSIGNMENT_SUFFIXES, code, pfx, prefixed};
 
 /// 规则属于哪一类。**只用来分组和说明**，开关按条。界面上按这个顺序分组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -110,6 +110,24 @@ impl Kind {
             Kind::Internal => "internal",
             Kind::Custom => "custom",
         }
+    }
+
+    /// 分组的英文名（`data/redact.yaml` 的 `kinds`）
+    pub fn name(&self) -> &'static str {
+        self.names().name
+    }
+
+    /// 分组的中文名
+    pub fn name_zh(&self) -> &'static str {
+        self.names().name_zh
+    }
+
+    fn names(&self) -> &'static KindName {
+        KIND_NAMES
+            .iter()
+            .find(|n| n.kind == *self)
+            // 每一类都在数据文件里，测试钉着（`every_kind_has_names_in_the_order_the_ui_groups_by`）
+            .expect("every kind is named in data/redact.yaml")
     }
 
     /// 个人信息，不是凭据：占位符写明是哪一种，报出去只留认得出是哪一个的最少部分
@@ -189,7 +207,7 @@ pub enum Matcher {
     Assignment { suffixes: &'static [&'static str] },
     /// 按字段名认的值：字段名是其中一个
     Labeled { names: &'static [&'static str] },
-    /// 代码里实现的判据（校验位、词表、位置……），没有可展示的模式；界面按规则 id 给说明
+    /// 代码里实现的判据（校验位、词表、位置……），没有可展示的模式；说明是规则的 `about`
     Code,
 }
 
@@ -228,8 +246,15 @@ pub struct Builtin {
     /// 规则的 id，也是命中之后报出去的那个词（`anthropic-api-key` …）
     pub id: &'static str,
     pub kind: Kind,
-    /// 英文名。界面按 id 查自己的名称表，查不到才用它
+    /// 英文名
     pub name: &'static str,
+    /// 中文名
+    pub name_zh: &'static str,
+    /// 认什么，给人看的一句话（英文）。按位置认的写明只换哪一段；反引号括起来的一段是代码。
+    /// 前缀类的规则由 build.rs 按前缀和长度生成
+    pub about: &'static str,
+    /// 同上，中文
+    pub about_zh: &'static str,
     /// 出厂时开不开。**关着的是内网地址和邮箱、手机号**：它们在代码和文档里到处
     /// 都是，按「长得像」认误报得多，而危害远小于一把 key，想脱的人自己开
     pub on_by_default: bool,
@@ -239,23 +264,9 @@ pub struct Builtin {
     /// 个人号码写明是哪一种：模型看到 `<<TW_ID_NUMBER_1>>` 才知道那里原来是个
     /// 身份证号，答得像样
     pub label: Option<&'static str>,
-}
-
-const fn prefix(
-    id: &'static str,
-    kind: Kind,
-    name: &'static str,
-    prefix: &'static str,
-    min_tail: usize,
-) -> Builtin {
-    Builtin {
-        id,
-        kind,
-        name,
-        on_by_default: true,
-        matcher: Matcher::Prefix { prefix, min_tail },
-        label: None,
-    }
+    /// 这把凭据正当地会送往哪些服务商域名（后缀匹配，含子域）。危险命令「凭据发往陌生主机」
+    /// 用它；空的（私钥、个人信息……）送往任何非本机地址都算外传
+    pub hosts: &'static [&'static str],
 }
 
 /// `sk-` 开头的 OpenAI 老式 key 至少要多长。
@@ -317,779 +328,171 @@ pub const CARD_NETWORKS: &[CardNetwork] = &[
     },
 ];
 
-/// 全部内置规则。界面上先按 [`Kind`] 的顺序分组，组内按这里的顺序（见 `view::redact`）。
+/// 全部内置规则，从 `data/redact.yaml` 编译期生成（见 build.rs）。界面上先按 [`Kind`] 的
+/// 顺序分组，组内按这里的顺序（见 `view::redact`）；前缀表也按这里的顺序比。
 ///
 /// API 密钥那一段**只收前缀明确、长度有下限的**。代码里的 hash、base64 的
 /// 图片、UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
-pub const BUILTINS: &[Builtin] = &[
-    prefix(
-        "anthropic-api-key",
-        Kind::AiServices,
-        "Anthropic API key",
-        "sk-ant-",
-        20,
-    ),
-    prefix(
-        "openai-project-key",
-        Kind::AiServices,
-        "OpenAI project key",
-        "sk-proj-",
-        20,
-    ),
-    Builtin {
-        id: "openai-api-key",
-        kind: Kind::AiServices,
-        name: "OpenAI API key",
-        on_by_default: true,
-        matcher: Matcher::OpenaiLegacy {
+pub const BUILTINS: &[Builtin] = include!(concat!(env!("OUT_DIR"), "/redact_builtins.rs"));
+
+/// 一个分组叫什么（`data/redact.yaml` 的 `kinds`）。
+#[derive(Debug, Clone, Copy)]
+pub struct KindName {
+    pub kind: Kind,
+    pub name: &'static str,
+    pub name_zh: &'static str,
+}
+
+/// 每个分组的名字，按界面上的顺序（和 [`Kind`] 的定义顺序一致，测试钉着）。
+pub const KIND_NAMES: &[KindName] = include!(concat!(env!("OUT_DIR"), "/redact_kinds.rs"));
+
+/// 判据写在代码里的规则：数据文件里没写前缀的那些按 id 在这里找自己的 [`Matcher`]。
+///
+/// **数据和代码各管一半**：名字、说明、分组、出厂开关在 `data/redact.yaml`，判据（校验位、
+/// 词表、位置、整张号段表）在代码里，这张表把两边按 id 接起来。数据里有、这里没有的是编译错误
+/// （[`detector`]）；这里有、数据里没有的由测试抓（`every_detector_has_a_rule_in_the_data`）。
+/// 判据本身在哪个函数里：最早那一批在本文件，扩充的凭据在 `secrets/`，个人信息在 `personal/`；
+/// 每一条都有样本测试（命中、不命中）钉着。
+const DETECTORS: &[(&str, Matcher)] = &[
+    // OpenAI 老式密钥的长度下限扫描时直接用 `OPENAI_MIN`，所以它算代码判据，不进数据文件
+    (
+        "openai-api-key",
+        Matcher::OpenaiLegacy {
             min_len: OPENAI_MIN,
         },
-        label: None,
-    },
-    prefix(
-        "github-personal-token",
-        Kind::DevPlatforms,
-        "GitHub personal access token",
-        "ghp_",
-        30,
     ),
-    prefix(
-        "github-oauth-token",
-        Kind::DevPlatforms,
-        "GitHub OAuth token",
-        "gho_",
-        30,
-    ),
-    prefix(
-        "github-server-token",
-        Kind::DevPlatforms,
-        "GitHub server token",
-        "ghs_",
-        30,
-    ),
-    prefix(
-        "github-user-token",
-        Kind::DevPlatforms,
-        "GitHub user token",
-        "ghu_",
-        30,
-    ),
-    prefix(
-        "github-fine-grained-token",
-        Kind::DevPlatforms,
-        "GitHub fine-grained token",
-        "github_pat_",
-        30,
-    ),
-    prefix(
-        "slack-bot-token",
-        Kind::Business,
-        "Slack bot token",
-        "xoxb-",
-        20,
-    ),
-    prefix(
-        "slack-user-token",
-        Kind::Business,
-        "Slack user token",
-        "xoxp-",
-        20,
-    ),
-    prefix(
-        "slack-app-token",
-        Kind::Business,
-        "Slack app token",
-        "xoxa-",
-        20,
-    ),
-    prefix(
-        "aws-access-key-id",
-        Kind::Cloud,
-        "AWS access key ID",
-        "AKIA",
-        12,
-    ),
-    prefix(
-        "aws-temporary-key-id",
-        Kind::Cloud,
-        "AWS temporary access key ID",
-        "ASIA",
-        12,
-    ),
-    prefix("google-api-key", Kind::Cloud, "Google API key", "AIza", 30),
-    prefix(
-        "google-oauth-token",
-        Kind::Cloud,
-        "Google OAuth token",
-        "ya29.",
-        20,
-    ),
-    prefix(
-        "gitlab-token",
-        Kind::DevPlatforms,
-        "GitLab token",
-        "glpat-",
-        15,
-    ),
-    prefix(
-        "stripe-live-key",
-        Kind::Business,
-        "Stripe live key",
-        "sk_live_",
-        20,
-    ),
-    prefix(
-        "stripe-restricted-key",
-        Kind::Business,
-        "Stripe restricted key",
-        "rk_live_",
-        20,
-    ),
-    prefix("npm-token", Kind::DevPlatforms, "npm token", "npm_", 30),
-    prefix(
-        "digitalocean-token",
-        Kind::Cloud,
-        "DigitalOcean token",
-        "dop_v1_",
-        30,
-    ),
-    prefix("sendgrid-key", Kind::Business, "SendGrid key", "SG.", 30),
-    Builtin {
-        id: "private-key",
-        kind: Kind::PrivateKeys,
-        name: "Private key",
-        on_by_default: true,
-        matcher: Matcher::Pem,
-        label: None,
-    },
-    Builtin {
-        id: "jwt",
-        kind: Kind::Jwt,
-        name: "JWT",
-        on_by_default: true,
-        matcher: Matcher::Jwt,
-        label: None,
-    },
-    Builtin {
-        id: "conn-string-password",
-        kind: Kind::ConnStrings,
-        name: "Connection string password",
-        on_by_default: true,
-        matcher: Matcher::ConnString,
-        label: None,
-    },
-    Builtin {
-        id: "cn-resident-id",
-        kind: Kind::IdDocuments,
-        name: "Chinese resident ID number",
-        on_by_default: true,
-        matcher: Matcher::CnResidentId {
+    ("private-key", Matcher::Pem),
+    ("jwt", Matcher::Jwt),
+    ("conn-string-password", Matcher::ConnString),
+    (
+        "cn-resident-id",
+        Matcher::CnResidentId {
             born_since: BORN_SINCE,
         },
-        label: Some("TW_ID_NUMBER"),
-    },
-    Builtin {
-        id: "bank-card",
-        kind: Kind::Financial,
-        name: "Bank card number",
-        on_by_default: true,
-        matcher: Matcher::BankCard {
+    ),
+    (
+        "bank-card",
+        Matcher::BankCard {
             networks: CARD_NETWORKS,
         },
-        label: Some("TW_CARD_NUMBER"),
-    },
-    Builtin {
-        id: "email",
-        kind: Kind::Contact,
-        name: "Email address",
-        on_by_default: false,
-        matcher: Matcher::Email,
-        label: Some("TW_EMAIL"),
-    },
-    Builtin {
-        id: "cn-mobile-phone",
-        kind: Kind::Contact,
-        name: "Chinese mainland mobile number",
-        on_by_default: false,
-        matcher: Matcher::CnMobilePhone,
-        label: Some("TW_PHONE"),
-    },
-    Builtin {
-        id: "internal-ip",
-        kind: Kind::Internal,
-        name: "Internal IP address",
-        on_by_default: false,
-        matcher: Matcher::PrivateIp,
-        label: None,
-    },
-    Builtin {
-        id: "internal-domain",
-        kind: Kind::Internal,
-        name: "Internal domain",
-        on_by_default: false,
-        matcher: Matcher::DomainSuffix {
+    ),
+    ("email", Matcher::Email),
+    ("cn-mobile-phone", Matcher::CnMobilePhone),
+    ("internal-ip", Matcher::PrivateIp),
+    (
+        "internal-domain",
+        Matcher::DomainSuffix {
             suffixes: INTERNAL_SUFFIXES,
         },
-        label: None,
-    },
-    // ===== 扩充的凭据规则（secrets.rs 的判据）：只往这一段里加 =====
-    Builtin {
-        id: "thinkwatch-saved-secret",
-        kind: Kind::Saved,
-        name: "Secret saved in ThinkWatch",
-        on_by_default: true,
-        matcher: Matcher::Saved,
-        label: None,
-    },
-    // AI 服务。`sk-` 开头的几家要排在 OpenAI 老式密钥前面认（见 `classify_prefixed`）
-    prefixed(
-        "openai-service-key",
-        Kind::AiServices,
-        "OpenAI service account or admin key",
-        &[
-            pfx("sk-svcacct-", 58, Tail::Any),
-            pfx("sk-admin-", 58, Tail::Any),
-        ],
     ),
-    prefixed(
-        "openrouter-key",
-        Kind::AiServices,
-        "OpenRouter API key",
-        &[pfx("sk-or-v1-", 64, Tail::Hex)],
-    ),
-    prefixed(
-        "xai-key",
-        Kind::AiServices,
-        "xAI API key",
-        &[pfx("xai-", 70, Tail::Alnum)],
-    ),
-    prefixed(
-        "groq-key",
-        Kind::AiServices,
-        "Groq API key",
-        &[pfx("gsk_", 52, Tail::Alnum)],
-    ),
-    prefixed(
-        "huggingface-token",
-        Kind::AiServices,
-        "Hugging Face token",
-        &[
-            pfx("hf_", 34, Tail::Alnum),
-            pfx("api_org_", 34, Tail::Alnum),
-        ],
-    ),
-    prefixed(
-        "replicate-token",
-        Kind::AiServices,
-        "Replicate API token",
-        &[pfx("r8_", 37, Tail::Alnum)],
-    ),
-    prefixed(
-        "perplexity-key",
-        Kind::AiServices,
-        "Perplexity API key",
-        &[pfx("pplx-", 48, Tail::Alnum)],
-    ),
-    prefixed(
-        "bedrock-api-key",
-        Kind::AiServices,
-        "Amazon Bedrock API key",
-        &[pfx("ABSK", 100, Tail::Any)],
-    ),
-    prefixed(
-        "fireworks-key",
-        Kind::AiServices,
-        "Fireworks AI API key",
-        &[pfx("fw_", 20, Tail::Alnum)],
-    ),
-    prefixed(
-        "cerebras-key",
-        Kind::AiServices,
-        "Cerebras API key",
-        &[pfx("csk-", 48, Tail::Alnum)],
-    ),
-    prefixed(
-        "langsmith-key",
-        Kind::AiServices,
-        "LangSmith API key",
-        &[
-            pfx("lsv2_pt_", 43, Tail::Any),
-            pfx("lsv2_sk_", 43, Tail::Any),
-        ],
-    ),
-    prefixed(
-        "langfuse-secret-key",
-        Kind::AiServices,
-        "Langfuse secret key",
-        &[pfx("sk-lf-", 36, Tail::Any)],
-    ),
-    prefixed(
-        "pinecone-key",
-        Kind::AiServices,
-        "Pinecone API key",
-        &[pfx("pcsk_", 69, Tail::Any)],
-    ),
-    prefixed(
-        "tavily-key",
-        Kind::AiServices,
-        "Tavily API key",
-        &[pfx("tvly-", 32, Tail::Any)],
-    ),
-    prefixed(
-        "minimax-key",
-        Kind::AiServices,
-        "MiniMax API key",
-        &[pfx("sk-api-", 100, Tail::Any)],
-    ),
-    code("zhipu-api-key", Kind::AiServices, "Zhipu AI API key"),
-    code("qianfan-api-key", Kind::AiServices, "Baidu Qianfan API key"),
-    code(
-        "sk-compat-key",
-        Kind::AiServices,
-        "OpenAI-compatible API key",
-    ),
-    // 代码托管与软件发布
-    prefixed(
-        "github-refresh-token",
-        Kind::DevPlatforms,
-        "GitHub refresh token",
-        &[pfx("ghr_", 36, Tail::Alnum)],
-    ),
-    prefixed(
-        "gitlab-other-token",
-        Kind::DevPlatforms,
-        "GitLab token (other kinds)",
-        &[
-            pfx("glptt-", 20, Tail::Any),
-            pfx("gldt-", 20, Tail::Any),
-            pfx("glrt-", 20, Tail::Any),
-            pfx("gloas-", 20, Tail::Any),
-            pfx("glcbt-", 20, Tail::Any),
-            pfx("glft-", 20, Tail::Any),
-            pfx("glsoat-", 20, Tail::Any),
-            pfx("glimt-", 20, Tail::Any),
-            pfx("glagent-", 20, Tail::Any),
-        ],
-    ),
-    prefixed(
-        "pypi-token",
-        Kind::DevPlatforms,
-        "PyPI API token",
-        &[pfx("pypi-AgEIcHlwaS5vcmc", 50, Tail::Any)],
-    ),
-    prefixed(
-        "rubygems-token",
-        Kind::DevPlatforms,
-        "RubyGems API key",
-        &[pfx("rubygems_", 48, Tail::Hex)],
-    ),
-    prefixed(
-        "clojars-token",
-        Kind::DevPlatforms,
-        "Clojars deploy token",
-        &[pfx("CLOJARS_", 60, Tail::Alnum)],
-    ),
-    prefixed(
-        "docker-hub-token",
-        Kind::DevPlatforms,
-        "Docker Hub access token",
-        &[
-            pfx("dckr_pat_", 27, Tail::Any),
-            pfx("dckr_oat_", 32, Tail::Any),
-        ],
-    ),
-    prefixed(
-        "artifactory-key",
-        Kind::DevPlatforms,
-        "JFrog Artifactory API key",
-        &[pfx("AKCp", 69, Tail::Alnum)],
-    ),
-    prefixed(
-        "databricks-token",
-        Kind::DevPlatforms,
-        "Databricks access token",
-        &[pfx("dapi", 32, Tail::Hex)],
-    ),
-    prefixed(
-        "sentry-token",
-        Kind::DevPlatforms,
-        "Sentry auth token",
-        &[pfx("sntrys_", 40, Tail::Any), pfx("sntryu_", 64, Tail::Hex)],
-    ),
-    prefixed(
-        "grafana-token",
-        Kind::DevPlatforms,
-        "Grafana token",
-        &[pfx("glsa_", 41, Tail::Any), pfx("glc_", 32, Tail::Any)],
-    ),
-    prefixed(
-        "postman-key",
-        Kind::DevPlatforms,
-        "Postman API key",
-        &[pfx("PMAK-", 59, Tail::Any)],
-    ),
-    // 云服务与基础设施
-    prefixed(
-        "aws-other-key-id",
-        Kind::Cloud,
-        "AWS access key ID (other kinds)",
-        &[pfx("ABIA", 16, Tail::Alnum), pfx("ACCA", 16, Tail::Alnum)],
-    ),
-    prefixed(
-        "alibaba-access-key-id",
-        Kind::Cloud,
-        "Alibaba Cloud AccessKey ID",
-        &[pfx("LTAI", 12, Tail::Alnum)],
-    ),
-    prefixed(
-        "tencent-secret-id",
-        Kind::Cloud,
-        "Tencent Cloud SecretId",
-        &[pfx("AKID", 32, Tail::Alnum)],
-    ),
-    prefixed(
-        "volcengine-access-key-id",
-        Kind::Cloud,
-        "Volcengine AccessKey ID",
-        &[pfx("AKLT", 40, Tail::Any), pfx("AKTP", 40, Tail::Any)],
-    ),
-    code(
-        "azure-ad-client-secret",
-        Kind::Cloud,
-        "Azure AD client secret",
-    ),
-    prefixed(
-        "digitalocean-other-token",
-        Kind::Cloud,
-        "DigitalOcean token (other kinds)",
-        &[pfx("doo_v1_", 64, Tail::Hex), pfx("dor_v1_", 64, Tail::Hex)],
-    ),
-    prefixed(
-        "cloudflare-origin-ca-key",
-        Kind::Cloud,
-        "Cloudflare Origin CA key",
-        &[pfx("v1.0-", 171, Tail::Any)],
-    ),
-    prefixed(
-        "vault-token",
-        Kind::Cloud,
-        "HashiCorp Vault token",
-        &[pfx("hvs.", 90, Tail::Any), pfx("hvb.", 138, Tail::Any)],
-    ),
-    code("terraform-token", Kind::Cloud, "Terraform Cloud token"),
-    prefixed(
-        "doppler-token",
-        Kind::Cloud,
-        "Doppler token",
-        &[pfx("dp.pt.", 43, Tail::Alnum)],
-    ),
-    prefixed(
-        "pulumi-token",
-        Kind::Cloud,
-        "Pulumi access token",
-        &[pfx("pul-", 40, Tail::Hex)],
-    ),
-    prefixed(
-        "heroku-key",
-        Kind::Cloud,
-        "Heroku API key",
-        &[pfx("HRKU-AA", 58, Tail::Any)],
-    ),
-    prefixed(
-        "flyio-token",
-        Kind::Cloud,
-        "Fly.io token",
-        &[pfx("fo1_", 43, Tail::Any)],
-    ),
-    prefixed(
-        "supabase-key",
-        Kind::Cloud,
-        "Supabase key",
-        &[
-            pfx("sbp_", 40, Tail::Alnum),
-            pfx("sb_secret_", 31, Tail::Any),
-        ],
-    ),
-    prefixed(
-        "age-secret-key",
-        Kind::Cloud,
-        "age secret key",
-        &[pfx("AGE-SECRET-KEY-1", 58, Tail::Alnum)],
-    ),
-    prefixed(
-        "onepassword-token",
-        Kind::Cloud,
-        "1Password service account token",
-        &[pfx("ops_eyJ", 200, Tail::Any)],
-    ),
-    // 支付、通信与协作
-    prefixed(
-        "stripe-webhook-secret",
-        Kind::Business,
-        "Stripe webhook signing secret",
-        &[pfx("whsec_", 32, Tail::Any)],
-    ),
-    prefixed(
-        "shopify-token",
-        Kind::Business,
-        "Shopify token",
-        &[
-            pfx("shpat_", 32, Tail::Hex),
-            pfx("shpca_", 32, Tail::Hex),
-            pfx("shppa_", 32, Tail::Hex),
-            pfx("shpss_", 32, Tail::Hex),
-        ],
-    ),
-    prefixed(
-        "twilio-api-key",
-        Kind::Business,
-        "Twilio API key",
-        &[pfx("SK", 32, Tail::Hex)],
-    ),
-    prefixed(
-        "brevo-key",
-        Kind::Business,
-        "Brevo API key",
-        &[pfx("xkeysib-", 81, Tail::Any)],
-    ),
-    prefixed(
-        "slack-other-token",
-        Kind::Business,
-        "Slack token (other kinds)",
-        &[
-            pfx("xapp-", 20, Tail::Any),
-            pfx("xoxe-", 20, Tail::Any),
-            pfx("xoxe.xoxp-", 20, Tail::Any),
-            pfx("xoxe.xoxb-", 20, Tail::Any),
-            pfx("xoxr-", 20, Tail::Any),
-        ],
-    ),
-    prefixed(
-        "linear-key",
-        Kind::Business,
-        "Linear API key",
-        &[pfx("lin_api_", 40, Tail::Alnum)],
-    ),
-    prefixed(
-        "notion-token",
-        Kind::Business,
-        "Notion token",
-        &[pfx("ntn_", 46, Tail::Alnum)],
-    ),
-    // Atlassian 的令牌在 186 位左右，**末尾九位前面隔着一个 `=`**（不是 token 里的字符）：
-    // 切出来的 token 只有 180 上下，下限放在 150
-    prefixed(
-        "atlassian-token",
-        Kind::Business,
-        "Atlassian API token",
-        &[pfx("ATATT3", 150, Tail::Any)],
-    ),
-    // 按位置认的：只换值那一段
-    code(
-        "auth-header-credential",
-        Kind::InContext,
-        "Credential in a request header",
-    ),
-    code(
-        "command-line-password",
-        Kind::InContext,
-        "Password on a command line",
-    ),
-    code("url-token", Kind::InContext, "Token in a URL"),
-    code("bot-webhook", Kind::InContext, "Chat bot webhook token"),
-    code("telegram-bot-token", Kind::InContext, "Telegram bot token"),
-    Builtin {
-        id: "config-assignment",
-        kind: Kind::InContext,
-        name: "Secret assigned in a config file",
-        on_by_default: true,
-        matcher: Matcher::Assignment {
+    // 扩充的凭据规则（secrets/）
+    ("thinkwatch-saved-secret", Matcher::Saved),
+    ("zhipu-api-key", Matcher::Code),
+    ("qianfan-api-key", Matcher::Code),
+    ("sk-compat-key", Matcher::Code),
+    ("azure-ad-client-secret", Matcher::Code),
+    ("terraform-token", Matcher::Code),
+    ("auth-header-credential", Matcher::Code),
+    ("command-line-password", Matcher::Code),
+    ("url-token", Matcher::Code),
+    ("bot-webhook", Matcher::Code),
+    ("telegram-bot-token", Matcher::Code),
+    (
+        "config-assignment",
+        Matcher::Assignment {
             suffixes: ASSIGNMENT_SUFFIXES,
         },
-        label: None,
-    },
-    // 加密货币
-    code("crypto-mnemonic", Kind::Crypto, "Wallet recovery phrase"),
-    code("crypto-wif-key", Kind::Crypto, "Bitcoin private key (WIF)"),
-    code(
-        "crypto-extended-key",
-        Kind::Crypto,
-        "Extended private key (xprv)",
     ),
-    // ===== 扩充的个人信息规则（personal.rs 的判据）：只往这一段里加 =====
-    super::personal::code(
-        "cn-resident-id-15",
-        Kind::IdDocuments,
-        "Chinese resident ID number (15-digit)",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "passport-mrz",
-        Kind::IdDocuments,
-        "Passport machine-readable zone",
-        true,
-        "TW_PASSPORT",
-    ),
-    super::personal::code(
-        "cn-passport",
-        Kind::IdDocuments,
-        "Chinese passport number",
-        false,
-        "TW_PASSPORT",
-    ),
-    super::personal::code(
-        "hk-macau-taiwan-id",
-        Kind::IdDocuments,
-        "Hong Kong, Macao or Taiwan ID card number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "mainland-travel-permit",
-        Kind::IdDocuments,
-        "Mainland travel permit number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "us-ssn",
-        Kind::ForeignIds,
-        "US Social Security number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "uk-nino",
-        Kind::ForeignIds,
-        "UK National Insurance number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "sg-nric",
-        Kind::ForeignIds,
-        "Singapore NRIC / FIN",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "kr-rrn",
-        Kind::ForeignIds,
-        "Korean resident registration number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "jp-my-number",
-        Kind::ForeignIds,
-        "Japanese My Number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "in-aadhaar",
-        Kind::ForeignIds,
-        "Indian Aadhaar number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code(
-        "br-cpf",
-        Kind::ForeignIds,
-        "Brazilian CPF number",
-        false,
-        "TW_ID_NUMBER",
-    ),
-    super::personal::code("iban", Kind::Financial, "IBAN", true, "TW_ACCOUNT_NUMBER"),
-    super::personal::code(
-        "cn-landline",
-        Kind::Contact,
-        "Chinese mainland landline number",
-        false,
-        "TW_PHONE",
-    ),
-    super::personal::code(
-        "intl-phone",
-        Kind::Contact,
-        "International phone number",
-        false,
-        "TW_PHONE",
-    ),
-    super::personal::code(
-        "cn-address",
-        Kind::Location,
-        "Chinese mainland street address",
-        false,
-        "TW_ADDRESS",
-    ),
-    super::personal::code(
-        "geo-coordinates",
-        Kind::Location,
-        "Precise coordinates",
-        false,
-        "TW_LOCATION",
-    ),
-    super::personal::code(
-        "cn-license-plate",
-        Kind::Vehicle,
-        "Chinese licence plate number",
-        false,
-        "TW_PLATE",
-    ),
-    super::personal::code(
-        "vin",
-        Kind::Vehicle,
-        "Vehicle identification number",
-        false,
-        "TW_VIN",
-    ),
-    super::personal::code("imei", Kind::Device, "IMEI", false, "TW_DEVICE_ID"),
-    super::personal::code(
-        "mac-address",
-        Kind::Device,
-        "MAC address",
-        false,
-        "TW_DEVICE_ID",
-    ),
-    super::personal::code(
-        "public-ip",
-        Kind::Device,
-        "Public IP address",
-        false,
-        "TW_IP",
-    ),
-    super::personal::labeled(
+    ("crypto-mnemonic", Matcher::Code),
+    ("crypto-wif-key", Matcher::Code),
+    ("crypto-extended-key", Matcher::Code),
+    // 扩充的个人信息规则（personal/）
+    ("cn-resident-id-15", Matcher::Code),
+    ("passport-mrz", Matcher::Code),
+    ("cn-passport", Matcher::Code),
+    ("hk-macau-taiwan-id", Matcher::Code),
+    ("mainland-travel-permit", Matcher::Code),
+    ("us-ssn", Matcher::Code),
+    ("uk-nino", Matcher::Code),
+    ("sg-nric", Matcher::Code),
+    ("kr-rrn", Matcher::Code),
+    ("jp-my-number", Matcher::Code),
+    ("in-aadhaar", Matcher::Code),
+    ("br-cpf", Matcher::Code),
+    ("iban", Matcher::Code),
+    ("cn-landline", Matcher::Code),
+    ("intl-phone", Matcher::Code),
+    ("cn-address", Matcher::Code),
+    ("geo-coordinates", Matcher::Code),
+    ("cn-license-plate", Matcher::Code),
+    ("vin", Matcher::Code),
+    ("imei", Matcher::Code),
+    ("mac-address", Matcher::Code),
+    ("public-ip", Matcher::Code),
+    (
         "labeled-name",
-        "Name (by field name)",
-        super::personal::NAME_FIELDS,
-        "TW_NAME",
+        Matcher::Labeled {
+            names: super::personal::NAME_FIELDS,
+        },
     ),
-    super::personal::labeled(
+    (
         "labeled-address",
-        "Address (by field name)",
-        super::personal::ADDRESS_FIELDS,
-        "TW_ADDRESS",
+        Matcher::Labeled {
+            names: super::personal::ADDRESS_FIELDS,
+        },
     ),
-    super::personal::labeled(
+    (
         "labeled-birth-date",
-        "Date of birth (by field name)",
-        super::personal::BIRTH_FIELDS,
-        "TW_BIRTH_DATE",
+        Matcher::Labeled {
+            names: super::personal::BIRTH_FIELDS,
+        },
     ),
-    super::personal::labeled(
+    (
         "labeled-account",
-        "Account number (by field name)",
-        super::personal::ACCOUNT_FIELDS,
-        "TW_ACCOUNT_NUMBER",
+        Matcher::Labeled {
+            names: super::personal::ACCOUNT_FIELDS,
+        },
     ),
-    super::personal::labeled(
+    (
         "labeled-health",
-        "Health information (by field name)",
-        super::personal::HEALTH_FIELDS,
-        "TW_HEALTH",
+        Matcher::Labeled {
+            names: super::personal::HEALTH_FIELDS,
+        },
     ),
 ];
+
+/// 数据文件里一条代码判据的规则在 [`DETECTORS`] 里的 [`Matcher`]。**在编译期求值**
+/// （生成的 [`BUILTINS`] 里调它）：查不到就停在编译上，不会带着一条认不出任何东西的规则上线
+const fn detector(id: &str) -> Matcher {
+    let mut i = 0;
+    while i < DETECTORS.len() {
+        if same(DETECTORS[i].0, id) {
+            return DETECTORS[i].1;
+        }
+        i += 1;
+    }
+    panic!("a rule in data/redact.yaml has no prefix and no detector in rules::DETECTORS")
+}
+
+/// 两个字符串相等。`==` 在 const fn 里用不了
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(test)]
+#[path = "catalog_tests.rs"]
+mod catalog_tests;
 
 pub fn builtin(id: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|b| b.id == id)

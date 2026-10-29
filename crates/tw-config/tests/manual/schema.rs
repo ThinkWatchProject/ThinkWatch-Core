@@ -2190,7 +2190,8 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             };
             for b in tw_guard::redact::rules::BUILTINS {
                 let on = if b.on_by_default { yes } else { no };
-                out += &format!("| `{}` | {} | {on} |\n", b.id, b.name);
+                let name = if zh { b.name_zh } else { b.name };
+                out += &format!("| `{}` | {name} | {on} |\n", b.id);
             }
         }
         "inspect_tools" => {
@@ -2201,7 +2202,8 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             };
             for s in &tw_guard::tools::rules::builtin().dangerous {
                 let a = ToolAction::factory(s).slug();
-                out += &format!("| `{}` | {} | `{a}` |\n", s.id, s.name);
+                let name = if zh { &s.name_zh } else { &s.name };
+                out += &format!("| `{}` | {name} | `{a}` |\n", s.id);
             }
         }
         "content" => {
@@ -2213,7 +2215,8 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             for b in tw_guard::content::builtins() {
                 let on = if b.on_by_default { yes } else { no };
                 let a = ContentAction::factory(b).slug();
-                out += &format!("| `{}` | {} | {} | {on} | `{a}` |\n", b.id, b.name, b.group);
+                let name = if zh { &b.name_zh } else { &b.name };
+                out += &format!("| `{}` | {name} | {} | {on} | `{a}` |\n", b.id, b.group);
             }
         }
         _ => return None,

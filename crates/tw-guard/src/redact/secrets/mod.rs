@@ -7,8 +7,8 @@
 //!
 //! 分成几块：
 //!
-//! - 多前缀的规则（[`Matcher::Prefixes`]）在 [`super::rules`] 的快速排除和前缀表里认，这里只
-//!   放写表用的几个函数；
+//! - 多前缀的规则（[`super::rules::Matcher::Prefixes`]）在 [`super::rules`] 的快速排除和前缀表里
+//!   认，前缀写在 `data/redact.yaml`；
 //! - [`saved`]：按值认用户在 ThinkWatch 里保存的凭据；
 //! - [`shapes`]：前缀不够、要看整段结构的几种（`sk-` 短格式、智谱、千帆、Azure、Terraform、
 //!   Telegram）；
@@ -19,51 +19,13 @@
 
 use std::ops::Range;
 
-use super::rules::{Builtin, Hit, Kind, Matcher, Pfx, RuleSet, Tail};
+use super::rules::{Hit, RuleSet};
 
 mod assign;
 mod crypto;
 mod place;
 pub(crate) mod saved;
 mod shapes;
-
-/// [`Matcher::Prefixes`] 里的一项
-pub(super) const fn pfx(prefix: &'static str, min_tail: usize, tail: Tail) -> Pfx {
-    Pfx {
-        prefix,
-        min_tail,
-        tail,
-    }
-}
-
-/// 一条多前缀的规则：出厂开、占位符用默认标签
-pub(super) const fn prefixed(
-    id: &'static str,
-    kind: Kind,
-    name: &'static str,
-    list: &'static [Pfx],
-) -> Builtin {
-    Builtin {
-        id,
-        kind,
-        name,
-        on_by_default: true,
-        matcher: Matcher::Prefixes { list },
-        label: None,
-    }
-}
-
-/// 一条代码实现的规则：出厂开、占位符用默认标签
-pub(super) const fn code(id: &'static str, kind: Kind, name: &'static str) -> Builtin {
-    Builtin {
-        id,
-        kind,
-        name,
-        on_by_default: true,
-        matcher: Matcher::Code,
-        label: None,
-    }
-}
 
 /// 配置赋值认哪些变量名结尾（不分大小写，`_`、`-` 不算）。**界面上的说明和判据用的是同一张表**
 pub(super) const ASSIGNMENT_SUFFIXES: &[&str] = &[

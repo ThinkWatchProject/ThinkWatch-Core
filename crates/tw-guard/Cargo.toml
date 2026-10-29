@@ -25,6 +25,11 @@ serde_yaml_ng = { workspace = true }
 tw-dialect = { workspace = true }
 ts-rs = { workspace = true, optional = true }
 
+# 出站脱敏的规则目录（`data/redact.yaml`）在编译期生成常量，见 build.rs
+[build-dependencies]
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
 [features]
 # 规则视图、「测试…」的请求和结果导出成 TypeScript。**默认关** —— 只有桌面端生成前端
 # 类型时开（经由 tw-api 的 `ts`），企业版不背 ts-rs。

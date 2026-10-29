@@ -99,85 +99,10 @@ fn credentials() -> &'static RuleSet {
 
 /// 一把凭据正当地会送往哪些服务商域名（后缀匹配，含子域）。
 ///
-/// **小而明确，直接对着脱敏内置规则的 id 写。**没列的（私钥）没有固定服务商：送往任何
-/// 非本机地址都算外传。
+/// **写在脱敏规则目录里**（`data/redact.yaml` 的 `hosts`），和规则的名字、前缀放在一起：加一条
+/// 凭据规则只改那一个文件。没写的（私钥）没有固定服务商：送往任何非本机地址都算外传。
 fn provider_hosts(id: &str) -> &'static [&'static str] {
-    match id {
-        "anthropic-api-key" => &["anthropic.com"],
-        "openai-api-key" | "openai-project-key" => &["openai.com"],
-        "github-personal-token"
-        | "github-oauth-token"
-        | "github-server-token"
-        | "github-user-token"
-        | "github-fine-grained-token" => &["github.com", "githubusercontent.com"],
-        "slack-bot-token" | "slack-user-token" | "slack-app-token" => &["slack.com"],
-        "aws-access-key-id" | "aws-temporary-key-id" => &["amazonaws.com"],
-        "google-api-key" | "google-oauth-token" => &["googleapis.com", "google.com"],
-        "gitlab-token" => &["gitlab.com"],
-        "stripe-live-key" | "stripe-restricted-key" => &["stripe.com"],
-        "npm-token" => &["npmjs.org", "npmjs.com"],
-        "digitalocean-token" => &["digitalocean.com"],
-        "sendgrid-key" => &["sendgrid.com"],
-        "openai-service-key" => &["openai.com"],
-        "openrouter-key" => &["openrouter.ai"],
-        "xai-key" => &["x.ai"],
-        "groq-key" => &["groq.com"],
-        "huggingface-token" => &["huggingface.co", "hf.co"],
-        "replicate-token" => &["replicate.com"],
-        "perplexity-key" => &["perplexity.ai"],
-        "bedrock-api-key" => &["amazonaws.com"],
-        "fireworks-key" => &["fireworks.ai"],
-        "cerebras-key" => &["cerebras.ai"],
-        "langsmith-key" => &["langchain.com", "smith.langchain.com"],
-        "langfuse-secret-key" => &["langfuse.com"],
-        "pinecone-key" => &["pinecone.io"],
-        "tavily-key" => &["tavily.com"],
-        "minimax-key" => &["minimax.io", "minimaxi.com", "minimax.chat"],
-        "zhipu-api-key" => &["bigmodel.cn", "z.ai"],
-        "qianfan-api-key" => &["baidubce.com"],
-        // 兼容格式的几家各有各的域名，按格式猜不出是哪家：发往这几家都算正当
-        "sk-compat-key" => &[
-            "deepseek.com",
-            "aliyuncs.com",
-            "siliconflow.cn",
-            "siliconflow.com",
-        ],
-        "github-refresh-token" => &["github.com"],
-        "gitlab-other-token" => &["gitlab.com"],
-        "pypi-token" => &["pypi.org"],
-        "rubygems-token" => &["rubygems.org"],
-        "clojars-token" => &["clojars.org"],
-        "docker-hub-token" => &["docker.com", "docker.io"],
-        "artifactory-key" => &["jfrog.io"],
-        "databricks-token" => &["databricks.com", "azuredatabricks.net"],
-        "sentry-token" => &["sentry.io"],
-        "grafana-token" => &["grafana.net", "grafana.com"],
-        "postman-key" => &["getpostman.com", "postman.com"],
-        "aws-other-key-id" => &["amazonaws.com"],
-        "alibaba-access-key-id" => &["aliyuncs.com"],
-        "tencent-secret-id" => &["tencentcloudapi.com"],
-        "volcengine-access-key-id" => &["volcengineapi.com"],
-        "azure-ad-client-secret" => &["microsoftonline.com"],
-        "digitalocean-other-token" => &["digitalocean.com"],
-        "cloudflare-origin-ca-key" => &["cloudflare.com"],
-        "vault-token" => &["hashicorp.cloud"],
-        "terraform-token" => &["terraform.io", "hashicorp.cloud"],
-        "doppler-token" => &["doppler.com"],
-        "pulumi-token" => &["pulumi.com"],
-        "heroku-key" => &["heroku.com"],
-        "flyio-token" => &["fly.io", "machines.dev"],
-        "supabase-key" => &["supabase.co", "supabase.com"],
-        "onepassword-token" => &["1password.com"],
-        "stripe-webhook-secret" => &["stripe.com"],
-        "shopify-token" => &["myshopify.com", "shopify.com"],
-        "twilio-api-key" => &["twilio.com"],
-        "brevo-key" => &["brevo.com", "sendinblue.com"],
-        "slack-other-token" => &["slack.com"],
-        "linear-key" => &["linear.app"],
-        "notion-token" => &["notion.com", "notion.so"],
-        "atlassian-token" => &["atlassian.net", "atlassian.com"],
-        _ => &[],
-    }
+    crate::redact::rules::builtin(id).map_or(&[], |b| b.hosts)
 }
 
 /// `host` 由 `provider` 这个域名提供：本身相等，或者是它的子域（`api.anthropic.com`

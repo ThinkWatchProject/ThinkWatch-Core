@@ -146,8 +146,10 @@ impl Default for Sides {
 pub struct Builtin {
     /// 稳定的标识。配置按它引用，**改了就是另一条规则**
     pub id: String,
-    /// 英文名。界面按 id 查自己的名称表，查不到才用它
+    /// 英文名
     pub name: String,
+    /// 中文名
+    pub name_zh: String,
     /// 码位规则写的是码位（`U+E0000–U+E007F`）
     pub pattern: String,
     #[serde(rename = "match")]
@@ -160,21 +162,41 @@ pub struct Builtin {
     /// 出厂时开不开。**只开误报极少的那几条**
     #[serde(default)]
     pub on_by_default: bool,
-    /// 为什么值得看一眼（英文，界面按 id 查译文）。规则名说不清的才写
+    /// 为什么值得看一眼（英文）。规则名说不清的才写
     #[serde(default)]
     pub why: String,
+    /// 同上，中文。`why` 有的它都有
+    #[serde(default)]
+    pub why_zh: String,
+}
+
+/// `data/content.yaml` 整个文件：分组的名字和规则。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinFile {
+    kinds: Vec<crate::view::KindView>,
+    rules: Vec<Builtin>,
 }
 
 /// 出厂规则的原文。
 pub const BUILTIN: &str = include_str!("../data/content.yaml");
 
-/// 出厂的规则，按界面上的顺序。
-pub fn builtins() -> &'static [Builtin] {
-    static ALL: std::sync::OnceLock<Vec<Builtin>> = std::sync::OnceLock::new();
+fn builtin_file() -> &'static BuiltinFile {
+    static ALL: std::sync::OnceLock<BuiltinFile> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         // 随二进制一起编进来的文件，读不了是构建出了错 —— 测试会先挂
         serde_yaml_ng::from_str(BUILTIN).expect("data/content.yaml is valid")
     })
+}
+
+/// 出厂的规则，按界面上的顺序。
+pub fn builtins() -> &'static [Builtin] {
+    &builtin_file().rules
+}
+
+/// 出厂规则的分组（`group` 是其中一个），按界面上的顺序。
+pub fn kinds() -> &'static [crate::view::KindView] {
+    &builtin_file().kinds
 }
 
 /// 按 id 找一条出厂规则。
@@ -1046,8 +1068,23 @@ mod tests {
             builtins()
                 .iter()
                 .all(|b| b.name.is_ascii() && b.why.is_ascii()),
-            "名字和说明是英文的退路"
+            "name、why 是英文"
         );
+        // 中文名每条都有，说明有英文的就有中文的
+        for b in builtins() {
+            assert!(!b.name_zh.trim().is_empty(), "{} 没有中文名", b.id);
+            assert_eq!(b.why.is_empty(), b.why_zh.is_empty(), "{}", b.id);
+        }
+        // 每条的分组都有名字
+        for b in builtins() {
+            let k = kinds().iter().find(|k| k.slug == b.group);
+            assert!(
+                k.is_some_and(|k| !k.name.is_empty() && !k.name_zh.is_empty()),
+                "{} 的分组 {} 没有名字",
+                b.id,
+                b.group
+            );
+        }
         // ` dan ` 的空格要留着
         assert_eq!(builtin("dan").unwrap().pattern, " dan ");
         assert!(builtin("jailbreak").is_some() && builtin("nope").is_none());
