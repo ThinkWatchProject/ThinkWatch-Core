@@ -19,7 +19,9 @@ use crate::policy::{
     placeholder_label, redact_match,
 };
 use crate::redact::replace::{Ledger, Scheme};
-use crate::redact::rules::RuleSet;
+use std::sync::Arc;
+
+use crate::redact::rules::{RuleSet, Saved, SavedSource};
 use crate::view::RuleAction;
 
 /// 试的那一条规则叫什么。**不会写进任何地方**，只出现在结果的 `rule` 里
@@ -81,6 +83,9 @@ pub struct TrialHit {
     /// 第三档下做什么
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RuleAction>,
+    /// 出站脱敏认出的是一项保存的凭据（`thinkwatch-saved-secret`）：是哪一项。这时 `excerpt` 是空的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SavedSource>,
 }
 
 /// 试的结果。
@@ -144,11 +149,25 @@ impl TrialError {
     }
 }
 
-/// 在 `policy` 下试一试 `guard` 那一项。
+/// 在 `policy` 下试一试 `guard` 那一项，不带保存的凭据（见 [`run_with`]）。
 pub fn run(guard: Guard, policy: &Security, req: &TrialRequest) -> Result<TrialResult, TrialError> {
+    run_with(guard, policy, req, None)
+}
+
+/// 在 `policy` 下试一试 `guard` 那一项。
+///
+/// `saved` 是网关手里那一份保存的凭据（[`crate::redact::rules::RuleSet::saved`]；企业版从上游
+/// 配置编一份，[`Saved::new`]）：贴进来一把保存着的密钥，出站脱敏报 `thinkwatch-saved-secret`
+/// 和它是哪一项（不报值），「凭据发往陌生主机」也认它
+pub fn run_with(
+    guard: Guard,
+    policy: &Security,
+    req: &TrialRequest,
+    saved: Option<Arc<Saved>>,
+) -> Result<TrialResult, TrialError> {
     match guard {
-        Guard::Redact => redact(&policy.redact, req),
-        Guard::InspectTools => tools(&policy.inspect_tools, req),
+        Guard::Redact => redact(&policy.redact, req, saved),
+        Guard::InspectTools => tools(&policy.inspect_tools, req, saved),
         Guard::Content => content(&policy.content, req),
     }
 }
@@ -158,7 +177,11 @@ fn utf16_at(text: &str, byte: usize) -> usize {
     text.get(..byte).unwrap_or(text).encode_utf16().count()
 }
 
-fn redact(p: &RedactPolicy, req: &TrialRequest) -> Result<TrialResult, TrialError> {
+fn redact(
+    p: &RedactPolicy,
+    req: &TrialRequest,
+    saved: Option<Arc<Saved>>,
+) -> Result<TrialResult, TrialError> {
     let action = req
         .action
         .map(|a| {
@@ -197,12 +220,14 @@ fn redact(p: &RedactPolicy, req: &TrialRequest) -> Result<TrialResult, TrialErro
             if let Some(a) = action {
                 p.actions.insert(id.clone(), a);
             }
-            p.one_builtin(id).ok_or_else(|| TrialError::UnknownRule {
-                guard: Guard::Redact,
-                id: id.clone(),
-            })?
+            p.one_builtin(id)
+                .ok_or_else(|| TrialError::UnknownRule {
+                    guard: Guard::Redact,
+                    id: id.clone(),
+                })?
+                .with_saved_set(saved)
         }
-        (None, None) => p.rules()?,
+        (None, None) => p.rules()?.with_saved_set(saved),
     };
     let sample = &req.sample;
     // **按它在请求体里的样子找**，结论才和真的请求一致
@@ -231,6 +256,7 @@ fn redact(p: &RedactPolicy, req: &TrialRequest) -> Result<TrialResult, TrialErro
                 } else {
                     RuleAction::Placeholder
                 }),
+                source: rules.saved_source(&sample[h.bytes.clone()]).cloned(),
             })
             .collect(),
         output,
@@ -238,7 +264,11 @@ fn redact(p: &RedactPolicy, req: &TrialRequest) -> Result<TrialResult, TrialErro
     })
 }
 
-fn tools(p: &ToolPolicy, req: &TrialRequest) -> Result<TrialResult, TrialError> {
+fn tools(
+    p: &ToolPolicy,
+    req: &TrialRequest,
+    saved: Option<Arc<Saved>>,
+) -> Result<TrialResult, TrialError> {
     use crate::tools::rules as t;
     let rules = match (&req.pattern, &req.rule) {
         (Some(pattern), _) => {
@@ -262,7 +292,8 @@ fn tools(p: &ToolPolicy, req: &TrialRequest) -> Result<TrialResult, TrialError> 
             })?
         }
         (None, None) => p.rules()?,
-    };
+    }
+    .with_saved(saved);
     let sample = &req.sample;
     // 和网关一样：**每条规则只报第一处**
     let mut hits: Vec<TrialHit> = rules
@@ -282,6 +313,7 @@ fn tools(p: &ToolPolicy, req: &TrialRequest) -> Result<TrialResult, TrialError> 
                 } else {
                     RuleAction::Record
                 }),
+                source: None,
             })
         })
         .collect();
@@ -397,6 +429,7 @@ fn content(p: &ContentPolicy, req: &TrialRequest) -> Result<TrialResult, TrialEr
                         .collect()
                 },
                 action: Some(ContentAction::of(hit.action).into()),
+                source: None,
             }
         })
         .collect();
@@ -443,6 +476,7 @@ fn content_answer(rules: &content::Rules, sample: &str) -> TrialResult {
                     .take(content::SNIPPET_MAX)
                     .collect(),
                 action: Some(ContentAction::of(rule.action()).into()),
+                source: None,
             })
         })
         .collect();
@@ -859,5 +893,44 @@ mod tests {
             serde_json::to_value(&r).unwrap(),
             serde_json::json!({"hits": [], "output": null, "refused": false})
         );
+    }
+
+    /// 贴进来一把保存着的密钥：报它是哪一项，不报值
+    #[test]
+    fn a_saved_secret_is_shown_with_its_source_and_no_value() {
+        use crate::redact::rules::{SavedSecret, SavedSourceKind};
+        let saved = Saved::new(vec![SavedSecret {
+            value: "0123456789abcdef0123456789abcdef".into(),
+            source: SavedSource {
+                kind: SavedSourceKind::UpstreamKey,
+                name: "Mistral".into(),
+            },
+            hosts: vec!["api.mistral.ai".into()],
+        }])
+        .map(Arc::new);
+        let s = Security::default();
+        let r = run_with(
+            Guard::Redact,
+            &s,
+            &req("key 0123456789abcdef0123456789abcdef ok"),
+            saved,
+        )
+        .unwrap();
+        assert_eq!(r.hits.len(), 1, "{r:?}");
+        assert_eq!(r.hits[0].rule, "thinkwatch-saved-secret");
+        assert_eq!(r.hits[0].excerpt, "");
+        assert_eq!(
+            r.hits[0].source.as_ref().map(|s| s.name.as_str()),
+            Some("Mistral")
+        );
+        assert_eq!(r.output.as_deref(), Some("key <<TW_SECRET_1>> ok"));
+        // 不带就认不出
+        let r = run(
+            Guard::Redact,
+            &s,
+            &req("key 0123456789abcdef0123456789abcdef ok"),
+        )
+        .unwrap();
+        assert!(r.hits.is_empty());
     }
 }

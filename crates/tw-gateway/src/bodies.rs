@@ -297,6 +297,8 @@ fn carried_summaries(text: &str) -> Vec<(Range<usize>, String)> {
 fn masked(rule: &Rule, value: &str) -> String {
     let m = match rule.kind() {
         Kind::Internal => tw_secret::mask_secret(value),
+        // 保存的凭据报出去是空的（报的是哪一项），存下来的正文里留个记号，不让那一处凭空消失
+        Kind::Saved => "…".to_string(),
         _ => tw_guard::redact::rules::masked(rule, value),
     };
     m.replace('\\', "")

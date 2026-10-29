@@ -177,6 +177,7 @@ mod tests {
                 session: None,
                 sent_model: None,
                 detail: Default::default(),
+                source: None,
             })
             .unwrap();
             db.insert_plugin_run(&PluginRunRow {

@@ -36,11 +36,17 @@ pub const BUILTIN: &str = include_str!("../../data/rules.yaml");
 #[serde(deny_unknown_fields)]
 pub struct RuleSpec {
     pub id: String,
-    /// 界面上的名字（英文）。界面按 id 查自己的名称表，查不到才用它
+    /// 界面上的名字（英文）
     pub name: String,
+    /// 界面上的名字（中文）。内置规则都有，测试钉着
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name_zh: String,
     pub pattern: String,
     /// **为什么它值得看一眼。**没有这一句，一条命中就只是个规则 id
     pub why: String,
+    /// 同上，中文
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why_zh: String,
     /// `high` 或 `medium`。不写按 medium 算。
     ///
     /// **只有 high 会在拦截档下切断。**分级的判据是「它能不能一步拿到
@@ -63,6 +69,9 @@ impl RuleSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleFile {
+    /// 工具调用审查的规则表怎么分组，按界面上的顺序（危险命令一组是 `command`）
+    #[serde(default)]
+    pub kinds: Vec<crate::view::KindView>,
     #[serde(default)]
     pub injection: Vec<RuleSpec>,
     #[serde(default)]
@@ -97,6 +106,9 @@ pub struct Rule {
     pub high: bool,
     /// 用户自己加的，不是内置的。**界面上要分得开**
     pub custom: bool,
+    /// 用户在 ThinkWatch 里保存的凭据。「凭据发往陌生主机」把它们也算作凭据，各按各的主机判断
+    /// （见 [`Rules::with_saved`]）。别的规则用不到
+    pub saved: Option<std::sync::Arc<crate::redact::rules::Saved>>,
 }
 
 /// 一处命中：字节区间和那一小段文本。
@@ -138,7 +150,7 @@ impl Rule {
                     end: r.end,
                 });
             }
-            Some(check) => check.find_in(args, open)?,
+            Some(check) => check.find_with(args, open, self.saved.as_deref())?,
         };
         settled(r.end, args, open).then(|| Found {
             text: &args[r.clone()],
@@ -170,7 +182,7 @@ impl Rule {
                     .collect()
             }
             Some(check) => check
-                .find_in(args, open)
+                .find_with(args, open, self.saved.as_deref())
                 .filter(|r| settled(r.end, args, open))
                 .into_iter()
                 .collect(),
@@ -206,6 +218,22 @@ fn never_match() -> Regex {
 #[derive(Debug, Clone)]
 pub struct Rules {
     pub rules: Vec<Rule>,
+}
+
+impl Rules {
+    /// 代码实现的规则带上用户在 ThinkWatch 里保存的凭据（[`crate::redact::rules::RuleSet::saved`]）。
+    /// **和出站脱敏那条规则开没开无关**：一把保存的密钥被工具调用发往别处，照样是外传
+    pub fn with_saved(
+        mut self,
+        saved: Option<std::sync::Arc<crate::redact::rules::Saved>>,
+    ) -> Self {
+        for r in &mut self.rules {
+            if r.check.is_some() {
+                r.saved = saved.clone();
+            }
+        }
+        self
+    }
 }
 
 /// 内置规则文件，解析一次。
@@ -248,6 +276,7 @@ fn compile(spec: &RuleSpec, group: &'static str, custom: bool) -> Result<Rule, R
         group,
         high: spec.high(),
         custom,
+        saved: None,
     })
 }
 
@@ -317,8 +346,10 @@ fn custom_rule(c: Custom<'_>) -> Result<Rule, RuleError> {
     let spec = RuleSpec {
         id: c.name.to_string(),
         name: c.name.to_string(),
+        name_zh: String::new(),
         pattern: c.pattern.to_string(),
         why: String::new(),
+        why_zh: String::new(),
         level: Some(if c.cut { "high" } else { "medium" }.to_string()),
         check: None,
     };
@@ -360,6 +391,35 @@ mod tests {
         assert!(
             tool_rules(&[], |_| None, []).unwrap().rules.len() >= 10,
             "工具调用审查的内置规则少了"
+        );
+    }
+
+    /// 名字和说明只在这里写一份（界面不再存名称表），中英文都要有
+    #[test]
+    fn every_builtin_rule_is_named_and_explained_in_both_languages() {
+        let f = builtin();
+        for x in f.injection.iter().chain(&f.dangerous) {
+            for (field, text) in [
+                ("name", &x.name),
+                ("name_zh", &x.name_zh),
+                ("why", &x.why),
+                ("why_zh", &x.why_zh),
+            ] {
+                assert!(!text.trim().is_empty(), "{} 没写 {field}", x.id);
+            }
+            assert!(x.name.is_ascii() && x.why.is_ascii(), "{}", x.id);
+            assert!(
+                !x.name_zh.contains(['你', '我']) && !x.why_zh.contains(['你', '我']),
+                "{}：界面文案是书面陈述",
+                x.id
+            );
+        }
+        let slugs: Vec<&str> = f.kinds.iter().map(|k| k.slug.as_str()).collect();
+        assert_eq!(slugs, ["command"]);
+        assert!(
+            f.kinds
+                .iter()
+                .all(|k| !k.name.is_empty() && !k.name_zh.is_empty())
         );
     }
 

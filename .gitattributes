@@ -4,3 +4,8 @@ crates/tw-api/msg-codes.txt text eol=lf
 # manifest 也记着这份哈希。各平台检出、编进二进制的字节必须一样
 crates/tw-gateway/src/plugin/defaults/*.js text eol=lf
 crates/tw-gateway/src/plugin/defaults/manifests.json text eol=lf
+# 脱敏规则编进二进制的词表、数据表：编译时（const）按 `\n` 切行，Windows 检出换成 CRLF
+# 会多出 `\r`，词表就对不上了
+crates/tw-guard/src/redact/secrets/bip39/*.txt text eol=lf
+crates/tw-guard/src/redact/personal/data/*.txt text eol=lf
+crates/tw-guard/data/*.yaml text eol=lf

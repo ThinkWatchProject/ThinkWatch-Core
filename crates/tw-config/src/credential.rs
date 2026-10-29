@@ -497,21 +497,10 @@ impl From<SecretResolveError> for CredentialError {
     }
 }
 
+/// 地址里的主机名。和工具调用审查认目的地用的是同一个（认得 IPv6 字面量，见
+/// [`tw_guard::tools::net::url_host`]）
 pub(crate) fn host_of(url: &str) -> String {
-    let h = url.trim().to_ascii_lowercase();
-    h.split("://")
-        .nth(1)
-        .unwrap_or(&h)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next_back()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    tw_guard::tools::net::url_host(url)
 }
 
 fn is_or_under(host: &str, domain: &str) -> bool {

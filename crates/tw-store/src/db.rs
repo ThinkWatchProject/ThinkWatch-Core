@@ -34,7 +34,9 @@ use tw_api::Msg;
 /// 27：`bytes`（解码之后的回答有多少字节）换成网关和上游之间的流量 —— `sent_bytes`、
 /// `received_bytes` —— 和出口 `egress`；尝试链的每一跳（`routing`）多了 `proxy`。安全日志
 /// 多了细节（`security_events` 的 `session`、`sent_model`、`detail`）。
-pub(crate) const SCHEMA: i64 = 27;
+///
+/// 28：安全日志记下出站脱敏认出的是哪一项保存的凭据（`security_events` 的 `source`）。
+pub(crate) const SCHEMA: i64 = 28;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -540,7 +542,9 @@ impl Db {
                 -- 细节，JSON（`tw_api::SecurityHitDetail`）：每一处在哪儿、打过码的前后文、
                 -- 当时的规则、具体做了什么。**命中那一刻定下**：规则之后改了，这一条不变。
                 -- 存在这一行上，和请求记录一起过期
-                detail     TEXT    NOT NULL
+                detail     TEXT    NOT NULL,
+                -- 出站脱敏认出的是哪一项保存的凭据，JSON（`tw_api::SavedSource`）。别的是 NULL
+                source     TEXT
              );
              CREATE INDEX security_events_at ON security_events (at_ms DESC);
              CREATE INDEX security_events_request ON security_events (request_id);
@@ -1129,8 +1133,8 @@ impl Db {
         self.conn.execute(
             "INSERT INTO security_events
              (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count,
-              matching, revealed, session, sent_model, detail)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              matching, revealed, session, sent_model, detail, source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 e.at_ms,
                 e.request_id,
@@ -1148,6 +1152,9 @@ impl Db {
                 e.session,
                 e.sent_model,
                 serde_json::to_string(&e.detail).unwrap_or_default(),
+                e.source
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok()),
             ],
         )?;
         Ok(())
@@ -2052,6 +2059,8 @@ pub struct SecurityEvent {
     pub sent_model: Option<String>,
     /// 细节：每一处在哪儿、当时的规则、具体做了什么。**已打码**
     pub detail: tw_api::SecurityHitDetail,
+    /// 出站脱敏认出的是哪一项保存的凭据
+    pub source: Option<tw_api::SavedSource>,
 }
 
 /// 读安全日志时的那段 SELECT。**上游、密钥、模型、会话优先取请求那一行的。**
@@ -2072,7 +2081,7 @@ const SECURITY_SELECT: &str =
             WHEN r.id IS NULL THEN e.sent_model
             WHEN tw_reached(r.routing, r.error IS NOT NULL) THEN NULLIF(r.sent_model, '')
         END,
-        e.detail
+        e.detail, e.source
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 /// 安全日志按什么筛：`?1`–`?2` 这一段时间，`?3` 这一项（NULL 是全部）。
@@ -2104,6 +2113,12 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
     let detail: tw_api::SecurityHitDetail = serde_json::from_str(&detail).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(20, rusqlite::types::Type::Text, e.into())
     })?;
+    let source: Option<tw_api::SavedSource> = match r.get::<_, Option<String>>(21)? {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(21, rusqlite::types::Type::Text, e.into())
+        })?),
+        None => None,
+    };
     Ok(tw_api::SecurityEventView {
         id: r.get(0)?,
         at_ms: r.get(1)?,
@@ -2133,6 +2148,7 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         more_locations: detail.more_locations,
         rule_snapshot: detail.rule_snapshot,
         outcome_detail: detail.outcome_detail,
+        source,
     })
 }
 
@@ -3781,6 +3797,7 @@ mod security_log_tests {
             session: None,
             sent_model: None,
             detail: Default::default(),
+            source: None,
         }
     }
 
@@ -3802,6 +3819,29 @@ mod security_log_tests {
             db.insert_security_event(&event(at, guard, action)).unwrap();
         }
         db
+    }
+
+    /// 认出的是哪一项保存的凭据，存下来、读回来是同一项；别的记录没有
+    #[test]
+    fn the_source_of_a_saved_secret_is_kept() {
+        let db = Db::in_memory().unwrap();
+        let source = tw_api::SavedSource {
+            kind: tw_api::SavedSourceKind::UpstreamKey,
+            name: "DeepSeek".into(),
+        };
+        db.insert_security_event(&SecurityEvent {
+            rule: "thinkwatch-saved-secret".into(),
+            excerpt: String::new(),
+            source: Some(source.clone()),
+            ..event(1, Guard::Redact, SecurityOutcome::Replaced)
+        })
+        .unwrap();
+        db.insert_security_event(&event(2, Guard::Redact, SecurityOutcome::Recorded))
+            .unwrap();
+        let p = db.security_events(None, 0, i64::MAX, None, 10).unwrap();
+        let by_at = |at| p.events.iter().find(|e| e.at_ms == at).unwrap();
+        assert_eq!(by_at(1).source, Some(source));
+        assert_eq!(by_at(2).source, None);
     }
 
     fn ids(p: &tw_api::SecurityEventsPage) -> Vec<i64> {
