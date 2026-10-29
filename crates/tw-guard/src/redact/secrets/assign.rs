@@ -57,6 +57,11 @@ const NOT_SECRETS: &[&[u8]] = &[
 
 /// `b` 去掉 `_`、`-` 之后不分大小写地以 `s`（小写、无分隔符）结尾。返回 `s` 在 `b` 里的起点
 fn ends_norm(b: &[u8], s: &[u8]) -> Option<usize> {
+    // `s` 的每个字母都要对上 `b` 里的一个字节：`b` 比 `s` 短的一个字节都不用比。一个光秃秃的
+    // `token` 就是这样一下子过完 [`NOT_SECRETS`] 那二十几个的（正文里这个词很常见）
+    if b.len() < s.len() {
+        return None;
+    }
     let (mut i, mut j) = (b.len(), s.len());
     while j > 0 {
         if i == 0 {

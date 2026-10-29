@@ -18,7 +18,9 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-use super::super::anchor::{Anchor, Anchors, Bytes, C_DASH, C_UNDER, C_UPPER, Chars, DIGIT, LOWER};
+use super::super::anchor::{
+    Anchor, Anchors, Bytes, C_DASH, C_DIGIT, C_DOT, C_LOWER, C_UNDER, C_UPPER, Chars, DIGIT, LOWER,
+};
 use super::super::rules::{Hit, builtin_hit};
 
 /// WIF 私钥、扩展私钥的锚点：51、52 位，以 `5` `9` `K` `L` `c` 开头；`xprv` 一类开头的 111 位
@@ -370,17 +372,29 @@ fn word_shaped(t: &[u8]) -> bool {
 /// 词表里每个词的「头四个字母」（不足四个的，三个字母加一个结束符），按位存。**BIP39 的词
 /// 头四个字母各不相同**，所以一个 token 的头四个字母对得上一个词，它多半就是那个词 ——
 /// 比只看头三个字母（[`HEADS`]）挡掉的多得多，又不用真的去查词表
-fn heads4() -> &'static [u64] {
-    static T: OnceLock<Vec<u64>> = OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = vec![0u64; 27 * 27 * 27 * 27 / 64 + 1];
-        for w in ENGLISH.lines() {
-            let k = key4(w.as_bytes());
-            t[k / 64] |= 1 << (k % 64);
+///
+/// 编译时算好（和 [`HEADS`] 一样）：第一段每个小写 token 都查一次，不要每次先问一遍
+/// `OnceLock` 编好没有
+static HEADS4: [u64; 27 * 27 * 27 * 27 / 64 + 1] = {
+    let mut m = [0u64; 27 * 27 * 27 * 27 / 64 + 1];
+    let b = ENGLISH.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // 一行一个词：头四个字母，不足四个的补结束符
+        let mut c = [26usize; 4];
+        let mut j = 0;
+        while i + j < b.len() && b[i + j] != b'\n' {
+            if j < 4 {
+                c[j] = (b[i + j] - b'a') as usize;
+            }
+            j += 1;
         }
-        t
-    })
-}
+        let k = ((c[0] * 27 + c[1]) * 27 + c[2]) * 27 + c[3];
+        m[k / 64] |= 1 << (k % 64);
+        i += j + 1;
+    }
+    m
+};
 
 fn key4(w: &[u8]) -> usize {
     let c = |i: usize| w.get(i).map_or(26, |&b| usize::from(b - b'a'));
@@ -396,7 +410,7 @@ pub(in crate::redact) fn qualifies(t: &[u8]) -> bool {
         return false;
     }
     let k = key4(t);
-    heads4()[k / 64] & (1 << (k % 64)) != 0
+    HEADS4[k / 64] & (1 << (k % 64)) != 0
 }
 
 /// 一串助记词里的一员：像词的，或者编号
@@ -407,6 +421,34 @@ pub(in crate::redact) fn run_member(t: &[u8]) -> bool {
     } else {
         numbering(t)
     }
+}
+
+/// 同 [`run_member`]，用切 token 时顺手或起来的字符类（`anchor::class`）先分流：第一段
+/// （`engine::prescan`）每个小写 token 都问一次，这里不再逐字节看形状。全是小写字母的只剩
+/// 长度和两次查表；全是数字的（可带一个句末句号）只看长度和句号在哪儿；别的类一律不是
+#[inline]
+pub(in crate::redact) fn run_member_by_class(t: &[u8], cls: u8) -> bool {
+    let l = t.len();
+    let yes = if cls == C_LOWER {
+        if !(3..=8).contains(&l) {
+            false
+        } else {
+            let k = key3(t);
+            HEADS[k / 64] & (1 << (k % 64)) != 0 && {
+                let k = key4(t);
+                HEADS4[k / 64] & (1 << (k % 64)) != 0
+            }
+        }
+    } else if cls == C_DIGIT {
+        l <= 2
+    } else if cls == C_DIGIT | C_DOT {
+        // 只有末尾一个句号：`1.`、`12.`
+        (2..=3).contains(&l) && t[l - 1] == b'.' && !t[..l - 1].contains(&b'.')
+    } else {
+        false
+    };
+    debug_assert_eq!(yes, run_member(t), "{:?}", String::from_utf8_lossy(t));
+    yes
 }
 
 fn numbering(t: &[u8]) -> bool {
