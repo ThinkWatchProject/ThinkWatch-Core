@@ -78,19 +78,53 @@ pub fn hits_in(text: &str, rules: &RuleSet, scope: Scope) -> Vec<Hit> {
     if hits.is_empty() {
         return hits;
     }
-    off_placeholders(text, &mut hits);
+    counted(text, &mut hits, scope);
+    crate::redact::rules::resolve(hits, rules)
+}
+
+/// 只留算数的命中：不压在我们自己的占位符上、落在 `scope` 里、不在键和 base64 载荷里
+/// （见 [`hits_in`]）
+fn counted(text: &str, hits: &mut Vec<Hit>, scope: Scope) {
+    off_placeholders(text, hits);
     if !hits.is_empty()
         && let Scope::Written(shape) = scope
     {
         match tw_dialect::written::ranges(shape, text) {
-            Some(written) => within(&mut hits, &written),
+            Some(written) => within(hits, &written),
             None => hits.clear(),
         }
     }
     if !hits.is_empty() {
-        outside(&mut hits, untouched(text));
+        outside(hits, untouched(text));
     }
-    crate::redact::rules::resolve(hits, rules)
+}
+
+/// 值是例外（[`crate::redact::exceptions`]）、因此 [`hits_in`] 不报的那些命中：没有例外表时
+/// 它们是会报的。「测试…」用它把例外的值标出来（「例外，不处理」），而不是让它像没认出来
+/// 一样消失。
+///
+/// 按起点排好；同一处几条规则都认得的只留一条（规则照最先找到的）。**不合并重叠的**：
+/// 它们不换，合起来也说不出是哪个值。
+pub fn excepted_in(text: &str, rules: &RuleSet, scope: Scope) -> Vec<Hit> {
+    let Some(ex) = rules.exceptions() else {
+        return Vec::new();
+    };
+    let mut hits = crate::redact::rules::scan_unresolved(text, &rules.without_exceptions());
+    hits.retain(|h| {
+        crate::redact::exceptions::exceptable(&h.rule) && ex.excepts_json(&text[h.bytes.clone()])
+    });
+    if hits.is_empty() {
+        return hits;
+    }
+    counted(text, &mut hits, scope);
+    hits.sort_by_key(|h| (h.bytes.start, h.bytes.end));
+    hits.dedup_by(|a, b| a.bytes == b.bytes);
+    hits
+}
+
+/// [`excepted_in`] 一段纯文本，和 [`hits_plain`] 同一个换算。
+pub fn excepted_plain(text: &str, rules: &RuleSet) -> Vec<Hit> {
+    crate::redact::rules::plain_with(text, |encoded| excepted_in(encoded, rules, Scope::Whole))
 }
 
 /// 去掉压在我们自己的占位符上的命中（见 [`hits`]）。在解码过的正文上找的调用方（桌面版的

@@ -86,6 +86,10 @@ pub struct TrialHit {
     /// 出站脱敏认出的是一项保存的凭据（`thinkwatch-saved-secret`）：是哪一项。这时 `excerpt` 是空的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SavedSource>,
+    /// 出站脱敏：这个值是例外（`security.redact.exceptions`），规则认得出、但不换也不记，
+    /// 界面上写「例外，不处理」。这时 `action` 是空的，`output` 里也原样留着它
+    #[serde(default)]
+    pub excepted: bool,
 }
 
 /// 试的结果。
@@ -204,9 +208,11 @@ fn redact(
             let matching = req.matching.unwrap_or_default();
             let pattern = redact_match(pattern, matching, req.case_sensitive.unwrap_or(false))
                 .ok_or(TrialError::BadMatch { matching })?;
+            // 例外跨规则：一条还没存的规则也照样不换例外的值
             let set = RuleSet::none()
                 .with_rule(TRIAL, pattern, label.as_deref())
-                .map_err(|e| TrialError::BadPattern { detail: e.detail })?;
+                .map_err(|e| TrialError::BadPattern { detail: e.detail })?
+                .with_exceptions(p.exception_set());
             match action.unwrap_or_default() {
                 RedactAction::Record => {
                     set.recording(crate::redact::rules::Rule::Custom(TRIAL.into()))
@@ -242,23 +248,32 @@ fn redact(
         )
         .text
     });
-    Ok(TrialResult {
-        hits: hits
+    let hit = |h: &crate::redact::rules::Hit, excepted: bool| TrialHit {
+        rule: h.rule.id().to_string(),
+        custom: h.rule.custom(),
+        start: utf16_at(sample, h.bytes.start),
+        end: utf16_at(sample, h.bytes.end),
+        excerpt: crate::redact::rules::masked(&h.rule, &sample[h.bytes.clone()]),
+        action: (!excepted).then(|| {
+            if rules.records(&h.rule) {
+                RuleAction::Record
+            } else {
+                RuleAction::Placeholder
+            }
+        }),
+        source: rules.saved_source(&sample[h.bytes.clone()]).cloned(),
+        excepted,
+    };
+    // 例外的值照样标出来：用户要看得见「这个值认出来了，只是例外」，而不是像没认出来一样
+    let mut out: Vec<TrialHit> = hits.iter().map(|h| hit(h, false)).collect();
+    out.extend(
+        crate::redact::flow::excepted_plain(sample, &rules)
             .iter()
-            .map(|h| TrialHit {
-                rule: h.rule.id().to_string(),
-                custom: h.rule.custom(),
-                start: utf16_at(sample, h.bytes.start),
-                end: utf16_at(sample, h.bytes.end),
-                excerpt: crate::redact::rules::masked(&h.rule, &sample[h.bytes.clone()]),
-                action: Some(if rules.records(&h.rule) {
-                    RuleAction::Record
-                } else {
-                    RuleAction::Placeholder
-                }),
-                source: rules.saved_source(&sample[h.bytes.clone()]).cloned(),
-            })
-            .collect(),
+            .map(|h| hit(h, true)),
+    );
+    out.sort_by_key(|h| (h.start, h.end));
+    Ok(TrialResult {
+        hits: out,
         output,
         refused: false,
     })
@@ -314,6 +329,7 @@ fn tools(
                     RuleAction::Record
                 }),
                 source: None,
+                excepted: false,
             })
         })
         .collect();
@@ -430,6 +446,7 @@ fn content(p: &ContentPolicy, req: &TrialRequest) -> Result<TrialResult, TrialEr
                 },
                 action: Some(ContentAction::of(hit.action).into()),
                 source: None,
+                excepted: false,
             }
         })
         .collect();
@@ -477,6 +494,7 @@ fn content_answer(rules: &content::Rules, sample: &str) -> TrialResult {
                     .collect(),
                 action: Some(ContentAction::of(rule.action()).into()),
                 source: None,
+                excepted: false,
             })
         })
         .collect();
@@ -932,5 +950,58 @@ mod tests {
         )
         .unwrap();
         assert!(r.hits.is_empty());
+    }
+
+    /// 例外的值标成「例外」，不算命中：不给动作，发出去的样子里原样留着
+    #[test]
+    fn an_excepted_value_is_flagged_not_hit() {
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let mut s = Security::default();
+        s.redact.exceptions = vec![crate::policy::RedactException {
+            sha256: crate::redact::exceptions::sha256_hex(key),
+            masked: String::new(),
+            rule: "anthropic-api-key".into(),
+            added_at: 0,
+        }];
+        let sample = format!("{key} {other}");
+        let r = run(Guard::Redact, &s, &req(&sample)).unwrap();
+        assert_eq!(r.hits.len(), 2, "{r:?}");
+        assert_eq!(r.hits[0].rule, "anthropic-api-key");
+        assert!(r.hits[0].excepted && r.hits[0].action.is_none());
+        assert!(!r.hits[1].excepted && r.hits[1].action == Some(RuleAction::Placeholder));
+        assert_eq!(r.output.unwrap(), format!("{key} <<TW_SECRET_1>>"));
+        // 试一条正在写的规则也一样：例外跨规则
+        let r = run(
+            Guard::Redact,
+            &s,
+            &TrialRequest {
+                pattern: Some("sk-ant-api03-".into()),
+                ..req(key)
+            },
+        )
+        .unwrap();
+        assert!(r.hits.iter().all(|h| !h.excepted), "认的不是整个值：{r:?}");
+        let r = run(
+            Guard::Redact,
+            &s,
+            &TrialRequest {
+                pattern: Some(key.into()),
+                ..req(key)
+            },
+        )
+        .unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert!(r.hits[0].excepted && r.output.is_none(), "{r:?}");
+        let r = run(
+            Guard::Redact,
+            &s,
+            &TrialRequest {
+                rule: Some("anthropic-api-key".into()),
+                ..req(key)
+            },
+        )
+        .unwrap();
+        assert!(r.hits.len() == 1 && r.hits[0].excepted, "{r:?}");
     }
 }

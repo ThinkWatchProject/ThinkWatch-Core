@@ -19,6 +19,11 @@
 //!         label: PROJECT           # 可选；占位符 <<TW_PROJECT_1>>；不写 = SECRET
 //!         action: record           # 可选；placeholder | record；不写 = placeholder
 //!         disabled: true           # 可选
+//!     exceptions:                  # 例外值：这几个值在任何规则下都不换、不记（最多 500 个）
+//!       - sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+//!         masked: sk-an…7f9c       # 加入时打码后的样子，只给人看
+//!         rule: openai-api-key     # 最先认出它的规则；手动加入、没有规则认得时不写
+//!         added_at: 1767225600000  # 加入的时刻，毫秒
 //!   inspect_tools:
 //!     mode: observe
 //!     actions: { rm-rf-root: record }   # 只写和出厂不同的；cut | record
@@ -378,6 +383,57 @@ pub struct RedactPolicy {
     pub actions: BTreeMap<String, RedactAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom: Vec<CustomRedactRule>,
+    /// 例外值（见 [`crate::redact::exceptions`]）：值的 SHA-256 在这里的命中，哪条规则的都不换、
+    /// 不记。最多 [`EXCEPTIONS_MAX`] 个
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<RedactException>,
+}
+
+pub use crate::redact::exceptions::EXCEPTIONS_MAX;
+
+/// 一个例外值。**只存哈希和打码后的样子，不存原值**：例外表随配置导出、同步、备份。
+///
+/// 规则是保存的凭据（`thinkwatch-saved-secret`）的读得进来、**但不生效**：保存的凭据本就该换，
+/// 界面上也不给它「列为例外」。不当成配置错误 —— 那样的话一份手改过的配置会整份读不进来，
+/// 而它要的效果（不生效）本来就是对的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RedactException {
+    /// 值（解开转义之后的样子）的 SHA-256，64 个小写十六进制字符
+    pub sha256: String,
+    /// 加入时打码后的样子（和安全日志里的一样），只给人看是哪一个
+    #[serde(default)]
+    pub masked: String,
+    /// 最先认出它的规则：内置规则的 id 或者自定义规则的名字。手动加入、没有规则认得它时是空的
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rule: String,
+    /// 加入的时刻，毫秒
+    #[serde(default)]
+    pub added_at: i64,
+}
+
+/// 一个值加不进例外表。`code()` 是稳定的码。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExceptionError {
+    #[error("the value is empty")]
+    Empty,
+    /// 是一项保存的凭据：它本就该换
+    #[error("a saved secret cannot be an exception")]
+    Saved,
+    /// 现在的策略本身编不起来（绕过了校验写进去的）
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+}
+
+impl ExceptionError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ExceptionError::Empty => "exception_value_empty",
+            ExceptionError::Saved => "exception_saved_secret",
+            ExceptionError::Policy(e) => e.code(),
+        }
+    }
 }
 
 /// 用户自己写的一条工具调用规则：按工具调用的参数匹配。
@@ -548,6 +604,17 @@ pub enum PolicyError {
          checked in requests only"
     )]
     CodepointsInAnswer { name: String },
+    #[error(
+        "security.redact.exceptions has {count} values; at most {} are allowed",
+        EXCEPTIONS_MAX
+    )]
+    TooManyExceptions { count: usize },
+    #[error(
+        "the exception `{sha256}` is not a SHA-256 written as 64 lowercase hexadecimal characters"
+    )]
+    BadExceptionHash { sha256: String },
+    #[error("the exception `{sha256}` appears twice")]
+    DuplicateException { sha256: String },
 }
 
 impl PolicyError {
@@ -565,6 +632,9 @@ impl PolicyError {
             PolicyError::EmptyScope { .. } => "rule_scope_empty",
             PolicyError::BlockInAnswer { .. } => "rule_scope_block",
             PolicyError::CodepointsInAnswer { .. } => "rule_scope_codepoints",
+            PolicyError::TooManyExceptions { .. } => "redact_exceptions_too_many",
+            PolicyError::BadExceptionHash { .. } => "redact_exception_hash_bad",
+            PolicyError::DuplicateException { .. } => "redact_exception_duplicate",
         }
     }
 
@@ -580,7 +650,11 @@ impl PolicyError {
             | PolicyError::EmptyScope { .. }
             | PolicyError::BlockInAnswer { .. }
             | PolicyError::CodepointsInAnswer { .. } => Guard::Content,
-            PolicyError::BadLabel { .. } | PolicyError::BadMatch { .. } => Guard::Redact,
+            PolicyError::BadLabel { .. }
+            | PolicyError::BadMatch { .. }
+            | PolicyError::TooManyExceptions { .. }
+            | PolicyError::BadExceptionHash { .. }
+            | PolicyError::DuplicateException { .. } => Guard::Redact,
         }
     }
 }
@@ -645,7 +719,99 @@ impl RedactPolicy {
                 .chain(&self.disable)
                 .chain(self.actions.keys()),
             |id| crate::redact::rules::builtin(id).is_some(),
+        )?;
+        self.check_exceptions()
+    }
+
+    /// 例外表：不超过 [`EXCEPTIONS_MAX`] 个，每个都是我们写出去的那种哈希，不重复。
+    /// **规则名不查**：它只是给人看的记录，那条自定义规则之后删了、改了名，例外照样是那个值
+    pub fn check_exceptions(&self) -> Result<(), PolicyError> {
+        if self.exceptions.len() > EXCEPTIONS_MAX {
+            return Err(PolicyError::TooManyExceptions {
+                count: self.exceptions.len(),
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for e in &self.exceptions {
+            let Some(d) = crate::redact::exceptions::parse_hex(&e.sha256) else {
+                return Err(PolicyError::BadExceptionHash {
+                    sha256: e.sha256.clone(),
+                });
+            };
+            if !seen.insert(d) {
+                return Err(PolicyError::DuplicateException {
+                    sha256: e.sha256.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// 编好的例外表，给规则集用（[`RuleSet::with_exceptions`]）。**保存的凭据那条规则的不算**
+    /// （见 [`RedactException`]），写错的哈希跳过（校验时就拒绝了，到不了这里）。一个都不剩
+    /// 是 `None`
+    pub fn exception_set(&self) -> Option<std::sync::Arc<crate::redact::exceptions::Exceptions>> {
+        crate::redact::exceptions::Exceptions::new(
+            self.exceptions
+                .iter()
+                .filter(|e| e.rule != crate::redact::exceptions::SAVED_RULE)
+                .filter_map(|e| crate::redact::exceptions::parse_hex(&e.sha256)),
         )
+        .map(std::sync::Arc::new)
+    }
+
+    /// 这个哈希已经在例外表里了（不论是哪条规则加的）
+    pub fn has_exception(&self, sha256: &str) -> bool {
+        self.exceptions.iter().any(|e| e.sha256 == sha256)
+    }
+
+    /// 手动加入的一个值写成例外的样子（R5：用于还没出现在日志里的测试值）。**只返回哈希和
+    /// 打码后的样子，原值不出这个函数**。
+    ///
+    /// 两头的空白去掉（粘贴时常带一个换行）。按现在的规则（不带例外）找一遍，有规则认得出
+    /// 整个值的，按它打码、记下它；现在开着的规则都认不出时再按全部内置规则找一遍；都认不出
+    /// 的 `rule` 是空的，打码按 [`crate::redact::rules::masked_unknown`]。
+    ///
+    /// `saved` 是网关手里那一份保存的凭据：是其中一项的不收（[`ExceptionError::Saved`]）。
+    pub fn exception_of(
+        &self,
+        value: &str,
+        saved: Option<std::sync::Arc<crate::redact::rules::Saved>>,
+        added_at: i64,
+    ) -> Result<RedactException, ExceptionError> {
+        use crate::redact::rules::{BUILTINS, masked, masked_unknown};
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ExceptionError::Empty);
+        }
+        if saved.as_ref().is_some_and(|s| s.source_of(value).is_some()) {
+            return Err(ExceptionError::Saved);
+        }
+        let whole = |set: &RuleSet| {
+            crate::redact::flow::hits_plain(value, set)
+                .into_iter()
+                .find(|h| h.bytes == (0..value.len()))
+                .map(|h| h.rule)
+        };
+        let current = self.rules()?.without_exceptions().with_saved_set(saved);
+        let rule = whole(&current).or_else(|| {
+            let ids: Vec<&str> = BUILTINS.iter().map(|b| b.id).collect();
+            whole(&RuleSet::only(&ids))
+        });
+        if rule
+            .as_ref()
+            .is_some_and(|r| !crate::redact::exceptions::exceptable(r))
+        {
+            return Err(ExceptionError::Saved);
+        }
+        Ok(RedactException {
+            sha256: crate::redact::exceptions::sha256_hex(value),
+            masked: rule
+                .as_ref()
+                .map_or_else(|| masked_unknown(value), |r| masked(r, value)),
+            rule: rule.map(|r| r.id().to_string()).unwrap_or_default(),
+            added_at,
+        })
     }
 
     /// 这条内置规则在第三档下做什么（改过的按改过的）。出厂一律换成占位符
@@ -695,14 +861,15 @@ impl RedactPolicy {
                 set = set.recording(crate::redact::rules::Rule::Builtin(b.id));
             }
         }
-        Ok(set)
+        Ok(set.with_exceptions(self.exception_set()))
     }
 
     /// 只有一条内置规则，**不管它开没开**，动作按这份策略走。「试一条」用它。不是内置规则的
     /// id 是 `None`
     pub fn one_builtin(&self, id: &str) -> Option<RuleSet> {
         let b = crate::redact::rules::builtin(id)?;
-        let set = RuleSet::only(&[b.id]);
+        // 例外跨规则：试一条规则时也照样不换
+        let set = RuleSet::only(&[b.id]).with_exceptions(self.exception_set());
         Some(match self.builtin_action(b) {
             RedactAction::Record => set.recording(crate::redact::rules::Rule::Builtin(b.id)),
             RedactAction::Placeholder => set,
@@ -1457,5 +1624,228 @@ content:
                 .filter(|b| b.on_by_default)
                 .count()
         );
+    }
+
+    // ---------------------------------------------------------------- 例外值
+
+    const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const OTHER: &str = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    fn excepting(values: &[&str], extra: &str) -> RedactPolicy {
+        let mut p: RedactPolicy = serde_yaml_ng::from_str(extra).unwrap();
+        p.exceptions = values
+            .iter()
+            .map(|v| RedactException {
+                sha256: crate::redact::exceptions::sha256_hex(v),
+                masked: crate::redact::rules::masked_unknown(v),
+                rule: String::new(),
+                added_at: 1,
+            })
+            .collect();
+        p.check().unwrap();
+        p
+    }
+
+    fn body(text: &str) -> String {
+        serde_json::json!({"messages": [{"role": "user", "content": text}]}).to_string()
+    }
+
+    const SHAPE: crate::redact::flow::Shape =
+        crate::redact::flow::Shape::Generate(tw_dialect::ir::Dialect::Anthropic);
+
+    /// R4：例外的是这个值，不是这条规则下的这个值 —— 另一条规则（这里是一条自定义规则）认出
+    /// 同一个值也不换、不报；别的值照常
+    #[test]
+    fn an_exception_holds_across_every_rule_in_both_modes() {
+        let p = excepting(
+            &[KEY],
+            "custom:\n  - { name: 同一个值, pattern: 'sk-ant-api03-A+', match: regex }\n",
+        );
+        let rs = p.rules().unwrap();
+        assert!(rs.exceptions().is_some_and(|e| e.len() == 1));
+        let b = body(&format!("{KEY} 和 {OTHER}"));
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let found = crate::redact::flow::find(mode, &rs, b.as_bytes(), SHAPE);
+            assert_eq!(found.len(), 1, "{mode}: {found:?}");
+            assert_eq!(found[0].rule.id(), "github-personal-token");
+        }
+        let l = crate::redact::flow::look_hits(
+            Mode::Enforce,
+            &rs,
+            b.as_bytes(),
+            SHAPE,
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
+        let (out, ledger) =
+            crate::redact::flow::replace(Mode::Enforce, &rs, b.clone().into(), &l.ledger, SHAPE);
+        let out = String::from_utf8(out.to_vec()).unwrap();
+        assert!(out.contains(KEY) && !out.contains(OTHER), "{out}");
+        // 还原照旧：换掉的那一个换回来，例外的那个原样
+        let echo = format!("{KEY} <<TW_SECRET_1>>");
+        assert_eq!(
+            crate::redact::replace::restore_text(&echo, &ledger),
+            format!("{KEY} {OTHER}")
+        );
+        // 没有例外时认得出它（两条规则认到同一处，合成一处报）
+        let mut none = p.clone();
+        none.exceptions.clear();
+        let found =
+            crate::redact::flow::find(Mode::Observe, &none.rules().unwrap(), b.as_bytes(), SHAPE);
+        assert_eq!(found.len(), 2, "{found:?}");
+        // 只剩那条自定义规则时：它认得出，例外照样挡住它
+        let mut custom_only = p.clone();
+        custom_only.disable = vec!["anthropic-api-key".into()];
+        let rs2 = custom_only.rules().unwrap();
+        assert!(
+            crate::redact::flow::find(Mode::Enforce, &rs2, body(KEY).as_bytes(), SHAPE).is_empty()
+        );
+        custom_only.exceptions.clear();
+        let found = crate::redact::flow::find(
+            Mode::Enforce,
+            &custom_only.rules().unwrap(),
+            body(KEY).as_bytes(),
+            SHAPE,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rule.id(), "同一个值");
+        // 试一条规则时也一样
+        assert!(
+            crate::redact::rules::scan_plain(KEY, &p.one_builtin("anthropic-api-key").unwrap())
+                .is_empty()
+        );
+        // 解码过的正文（插件那一层、企业版）同样不认
+        assert!(crate::redact::rules::scan_text(KEY, &rs).is_empty());
+    }
+
+    /// 请求体里写着转义的值，按解开之后的样子比
+    #[test]
+    fn an_exception_matches_the_value_as_written_not_as_escaped() {
+        let value = "line1\"quoted\"-PRJ-123456";
+        let p = excepting(
+            &[value],
+            "custom:\n  - { name: 项目号, pattern: 'line1\"quoted\"-PRJ-\\d{6}', match: regex }\n",
+        );
+        let b = body(value);
+        assert!(b.contains("\\\""), "{b}");
+        assert!(
+            crate::redact::flow::find(Mode::Observe, &p.rules().unwrap(), b.as_bytes(), SHAPE)
+                .is_empty()
+        );
+    }
+
+    /// 保存的凭据不能列为例外：配置里写着也不生效
+    #[test]
+    fn a_saved_secret_is_never_an_exception() {
+        use crate::redact::rules::{SavedSecret, SavedSource, SavedSourceKind};
+        let saved = "0123456789abcdef0123456789abcdef";
+        let mut p = excepting(&[saved], "{}");
+        p.exceptions[0].rule = crate::redact::exceptions::SAVED_RULE.into();
+        p.check().unwrap();
+        assert!(p.exception_set().is_none(), "这一条不算");
+        let secret = SavedSecret {
+            value: saved.into(),
+            source: SavedSource {
+                kind: SavedSourceKind::UpstreamKey,
+                name: "A".into(),
+            },
+            hosts: vec![],
+        };
+        let rs = p.rules().unwrap().with_saved(vec![secret.clone()]);
+        let found = crate::redact::flow::find(Mode::Observe, &rs, body(saved).as_bytes(), SHAPE);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].sha256, None, "保存的凭据连哈希都不留");
+        // 规则写的不是它、值却是一项保存的凭据：哈希在表里也照样认
+        let p = excepting(&[saved], "{}");
+        let rs = p.rules().unwrap().with_saved(vec![secret.clone()]);
+        let found = crate::redact::flow::find(Mode::Observe, &rs, body(saved).as_bytes(), SHAPE);
+        assert_eq!(found.len(), 1, "{found:?}");
+        // 也加不进去
+        let set = crate::redact::rules::Saved::new(vec![secret]).map(std::sync::Arc::new);
+        assert_eq!(
+            RedactPolicy::default().exception_of(saved, set, 0),
+            Err(ExceptionError::Saved)
+        );
+    }
+
+    #[test]
+    fn the_exception_list_is_checked() {
+        let one = |sha256: &str| RedactException {
+            sha256: sha256.into(),
+            masked: String::new(),
+            rule: String::new(),
+            added_at: 0,
+        };
+        let mut p = RedactPolicy::default();
+        p.exceptions = (0..EXCEPTIONS_MAX)
+            .map(|i| one(&crate::redact::exceptions::sha256_hex(&i.to_string())))
+            .collect();
+        p.check().unwrap();
+        p.exceptions
+            .push(one(&crate::redact::exceptions::sha256_hex("x")));
+        let e = p.check().unwrap_err();
+        assert_eq!(e.code(), "redact_exceptions_too_many");
+        assert_eq!(e.guard(), Guard::Redact);
+        let h = crate::redact::exceptions::sha256_hex("a");
+        for (list, code) in [
+            (vec![one("abc")], "redact_exception_hash_bad"),
+            (vec![one(&h.to_uppercase())], "redact_exception_hash_bad"),
+            (vec![one(&h), one(&h)], "redact_exception_duplicate"),
+        ] {
+            let p = RedactPolicy {
+                exceptions: list,
+                ..Default::default()
+            };
+            assert_eq!(p.check().unwrap_err().code(), code);
+        }
+        // 写成配置里的样子：规则是空的不写
+        let p = RedactPolicy {
+            exceptions: vec![RedactException {
+                rule: String::new(),
+                ..one(&h)
+            }],
+            ..Default::default()
+        };
+        let y = serde_yaml_ng::to_string(&p).unwrap();
+        assert_eq!(
+            y,
+            format!("exceptions:\n- sha256: {h}\n  masked: ''\n  added_at: 0\n")
+        );
+        assert_eq!(serde_yaml_ng::from_str::<RedactPolicy>(&y).unwrap(), p);
+        assert!(
+            serde_yaml_ng::from_str::<RedactPolicy>("exceptions:\n- { sha256: x, value: y }")
+                .is_err(),
+            "不认的字段是错"
+        );
+    }
+
+    /// R5：手动加入。认得出的按那条规则打码、记下规则；认不出的规则是空的、按最小心的打码。
+    /// 返回的东西里没有原值
+    #[test]
+    fn a_value_added_by_hand_is_hashed_and_masked() {
+        let p = RedactPolicy::default();
+        let e = p.exception_of(&format!("  {KEY}\n"), None, 42).unwrap();
+        assert_eq!(e.sha256, crate::redact::exceptions::sha256_hex(KEY));
+        assert_eq!(e.rule, "anthropic-api-key");
+        assert_eq!(
+            e.masked,
+            crate::redact::rules::masked(
+                &crate::redact::rules::Rule::Builtin("anthropic-api-key"),
+                KEY
+            )
+        );
+        assert_eq!(e.added_at, 42);
+        assert!(!format!("{e:?}").contains(&KEY[8..]), "{e:?}");
+        // 出厂关着的规则也认：邮箱
+        let e = p.exception_of("jane@example.com", None, 0).unwrap();
+        assert_eq!(
+            (e.rule.as_str(), e.masked.as_str()),
+            ("email", "j…@example.com")
+        );
+        // 哪条都认不出
+        let e = p.exception_of("my-fixture-value-123456", None, 0).unwrap();
+        assert_eq!((e.rule.as_str(), e.masked.as_str()), ("", "…3456"));
+        let e = p.exception_of("short", None, 0).unwrap();
+        assert_eq!(e.masked, "…");
+        assert_eq!(p.exception_of(" \n", None, 0), Err(ExceptionError::Empty));
     }
 }

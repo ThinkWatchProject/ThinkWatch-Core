@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use super::anchor::{
     ALNUM, ANY_LEN, Anchor, Anchors, Bytes, C_DASH, C_DIGIT, C_DOT, C_LETTER, C_UNDER, Chars, DIGIT,
 };
+use super::exceptions::Exceptions;
 use super::secrets::ASSIGNMENT_SUFFIXES;
 pub use super::secrets::saved::{
     SAVED_MIN_CHARS, Saved, SavedSecret, SavedSource, SavedSourceKind,
@@ -624,6 +625,9 @@ pub struct RuleSet {
     /// 用户在 ThinkWatch 里保存的凭据（见 [`RuleSet::with_saved`]）。规则 `thinkwatch-saved-secret`
     /// 开着才按它找
     saved: Option<Arc<Saved>>,
+    /// 例外值（见 [`super::exceptions`]）：命中的值在表里的，哪条规则的都不换、不报。`None` 是
+    /// 一个都没有，一个哈希都不算
+    exceptions: Option<Arc<Exceptions>>,
     /// 自定义规则编成的预筛（[`CustomIndex`]），头一次扫的时候编。改了自定义规则就作废
     index: OnceLock<Arc<CustomIndex>>,
 }
@@ -646,6 +650,7 @@ impl RuleSet {
             custom: Vec::new(),
             record: HashSet::new(),
             saved: None,
+            exceptions: None,
             index: OnceLock::new(),
         }
     }
@@ -657,6 +662,7 @@ impl RuleSet {
             custom: Vec::new(),
             record: HashSet::new(),
             saved: None,
+            exceptions: None,
             index: OnceLock::new(),
         }
     }
@@ -672,6 +678,7 @@ impl RuleSet {
             custom: Vec::new(),
             record: HashSet::new(),
             saved: None,
+            exceptions: None,
             index: OnceLock::new(),
         }
     }
@@ -759,6 +766,42 @@ impl RuleSet {
         self.saved.as_ref()?.source_of(value)
     }
 
+    /// 带上例外值（见 [`super::exceptions`]）。`None` 是不带。**跟着配置一起换**
+    pub fn with_exceptions(mut self, exceptions: Option<Arc<Exceptions>>) -> Self {
+        self.exceptions = exceptions;
+        self
+    }
+
+    /// 例外值。没有是 `None`
+    pub fn exceptions(&self) -> Option<&Arc<Exceptions>> {
+        self.exceptions.as_ref()
+    }
+
+    /// 去掉例外值的一份：「测试…」要看见例外的值被哪条规则认出来过
+    pub fn without_exceptions(&self) -> RuleSet {
+        let mut set = self.clone();
+        set.exceptions = None;
+        set
+    }
+
+    /// 例外表的指纹（[`Exceptions::fingerprint`]），没有例外是 `None`。按规则集缓存扫描结果的
+    /// 地方要把它算进规则集的版本：例外表一变，同一段正文找出来的命中就变了
+    pub fn exceptions_fingerprint(&self) -> Option<super::exceptions::Digest32> {
+        self.exceptions.as_ref().map(|e| e.fingerprint())
+    }
+
+    /// `out` 里去掉值是例外的命中（保存的凭据的不去，见 [`super::exceptions`]）。`text` 是
+    /// JSON 原文：值先解开转义再算哈希
+    fn drop_excepted(&self, text: &str, out: &mut Vec<Hit>) {
+        if let Some(ex) = &self.exceptions
+            && !out.is_empty()
+        {
+            out.retain(|h| {
+                !super::exceptions::exceptable(&h.rule) || !ex.excepts_json(&text[h.bytes.clone()])
+            });
+        }
+    }
+
     /// 这条规则只记录：动作是「仅记录」
     pub fn recording(mut self, rule: Rule) -> Self {
         self.record.insert(rule);
@@ -790,6 +833,7 @@ impl RuleSet {
                 .collect(),
             record: self.record.clone(),
             saved: self.saved.clone(),
+            exceptions: self.exceptions.clone(),
             index: OnceLock::new(),
         })
     }
@@ -2112,6 +2156,9 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     // 接着用
     let spans = super::engine::scan_tokens(text, set, json, &mut out);
     custom_hits(text, set, json, spans, &mut out);
+    // **例外值在合并重叠之前去掉**：先合并的话，一个例外值和旁边另一处命中合成一处之后，
+    // 那一处就跟着例外一起不换了
+    set.drop_excepted(text, &mut out);
     out
 }
 
@@ -2244,11 +2291,21 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
         custom: Vec::new(),
         record: set.record.clone(),
         saved: set.saved.clone(),
+        exceptions: set.exceptions.clone(),
         index: OnceLock::new(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
-        for m in c.re.find_iter(text).filter(|m| !m.is_empty()) {
+        for m in
+            c.re.find_iter(text)
+                .filter(|m| !m.is_empty())
+                // 解码过的正文：值原样算哈希，不再解一次转义
+                .filter(|m| {
+                    !set.exceptions
+                        .as_ref()
+                        .is_some_and(|ex| ex.excepts(m.as_str()))
+                })
+        {
             out.push(Hit {
                 bytes: m.range(),
                 rule: Rule::Custom(c.name.clone()),
@@ -2284,18 +2341,23 @@ pub fn masked(rule: &Rule, value: &str) -> String {
         // 保存的凭据一个字都不留：报的是它是哪一项（[`Finding::source`]）
         Kind::Saved => String::new(),
         // 按位置认的多半是口令，没有前缀：留头五个就是留了大半个口令。只留最后四位，短的全打掉
-        Kind::InContext => {
-            let n = value.chars().count();
-            if n >= 16 {
-                let tail: String = value.chars().skip(n - 4).collect();
-                format!("…{tail}")
-            } else {
-                "…".to_string()
-            }
-        }
+        Kind::InContext => masked_unknown(value),
         // 助记词的头几个字母就是头一个词
         Kind::Crypto if rule.id() == "crypto-mnemonic" => "…".to_string(),
         _ => mask(value),
+    }
+}
+
+/// 不知道是什么的一个值打码后的样子：不足 16 个字符的全打掉，长的只留最后四位（`…7f9c`）。
+/// 按位置认的口令、手动加入例外时哪条规则都认不出的值用它 —— 说不清它是什么，就按最该
+/// 小心的那一种（口令）打
+pub fn masked_unknown(value: &str) -> String {
+    let n = value.chars().count();
+    if n >= 16 {
+        let tail: String = value.chars().skip(n - 4).collect();
+        format!("…{tail}")
+    } else {
+        "…".to_string()
     }
 }
 
@@ -2349,6 +2411,9 @@ pub struct Finding {
     pub count: u64,
     /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）；别的规则是 `None`
     pub source: Option<SavedSource>,
+    /// 值（解开转义之后的样子）的 SHA-256，小写十六进制：安全日志记下它，日后「列为例外」照它
+    /// 加（见 [`super::exceptions`]），**不记原值**。保存的凭据不能列为例外，是 `None`
+    pub sha256: Option<String>,
 }
 
 /// 把命中合并成「哪条规则 × 哪个值 × 几次」。**同一个值只报一次**：
@@ -2392,6 +2457,14 @@ fn findings_with(text: &str, hits: &[Hit], set: Option<&RuleSet>) -> Vec<Finding
                 }
                 _ => None,
             },
+            // 和比对例外表时一样，先解开转义再算（`text` 是 JSON 原文）
+            sha256: super::exceptions::exceptable(rule).then(|| {
+                if value.contains('\\') {
+                    super::exceptions::sha256_hex(&crate::locate::unescape(value))
+                } else {
+                    super::exceptions::sha256_hex(value)
+                }
+            }),
             rule: rule.clone(),
             count,
         })
@@ -2817,6 +2890,7 @@ mod tests {
                 .map(|(rule, value, count)| Finding {
                     source: None,
                     masked: masked(&rule, value),
+                    sha256: Some(super::super::exceptions::sha256_hex(value)),
                     rule,
                     count,
                 })

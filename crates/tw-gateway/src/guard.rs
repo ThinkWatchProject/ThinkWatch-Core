@@ -902,6 +902,7 @@ mod tests {
             rule: Rule::Builtin("thinkwatch-saved-secret"),
             masked: String::new(),
             count: 1,
+            sha256: None,
             source: Some(SavedSource {
                 kind: SavedSourceKind::UpstreamKey,
                 name: name.into(),
