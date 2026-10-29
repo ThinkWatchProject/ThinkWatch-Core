@@ -2474,9 +2474,34 @@ pub struct Finding {
     pub count: u64,
     /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）；别的规则是 `None`
     pub source: Option<SavedSource>,
-    /// 值（解开转义之后的样子）的 SHA-256，小写十六进制：安全日志记下它，日后「列为例外」照它
-    /// 加（见 [`super::exceptions`]），**不记原值**。保存的凭据不能列为例外，是 `None`
+    /// 值（解开转义之后的样子）的 SHA-256，小写十六进制：「列为例外」照它加（见
+    /// [`super::exceptions`]）。**只在把它列为例外真的管用时才有**：
+    ///
+    /// - 保存的凭据不能列为例外，是 `None`；
+    /// - 这个值的每一处都得是**某条规则原原本本认出来的那一段**。两条规则认到互相重叠的两段时
+    ///   合成了一处（[`resolve`]），只记录的规则让开要换的那几处、截成了几截，这些段没有哪条
+    ///   规则认过：例外表里写上它的哈希，什么都挡不住。这时也是 `None`；
+    /// - 不知道哪些段是原样认出来的（[`findings`]、[`findings_in`] 拿到的只是合并之后的命中）
+    ///   也是 `None`：宁可不给，也不给一个挡不住的。知道的是 [`crate::redact::flow`] 那几个
+    ///   报记录的入口。
     pub sha256: Option<String>,
+}
+
+/// 合并重叠之前、每条规则原原本本认出来的那些段（见 [`Finding::sha256`]）。
+#[derive(Debug, Clone, Default)]
+pub struct Exact(HashSet<(usize, usize)>);
+
+impl Exact {
+    /// `hits` 是合并之前的命中（[`scan_unresolved`] 之后、[`resolve`] 之前）
+    pub(crate) fn of(hits: &[Hit]) -> Self {
+        Self(hits.iter().map(|h| (h.bytes.start, h.bytes.end)).collect())
+    }
+    pub(crate) fn extend(&mut self, other: Exact) {
+        self.0.extend(other.0);
+    }
+    fn has(&self, r: &Range<usize>) -> bool {
+        self.0.contains(&(r.start, r.end))
+    }
 }
 
 /// 把命中合并成「哪条规则 × 哪个值 × 几次」。**同一个值只报一次**：
@@ -2489,30 +2514,52 @@ pub struct Finding {
 /// **合并按「规则 × 值」查表**，不在已经合过的里面一条条找：一个请求里贴进来几万个不同
 /// 的值时（一份导出的凭据清单），后者是平方级的，几十万个值要几分钟。
 pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
-    findings_with(text, hits, None)
+    findings_with(text, hits, None, None)
 }
 
 /// 同 [`findings`]，保存的凭据的命中带上是哪一项（[`Finding::source`]）。**按「规则 × 值」合并**，
 /// 所以两项不同的保存的凭据是两条，即使它们打码之后一样（都是空串）
 pub fn findings_in(text: &str, hits: &[Hit], set: &RuleSet) -> Vec<Finding> {
-    findings_with(text, hits, Some(set))
+    findings_with(text, hits, Some(set), None)
 }
 
-fn findings_with(text: &str, hits: &[Hit], set: Option<&RuleSet>) -> Vec<Finding> {
-    let mut out: Vec<(&Rule, &str, u64)> = Vec::new();
+/// 同 [`findings_in`]，`exact` 是合并之前每条规则原样认出来的段：每一处都在里面的值带上哈希
+/// （[`Finding::sha256`]）
+pub(crate) fn findings_exact(
+    text: &str,
+    hits: &[Hit],
+    set: &RuleSet,
+    exact: &Exact,
+) -> Vec<Finding> {
+    findings_with(text, hits, Some(set), Some(exact))
+}
+
+fn findings_with(
+    text: &str,
+    hits: &[Hit],
+    set: Option<&RuleSet>,
+    exact: Option<&Exact>,
+) -> Vec<Finding> {
+    // 规则、值、几处、每一处都是原样认出来的
+    let mut out: Vec<(&Rule, &str, u64, bool)> = Vec::new();
     let mut seen: HashMap<(&Rule, &str), usize> = HashMap::new();
     for h in hits {
         let value = &text[h.bytes.clone()];
+        let whole = exact.is_some_and(|e| e.has(&h.bytes));
         match seen.entry((&h.rule, value)) {
-            Entry::Occupied(at) => out[*at.get()].2 += 1,
+            Entry::Occupied(at) => {
+                let o = &mut out[*at.get()];
+                o.2 += 1;
+                o.3 &= whole;
+            }
             Entry::Vacant(slot) => {
                 slot.insert(out.len());
-                out.push((&h.rule, value, 1));
+                out.push((&h.rule, value, 1, whole));
             }
         }
     }
     out.into_iter()
-        .map(|(rule, value, count)| Finding {
+        .map(|(rule, value, count, whole)| Finding {
             masked: masked(rule, value),
             source: match (rule, set) {
                 (Rule::Builtin("thinkwatch-saved-secret"), Some(set)) => {
@@ -2521,7 +2568,7 @@ fn findings_with(text: &str, hits: &[Hit], set: Option<&RuleSet>) -> Vec<Finding
                 _ => None,
             },
             // 和比对例外表时一样，先解开转义再算（`text` 是 JSON 原文）
-            sha256: super::exceptions::exceptable(rule).then(|| {
+            sha256: (whole && super::exceptions::exceptable(rule)).then(|| {
                 if value.contains('\\') {
                     super::exceptions::sha256_hex(&crate::locate::unescape(value))
                 } else {
@@ -2953,7 +3000,7 @@ mod tests {
                 .map(|(rule, value, count)| Finding {
                     source: None,
                     masked: masked(&rule, value),
-                    sha256: Some(super::super::exceptions::sha256_hex(value)),
+                    sha256: None,
                     rule,
                     count,
                 })

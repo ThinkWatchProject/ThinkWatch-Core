@@ -6,6 +6,8 @@ mod anchor;
 pub mod cache;
 mod common;
 mod engine;
+#[cfg(test)]
+mod exception_tests;
 pub mod exceptions;
 pub mod flow;
 mod nest;

@@ -1569,11 +1569,13 @@ fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     // `crate::guard::find`）
     let scope = tw_guard::redact::flow::Scope::Written(shape);
     let cache = Some(&*p.rules.scan_cache);
-    let hits = tw_guard::redact::flow::hits_in_with(&text, &p.rules.redact, scope, cache);
+    let (hits, exact) =
+        tw_guard::redact::flow::hits_exact_with(&text, &p.rules.redact, scope, cache);
     if hits.is_empty() {
         return UpMsg::Text(text.into());
     }
-    let found = tw_guard::redact::flow::reported_with(&text, &p.rules.redact, &hits, scope, cache);
+    let found =
+        tw_guard::redact::flow::reported_exact(&text, &p.rules.redact, &hits, exact, scope, cache);
     let replaced = mode.acts().then(|| {
         // 只记录的规则命中的不换
         let r = tw_guard::redact::replace::apply(

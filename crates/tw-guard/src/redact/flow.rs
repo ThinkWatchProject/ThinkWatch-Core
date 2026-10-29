@@ -51,7 +51,7 @@ pub use tw_dialect::written::Shape;
 use crate::policy::Mode;
 pub use crate::redact::cache::ScanCache;
 use crate::redact::replace::{Ledger, Scheme};
-use crate::redact::rules::{Finding, Hit, RuleSet};
+use crate::redact::rules::{Exact, Finding, Hit, RuleSet};
 
 /// 在一份文字的哪些地方找。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,17 @@ pub fn hits_in_with(
     scope: Scope,
     cache: Option<&ScanCache>,
 ) -> Vec<Hit> {
+    hits_exact_with(text, rules, scope, cache).0
+}
+
+/// [`hits_in_with`]，连同合并之前每条规则原样认出来的那些段（[`Exact`]）：报记录时据此判断
+/// 一个值能不能列为例外（见 [`crate::redact::rules::Finding::sha256`]，[`reported_exact`]）
+pub fn hits_exact_with(
+    text: &str,
+    rules: &RuleSet,
+    scope: Scope,
+    cache: Option<&ScanCache>,
+) -> (Vec<Hit>, Exact) {
     let hits = match cache.and_then(|c| c.kept(text, rules, scope)) {
         Some(hits) => hits,
         None => kept(
@@ -103,7 +114,8 @@ pub fn hits_in_with(
             },
         ),
     };
-    crate::redact::rules::resolve(hits, rules)
+    let exact = Exact::of(&hits);
+    (crate::redact::rules::resolve(hits, rules), exact)
 }
 
 /// [`hits_in`] 里合并之前的那几步：在 `text` 上按规则找到的 `hits` 去掉不算的 —— 压在占位符上
@@ -223,7 +235,8 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape) -> Vec<Findi
         return Vec::new();
     };
     let scope = Scope::Written(shape);
-    reported(text, rules, &hits_in(text, rules, scope), scope)
+    let (hits, exact) = hits_exact_with(text, rules, scope, None);
+    reported_exact(text, rules, &hits, exact, scope, None)
 }
 
 /// 报出去的记录：`found`（[`hits_in`] 在 `text` 的 `scope` 里找到的），**加上被换成占位符的
@@ -237,7 +250,9 @@ pub fn reported(text: &str, rules: &RuleSet, found: &[Hit], scope: Scope) -> Vec
     reported_with(text, rules, found, scope, None)
 }
 
-/// [`reported`]，另找的那一遍也走 `cache`（只记录的那几条规则是另一套，指纹不同，各存各的）
+/// [`reported`]，另找的那一遍也走 `cache`（只记录的那几条规则是另一套，指纹不同，各存各的）。
+/// 不知道 `found` 里哪些段是原样认出来的：记录不带哈希（[`crate::redact::rules::Finding::sha256`]），
+/// 要带的用 [`reported_exact`]
 pub fn reported_with(
     text: &str,
     rules: &RuleSet,
@@ -245,8 +260,36 @@ pub fn reported_with(
     scope: Scope,
     cache: Option<&ScanCache>,
 ) -> Vec<Finding> {
+    reported_as(text, rules, found, None, scope, cache)
+}
+
+/// [`reported_with`]，`exact` 是 [`hits_exact_with`] 和 `found` 一起交回来的：原样认出来的值
+/// 带上哈希，「列为例外」照它加
+pub fn reported_exact(
+    text: &str,
+    rules: &RuleSet,
+    found: &[Hit],
+    exact: Exact,
+    scope: Scope,
+    cache: Option<&ScanCache>,
+) -> Vec<Finding> {
+    reported_as(text, rules, found, Some(exact), scope, cache)
+}
+
+fn reported_as(
+    text: &str,
+    rules: &RuleSet,
+    found: &[Hit],
+    exact: Option<Exact>,
+    scope: Scope,
+    cache: Option<&ScanCache>,
+) -> Vec<Finding> {
+    let findings = |hits: &[Hit], exact: &Option<Exact>| match exact {
+        Some(e) => crate::redact::rules::findings_exact(text, hits, rules, e),
+        None => crate::redact::rules::findings_in(text, hits, rules),
+    };
     let Some(rec) = rules.recording_only() else {
-        return crate::redact::rules::findings_in(text, found, rules);
+        return findings(found, &exact);
     };
     // 只记录的规则的命中在 `found` 里可能被截成了几截（让开要换的那几处，见
     // `crate::redact::rules::scan`）：报的是它整个认出来的那一处，另找一遍
@@ -255,9 +298,14 @@ pub fn reported_with(
         .filter(|h| !rules.records(&h.rule))
         .cloned()
         .collect();
-    all.extend(hits_in_with(text, &rec, scope, cache));
+    let (more, more_exact) = hits_exact_with(text, &rec, scope, cache);
+    all.extend(more);
     all.sort_by_key(|h| h.bytes.start);
-    crate::redact::rules::findings_in(text, &all, rules)
+    let exact = exact.map(|mut e| {
+        e.extend(more_exact);
+        e
+    });
+    findings(&all, &exact)
 }
 
 /// 一本新账，让开 `body` 里已经写着的占位符（见 [`Ledger::avoiding`]）。
@@ -339,8 +387,8 @@ pub fn look_hits_with(
         return empty();
     };
     let scope = Scope::Written(shape);
-    let hits = hits_in_with(text, rules, scope, cache);
-    let found = reported_with(text, rules, &hits, scope, cache);
+    let (hits, exact) = hits_exact_with(text, rules, scope, cache);
+    let found = reported_exact(text, rules, &hits, exact, scope, cache);
     let ledger = if !mode.acts() {
         Ledger::new(Scheme::SECRET)
     } else {
