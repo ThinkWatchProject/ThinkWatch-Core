@@ -177,7 +177,14 @@ pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) 
         (Some(b'=' | b':'), _) => i += 1,
         _ => return none,
     }
+    // `.env`、shell 的写法：名字、`=`、值紧挨着（`DB_PASSWORD=…`）。这种写法里的值就是一个
+    // 字面量，引号里可以有空格，不加引号的可以带着代码里才是分隔的标点，见 [`env_value`]
+    let env = b[name.end] == b'=' && i == name.end + 1 && skip_blank(b, i) == i;
     i = skip_blank(b, i);
+    let mut seen = i;
+    if env && let Some((from, to, end)) = env_value(b, i, &mut seen) {
+        return push(text, from, to, placed).max(end);
+    }
     let (from, to) = if let Some((n, q)) = quote_at(b, i) {
         let from = i + n;
         let (to, seen) = value_run(b, from, |c| {
@@ -197,10 +204,15 @@ pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) 
             return seen;
         };
         if !closes(b, skip_blank(b, to)) {
-            return to;
+            return to.max(seen);
         }
         (i, to)
     };
+    push(text, from, to, placed).max(seen)
+}
+
+/// 找到的值像不像口令，像就记下来。返回 `to`
+fn push(text: &str, from: usize, to: usize, placed: &mut Vec<Hit>) -> usize {
     let v = &text[from..to];
     // 路径、URL、引用（`$X`、`%X%`、`@Value`、`!Ref`、`*alias`）不是口令
     if v.starts_with(['/', '~', '.', '$', '%', '@', '!', '*', '&']) || v.contains("://") {
@@ -213,4 +225,96 @@ pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) 
         ));
     }
     to
+}
+
+/// `.env` 写法（`NAME=值`）的值，`i` 是 `=` 后面。返回 (值的起点, 终点, 引号收尾之后)，
+/// `seen` 记下看到了哪儿。
+///
+/// - 引号里的：到**同一行**里同一种引号为止，中间可以有空格（`"correct horse battery 9"`）；
+/// - 不加引号的：到空白、行尾为止，`&,;()[]{}<>` 都算值里的（`Tr0ub4dor&3xyz`）。但下面这几种
+///   是代码，不是 `.env`，交回给通常的写法（到第一个标点为止）：括号不配对（`f(token=abc)`
+///   的 `)`）、以括号开头（数组、对象、模板）、像一次调用（`make_token(1)`）；`&名字=` 是
+///   表单编码里的下一个参数，值在它前面截断
+fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usize)> {
+    use super::place::{MAX_SPAN, quote_at, skip_blank, value_run};
+    if let Some((n, q)) = quote_at(b, i) {
+        let from = i + n;
+        let lim = (from + MAX_SPAN + 1).min(b.len());
+        let mut j = from;
+        while j < lim {
+            if quote_at(b, j) == Some((n, q)) {
+                break;
+            }
+            match b[j] {
+                b'\n' | b'\r' => return None,
+                // 转义过的引号收尾时，一个原样的 `"` 是装着这段话的 JSON 字符串结束了
+                b'"' if n > 1 => return None,
+                b'\\' if matches!(b.get(j + 1), Some(b'n' | b'r')) => return None,
+                b'\\' => j += 2,
+                _ => j += 1,
+            }
+        }
+        *seen = (*seen).max(j);
+        if j >= lim || j - from > MAX_SPAN || !closes(b, skip_blank(b, j + n)) {
+            return None;
+        }
+        return Some((from, j, j + n));
+    }
+    let (to, end) = value_run(b, i, |c| {
+        c.is_ascii_graphic() && !matches!(c, b'"' | b'\'' | b'`' | b'\\')
+    });
+    *seen = (*seen).max(end);
+    let mut to = to?;
+    // 表单编码：`token=abc123&state=xyz` 的值到 `&` 为止，后面是下一个参数
+    if let Some(amp) = b[i..to].iter().position(|&c| c == b'&') {
+        let rest = &b[i + amp + 1..to];
+        let name = rest
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            .count();
+        if name > 0 && rest.get(name) == Some(&b'=') {
+            to = i + amp;
+            let v = &b[i..to];
+            return (v.iter().all(|&c| bare(c)) && !v.is_empty()).then_some((i, to, to));
+        }
+    }
+    let v = &b[i..to];
+    if v.iter().all(|&c| bare(c)) || !closes(b, skip_blank(b, to)) || !literal(v) {
+        // 没有多出来的标点（通常的写法照样认得出），或者是代码
+        return None;
+    }
+    Some((i, to, to))
+}
+
+/// 一段带着括号、尖括号的值是不是一个字面量：不以括号开头，括号都配对，不像一次调用
+fn literal(v: &[u8]) -> bool {
+    if matches!(v.first(), Some(b'(' | b'[' | b'{' | b'<')) {
+        return false;
+    }
+    let ident = v
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.'))
+        .count();
+    if ident > 0 && v[0].is_ascii_alphabetic() && v.get(ident) == Some(&b'(') {
+        return false;
+    }
+    let mut depth = [0i32; 4];
+    for &c in v {
+        let (k, d) = match c {
+            b'(' => (0, 1),
+            b')' => (0, -1),
+            b'[' => (1, 1),
+            b']' => (1, -1),
+            b'{' => (2, 1),
+            b'}' => (2, -1),
+            b'<' => (3, 1),
+            b'>' => (3, -1),
+            _ => continue,
+        };
+        depth[k] += d;
+        if depth[k] < 0 {
+            return false;
+        }
+    }
+    depth == [0; 4]
 }

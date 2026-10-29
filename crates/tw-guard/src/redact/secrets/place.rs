@@ -370,7 +370,17 @@ fn push_if(text: &str, r: Range<usize>, min: usize, id: &'static str, placed: &m
 
 // ---------------------------------------------------------------- 请求头
 
-/// 鉴权方式的那个词（`Bearer`、`Basic` ……），后面跟着空格
+/// `i` 处的一个空白：空格、制表符，或者请求体里转义过的制表符 `\t`（`i` 前面是一个字母，
+/// 这个反斜杠不会是别的转义的后一半）。返回它占几个字节，不是空白是 0
+fn blank_at(b: &[u8], i: usize) -> usize {
+    match b.get(i) {
+        Some(b' ' | b'\t') => 1,
+        Some(b'\\') if b.get(i + 1) == Some(&b't') => 2,
+        _ => 0,
+    }
+}
+
+/// 鉴权方式的那个词（`Bearer`、`Basic` ……），后面跟着空格或者制表符
 const SCHEMES: &[&str] = &["bearer", "basic", "token", "bot"];
 
 /// `Authorization: Bearer …`、`x-api-key: …` 的值。`s..e` 是头名。
@@ -403,10 +413,13 @@ fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
         // 鉴权方式的词都很短，多看几个字母就够了
         let w = run_to(b, i, i + 16, |c| c.is_ascii_alphabetic());
         if w > i
-            && b.get(w) == Some(&b' ')
+            && blank_at(b, w) > 0
             && SCHEMES.iter().any(|x| x.eq_ignore_ascii_case(&text[i..w]))
         {
-            i = skip_blank(b, w);
+            i = w;
+            while let n @ 1.. = blank_at(b, i) {
+                i += n;
+            }
         }
     }
     let (end, seen) = value_run(b, i, token68);

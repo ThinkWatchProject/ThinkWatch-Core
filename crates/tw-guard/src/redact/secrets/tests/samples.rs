@@ -248,6 +248,8 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                         tok(3),
                     ),
                     (format!("X-Goog-Api-Key: {}", tok(4)), tok(4)),
+                    // 鉴权方式和值之间是制表符（请求体里是转义过的 `\t`）
+                    (format!("Authorization: Bearer\t{}", tok(5)), tok(5)),
                 ],
                 misses: vec![
                     "Authorization: Bearer $TOKEN".to_string(),
@@ -410,6 +412,27 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                     "export GITHUB_TOKEN=abc123def456ghi".to_string(),
                     "abc123def456ghi".to_string(),
                 ),
+                // `.env` 的写法：不加引号的值带着代码里才是分隔的标点，引号里的带着空格
+                (
+                    "DB_PASSWORD=Tr0ub4dor&3xyz".to_string(),
+                    "Tr0ub4dor&3xyz".to_string(),
+                ),
+                (
+                    "MAIL_PASSWORD=x9;Q[2]{a}<b>,c # prod".to_string(),
+                    "x9;Q[2]{a}<b>,c".to_string(),
+                ),
+                (
+                    "DB_PASSWORD=\"correct horse battery staple 9\"".to_string(),
+                    "correct horse battery staple 9".to_string(),
+                ),
+                (
+                    "client(api_token=abc123def456)".to_string(),
+                    "abc123def456".to_string(),
+                ),
+                (
+                    "curl -d token=abc123def456&state=xyz".to_string(),
+                    "abc123def456".to_string(),
+                ),
             ],
             misses: vec![
                 "password = request.form[\"password\"]".to_string(),
@@ -423,6 +446,10 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                 "if password == \"hunter2hunter2\":".to_string(),
                 "secret = \"abc\" + suffix123".to_string(),
                 "max_tokens = 4096".to_string(),
+                "TOKEN=generate_token(user_id=12345)".to_string(),
+                "\"password\": \"Must be 8 characters long\"".to_string(),
+                "SECRET=[1,2,3]".to_string(),
+                "DB_PASSWORD=\"unterminated 12345\nnext line\"".to_string(),
             ],
         },
         "crypto-mnemonic" => {
