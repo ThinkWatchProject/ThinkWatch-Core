@@ -433,6 +433,7 @@ impl Recorder {
                         sent_model: None,
                         detail: it.detail.clone(),
                         source: it.source.clone(),
+                        value_sha256: it.value_sha256.clone(),
                     });
                 }
             }
@@ -486,6 +487,7 @@ impl Recorder {
                     },
                     detail: detail.clone(),
                     source: None,
+                    value_sha256: None,
                 });
             }
             /*
@@ -531,6 +533,7 @@ impl Recorder {
                     sent_model,
                     detail: detail.clone(),
                     source: None,
+                    value_sha256: None,
                 });
             }
             Event::RequestHeaders {
@@ -2092,6 +2095,9 @@ mod pricing_report_tests {
 mod security_tests {
     use super::tests::{finished, rec, started};
 
+    /// 一个值的哈希（随便哪个，这里测的是它记下、读回、不出进程）
+    const HASH: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
     fn secrets(replaced: bool) -> tw_api::Event {
         tw_api::Event::SecretsFound {
             id: 1,
@@ -2107,6 +2113,7 @@ mod security_tests {
                     replaced,
                     detail: Default::default(),
                     source: None,
+                    value_sha256: Some(HASH.into()),
                 },
                 tw_api::SecretItem {
                     rule: "公司令牌".into(),
@@ -2117,6 +2124,7 @@ mod security_tests {
                     replaced,
                     detail: Default::default(),
                     source: None,
+                    value_sha256: None,
                 },
             ],
             at_ms: 10,
@@ -2150,6 +2158,24 @@ mod security_tests {
             // 密钥和模型取自请求那一行
             assert_eq!(got[0].client, "claude-code");
             assert_eq!(got[0].model, "claude-sonnet-4-5");
+            // 值的哈希记下了、读得回来，但不出进程：事件和视图写成 JSON 都不带它
+            assert_eq!(got[1].value_sha256.as_deref(), Some(HASH));
+            assert_eq!(got[0].value_sha256, None);
+            assert_eq!(
+                r.db()
+                    .exception_source(got[1].id)
+                    .unwrap()
+                    .unwrap()
+                    .value_sha256
+                    .as_deref(),
+                Some(HASH)
+            );
+            assert!(!serde_json::to_string(&got).unwrap().contains(HASH));
+            assert!(
+                !serde_json::to_string(&secrets(replaced))
+                    .unwrap()
+                    .contains(HASH)
+            );
         }
     }
 
@@ -2333,6 +2359,7 @@ mod security_detail_tests {
                 replaced: true,
                 detail,
                 source: None,
+                value_sha256: None,
             }],
             at_ms: 10,
         }

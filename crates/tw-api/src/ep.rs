@@ -207,6 +207,12 @@ endpoints! {
     UpdateCustomRule: PUT "/security/{guard}/custom/{name}" [guard, name], api::CustomRuleSave => api::ConfigWritten;
     DeleteCustomRule: DELETE "/security/{guard}/custom/{name}" [guard, name], api::BaseVersion => api::ConfigWritten;
     TestSecurity: POST "/security/{guard}/test" [guard], api::SecurityTestRequest => api::SecurityTestResult;
+    /// 出站脱敏的例外值：列出、手动加入（交原值，core 当场算哈希）、从安全日志的一条加入
+    /// （交那一行的号）、移出（按哈希）。加入时已经在表里的不再写一次
+    RedactExceptions: GET "/security/redact/exceptions", () => api::RedactExceptions;
+    AddRedactException: POST "/security/redact/exceptions", api::ExceptionAdd => api::ExceptionAdded;
+    AddRedactExceptionFromEvent: POST "/security/redact/exceptions/from-event", api::ExceptionFromEvent => api::ExceptionAdded;
+    RemoveRedactException: DELETE "/security/redact/exceptions/{sha256}" [sha256], api::BaseVersion => api::ConfigWritten;
 
     // ─────────────────────────────────────────────── 脚本插件
     //

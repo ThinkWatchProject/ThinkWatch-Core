@@ -252,6 +252,8 @@ pub fn items(
             replaced: seen.replaced && !seen.redaction.rules.records(&f.rule),
             detail,
             source: f.source.clone(),
+            // 只给安全日志：事件流不带它（见 `tw_api::SecretItem::value_sha256`）
+            value_sha256: f.sha256.clone(),
         })
         .collect()
 }

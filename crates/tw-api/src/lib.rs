@@ -26,7 +26,7 @@ pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 // `SecurityTestRequest`……）
 pub use tw_guard::content::Outcome as ContentOutcome;
 pub use tw_guard::locate::{Direction as SecurityDirection, Part as HitPart};
-pub use tw_guard::policy::{ContentMatch, ContentScope, Guard, Mode as GuardMode};
+pub use tw_guard::policy::{ContentMatch, ContentScope, Guard, Mode as GuardMode, RedactException};
 /// 保存的凭据是哪一项（出站脱敏的 `thinkwatch-saved-secret`）。定义在 tw-guard：企业版只依赖
 /// 第一层，也要用它
 pub use tw_guard::redact::rules::{SavedSource, SavedSourceKind};
@@ -1116,7 +1116,19 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 的 `upstream-key` / `upstream-header` / `access-key` / `proxy-password` / `control-key` /
 /// `sync-credential`，`name` 是上游名、密钥名、代理名，控制面密钥和同步凭据是空的），这时打码
 /// 后的值是空串。按位置认的（`in-context` 一类）打码只留最后四位
-pub const CONTROL_API_VERSION: u32 = 56;
+///
+/// **57 起出站脱敏有例外值**（配置的 `security.redact.exceptions`，存值的 SHA-256 和打码后的样子）：
+/// 例外的值在任何规则下都不换、不记。新端点 `GET /security/redact/exceptions`（→
+/// [`RedactExceptions`]）、`POST /security/redact/exceptions`（[`ExceptionAdd`]：交原值，core 当场
+/// 算哈希、按认出它的规则打码 → [`ExceptionAdded`]）、`POST /security/redact/exceptions/from-event`
+/// （[`ExceptionFromEvent`]：交安全日志那一行的号 → [`ExceptionAdded`]）、
+/// `DELETE /security/redact/exceptions/{sha256}`（→ [`ConfigWritten`]）。[`SecurityEventView`] 多了
+/// `excepted`（这个值此刻是例外）和 `exceptable`（这一条能列为例外），「测试…」的命中
+/// （`SecurityTestHit`）多了 `excepted`（例外的值照样标出来，`action` 是空的）。新码：
+/// `config.redact_exceptions_too_many`、`config.redact_exception_hash_bad`、
+/// `config.redact_exception_duplicate`、`security.exception_*`、`security.exceptions_full`、
+/// `security.unknown_event`
+pub const CONTROL_API_VERSION: u32 = 57;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -6234,6 +6246,13 @@ pub struct SecretItem {
     /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`：这时 `masked` 是空的）。别的规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SavedSource>,
+    /// 值的 SHA-256（[`tw_guard::redact::rules::Finding::sha256`]），给安全日志记下，日后
+    /// 「列为例外」照它加。**只在进程里走**：事件流、在途快照都不带它 —— 界面要列为例外时
+    /// 交回的是日志那一行的号，用不着哈希；一个不需要它的地方拿到它，对短的值（手机号）
+    /// 就是一张可以穷举的答案
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub value_sha256: Option<String>,
 }
 
 /// 各项防护在一段时间里各留下了几条记录。
@@ -6334,6 +6353,19 @@ pub struct SecurityEventView {
     /// 出站脱敏认出的是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）。别的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SavedSource>,
+    /// 出站脱敏：这个值此刻在例外表里（`security.redact.exceptions`），界面上标「例外」。
+    /// 读的时候按现在的例外表算，不是记下时的
+    #[serde(default)]
+    pub excepted: bool,
+    /// 出站脱敏：这一条能「列为例外」（`POST /security/redact/exceptions/from-event`）。保存的
+    /// 凭据、别的防护的记录不能；已经是例外的也是 false
+    #[serde(default)]
+    pub exceptable: bool,
+    /// 记下时值的 SHA-256。**不出进程**（同 [`SecretItem::value_sha256`]）：控制面读出来之后
+    /// 照它算 `excepted`、`exceptable`，列为例外时按这一行的号从库里取
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub value_sha256: Option<String>,
 }
 
 /// 一条安全记录最多列几处命中（[`SecurityEventView::locations`]）。再多的只数个数
@@ -6530,6 +6562,57 @@ pub struct RulesToggle {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
+}
+
+/// 出站脱敏的例外表（`GET /security/redact/exceptions`）：按配置里的先后（先加的在前）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RedactExceptions {
+    /// 每一项是配置里的那一项原样：哈希、打码后的样子、最先认出它的规则、加入的时刻。移出例外
+    /// 按 `sha256`
+    pub items: Vec<RedactException>,
+    /// 最多几个（[`tw_guard::policy::EXCEPTIONS_MAX`]）。满了「添加例外」置灰
+    pub max: u32,
+}
+
+/// 手动加入一个例外值（`POST /security/redact/exceptions`）：还没出现在日志里的测试值。
+///
+/// **原值只在这个请求里**：core 收到就算哈希，不写进配置、日志、事件和回答。两头的空白去掉
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExceptionAdd {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 不把值打出来：这个类型带着用户粘贴的原值，一条调试日志就能把它留在盘上
+impl std::fmt::Debug for ExceptionAdd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExceptionAdd")
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("base_version", &self.base_version)
+            .finish()
+    }
+}
+
+/// 把安全日志里的一条列为例外（`POST /security/redact/exceptions/from-event`）：交的是那一行的
+/// 号（[`SecurityEventView::id`]），哈希、打码后的样子和规则 core 从库里取。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExceptionFromEvent {
+    pub event_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 加入了例外（或者它本来就在：这时 `version` 是没改动的那一版）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExceptionAdded {
+    pub version: String,
+    /// 例外表里的那一项
+    pub exception: RedactException,
 }
 
 /// 改一条内置规则在第三档下做什么。

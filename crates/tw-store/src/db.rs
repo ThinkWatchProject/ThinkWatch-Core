@@ -36,7 +36,10 @@ use tw_api::Msg;
 /// 多了细节（`security_events` 的 `session`、`sent_model`、`detail`）。
 ///
 /// 28：安全日志记下出站脱敏认出的是哪一项保存的凭据（`security_events` 的 `source`）。
-pub(crate) const SCHEMA: i64 = 28;
+///
+/// 29：安全日志记下出站脱敏命中的值的 SHA-256（`security_events` 的 `value_sha256`），「列为例外」
+/// 照它加。
+pub(crate) const SCHEMA: i64 = 29;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -544,7 +547,10 @@ impl Db {
                 -- 存在这一行上，和请求记录一起过期
                 detail     TEXT    NOT NULL,
                 -- 出站脱敏认出的是哪一项保存的凭据，JSON（`tw_api::SavedSource`）。别的是 NULL
-                source     TEXT
+                source     TEXT,
+                -- 出站脱敏命中的值（解开转义之后）的 SHA-256，小写十六进制：「列为例外」照它加，
+                -- 读的时候照它标「例外」。**不存原值。**保存的凭据、别的防护是 NULL
+                value_sha256 TEXT
              );
              CREATE INDEX security_events_at ON security_events (at_ms DESC);
              CREATE INDEX security_events_request ON security_events (request_id);
@@ -1133,8 +1139,8 @@ impl Db {
         self.conn.execute(
             "INSERT INTO security_events
              (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count,
-              matching, revealed, session, sent_model, detail, source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+              matching, revealed, session, sent_model, detail, source, value_sha256)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 e.at_ms,
                 e.request_id,
@@ -1155,9 +1161,31 @@ impl Db {
                 e.source
                     .as_ref()
                     .and_then(|s| serde_json::to_string(s).ok()),
+                e.value_sha256,
             ],
         )?;
         Ok(())
+    }
+
+    /// 安全日志的第 `id` 条拿去「列为例外」时要的那几样。没有这一条（过了保留期、库重建过）是
+    /// `None`
+    pub fn exception_source(&self, id: i64) -> Result<Option<ExceptionSource>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT guard, rule, excerpt, value_sha256 FROM security_events WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(ExceptionSource {
+                        guard: slug_col(r, 0, tw_api::Guard::from_slug)?,
+                        rule: r.get(1)?,
+                        masked: r.get(2)?,
+                        value_sha256: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// 安全日志的一页，按时间倒序，连同这一段一共几条、各做了什么。
@@ -2061,6 +2089,19 @@ pub struct SecurityEvent {
     pub detail: tw_api::SecurityHitDetail,
     /// 出站脱敏认出的是哪一项保存的凭据
     pub source: Option<tw_api::SavedSource>,
+    /// 出站脱敏命中的值的 SHA-256（[`tw_api::SecretItem::value_sha256`]）。别的是 `None`
+    pub value_sha256: Option<String>,
+}
+
+/// 安全日志里的一条拿去「列为例外」时要的那几样（[`Db::exception_source`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionSource {
+    pub guard: tw_api::Guard,
+    pub rule: String,
+    /// 打码后的值，原样进例外表
+    pub masked: String,
+    /// `None`：这一条不能列为例外（保存的凭据、别的防护）
+    pub value_sha256: Option<String>,
 }
 
 /// 读安全日志时的那段 SELECT。**上游、密钥、模型、会话优先取请求那一行的。**
@@ -2081,7 +2122,7 @@ const SECURITY_SELECT: &str =
             WHEN r.id IS NULL THEN e.sent_model
             WHEN tw_reached(r.routing, r.error IS NOT NULL) THEN NULLIF(r.sent_model, '')
         END,
-        e.detail, e.source
+        e.detail, e.source, e.value_sha256
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 /// 安全日志按什么筛：`?1`–`?2` 这一段时间，`?3` 这一项（NULL 是全部）。
@@ -2149,6 +2190,10 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         rule_snapshot: detail.rule_snapshot,
         outcome_detail: detail.outcome_detail,
         source,
+        // 两样按控制面手里的例外表算（`tw_control::security::annotate`），库里只有哈希
+        excepted: false,
+        exceptable: false,
+        value_sha256: r.get(22)?,
     })
 }
 
@@ -3798,6 +3843,7 @@ mod security_log_tests {
             sent_model: None,
             detail: Default::default(),
             source: None,
+            value_sha256: None,
         }
     }
 
