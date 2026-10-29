@@ -1114,11 +1114,13 @@ fn start(
 /// 找到的命中跟着请求体交去留档：落盘前打码不再把同一份正文找一遍（见
 /// [`crate::bodies::BodyRecord::found`]）。
 fn look(rt: &Runtime, req: &Inbound) -> tw_guard::redact::flow::Look {
-    crate::guard::look_hits(
+    crate::guard::look_hits_from(
         rt.config.security.redact.mode,
         &rt.redact,
         &req.body,
         crate::client_api::ClientApi::written(req.uri.path()),
+        tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+        Some(&rt.scan_cache),
     )
 }
 
