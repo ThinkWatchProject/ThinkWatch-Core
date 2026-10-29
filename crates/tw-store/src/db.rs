@@ -414,6 +414,8 @@ impl Db {
         // - `requests_routed`：各条路由、规则命中了多少要的那几项，落库时从路由那一列里取出来
         //   存在索引里。数的时候只读索引，不再把一周几 MB 的 JSON 读出来解一遍（见
         //   `route_hits`）
+        // - `security_events_rule_hits`：一项防护每条规则最近几天命中几次，只读索引（见
+        //   `security_rule_hits`）。规则表的组头每次打开都要它
         let sql = format!(
             "CREATE INDEX IF NOT EXISTS requests_client ON requests (client, at_ms)
                 WHERE client > '';
@@ -421,7 +423,9 @@ impl Db {
                 WHERE session IS NOT NULL AND local = 0;
              CREATE INDEX IF NOT EXISTS requests_routed
                 ON requests (at_ms, {ROUTE}, {RULE}, {REWRITTEN_BY}, {DENIED_BY}, error IS NOT NULL)
-                WHERE {ROUTED};"
+                WHERE {ROUTED};
+             CREATE INDEX IF NOT EXISTS security_events_rule_hits
+                ON security_events (guard, at_ms, rule, custom, count);"
         );
         if let Err(e) = self.conn.execute_batch(&sql) {
             tracing::warn!(
@@ -1165,6 +1169,32 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// 一项防护从 `since_ms` 起每条规则命中了几次：各条记录的 `count` 加起来，不论做了什么
+    /// （只记录的、换掉的、切断的都算）。按规则排，没命中的规则不在里面。
+    ///
+    /// **按记录的 `count` 加，不是数行**：出站脱敏一行是「一个请求里的一个值」，同一个值在一个
+    /// 请求里出现三次是一行、`count` 3；内容过滤一行是一条规则在一个请求里的几处
+    pub fn security_rule_hits(
+        &self,
+        guard: &str,
+        since_ms: i64,
+    ) -> Result<Vec<tw_api::SecurityRuleHits>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT rule, custom, SUM(count) FROM security_events
+             WHERE guard = ?1 AND at_ms >= ?2
+             GROUP BY rule, custom
+             ORDER BY rule, custom",
+        )?;
+        let rows = st.query_map(params![guard, since_ms], |r| {
+            Ok(tw_api::SecurityRuleHits {
+                rule: r.get(0)?,
+                custom: r.get::<_, i64>(1)? != 0,
+                count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// 安全日志的第 `id` 条拿去「列为例外」时要的那几样。没有这一条（过了保留期、库重建过）是

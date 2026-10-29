@@ -1118,16 +1118,18 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 后的值是空串。按位置认的（`in-context` 一类）打码只留最后四位
 ///
 /// **57 起出站脱敏有例外值**（配置的 `security.redact.exceptions`，存值的 SHA-256 和打码后的样子）：
-/// 例外的值在任何规则下都不换、不记。新端点 `GET /security/redact/exceptions`（→
-/// [`RedactExceptions`]）、`POST /security/redact/exceptions`（[`ExceptionAdd`]：交原值，core 当场
-/// 算哈希、按认出它的规则打码 → [`ExceptionAdded`]）、`POST /security/redact/exceptions/from-event`
-/// （[`ExceptionFromEvent`]：交安全日志那一行的号 → [`ExceptionAdded`]）、
-/// `DELETE /security/redact/exceptions/{sha256}`（→ [`ConfigWritten`]）。[`SecurityEventView`] 多了
+/// 例外的值在任何规则下都不换、不记。新端点 `GET /security/exceptions`（→
+/// [`RedactExceptions`]）、`POST /security/exceptions`（[`ExceptionAdd`]：交原值，core 当场
+/// 算哈希、按认出它的规则打码 → [`ExceptionAdded`]）、`POST /security/events/{id}/exception`
+/// （把安全日志的那一行列为例外，[`BaseVersion`] → [`ExceptionAdded`]）、
+/// `DELETE /security/exceptions/{sha256}`（→ [`ConfigWritten`]）。[`SecurityEventView`] 多了
 /// `excepted`（这个值此刻是例外）和 `exceptable`（这一条能列为例外），「测试…」的命中
 /// （`SecurityTestHit`）多了 `excepted`（例外的值照样标出来，`action` 是空的）。新码：
 /// `config.redact_exceptions_too_many`、`config.redact_exception_hash_bad`、
 /// `config.redact_exception_duplicate`、`security.exception_*`、`security.exceptions_full`、
-/// `security.unknown_event`
+/// `security.unknown_event`。新端点 `GET /security/counts`（[`SecurityRuleHitsQuery`] →
+/// [`SecurityRuleHits`] 的列表）：一项防护从某个时刻起每条规则命中了几次，各条记录的 `count`
+/// 加起来，规则表的组头用
 pub const CONTROL_API_VERSION: u32 = 57;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
@@ -4408,6 +4410,28 @@ pub struct SecurityEventsQuery {
     pub limit: Option<usize>,
 }
 
+/// `GET /security/counts`：一项防护从某个时刻起每条规则命中了几次（规则表的组头「最近 7 天
+/// 命中 N 次」）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityRuleHitsQuery {
+    pub guard: Guard,
+    /// 从这个时刻起（毫秒，含）。不给是全部
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+}
+
+/// 一条规则命中了几次（[`SecurityRuleHitsQuery`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityRuleHits {
+    /// 内置规则的 id，或者自定义规则的名字
+    pub rule: String,
+    pub custom: bool,
+    /// 这段时间里各条记录的 `count` 加起来（[`SecurityEventView::count`]），不论做了什么
+    pub count: i64,
+}
+
 /// `GET /config/at`：配置原文里的第几个字节落在哪个字段上。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -6357,7 +6381,7 @@ pub struct SecurityEventView {
     /// 读的时候按现在的例外表算，不是记下时的
     #[serde(default)]
     pub excepted: bool,
-    /// 出站脱敏：这一条能「列为例外」（`POST /security/redact/exceptions/from-event`）。保存的
+    /// 出站脱敏：这一条能「列为例外」（`POST /security/events/{id}/exception`）。保存的
     /// 凭据、别的防护的记录不能；已经是例外的也是 false
     #[serde(default)]
     pub exceptable: bool,
@@ -6564,7 +6588,7 @@ pub struct RulesToggle {
     pub base_version: Option<String>,
 }
 
-/// 出站脱敏的例外表（`GET /security/redact/exceptions`）：按配置里的先后（先加的在前）。
+/// 出站脱敏的例外表（`GET /security/exceptions`）：按配置里的先后（先加的在前）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RedactExceptions {
@@ -6575,7 +6599,7 @@ pub struct RedactExceptions {
     pub max: u32,
 }
 
-/// 手动加入一个例外值（`POST /security/redact/exceptions`）：还没出现在日志里的测试值。
+/// 手动加入一个例外值（`POST /security/exceptions`）：还没出现在日志里的测试值。
 ///
 /// **原值只在这个请求里**：core 收到就算哈希，不写进配置、日志、事件和回答。两头的空白去掉
 #[derive(Clone, Serialize, Deserialize)]
@@ -6594,16 +6618,6 @@ impl std::fmt::Debug for ExceptionAdd {
             .field("base_version", &self.base_version)
             .finish()
     }
-}
-
-/// 把安全日志里的一条列为例外（`POST /security/redact/exceptions/from-event`）：交的是那一行的
-/// 号（[`SecurityEventView::id`]），哈希、打码后的样子和规则 core 从库里取。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ExceptionFromEvent {
-    pub event_id: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<String>,
 }
 
 /// 加入了例外（或者它本来就在：这时 `version` 是没改动的那一版）。
@@ -7113,6 +7127,17 @@ pub struct PluginRunView {
 
 #[cfg(test)]
 mod tests {
+    /// 手动加入例外的请求带着原值：调试输出里不能有它
+    #[test]
+    fn an_exception_request_does_not_print_its_value() {
+        let req = ExceptionAdd {
+            value: "sk-ant-api03-SECRETSECRETSECRET".into(),
+            base_version: None,
+        };
+        let d = format!("{req:?}");
+        assert!(!d.contains("SECRET"), "{d}");
+    }
+
     use super::*;
 
     fn attempt(outcome: AttemptOutcome, status: Option<u16>, code: Option<&str>) -> AttemptView {

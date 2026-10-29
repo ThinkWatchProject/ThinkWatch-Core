@@ -22,6 +22,21 @@
 //!   写，几十条就是几十次热重载、几十个版本；
 //! - **自定义规则写成配置里那个类型序列化出来的样子**，默认值不写 —— 写进去的就是
 //!   读回来的那一份。
+//!
+//! # 例外值
+//!
+//! 出站脱敏的例外值（[`tw_guard::redact::exceptions`]）写在 `security.redact.exceptions`，和规则
+//! 一样走配置的写入路径，随配置导出、同步、备份。**原值不落在任何地方**：
+//!
+//! - 手动加入时界面交原值，这里当场算哈希、按认出它的规则打码，写进配置的只有这两样；
+//!   原值不进日志（[`tw_api::ExceptionAdd`] 的 `Debug` 不打它）、不进回答。
+//! - 从安全日志加入时界面交的是**那一行的号**，不是哈希：日志那一行记着值的哈希
+//!   （`security_events.value_sha256`），这里从库里取。哈希只在 core 的进程和库里，事件流、
+//!   日志视图都不带它 —— 对手机号这种短的值，一个不加盐的 SHA-256 是能穷举回去的，没理由
+//!   交给不需要它的界面。界面要的「这一条已经是例外」「这一条能列为例外」读的时候在这里
+//!   照现在的例外表算好（[`annotate`]）。
+//! - 移出按哈希：例外表本身（`GET /security/exceptions`）就是配置里的那一份，界面
+//!   拿得到配置原文，哈希在这里不多泄露什么。
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -45,6 +60,7 @@ pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
         .at(ep::Security, detail)
         .at(ep::SecurityEvents, events)
+        .at(ep::SecurityRuleCounts, counts)
         .at(ep::SetSecurityMode, set_mode)
         .at(ep::ToggleBuiltinRule, toggle_builtin)
         .at(ep::SetBuiltinRuleAction, set_builtin_action)
@@ -53,6 +69,10 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::UpdateCustomRule, update_custom)
         .at(ep::DeleteCustomRule, delete_custom)
         .at(ep::TestSecurity, test)
+        .at(ep::RedactExceptions, exceptions)
+        .at(ep::AddRedactException, add_exception)
+        .at(ep::ExceptSecurityEvent, add_exception_from_event)
+        .at(ep::RemoveRedactException, remove_exception)
 }
 
 /// 这一边对每项防护要知道的事。路径里写的就是配置里的那个键。
@@ -207,7 +227,23 @@ async fn events(
             q.limit.unwrap_or(100).clamp(1, PAGE_MAX),
         )
         .map_err(crate::records)?;
+    let mut page = page;
+    annotate(&s.config(), &mut page.events);
     Ok(Json(page))
+}
+
+/// 每条规则命中了几次。只读索引（`security_events_rule_hits`），不翻日志
+async fn counts(
+    State(s): State<ControlState>,
+    Query(q): Query<tw_api::SecurityRuleHitsQuery>,
+) -> Result<Json<Vec<tw_api::SecurityRuleHits>>, Fail> {
+    let store = crate::need_store(&s)?;
+    let g = store.lock().await;
+    let hits = g
+        .db()
+        .security_rule_hits(q.guard.slug(), q.since_ms.unwrap_or(0))
+        .map_err(crate::records)?;
+    Ok(Json(hits))
 }
 
 // ---------------------------------------------------------------- 写
@@ -560,10 +596,12 @@ fn rule_fail(e: PolicyError) -> Fail {
         PolicyError::EmptyScope { .. } => scope_empty(),
         PolicyError::BlockInAnswer { .. } => block_in_answer(),
         PolicyError::CodepointsInAnswer { .. } => codepoints_in_answer(),
-        // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id 不在这里写
-        e @ (PolicyError::DuplicateName { .. } | PolicyError::UnknownRule { .. }) => {
-            tw_config::policy_msg(&e)
-        }
+        // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id、例外表不在这里写
+        e @ (PolicyError::DuplicateName { .. }
+        | PolicyError::UnknownRule { .. }
+        | PolicyError::TooManyExceptions { .. }
+        | PolicyError::BadExceptionHash { .. }
+        | PolicyError::DuplicateException { .. }) => tw_config::policy_msg(&e),
     };
     fail(StatusCode::BAD_REQUEST, m)
 }
@@ -685,6 +723,174 @@ async fn delete_custom(
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+// ---------------------------------------------------------------- 例外值
+
+/// 例外表那一节：按 `sha256` 认
+const EXCEPTIONS: edit::Section = edit::Section {
+    path: &["security", "redact", "exceptions"],
+    what: "redaction exception",
+    key: "sha256",
+};
+
+/// 安全日志的记录按现在的例外表标上 `excepted`、`exceptable`（见文件头）。**每个返回日志
+/// 记录的端点都要过一遍**：库里只有哈希，这两样是读的时候算的
+pub(crate) fn annotate<'a>(
+    cfg: &tw_config::Config,
+    views: impl IntoIterator<Item = &'a mut tw_api::SecurityEventView>,
+) {
+    let set = cfg.security.redact.exception_set();
+    for v in views {
+        let hash = match (v.guard, v.value_sha256.as_deref()) {
+            (Guard::Redact, Some(h)) => h,
+            _ => continue,
+        };
+        v.excepted = set.as_ref().is_some_and(|ex| ex.contains_hex(hash));
+        v.exceptable = !v.excepted;
+    }
+}
+
+async fn exceptions(State(s): State<ControlState>) -> Json<tw_api::RedactExceptions> {
+    Json(tw_api::RedactExceptions {
+        items: s.config().security.redact.exceptions.clone(),
+        max: tw_guard::policy::EXCEPTIONS_MAX as u32,
+    })
+}
+
+/// 手动加入：交来的是原值。**算完哈希它就没用了**，不进任何一条日志、不进回答
+async fn add_exception(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ExceptionAdd>,
+) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
+    // 网关手里那一份保存的凭据：贴进来一把上游的密钥，认得出它、不收
+    let saved = s.gateway.runtime().redact.saved().cloned();
+    let e = s
+        .config()
+        .security
+        .redact
+        .exception_of(&req.value, saved, crate::config::now_ms() as i64)
+        .map_err(exception_fail)?;
+    drop(req.value);
+    put_exception(&s, e, req.base_version.as_deref()).await
+}
+
+/// 从安全日志的一条加入：哈希、打码后的样子、规则都取自那一行
+async fn add_exception_from_event(
+    State(s): State<ControlState>,
+    Path(id): Path<i64>,
+    Json(req): Json<tw_api::BaseVersion>,
+) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
+    let store = crate::need_store(&s)?;
+    let src = store
+        .lock()
+        .await
+        .db()
+        .exception_source(id)
+        .map_err(crate::records)?
+        .ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!(
+                    "security.unknown_event", id = id.to_string() =>
+                    "There is no security log entry {id}; it may have passed the retention period."
+                ),
+            )
+        })?;
+    let sha256 = match (src.guard, src.value_sha256) {
+        (Guard::Redact, Some(h)) => h,
+        // 保存的凭据、工具调用审查和内容过滤的记录：没有可以例外的「值」
+        _ => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                msg!(
+                    "security.exception_not_exceptable" =>
+                    "Only a value found by outbound redaction can be an exception, and a saved \
+                     secret cannot."
+                ),
+            ));
+        }
+    };
+    let e = tw_config::RedactException {
+        sha256,
+        masked: src.masked,
+        rule: src.rule,
+        added_at: crate::config::now_ms() as i64,
+    };
+    put_exception(&s, e, req.base_version.as_deref()).await
+}
+
+/// 写进例外表。**已经在表里的不再写一次**（不论是哪条规则加的）：回那一项和现在的版本。
+/// 满了是 409
+async fn put_exception(
+    s: &ControlState,
+    e: tw_config::RedactException,
+    base_version: Option<&str>,
+) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
+    let cur = s.cfg.current().map_err(crate::unreadable_config)?;
+    if let Ok(cfg) = tw_config::try_parse(&cur.text) {
+        let list = &cfg.security.redact.exceptions;
+        if let Some(have) = list.iter().find(|x| x.sha256 == e.sha256) {
+            return Ok(Json(tw_api::ExceptionAdded {
+                version: cur.version(),
+                exception: have.clone(),
+            }));
+        }
+        if list.len() >= tw_guard::policy::EXCEPTIONS_MAX {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                msg!(
+                    "security.exceptions_full", max = tw_guard::policy::EXCEPTIONS_MAX.to_string() =>
+                    "There are already {max} exceptions; remove one before adding another."
+                ),
+            ));
+        }
+    }
+    let m = item(&e)?;
+    let version = s
+        .cfg
+        .transform(base_version, Origin::Ui, |text, _| {
+            Ok(edit::upsert(text, EXCEPTIONS, None, &m)?)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ExceptionAdded {
+        version,
+        exception: e,
+    }))
+}
+
+async fn remove_exception(
+    State(s): State<ControlState>,
+    Path(sha256): Path<String>,
+    Query(q): Query<tw_api::BaseVersion>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let version = s
+        .cfg
+        .transform(q.base_version.as_deref(), Origin::Ui, |text, _| {
+            Ok(edit::remove(text, EXCEPTIONS, &sha256)?)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 一个值加不进例外表
+fn exception_fail(e: tw_guard::policy::ExceptionError) -> Fail {
+    use tw_guard::policy::ExceptionError;
+    let m = match e {
+        ExceptionError::Empty => {
+            msg!("security.exception_value_empty" => "The value is empty.")
+        }
+        ExceptionError::Saved => msg!(
+            "security.exception_saved_secret" =>
+            "This value is a secret saved in ThinkWatch; saved secrets are always replaced and \
+             cannot be exceptions."
+        ),
+        // 配置读进来时校验过，到这里还编不起来是绕过校验写进去的：那是这边的问题
+        ExceptionError::Policy(e) => return internal(e),
+    };
+    fail(StatusCode::BAD_REQUEST, m)
 }
 
 // ---------------------------------------------------------------- 测试
