@@ -59,9 +59,11 @@
 //!
 //! # 键、存什么、存多少
 //!
-//! 键是 SHA-256（规则集的指纹 + 今天的日期 + 这一段的原文）。指纹见
-//! [`RuleSet::fingerprint`]：改规则、改保存的密钥即整体失效。日期也算进去：身份证号、卡号
-//! 的出生日期、有效期按「今天」核对，跨了一天同一段文字的结论可能不同。
+//! 键是 SHA-256（规则集的指纹 + 今天的日期 + 在哪儿找（整段，还是哪种形状的正文）+ 是哪个
+//! 数组里的元素 + 这一段的原文）。指纹见 [`RuleSet::fingerprint`]：改规则、改保存的密钥即整体
+//! 失效；之后往规则集里加的、会改变命中的东西（例外值……）也要喂进指纹，那个函数把字段一个个
+//! 拆开写，漏了编译不过。日期也算进去：身份证号、卡号的出生日期、有效期按「今天」核对，跨了
+//! 一天同一段文字的结论可能不同。
 //!
 //! 存的只有命中的区间和规则 id，**不存值**：要换的时候从原文现取。
 //!
@@ -355,31 +357,27 @@ fn find(text: &str, p: &Piece, rules: &RuleSet, scope: Scope, cmdline: bool) -> 
         return None;
     }
     let open = cmdline && super::secrets::place::command_open_at_end(&text[p.range.clone()]);
-    let mut lost = false;
     let hits = match scope {
         Scope::Whole => super::flow::kept(&piece, raw, None::<fn() -> _>),
-        Scope::Written(shape) => super::flow::kept(
-            &piece,
-            raw,
-            Some(|| {
-                let found = match &p.parent {
-                    None => tw_dialect::written::ranges(shape, &piece),
-                    Some(k) => {
-                        let head = format!("{{\"{}\":[", &text[k.clone()]);
-                        let alone = format!("{head}{piece}]}}");
-                        tw_dialect::written::ranges(shape, &alone).map(|rs| {
-                            rs.into_iter()
-                                .map(|r| r.start - head.len()..r.end - head.len())
-                                .collect()
-                        })
-                    }
-                };
-                lost = found.is_none();
-                found
-            }),
-        ),
+        Scope::Written(shape) => {
+            // 没有命中也先认一遍：整段请求体认不出正文时（一个超出范围的数、一个落单的代理对，
+            // 只看结构的 JSON 校验放过了它们）整个请求一处都不算，那一段单拿出来同样认不出，
+            // 得知道 —— 不然别的段的命中照算，和整段做的不一样
+            let written = match &p.parent {
+                None => tw_dialect::written::ranges(shape, &piece)?,
+                Some(k) => {
+                    let head = format!("{{\"{}\":[", &text[k.clone()]);
+                    let alone = format!("{head}{piece}]}}");
+                    tw_dialect::written::ranges(shape, &alone)?
+                        .into_iter()
+                        .map(|r| r.start - head.len()..r.end - head.len())
+                        .collect()
+                }
+            };
+            super::flow::kept(&piece, raw, Some(|| Some(written)))
+        }
     };
-    (!lost).then(|| Found {
+    Some(Found {
         hits: hits.into(),
         open,
     })

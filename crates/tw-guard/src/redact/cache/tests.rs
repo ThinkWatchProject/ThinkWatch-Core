@@ -75,7 +75,7 @@ fn fragment(r: &mut Rng) -> String {
     let card = luhn_done(&format!("62220212345{:04}", r.next(10_000)));
     let id = id_done(&format!("11010119900307{:03}", r.next(1000)));
     let pool: Vec<String> = vec![
-        format!("sk-ant-api03-{}", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789".repeat(1)),
+        "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789".into(),
         "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789".into(),
         format!("AKIA{}", ["QRSTUVWXYZ234567", "ABCDEFGHIJKLMNOP"][r.next(2)]),
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk".into(),
@@ -124,7 +124,7 @@ fn fragment(r: &mut Rng) -> String {
         format!("x{SAVED}"),
         "E-123456 and MYCORP-222222".into(),
         "mycorp-333333".into(),
-        "你好，世界。这是一段中文。".into(),
+        "今天天气晴，适合出门。这是一段中文。".into(),
         "姓名：张三，电话 13800138000".into(),
         "{\"real_name\":\"张三\",\"phone\":\"13800138000\"}".into(),
         "{\"name\":\"李四\"}".into(),
@@ -705,6 +705,24 @@ fn a_broken_piece_falls_back_to_the_whole_scan() {
     assert!(cache.kept(&text, &rules, Scope::Whole).is_none());
     assert_eq!(cache.len(), 0, "{text}");
     agree(&text, &rules, Dialect::Anthropic, &cache, "broken");
+}
+
+/// 只看结构的 JSON 校验放过、认正文时却解不开的请求体（超出范围的数、落单的代理对）：整段做的
+/// 时候一处都不算。那一段没有命中也一样 —— 别的段的命中不能照算
+#[test]
+fn a_body_whose_written_text_cannot_be_read_counts_nothing_either_way() {
+    let rules = RuleSet::defaults();
+    let pad = "padding ".repeat(150);
+    for odd in [r#"{"n":1e400}"#, r#"{"s":"\ud800"}"#] {
+        let text = format!(
+            r#"{{"messages":[{{"role":"user","content":"{pad} AKIAQRSTUVWXYZ234567"}},{odd},{{"role":"user","content":"{pad}"}}]}}"#
+        );
+        let written = Scope::Written(shape(Dialect::Anthropic));
+        assert!(flow::hits_in(&text, &rules, written).is_empty(), "{odd}");
+        let cache = ScanCache::new();
+        agree(&text, &rules, Dialect::Anthropic, &cache, odd);
+        agree(&text, &rules, Dialect::Anthropic, &cache, odd);
+    }
 }
 
 // ---------------------------------------------------------------- 容量
