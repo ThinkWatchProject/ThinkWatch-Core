@@ -34,6 +34,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use super::secrets::saved::{
+    SAVED_MIN_CHARS, Saved, SavedSecret, SavedSource, SavedSourceKind,
+};
+use super::secrets::{ASSIGNMENT_SUFFIXES, code, pfx, prefixed};
+
 /// 规则属于哪一类。**只用来分组和说明**，开关按条。界面上按这个顺序分组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -518,6 +523,389 @@ pub const BUILTINS: &[Builtin] = &[
         label: None,
     },
     // ===== 扩充的凭据规则（secrets.rs 的判据）：只往这一段里加 =====
+    Builtin {
+        id: "thinkwatch-saved-secret",
+        kind: Kind::Saved,
+        name: "Secret saved in ThinkWatch",
+        on_by_default: true,
+        matcher: Matcher::Saved,
+        label: None,
+    },
+    // AI 服务。`sk-` 开头的几家要排在 OpenAI 老式密钥前面认（见 `classify_prefixed`）
+    prefixed(
+        "openai-service-key",
+        Kind::AiServices,
+        "OpenAI service account or admin key",
+        &[
+            pfx("sk-svcacct-", 58, Tail::Any),
+            pfx("sk-admin-", 58, Tail::Any),
+        ],
+    ),
+    prefixed(
+        "openrouter-key",
+        Kind::AiServices,
+        "OpenRouter API key",
+        &[pfx("sk-or-v1-", 64, Tail::Hex)],
+    ),
+    prefixed(
+        "xai-key",
+        Kind::AiServices,
+        "xAI API key",
+        &[pfx("xai-", 70, Tail::Alnum)],
+    ),
+    prefixed(
+        "groq-key",
+        Kind::AiServices,
+        "Groq API key",
+        &[pfx("gsk_", 52, Tail::Alnum)],
+    ),
+    prefixed(
+        "huggingface-token",
+        Kind::AiServices,
+        "Hugging Face token",
+        &[
+            pfx("hf_", 34, Tail::Alnum),
+            pfx("api_org_", 34, Tail::Alnum),
+        ],
+    ),
+    prefixed(
+        "replicate-token",
+        Kind::AiServices,
+        "Replicate API token",
+        &[pfx("r8_", 37, Tail::Alnum)],
+    ),
+    prefixed(
+        "perplexity-key",
+        Kind::AiServices,
+        "Perplexity API key",
+        &[pfx("pplx-", 48, Tail::Alnum)],
+    ),
+    prefixed(
+        "bedrock-api-key",
+        Kind::AiServices,
+        "Amazon Bedrock API key",
+        &[pfx("ABSK", 100, Tail::Any)],
+    ),
+    prefixed(
+        "fireworks-key",
+        Kind::AiServices,
+        "Fireworks AI API key",
+        &[pfx("fw_", 20, Tail::Alnum)],
+    ),
+    prefixed(
+        "cerebras-key",
+        Kind::AiServices,
+        "Cerebras API key",
+        &[pfx("csk-", 48, Tail::Alnum)],
+    ),
+    prefixed(
+        "langsmith-key",
+        Kind::AiServices,
+        "LangSmith API key",
+        &[
+            pfx("lsv2_pt_", 43, Tail::Any),
+            pfx("lsv2_sk_", 43, Tail::Any),
+        ],
+    ),
+    prefixed(
+        "langfuse-secret-key",
+        Kind::AiServices,
+        "Langfuse secret key",
+        &[pfx("sk-lf-", 36, Tail::Any)],
+    ),
+    prefixed(
+        "pinecone-key",
+        Kind::AiServices,
+        "Pinecone API key",
+        &[pfx("pcsk_", 69, Tail::Any)],
+    ),
+    prefixed(
+        "tavily-key",
+        Kind::AiServices,
+        "Tavily API key",
+        &[pfx("tvly-", 32, Tail::Any)],
+    ),
+    prefixed(
+        "minimax-key",
+        Kind::AiServices,
+        "MiniMax API key",
+        &[pfx("sk-api-", 100, Tail::Any)],
+    ),
+    code("zhipu-api-key", Kind::AiServices, "Zhipu AI API key"),
+    code("qianfan-api-key", Kind::AiServices, "Baidu Qianfan API key"),
+    code(
+        "sk-compat-key",
+        Kind::AiServices,
+        "OpenAI-compatible API key",
+    ),
+    // 代码托管与软件发布
+    prefixed(
+        "github-refresh-token",
+        Kind::DevPlatforms,
+        "GitHub refresh token",
+        &[pfx("ghr_", 36, Tail::Alnum)],
+    ),
+    prefixed(
+        "gitlab-other-token",
+        Kind::DevPlatforms,
+        "GitLab token (other kinds)",
+        &[
+            pfx("glptt-", 20, Tail::Any),
+            pfx("gldt-", 20, Tail::Any),
+            pfx("glrt-", 20, Tail::Any),
+            pfx("gloas-", 20, Tail::Any),
+            pfx("glcbt-", 20, Tail::Any),
+            pfx("glft-", 20, Tail::Any),
+            pfx("glsoat-", 20, Tail::Any),
+            pfx("glimt-", 20, Tail::Any),
+            pfx("glagent-", 20, Tail::Any),
+        ],
+    ),
+    prefixed(
+        "pypi-token",
+        Kind::DevPlatforms,
+        "PyPI API token",
+        &[pfx("pypi-AgEIcHlwaS5vcmc", 50, Tail::Any)],
+    ),
+    prefixed(
+        "rubygems-token",
+        Kind::DevPlatforms,
+        "RubyGems API key",
+        &[pfx("rubygems_", 48, Tail::Hex)],
+    ),
+    prefixed(
+        "clojars-token",
+        Kind::DevPlatforms,
+        "Clojars deploy token",
+        &[pfx("CLOJARS_", 60, Tail::Alnum)],
+    ),
+    prefixed(
+        "docker-hub-token",
+        Kind::DevPlatforms,
+        "Docker Hub access token",
+        &[
+            pfx("dckr_pat_", 27, Tail::Any),
+            pfx("dckr_oat_", 32, Tail::Any),
+        ],
+    ),
+    prefixed(
+        "artifactory-key",
+        Kind::DevPlatforms,
+        "JFrog Artifactory API key",
+        &[pfx("AKCp", 69, Tail::Alnum)],
+    ),
+    prefixed(
+        "databricks-token",
+        Kind::DevPlatforms,
+        "Databricks access token",
+        &[pfx("dapi", 32, Tail::Hex)],
+    ),
+    prefixed(
+        "sentry-token",
+        Kind::DevPlatforms,
+        "Sentry auth token",
+        &[pfx("sntrys_", 40, Tail::Any), pfx("sntryu_", 64, Tail::Hex)],
+    ),
+    prefixed(
+        "grafana-token",
+        Kind::DevPlatforms,
+        "Grafana token",
+        &[pfx("glsa_", 41, Tail::Any), pfx("glc_", 32, Tail::Any)],
+    ),
+    prefixed(
+        "postman-key",
+        Kind::DevPlatforms,
+        "Postman API key",
+        &[pfx("PMAK-", 59, Tail::Any)],
+    ),
+    // 云服务与基础设施
+    prefixed(
+        "aws-other-key-id",
+        Kind::Cloud,
+        "AWS access key ID (other kinds)",
+        &[pfx("ABIA", 16, Tail::Alnum), pfx("ACCA", 16, Tail::Alnum)],
+    ),
+    prefixed(
+        "alibaba-access-key-id",
+        Kind::Cloud,
+        "Alibaba Cloud AccessKey ID",
+        &[pfx("LTAI", 12, Tail::Alnum)],
+    ),
+    prefixed(
+        "tencent-secret-id",
+        Kind::Cloud,
+        "Tencent Cloud SecretId",
+        &[pfx("AKID", 32, Tail::Alnum)],
+    ),
+    prefixed(
+        "volcengine-access-key-id",
+        Kind::Cloud,
+        "Volcengine AccessKey ID",
+        &[pfx("AKLT", 40, Tail::Any), pfx("AKTP", 40, Tail::Any)],
+    ),
+    code(
+        "azure-ad-client-secret",
+        Kind::Cloud,
+        "Azure AD client secret",
+    ),
+    prefixed(
+        "digitalocean-other-token",
+        Kind::Cloud,
+        "DigitalOcean token (other kinds)",
+        &[pfx("doo_v1_", 64, Tail::Hex), pfx("dor_v1_", 64, Tail::Hex)],
+    ),
+    prefixed(
+        "cloudflare-origin-ca-key",
+        Kind::Cloud,
+        "Cloudflare Origin CA key",
+        &[pfx("v1.0-", 171, Tail::Any)],
+    ),
+    prefixed(
+        "vault-token",
+        Kind::Cloud,
+        "HashiCorp Vault token",
+        &[pfx("hvs.", 90, Tail::Any), pfx("hvb.", 138, Tail::Any)],
+    ),
+    code("terraform-token", Kind::Cloud, "Terraform Cloud token"),
+    prefixed(
+        "doppler-token",
+        Kind::Cloud,
+        "Doppler token",
+        &[pfx("dp.pt.", 43, Tail::Alnum)],
+    ),
+    prefixed(
+        "pulumi-token",
+        Kind::Cloud,
+        "Pulumi access token",
+        &[pfx("pul-", 40, Tail::Hex)],
+    ),
+    prefixed(
+        "heroku-key",
+        Kind::Cloud,
+        "Heroku API key",
+        &[pfx("HRKU-AA", 58, Tail::Any)],
+    ),
+    prefixed(
+        "flyio-token",
+        Kind::Cloud,
+        "Fly.io token",
+        &[pfx("fo1_", 43, Tail::Any)],
+    ),
+    prefixed(
+        "supabase-key",
+        Kind::Cloud,
+        "Supabase key",
+        &[
+            pfx("sbp_", 40, Tail::Alnum),
+            pfx("sb_secret_", 31, Tail::Any),
+        ],
+    ),
+    prefixed(
+        "age-secret-key",
+        Kind::Cloud,
+        "age secret key",
+        &[pfx("AGE-SECRET-KEY-1", 58, Tail::Alnum)],
+    ),
+    prefixed(
+        "onepassword-token",
+        Kind::Cloud,
+        "1Password service account token",
+        &[pfx("ops_eyJ", 200, Tail::Any)],
+    ),
+    // 支付、通信与协作
+    prefixed(
+        "stripe-webhook-secret",
+        Kind::Business,
+        "Stripe webhook signing secret",
+        &[pfx("whsec_", 32, Tail::Any)],
+    ),
+    prefixed(
+        "shopify-token",
+        Kind::Business,
+        "Shopify token",
+        &[
+            pfx("shpat_", 32, Tail::Hex),
+            pfx("shpca_", 32, Tail::Hex),
+            pfx("shppa_", 32, Tail::Hex),
+            pfx("shpss_", 32, Tail::Hex),
+        ],
+    ),
+    prefixed(
+        "twilio-api-key",
+        Kind::Business,
+        "Twilio API key",
+        &[pfx("SK", 32, Tail::Hex)],
+    ),
+    prefixed(
+        "brevo-key",
+        Kind::Business,
+        "Brevo API key",
+        &[pfx("xkeysib-", 81, Tail::Any)],
+    ),
+    prefixed(
+        "slack-other-token",
+        Kind::Business,
+        "Slack token (other kinds)",
+        &[
+            pfx("xapp-", 20, Tail::Any),
+            pfx("xoxe-", 20, Tail::Any),
+            pfx("xoxe.xoxp-", 20, Tail::Any),
+            pfx("xoxe.xoxb-", 20, Tail::Any),
+            pfx("xoxr-", 20, Tail::Any),
+        ],
+    ),
+    prefixed(
+        "linear-key",
+        Kind::Business,
+        "Linear API key",
+        &[pfx("lin_api_", 40, Tail::Alnum)],
+    ),
+    prefixed(
+        "notion-token",
+        Kind::Business,
+        "Notion token",
+        &[pfx("ntn_", 46, Tail::Alnum)],
+    ),
+    // Atlassian 的令牌在 186 位左右，**末尾九位前面隔着一个 `=`**（不是 token 里的字符）：
+    // 切出来的 token 只有 180 上下，下限放在 150
+    prefixed(
+        "atlassian-token",
+        Kind::Business,
+        "Atlassian API token",
+        &[pfx("ATATT3", 150, Tail::Any)],
+    ),
+    // 按位置认的：只换值那一段
+    code(
+        "auth-header-credential",
+        Kind::InContext,
+        "Credential in a request header",
+    ),
+    code(
+        "command-line-password",
+        Kind::InContext,
+        "Password on a command line",
+    ),
+    code("url-token", Kind::InContext, "Token in a URL"),
+    code("bot-webhook", Kind::InContext, "Chat bot webhook token"),
+    code("telegram-bot-token", Kind::InContext, "Telegram bot token"),
+    Builtin {
+        id: "config-assignment",
+        kind: Kind::InContext,
+        name: "Secret assigned in a config file",
+        on_by_default: true,
+        matcher: Matcher::Assignment {
+            suffixes: ASSIGNMENT_SUFFIXES,
+        },
+        label: None,
+    },
+    // 加密货币
+    code("crypto-mnemonic", Kind::Crypto, "Wallet recovery phrase"),
+    code("crypto-wif-key", Kind::Crypto, "Bitcoin private key (WIF)"),
+    code(
+        "crypto-extended-key",
+        Kind::Crypto,
+        "Extended private key (xprv)",
+    ),
     // ===== 扩充的个人信息规则（personal.rs 的判据）：只往这一段里加 =====
 ];
 
@@ -645,6 +1033,9 @@ pub struct RuleSet {
     custom: Vec<Custom>,
     /// 动作是「仅记录」的规则：照样找、照样报，不换成占位符（见 [`RuleSet::records`]）
     record: HashSet<Rule>,
+    /// 用户在 ThinkWatch 里保存的凭据（见 [`RuleSet::with_saved`]）。规则 `thinkwatch-saved-secret`
+    /// 开着才按它找
+    saved: Option<Arc<Saved>>,
 }
 
 impl Default for RuleSet {
@@ -664,6 +1055,7 @@ impl RuleSet {
                 .collect(),
             custom: Vec::new(),
             record: HashSet::new(),
+            saved: None,
         }
     }
 
@@ -673,6 +1065,7 @@ impl RuleSet {
             on: HashSet::new(),
             custom: Vec::new(),
             record: HashSet::new(),
+            saved: None,
         }
     }
 
@@ -686,6 +1079,7 @@ impl RuleSet {
                 .collect(),
             custom: Vec::new(),
             record: HashSet::new(),
+            saved: None,
         }
     }
 
@@ -746,6 +1140,31 @@ impl RuleSet {
         self.on.contains(id)
     }
 
+    /// 带上用户在 ThinkWatch 里保存的凭据，按值认（规则 `thinkwatch-saved-secret`）。不足
+    /// [`SAVED_MIN_CHARS`] 个字符的不收；一个都不剩就和没带一样。**跟着配置一起换**：调用方
+    /// 在建运行时的地方建一次
+    pub fn with_saved(mut self, list: Vec<SavedSecret>) -> Self {
+        self.saved = Saved::new(list).map(Arc::new);
+        self
+    }
+
+    /// 带上一份已经编好的保存的凭据（和网关、工具调用审查共用同一份）。`None` 是不带
+    pub fn with_saved_set(mut self, saved: Option<Arc<Saved>>) -> Self {
+        self.saved = saved;
+        self
+    }
+
+    /// 编好的保存的凭据，给工具调用审查的「凭据发往陌生主机」用（见
+    /// [`crate::tools::rules::Rules::with_saved`]）。没有是 `None`
+    pub fn saved(&self) -> Option<&Arc<Saved>> {
+        self.saved.as_ref()
+    }
+
+    /// 命中的这个值是哪一项保存的凭据。不是保存的凭据是 `None`
+    pub fn saved_source(&self, value: &str) -> Option<&SavedSource> {
+        self.saved.as_ref()?.source_of(value)
+    }
+
     /// 这条规则只记录：动作是「仅记录」
     pub fn recording(mut self, rule: Rule) -> Self {
         self.record.insert(rule);
@@ -776,6 +1195,7 @@ impl RuleSet {
                 .cloned()
                 .collect(),
             record: self.record.clone(),
+            saved: self.saved.clone(),
         })
     }
 
@@ -832,29 +1252,87 @@ const KEY_MIN: usize = {
     let mut min = OPENAI_MIN;
     let mut i = 0;
     while i < BUILTINS.len() {
-        if let Matcher::Prefix { prefix, min_tail } = BUILTINS[i].matcher
-            && prefix.len() + min_tail < min
-        {
-            min = prefix.len() + min_tail;
+        match BUILTINS[i].matcher {
+            Matcher::Prefix { prefix, min_tail } => {
+                if prefix.len() + min_tail < min {
+                    min = prefix.len() + min_tail;
+                }
+            }
+            Matcher::Prefixes { list } => {
+                let mut j = 0;
+                while j < list.len() {
+                    if list[j].prefix.len() + list[j].min_tail < min {
+                        min = list[j].prefix.len() + list[j].min_tail;
+                    }
+                    j += 1;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
     min
 };
 
-/// 一把密钥能以哪些字节开头：每条前缀规则的头一个字节，和 OpenAI 老式密钥的 `s`
+/// 一把密钥能以哪些字节开头：每条前缀规则（单前缀、多前缀）的头一个字节，和 OpenAI 老式
+/// 密钥的 `s`
 const KEY_FIRST: [bool; 256] = {
     let mut t = [false; 256];
     t[b's' as usize] = true;
     let mut i = 0;
     while i < BUILTINS.len() {
-        if let Matcher::Prefix { prefix, .. } = BUILTINS[i].matcher {
-            t[prefix.as_bytes()[0] as usize] = true;
+        match BUILTINS[i].matcher {
+            Matcher::Prefix { prefix, .. } => t[prefix.as_bytes()[0] as usize] = true,
+            Matcher::Prefixes { list } => {
+                let mut j = 0;
+                while j < list.len() {
+                    t[list[j].prefix.as_bytes()[0] as usize] = true;
+                    j += 1;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
     t
 };
+
+/// 前缀表里的一项：前缀、尾巴至少几个、尾巴的字符、哪条规则
+type Entry3 = (&'static str, usize, Tail, &'static str);
+
+/// 前缀表，按头一个字节分好，组内照 [`BUILTINS`] 里的顺序。**一个 token 只和同一个头字节的
+/// 那几项比**：前缀规则有一百来项，过了快速排除的 token 挨个比一遍，在几 MB 的请求体上就是
+/// 好几毫秒
+fn prefix_table() -> &'static [Vec<Entry3>] {
+    static T: std::sync::OnceLock<Vec<Vec<Entry3>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t: Vec<Vec<Entry3>> = vec![Vec::new(); 256];
+        for b in BUILTINS {
+            match b.matcher {
+                Matcher::Prefix { prefix, min_tail } => {
+                    t[usize::from(prefix.as_bytes()[0])].push((prefix, min_tail, Tail::Any, b.id));
+                }
+                Matcher::Prefixes { list } => {
+                    for p in list {
+                        t[usize::from(p.prefix.as_bytes()[0])]
+                            .push((p.prefix, p.min_tail, p.tail, b.id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        t
+    })
+}
+
+/// 前缀后面那段的字符对得上 `tail`。token 里本来只有 token 字符，`Any` 不用再看
+fn tail_fits(tail: Tail, t: &str) -> bool {
+    match tail {
+        Tail::Any => true,
+        Tail::Hex => t.bytes().all(|c| c.is_ascii_hexdigit()),
+        Tail::Alnum => t.bytes().all(|c| c.is_ascii_alphanumeric()),
+    }
+}
 
 /// 一段 token 是哪种 API 密钥。**只看开着的那几条。**`openai`：OpenAI 老式密钥那条开着
 /// （扫之前问一次，不在每个 token 上查一遍表）。
@@ -870,21 +1348,26 @@ fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str
 
 /// [`classify_token`] 的判据本身。
 fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
-    for b in BUILTINS {
-        if let Matcher::Prefix { prefix, min_tail } = b.matcher
-            && let Some(tail) = tok.strip_prefix(prefix)
-            && tail.len() >= min_tail
+    let row = &prefix_table()[usize::from(tok.as_bytes()[0])];
+    for &(prefix, min_tail, tail, id) in row {
+        if let Some(t) = tok.strip_prefix(prefix)
+            && t.len() >= min_tail
+            && tail_fits(tail, t)
         {
             // 前缀认出来了但这条关着 —— **不再往下猜**。`sk-ant-…` 关掉之后
             // 不该被当成一把 OpenAI 老式 key 换掉
-            return set.is_on(b.id).then_some(b.id);
+            return set.is_on(id).then_some(id);
         }
     }
     if openai
         && let Some(tail) = tok.strip_prefix("sk-")
         && tok.len() >= OPENAI_MIN
-        && !tail.starts_with("ant-")
-        && !tail.starts_with("proj-")
+        // 别家的 `sk-` 前缀（`sk-ant-`、`sk-or-v1-`、`sk-lf-` ……）不归 OpenAI：尾巴不够长、
+        // 字符不对的也不归 —— 报错了服务商，「凭据发往陌生主机」就会把发往它自家接口的
+        // 请求当成外传
+        && !row
+            .iter()
+            .any(|(prefix, ..)| prefix.starts_with("sk-") && tok.starts_with(prefix))
         && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         // **全是字母或者全是数字的一长串多半是别的东西**（hash、id、
         // 或者一串占位用的 aaaa）。真的 key 两样都有
@@ -1707,6 +2190,13 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
     // JSON 的文本（直接拿来扫的一段话）不分里外
     let json = json_like(text);
+    // 保存的凭据最先找：同一处另一条规则也认得出时（一把保存的 `sk-ant-…`、连接串里的代理
+    // 口令），报成哪一项保存的凭据说得最清楚（重叠的合成一处时，最先记下的说了算）
+    if let Some(saved) = &set.saved
+        && set.is_on("thinkwatch-saved-secret")
+    {
+        saved.find(text, &mut out);
+    }
     if set.is_on("private-key") {
         private_keys(text, json, &mut out);
     }
@@ -1901,6 +2391,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
         on: set.on.clone(),
         custom: Vec::new(),
         record: set.record.clone(),
+        saved: set.saved.clone(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
@@ -1931,6 +2422,20 @@ pub fn masked(rule: &Rule, value: &str) -> String {
     match rule.kind() {
         Kind::Internal => value.to_string(),
         k if k.is_personal() => last_four(value),
+        // 保存的凭据一个字都不留：报的是它是哪一项（[`Finding::source`]）
+        Kind::Saved => String::new(),
+        // 按位置认的多半是口令，没有前缀：留头五个就是留了大半个口令。只留最后四位，短的全打掉
+        Kind::InContext => {
+            let n = value.chars().count();
+            if n >= 16 {
+                let tail: String = value.chars().skip(n - 4).collect();
+                format!("…{tail}")
+            } else {
+                "…".to_string()
+            }
+        }
+        // 助记词的头几个字母就是头一个词
+        Kind::Crypto if rule.id() == "crypto-mnemonic" => "…".to_string(),
         _ => mask(value),
     }
 }
@@ -1983,6 +2488,8 @@ pub struct Finding {
     pub masked: String,
     /// 这个值在这段文本里出现了几次
     pub count: u64,
+    /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）；别的规则是 `None`
+    pub source: Option<SavedSource>,
 }
 
 /// 把命中合并成「哪条规则 × 哪个值 × 几次」。**同一个值只报一次**：
@@ -1995,6 +2502,16 @@ pub struct Finding {
 /// **合并按「规则 × 值」查表**，不在已经合过的里面一条条找：一个请求里贴进来几万个不同
 /// 的值时（一份导出的凭据清单），后者是平方级的，几十万个值要几分钟。
 pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
+    findings_with(text, hits, None)
+}
+
+/// 同 [`findings`]，保存的凭据的命中带上是哪一项（[`Finding::source`]）。**按「规则 × 值」合并**，
+/// 所以两项不同的保存的凭据是两条，即使它们打码之后一样（都是空串）
+pub fn findings_in(text: &str, hits: &[Hit], set: &RuleSet) -> Vec<Finding> {
+    findings_with(text, hits, Some(set))
+}
+
+fn findings_with(text: &str, hits: &[Hit], set: Option<&RuleSet>) -> Vec<Finding> {
     let mut out: Vec<(&Rule, &str, u64)> = Vec::new();
     let mut seen: HashMap<(&Rule, &str), usize> = HashMap::new();
     for h in hits {
@@ -2010,6 +2527,12 @@ pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
     out.into_iter()
         .map(|(rule, value, count)| Finding {
             masked: masked(rule, value),
+            source: match (rule, set) {
+                (Rule::Builtin("thinkwatch-saved-secret"), Some(set)) => {
+                    set.saved_source(value).cloned()
+                }
+                _ => None,
+            },
             rule: rule.clone(),
             count,
         })
@@ -2428,6 +2951,7 @@ mod tests {
             }
             out.into_iter()
                 .map(|(rule, value, count)| Finding {
+                    source: None,
                     masked: masked(&rule, value),
                     rule,
                     count,
@@ -2520,6 +3044,45 @@ mod tests {
                             }
                         }
                     }
+                }
+                Matcher::Prefixes { list } => {
+                    for p in list {
+                        let key = format!("{}{}", p.prefix, &"a1".repeat(p.min_tail)[..p.min_tail]);
+                        let hits = scan(&key, &only);
+                        assert_eq!(hits.len(), 1, "{} 认不出它自己说的形状：{key}", b.id);
+                        let short = &key[..key.len() - 1];
+                        assert!(scan(short, &only).is_empty(), "{} 认了更短的 {short}", b.id);
+                    }
+                }
+                Matcher::Saved => {
+                    let value = "a1b2c3d4e5f6g7h8";
+                    let set = only.clone().with_saved(vec![SavedSecret {
+                        value: value.to_string(),
+                        source: SavedSource {
+                            kind: SavedSourceKind::UpstreamKey,
+                            name: "x".into(),
+                        },
+                        hosts: Vec::new(),
+                    }]);
+                    assert_eq!(scan(value, &set).len(), 1);
+                    assert!(scan(&value[1..], &set).is_empty());
+                }
+                Matcher::Assignment { suffixes } => {
+                    for s in suffixes {
+                        let t = format!("MY_{s}=Abc123def456");
+                        let hits = scan(&t, &only);
+                        assert_eq!(hits.len(), 1, "{t}");
+                        assert_eq!(&t[hits[0].bytes.clone()], "Abc123def456");
+                    }
+                }
+                // 代码实现的凭据规则：说明由界面按 id 给，判据由样本钉着（个人信息那一路有自己的）
+                Matcher::Code if !b.kind.is_personal() => {
+                    let s = super::super::secrets::tests::samples::sample(b.id)
+                        .unwrap_or_else(|| panic!("{} 没有样本", b.id));
+                    let (text, value) = &s.hits[0];
+                    let hits = scan_plain(text, &only);
+                    assert_eq!(hits.len(), 1, "{} 认不出它的样本 {text}", b.id);
+                    assert_eq!(&text[hits[0].bytes.clone()], value);
                 }
                 _ => {}
             }
@@ -3396,9 +3959,10 @@ mod tests {
         const TAIL: &[u8] = b"abcXYZ0189-_.";
         let mut heads: Vec<&str> = BUILTINS
             .iter()
-            .filter_map(|b| match b.matcher {
-                Matcher::Prefix { prefix, .. } => Some(prefix),
-                _ => None,
+            .flat_map(|b| match b.matcher {
+                Matcher::Prefix { prefix, .. } => vec![prefix],
+                Matcher::Prefixes { list } => list.iter().map(|p| p.prefix).collect(),
+                _ => Vec::new(),
             })
             .collect();
         heads.extend(["sk-", "s", "x", "", "Sk-", "ak"]);
@@ -3425,6 +3989,18 @@ mod tests {
                         "{tok}"
                     );
                 }
+            }
+        }
+        // 按头字节分好的前缀表和逐条比前缀的结论一样
+        for b in BUILTINS {
+            let list: Vec<(&str, usize)> = match b.matcher {
+                Matcher::Prefix { prefix, min_tail } => vec![(prefix, min_tail)],
+                Matcher::Prefixes { list } => list.iter().map(|p| (p.prefix, p.min_tail)).collect(),
+                _ => continue,
+            };
+            for (prefix, min_tail) in list {
+                let tok = format!("{prefix}{}", &"a1".repeat(min_tail)[..min_tail]);
+                assert_eq!(classify_prefixed(&tok, &all(), false), Some(b.id), "{tok}");
             }
         }
         // 最短的那种刚好够长时认得出

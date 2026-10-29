@@ -700,14 +700,16 @@ fn unknown_rule(id: &str) -> Fail {
 }
 
 /// 「测试…」。怎么算全在共享层（[`tw_guard::trial`]）：按配置里现在这一份策略试，
-/// 和网关手里那一份是同一份。
+/// 和网关手里那一份是同一份，保存的凭据也是网关手里那一份。
 async fn test(
     State(s): State<ControlState>,
     Path(guard): Path<String>,
     Json(req): Json<tw_api::SecurityTestRequest>,
 ) -> Result<Json<tw_api::SecurityTestResult>, Fail> {
     let guard = Guard::parse(&guard)?;
-    tw_guard::trial::run(guard, &s.config().security, &req)
+    // 网关手里那一份保存的凭据：贴进来一把上游的密钥，试出来的和真的请求一样
+    let saved = s.gateway.runtime().redact.saved().cloned();
+    tw_guard::trial::run_with(guard, &s.config().security, &req, saved)
         .map(Json)
         .map_err(|e| trial_fail(guard, e))
 }

@@ -97,6 +97,9 @@ pub struct Rule {
     pub high: bool,
     /// 用户自己加的，不是内置的。**界面上要分得开**
     pub custom: bool,
+    /// 用户在 ThinkWatch 里保存的凭据。「凭据发往陌生主机」把它们也算作凭据，各按各的主机判断
+    /// （见 [`Rules::with_saved`]）。别的规则用不到
+    pub saved: Option<std::sync::Arc<crate::redact::rules::Saved>>,
 }
 
 /// 一处命中：字节区间和那一小段文本。
@@ -138,7 +141,7 @@ impl Rule {
                     end: r.end,
                 });
             }
-            Some(check) => check.find_in(args, open)?,
+            Some(check) => check.find_with(args, open, self.saved.as_deref())?,
         };
         settled(r.end, args, open).then(|| Found {
             text: &args[r.clone()],
@@ -170,7 +173,7 @@ impl Rule {
                     .collect()
             }
             Some(check) => check
-                .find_in(args, open)
+                .find_with(args, open, self.saved.as_deref())
                 .filter(|r| settled(r.end, args, open))
                 .into_iter()
                 .collect(),
@@ -206,6 +209,22 @@ fn never_match() -> Regex {
 #[derive(Debug, Clone)]
 pub struct Rules {
     pub rules: Vec<Rule>,
+}
+
+impl Rules {
+    /// 代码实现的规则带上用户在 ThinkWatch 里保存的凭据（[`crate::redact::rules::RuleSet::saved`]）。
+    /// **和出站脱敏那条规则开没开无关**：一把保存的密钥被工具调用发往别处，照样是外传
+    pub fn with_saved(
+        mut self,
+        saved: Option<std::sync::Arc<crate::redact::rules::Saved>>,
+    ) -> Self {
+        for r in &mut self.rules {
+            if r.check.is_some() {
+                r.saved = saved.clone();
+            }
+        }
+        self
+    }
 }
 
 /// 内置规则文件，解析一次。
@@ -248,6 +267,7 @@ fn compile(spec: &RuleSpec, group: &'static str, custom: bool) -> Result<Rule, R
         group,
         high: spec.high(),
         custom,
+        saved: None,
     })
 }
 

@@ -673,6 +673,69 @@ pricing:
 | `cn-mobile-phone` | Chinese mainland mobile number | 关 |
 | `internal-ip` | Internal IP address | 关 |
 | `internal-domain` | Internal domain | 关 |
+| `thinkwatch-saved-secret` | Secret saved in ThinkWatch | 开 |
+| `openai-service-key` | OpenAI service account or admin key | 开 |
+| `openrouter-key` | OpenRouter API key | 开 |
+| `xai-key` | xAI API key | 开 |
+| `groq-key` | Groq API key | 开 |
+| `huggingface-token` | Hugging Face token | 开 |
+| `replicate-token` | Replicate API token | 开 |
+| `perplexity-key` | Perplexity API key | 开 |
+| `bedrock-api-key` | Amazon Bedrock API key | 开 |
+| `fireworks-key` | Fireworks AI API key | 开 |
+| `cerebras-key` | Cerebras API key | 开 |
+| `langsmith-key` | LangSmith API key | 开 |
+| `langfuse-secret-key` | Langfuse secret key | 开 |
+| `pinecone-key` | Pinecone API key | 开 |
+| `tavily-key` | Tavily API key | 开 |
+| `minimax-key` | MiniMax API key | 开 |
+| `zhipu-api-key` | Zhipu AI API key | 开 |
+| `qianfan-api-key` | Baidu Qianfan API key | 开 |
+| `sk-compat-key` | OpenAI-compatible API key | 开 |
+| `github-refresh-token` | GitHub refresh token | 开 |
+| `gitlab-other-token` | GitLab token (other kinds) | 开 |
+| `pypi-token` | PyPI API token | 开 |
+| `rubygems-token` | RubyGems API key | 开 |
+| `clojars-token` | Clojars deploy token | 开 |
+| `docker-hub-token` | Docker Hub access token | 开 |
+| `artifactory-key` | JFrog Artifactory API key | 开 |
+| `databricks-token` | Databricks access token | 开 |
+| `sentry-token` | Sentry auth token | 开 |
+| `grafana-token` | Grafana token | 开 |
+| `postman-key` | Postman API key | 开 |
+| `aws-other-key-id` | AWS access key ID (other kinds) | 开 |
+| `alibaba-access-key-id` | Alibaba Cloud AccessKey ID | 开 |
+| `tencent-secret-id` | Tencent Cloud SecretId | 开 |
+| `volcengine-access-key-id` | Volcengine AccessKey ID | 开 |
+| `azure-ad-client-secret` | Azure AD client secret | 开 |
+| `digitalocean-other-token` | DigitalOcean token (other kinds) | 开 |
+| `cloudflare-origin-ca-key` | Cloudflare Origin CA key | 开 |
+| `vault-token` | HashiCorp Vault token | 开 |
+| `terraform-token` | Terraform Cloud token | 开 |
+| `doppler-token` | Doppler token | 开 |
+| `pulumi-token` | Pulumi access token | 开 |
+| `heroku-key` | Heroku API key | 开 |
+| `flyio-token` | Fly.io token | 开 |
+| `supabase-key` | Supabase key | 开 |
+| `age-secret-key` | age secret key | 开 |
+| `onepassword-token` | 1Password service account token | 开 |
+| `stripe-webhook-secret` | Stripe webhook signing secret | 开 |
+| `shopify-token` | Shopify token | 开 |
+| `twilio-api-key` | Twilio API key | 开 |
+| `brevo-key` | Brevo API key | 开 |
+| `slack-other-token` | Slack token (other kinds) | 开 |
+| `linear-key` | Linear API key | 开 |
+| `notion-token` | Notion token | 开 |
+| `atlassian-token` | Atlassian API token | 开 |
+| `auth-header-credential` | Credential in a request header | 开 |
+| `command-line-password` | Password on a command line | 开 |
+| `url-token` | Token in a URL | 开 |
+| `bot-webhook` | Chat bot webhook token | 开 |
+| `telegram-bot-token` | Telegram bot token | 开 |
+| `config-assignment` | Secret assigned in a config file | 开 |
+| `crypto-mnemonic` | Wallet recovery phrase | 开 |
+| `crypto-wif-key` | Bitcoin private key (WIF) | 开 |
+| `crypto-extended-key` | Extended private key (xprv) | 开 |
 <!-- /generated -->
 
 `cn-resident-id`、`bank-card`、`email`、`cn-mobile-phone` 查找的是个人信息而不是凭据。前两条出厂开启，只认结构上核对得上的：

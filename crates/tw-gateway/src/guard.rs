@@ -187,8 +187,9 @@ pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
 /// 安全日志里一处一行，不因为多试了几跳多出几行
 #[derive(Default)]
 pub struct Reported {
-    /// 出站脱敏报过的值：规则和打了码的那个值
-    secrets: HashSet<(String, String)>,
+    /// 出站脱敏报过的值：规则、打了码的那个值，和它是哪一项保存的凭据（保存的凭据打码是空的，
+    /// 两项不同的靠这个分开）
+    secrets: HashSet<(String, String, Option<tw_guard::redact::rules::SavedSource>)>,
     /// 内容过滤报过的命中：规则和摘录
     content: HashSet<(String, String)>,
 }
@@ -200,7 +201,7 @@ impl Reported {
             .into_iter()
             .filter(|f| {
                 self.secrets
-                    .insert((f.rule.id().to_string(), f.masked.clone()))
+                    .insert((f.rule.id().to_string(), f.masked.clone(), f.source.clone()))
             })
             .collect()
     }
@@ -244,6 +245,7 @@ pub fn items(
             // 拦截档下，动作是「仅记录」的规则原样发出
             replaced: seen.replaced && !seen.redaction.rules.records(&f.rule),
             detail,
+            source: f.source.clone(),
         })
         .collect()
 }

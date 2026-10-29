@@ -902,6 +902,69 @@ Built-in rules:
 | `cn-mobile-phone` | Chinese mainland mobile number | off |
 | `internal-ip` | Internal IP address | off |
 | `internal-domain` | Internal domain | off |
+| `thinkwatch-saved-secret` | Secret saved in ThinkWatch | on |
+| `openai-service-key` | OpenAI service account or admin key | on |
+| `openrouter-key` | OpenRouter API key | on |
+| `xai-key` | xAI API key | on |
+| `groq-key` | Groq API key | on |
+| `huggingface-token` | Hugging Face token | on |
+| `replicate-token` | Replicate API token | on |
+| `perplexity-key` | Perplexity API key | on |
+| `bedrock-api-key` | Amazon Bedrock API key | on |
+| `fireworks-key` | Fireworks AI API key | on |
+| `cerebras-key` | Cerebras API key | on |
+| `langsmith-key` | LangSmith API key | on |
+| `langfuse-secret-key` | Langfuse secret key | on |
+| `pinecone-key` | Pinecone API key | on |
+| `tavily-key` | Tavily API key | on |
+| `minimax-key` | MiniMax API key | on |
+| `zhipu-api-key` | Zhipu AI API key | on |
+| `qianfan-api-key` | Baidu Qianfan API key | on |
+| `sk-compat-key` | OpenAI-compatible API key | on |
+| `github-refresh-token` | GitHub refresh token | on |
+| `gitlab-other-token` | GitLab token (other kinds) | on |
+| `pypi-token` | PyPI API token | on |
+| `rubygems-token` | RubyGems API key | on |
+| `clojars-token` | Clojars deploy token | on |
+| `docker-hub-token` | Docker Hub access token | on |
+| `artifactory-key` | JFrog Artifactory API key | on |
+| `databricks-token` | Databricks access token | on |
+| `sentry-token` | Sentry auth token | on |
+| `grafana-token` | Grafana token | on |
+| `postman-key` | Postman API key | on |
+| `aws-other-key-id` | AWS access key ID (other kinds) | on |
+| `alibaba-access-key-id` | Alibaba Cloud AccessKey ID | on |
+| `tencent-secret-id` | Tencent Cloud SecretId | on |
+| `volcengine-access-key-id` | Volcengine AccessKey ID | on |
+| `azure-ad-client-secret` | Azure AD client secret | on |
+| `digitalocean-other-token` | DigitalOcean token (other kinds) | on |
+| `cloudflare-origin-ca-key` | Cloudflare Origin CA key | on |
+| `vault-token` | HashiCorp Vault token | on |
+| `terraform-token` | Terraform Cloud token | on |
+| `doppler-token` | Doppler token | on |
+| `pulumi-token` | Pulumi access token | on |
+| `heroku-key` | Heroku API key | on |
+| `flyio-token` | Fly.io token | on |
+| `supabase-key` | Supabase key | on |
+| `age-secret-key` | age secret key | on |
+| `onepassword-token` | 1Password service account token | on |
+| `stripe-webhook-secret` | Stripe webhook signing secret | on |
+| `shopify-token` | Shopify token | on |
+| `twilio-api-key` | Twilio API key | on |
+| `brevo-key` | Brevo API key | on |
+| `slack-other-token` | Slack token (other kinds) | on |
+| `linear-key` | Linear API key | on |
+| `notion-token` | Notion token | on |
+| `atlassian-token` | Atlassian API token | on |
+| `auth-header-credential` | Credential in a request header | on |
+| `command-line-password` | Password on a command line | on |
+| `url-token` | Token in a URL | on |
+| `bot-webhook` | Chat bot webhook token | on |
+| `telegram-bot-token` | Telegram bot token | on |
+| `config-assignment` | Secret assigned in a config file | on |
+| `crypto-mnemonic` | Wallet recovery phrase | on |
+| `crypto-wif-key` | Bitcoin private key (WIF) | on |
+| `crypto-extended-key` | Extended private key (xprv) | on |
 <!-- /generated -->
 
 `cn-resident-id`, `bank-card`, `email` and `cn-mobile-phone` look for

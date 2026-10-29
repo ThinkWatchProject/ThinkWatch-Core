@@ -531,3 +531,56 @@ async fn id_and_card_numbers_leave_as_named_placeholders_and_come_back_whole() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_saved_upstream_key_without_any_prefix_is_replaced_and_named_by_its_upstream() {
+    // 没有前缀的上游密钥（32 位十六进制、UUID）格式规则认不出；它就写在配置里，按值认
+    const SAVED: &str = "0123456789abcdef0123456789abcdef";
+    let (up, seen) = start_upstream(false).await;
+    let mut p = provider("relay", up);
+    p.key = Some(SAVED.into());
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "claude-code".into(),
+            key: "tw-testkey".into(),
+            ..Default::default()
+        }],
+        providers: vec![p],
+        security: Security {
+            redact: policy(SecurityMode::Enforce),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let body = format!(
+        r#"{{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{{"role":"user","content":"配置里写的是 {SAVED}，对吗"}}]}}"#
+    );
+    ask(addr, &body, false).await;
+    let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+    assert!(!sent.contains(SAVED), "上游看到了保存的密钥：{sent}");
+
+    let mut items = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::SecretsFound { items: it, .. } = ev {
+            items = Some(it);
+            break;
+        }
+    }
+    let items = items.expect("没发脱敏事件");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].rule, "thinkwatch-saved-secret");
+    assert_eq!(items[0].kind, "saved");
+    assert_eq!(items[0].masked, "", "一个字都不报");
+    let source = items[0].source.as_ref().expect("说是哪一项");
+    assert_eq!(source.kind, tw_api::SavedSourceKind::UpstreamKey);
+    assert_eq!(source.name, "relay");
+}
