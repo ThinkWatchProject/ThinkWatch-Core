@@ -622,6 +622,7 @@ pricing:
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
 | `actions` | 映射： 内置规则 id → `placeholder` \| `record` | `{}` | 内置规则在 `enforce` 下的动作，只写与出厂不同的（`email: record`）。`placeholder` 将值替换为占位符后发送，回答中出现该占位符时还原为原值；`record` 原样发送，记录命中。 |
 | `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：匹配到的内容和凭据一样替换，或只记录。 |
+| `exceptions` | 对象列表，见 [`security.redact.exceptions[]`](#cfg-security-redact-exceptions) | `[]` | 例外值：在任何规则下都不替换、不记录。只保存哈希，不保存值本身；最多 500 个。保存的凭据不能列为例外：规则为 `thinkwatch-saved-secret` 的条目可以读入，但不生效。 |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -776,6 +777,19 @@ pricing:
 - `cn-mobile-phone`：中国大陆手机号，11 位数字，以 `1` 开头、第二位为 `3` 至 `9`，前后不紧挨其他数字。
 
 夹在更长的一串字母或数字中间的号码不认；请求体中以 JSON 数值写出的号码（例如工具调用的参数）也不认，替换它会使请求体不再是合法的 JSON。占位符写明原来是什么（`<<TW_ID_NUMBER_1>>`、`<<TW_CARD_NUMBER_1>>`、`<<TW_EMAIL_1>>`、`<<TW_PHONE_1>>`），安全日志中号码只显示最后四位，邮箱只显示第一个字和域名。自定义规则替换为 `<<TW_SECRET_1>>`，写了占位符名称（`label`）时用它。
+
+例外值：某个值反复被规则认出、但并不敏感（测试用的固定值、文档里的示例密钥）时，可以写进 `exceptions`。规则照常工作，只有这个值在任何规则下、`observe` 和 `enforce` 两档都不处理。每一项只保存值的 SHA-256，不保存值本身，因此可以随导出、同步和备份一起带走。应用从安全日志或粘贴的值加入；手写时 `sha256` 是值在消息中原本的样子的哈希，不含两边的引号和 JSON 转义。
+
+<!-- generated: table security.redact.exceptions[] -->
+<a id="cfg-security-redact-exceptions"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `sha256` | 字符串 | **必填** | 值的 SHA-256，64 个小写十六进制字符。请求体中的转义先解开：哈希按值本身计算。 |
+| `masked` | 字符串 | `''` | 加入时显示的值，打码方式与安全日志相同。 |
+| `rule` | 字符串 | `''` | 最先认出该值的规则：内置规则的 id 或自定义规则的名称。手动添加且没有规则认出的值为空。 |
+| `added_at` | 整数 | `0` | 加入的时间，Unix 纪元以来的毫秒数。 |
+<!-- /generated -->
 
 #### `security.inspect_tools`
 

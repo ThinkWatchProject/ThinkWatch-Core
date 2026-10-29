@@ -851,6 +851,7 @@ written text.
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
 | `actions` | map of built-in rule id → `placeholder` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting (`email: record`). `placeholder` sends a placeholder in place of the value and puts the value back where the answer repeats the placeholder; `record` sends the value as it is and records the match. |
 | `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a rule matches is replaced like a credential, or only recorded. |
+| `exceptions` | list of [`security.redact.exceptions[]`](#cfg-security-redact-exceptions) | `[]` | Values that are never replaced or recorded, under any rule. Each is kept as a hash, never as the value itself; at most 500. A saved secret cannot be an exception: an entry whose rule is `thinkwatch-saved-secret` is read but has no effect. |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -1029,6 +1030,26 @@ invalid JSON. The placeholders of these rules say what was there
 of a number, and the first character and the domain of an email address. A
 custom rule replaces with `<<TW_SECRET_1>>` unless it names its own
 placeholder (`label`).
+
+Exceptions: a value that a rule keeps matching but that is not sensitive (a
+test fixture, a sample key in documentation) can be listed under
+`exceptions`. The rules keep working; only that value is left alone, under
+every rule, in both `observe` and `enforce`. Each entry holds the SHA-256 of
+the value, never the value itself, so the list can travel with exports,
+sync and backups. The app adds entries from the security log or from a
+pasted value; written by hand, `sha256` is the hash of the value as it
+appears in the message, with no surrounding quotes or JSON escapes.
+
+<!-- generated: table security.redact.exceptions[] -->
+<a id="cfg-security-redact-exceptions"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `sha256` | string | **required** | SHA-256 of the value, as 64 lowercase hexadecimal characters. Escapes in the request body are decoded first: the hash is of the value as written. |
+| `masked` | string | `''` | The value as shown when it was added, masked the same way as in the security log. |
+| `rule` | string | `''` | The rule that first recognised the value: a built-in rule id or a custom rule name. Empty for a value added by hand that no rule recognises. |
+| `added_at` | integer | `0` | When the value was added, in milliseconds since the Unix epoch. |
+<!-- /generated -->
 
 #### `security.inspect_tools`
 
