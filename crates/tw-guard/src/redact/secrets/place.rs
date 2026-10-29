@@ -34,6 +34,7 @@ enum Mark {
 /// 标记是整个 token（不分大小写）
 const WORDS: &[(&str, Mark)] = &[
     ("authorization", Mark::Header),
+    ("proxy-authorization", Mark::Header),
     ("x-api-key", Mark::Header),
     ("api-key", Mark::Header),
     ("x-goog-api-key", Mark::Header),
@@ -361,8 +362,8 @@ fn push_if(text: &str, r: Range<usize>, min: usize, id: &'static str, placed: &m
 
 // ---------------------------------------------------------------- 请求头
 
-/// `i` 处的一个空白：空格、制表符，或者请求体里转义过的制表符 `\t`（`i` 前面是一个字母，
-/// 这个反斜杠不会是别的转义的后一半）。返回它占几个字节，不是空白是 0
+/// `i` 处的一个空白：空格、制表符，或者请求体里转义过的制表符 `\t`（调用方保证 `i` 前面
+/// 不是反斜杠，这个反斜杠不会是别的转义的后一半）。返回它占几个字节，不是空白是 0
 fn blank_at(b: &[u8], i: usize) -> usize {
     match b.get(i) {
         Some(b' ' | b'\t') => 1,
@@ -382,7 +383,8 @@ const SCHEMES: &[&str] = &["bearer", "basic", "token", "bot"];
 /// 返回往后看到了哪儿
 fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
-    let auth = e - s == "authorization".len();
+    let auth = b[s..e].len() >= "authorization".len()
+        && b[e - "authorization".len()..e].eq_ignore_ascii_case(b"authorization");
     let mut i = e;
     if let Some((n, _)) = quote_at(b, i) {
         i += n;
@@ -396,7 +398,10 @@ fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
         Some(b'=') if b.get(i + 1) != Some(&b'=') => i += 1,
         _ => return e,
     }
-    i = skip_blank(b, i);
+    // 冒号后面可以是空格、制表符，请求体里是转义过的 `\t`（前面是冒号，不会是别的转义的后一半）
+    while let n @ 1.. = blank_at(b, i) {
+        i += n;
+    }
     if let Some((n, _)) = quote_at(b, i) {
         i += n;
     }
