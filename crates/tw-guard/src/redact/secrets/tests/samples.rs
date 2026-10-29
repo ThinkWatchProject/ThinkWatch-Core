@@ -433,6 +433,11 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                     "curl -d token=abc123def456&state=xyz".to_string(),
                     "abc123def456".to_string(),
                 ),
+                // shell 里分隔命令的 `;` 不是值的一部分
+                (
+                    "if [ -n \"$x\" ]; then TOKEN=abc123def;fi".to_string(),
+                    "abc123def".to_string(),
+                ),
             ],
             misses: vec![
                 "password = request.form[\"password\"]".to_string(),
@@ -449,6 +454,13 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                 "TOKEN=generate_token(user_id=12345)".to_string(),
                 "\"password\": \"Must be 8 characters long\"".to_string(),
                 "SECRET=[1,2,3]".to_string(),
+                // 下标、泛型类型、表达式
+                "token=cfg[key2]".to_string(),
+                "password=arr[i+1]".to_string(),
+                "auth_token=self.tokens[0]".to_string(),
+                "secret=Map<String,V2>".to_string(),
+                "token=Vec<u8>::new2".to_string(),
+                "secret=x<y&&z>w1".to_string(),
                 "DB_PASSWORD=\"unterminated 12345\nnext line\"".to_string(),
             ],
         },

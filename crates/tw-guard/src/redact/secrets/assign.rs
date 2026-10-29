@@ -285,6 +285,14 @@ fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usiz
             return (v.iter().all(|&c| bare(c)) && !v.is_empty()).then_some((i, to, to));
         }
     }
+    // shell 里分隔命令的 `;`：后面是这一行的结尾，或者 `fi`、`done` 这样的关键字
+    if let Some(semi) = b[i..to]
+        .iter()
+        .enumerate()
+        .position(|(k, &c)| c == b';' && (i + k + 1 == to || shell_keyword(&b[i + k + 1..to])))
+    {
+        to = i + semi;
+    }
     let v = &b[i..to];
     if v.iter().all(|&c| bare(c)) || !closes(b, skip_blank(b, to)) || !literal(v) {
         // 没有多出来的标点（通常的写法照样认得出），或者是代码
@@ -293,7 +301,20 @@ fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usiz
     Some((i, to, to))
 }
 
-/// 一段带着括号、尖括号的值是不是一个字面量：不以括号开头，括号都配对，不像一次调用
+/// `b` 以一个 shell 的关键字开头（后面不再接名字里的字符）：`TOKEN=abc;fi` 的 `fi`
+fn shell_keyword(b: &[u8]) -> bool {
+    const WORDS: &[&[u8]] = &[
+        b"fi", b"done", b"then", b"do", b"else", b"elif", b"esac", b"export", b"echo", b"unset",
+    ];
+    let n = b
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+        .count();
+    WORDS.contains(&&b[..n])
+}
+
+/// 一段带着括号、尖括号的值是不是一个字面量：不以括号开头，括号都配对，不像一次调用、一次
+/// 下标（`cfg[key2]`、`arr[i+1]`）或者一个泛型类型（`Map<String,V2>`）
 fn literal(v: &[u8]) -> bool {
     if matches!(v.first(), Some(b'(' | b'[' | b'{' | b'<')) {
         return false;
@@ -302,7 +323,10 @@ fn literal(v: &[u8]) -> bool {
         .iter()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.'))
         .count();
-    if ident > 0 && v[0].is_ascii_alphabetic() && v.get(ident) == Some(&b'(') {
+    if ident > 0
+        && (v[0].is_ascii_alphabetic() || v[0] == b'_')
+        && matches!(v.get(ident), Some(b'(' | b'[' | b'<'))
+    {
         return false;
     }
     let mut depth = [0i32; 4];
