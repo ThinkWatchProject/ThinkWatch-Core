@@ -482,3 +482,102 @@ fn only_k_and_s_fold_to_non_ascii_letters() {
     }
     assert_eq!(extra, ['k', 's']);
 }
+
+/// 样本变个形再比：翻一个字母的大小写、整段大小写、在锚点中间插进转义或别的字、截到长度
+/// 边界上、两份挨着、前后贴上非 ASCII 的字、删掉一个字。两种扫法照样一处不差
+#[test]
+fn mutated_samples_scan_the_same_both_ways() {
+    let samples = samples();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut all_sets = sets();
+    for b in BUILTINS {
+        all_sets.push((b.id, RuleSet::only(&[b.id])));
+    }
+    let rounds: usize = std::env::var("TW_ORACLE_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let neigh = [
+        "中", "é", "\\u00e9", "\\n", "\\\"", "\"", "\\\\", "", " ", "x", "_", "-", ".", "..", "0",
+        "\u{200b}", "ſ", "K",
+    ];
+    for round in 0..rounds {
+        let s = rng.pick(&samples).clone();
+        let mut t: Vec<u8> = s.into_bytes();
+        match rng.below(7) {
+            0 => {
+                // 翻一个 ASCII 字母的大小写
+                let idx: Vec<usize> = (0..t.len())
+                    .filter(|&i| t[i].is_ascii_alphabetic())
+                    .collect();
+                if !idx.is_empty() {
+                    let i = *rng.pick(&idx);
+                    t[i] ^= 0x20;
+                }
+            }
+            1 => {
+                // 整段大写或小写
+                if rng.below(2) == 0 {
+                    t.make_ascii_uppercase()
+                } else {
+                    t.make_ascii_lowercase()
+                }
+            }
+            2 => {
+                // 在一个字符边界上插进一个转义或别的字
+                let st = String::from_utf8(t.clone()).unwrap();
+                let bounds: Vec<usize> = st
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain([st.len()])
+                    .collect();
+                let at = *rng.pick(&bounds);
+                let ins = rng.pick(&neigh).as_bytes().to_vec();
+                t.splice(at..at, ins);
+            }
+            3 => {
+                // 补长或截短到长度边界上
+                let target = *rng.pick(&[
+                    31usize, 32, 33, 34, 35, 36, 63, 64, 65, 126, 127, 128, 129, 130, 131, 256,
+                ]);
+                let st = String::from_utf8(t.clone()).unwrap();
+                let tok_end = st
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c)))
+                    .unwrap_or(st.len());
+                let tok = &st[..tok_end];
+                let mut nt = tok.to_string();
+                while nt.len() < target {
+                    nt.push(*rng.pick(&['a', 'Z', '7', 'f', '-', '_', '.']));
+                }
+                nt.truncate(target);
+                t = format!("{nt}{}", &st[tok_end..]).into_bytes();
+            }
+            4 => {
+                // 两份挨着
+                let st = String::from_utf8(t.clone()).unwrap();
+                t = format!("{st}{}{st}", rng.pick(&neigh)).into_bytes();
+            }
+            5 => {
+                // 前后贴上别的字
+                let st = String::from_utf8(t.clone()).unwrap();
+                t = format!("{}{st}{}", rng.pick(&neigh), rng.pick(&neigh)).into_bytes();
+            }
+            _ => {
+                // 删掉一个字
+                let st = String::from_utf8(t.clone()).unwrap();
+                let bounds: Vec<usize> = st.char_indices().map(|(i, _)| i).collect();
+                if !bounds.is_empty() {
+                    let at = *rng.pick(&bounds);
+                    let n = st[at..].chars().next().unwrap().len_utf8();
+                    t.drain(at..at + n);
+                }
+            }
+        }
+        let text = String::from_utf8(t).unwrap();
+        let (name, set) = &all_sets[round % all_sets.len()];
+        same(name, &text, set);
+        same(name, &body(&text), set);
+        same(name, &ascii_body(&text), set);
+        same(name, &body(&body(&text)), set);
+    }
+}
