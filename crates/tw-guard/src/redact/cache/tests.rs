@@ -414,6 +414,8 @@ fn multi_turn_conversations_find_exactly_what_a_full_scan_finds() {
         };
         let escaped = r.chance(4);
         let mut history = Vec::new();
+        // 上一轮的请求够不够长、走没走缓存
+        let mut warm = false;
         for turn in 0..7 {
             history.extend(messages(&mut r, d));
             let mut text = body(d, &system, &history, &extra);
@@ -429,13 +431,14 @@ fn multi_turn_conversations_find_exactly_what_a_full_scan_finds() {
             } else {
                 1
             };
-            if turn > 0 && !escaped {
+            if warm {
                 assert!(
                     cache.misses() - before <= 2 * per_set * 6,
                     "{what}: 扫了 {} 段",
                     cache.misses() - before
                 );
             }
+            warm = text.len() >= BODY_MIN;
             let before = cache.misses();
             agree(&text, rules, d, &cache, &format!("{what} again"));
             assert_eq!(cache.misses(), before, "{what}: 同一份再来一遍全是取的");
@@ -699,11 +702,9 @@ fn a_broken_piece_falls_back_to_the_whole_scan() {
     let text =
         format!(r#"{{"messages":[{{"content":"{pad} AKIAQRSTUVWXYZ234567"}},{{"content":01}}]}}"#);
     let cache = ScanCache::new();
-    assert_eq!(
-        cache.scan_unresolved(&text, &rules),
-        crate::redact::rules::scan_unresolved(&text, &rules)
-    );
+    assert!(cache.kept(&text, &rules, Scope::Whole).is_none());
     assert_eq!(cache.len(), 0, "{text}");
+    agree(&text, &rules, Dialect::Anthropic, &cache, "broken");
 }
 
 // ---------------------------------------------------------------- 容量
@@ -720,10 +721,10 @@ fn short_and_huge_pieces_are_scanned_but_not_kept() {
     let rules = RuleSet::defaults();
     let cache = ScanCache::new();
     // 每条消息不到 64 字节
-    cache.scan_unresolved(&conversation(50, 10), &rules);
+    cache.kept(&conversation(50, 10), &rules, Scope::Whole);
     assert_eq!(cache.len(), 0);
     // 够长的存下来
-    cache.scan_unresolved(&conversation(50, 100), &rules);
+    cache.kept(&conversation(50, 100), &rules, Scope::Whole);
     assert_eq!(cache.len(), 50);
     // 一条超过 1 MiB 的不存，旁边的照存
     let text = json!({"messages": [
@@ -732,7 +733,7 @@ fn short_and_huge_pieces_are_scanned_but_not_kept() {
     ]})
     .to_string();
     let cache = ScanCache::new();
-    cache.scan_unresolved(&text, &rules);
+    cache.kept(&text, &rules, Scope::Whole);
     assert_eq!(cache.len(), 1);
 }
 
@@ -740,7 +741,7 @@ fn short_and_huge_pieces_are_scanned_but_not_kept() {
 fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
     let rules = RuleSet::defaults();
     let cache = ScanCache::new();
-    cache.scan_unresolved(&conversation(CAPACITY + 300, 80), &rules);
+    cache.kept(&conversation(CAPACITY + 300, 80), &rules, Scope::Whole);
     assert_eq!(cache.len(), CAPACITY);
     // 最近用过的留着：最后那 2000 条再来一遍全是取的
     let tail = {
@@ -750,11 +751,11 @@ fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
         json!({"messages": history}).to_string()
     };
     let before = cache.misses();
-    cache.scan_unresolved(&tail, &rules);
+    cache.kept(&tail, &rules, Scope::Whole);
     assert_eq!(cache.misses(), before, "最近的 2000 条都还在");
     // 最早的 300 条挤掉了
     let head = conversation(300, 80);
-    cache.scan_unresolved(&head, &rules);
+    cache.kept(&head, &rules, Scope::Whole);
     assert_eq!(cache.misses(), before + 300);
     assert_eq!(cache.len(), CAPACITY);
     // 一段的命中太多的不存；存着的命中加起来有上限
@@ -766,7 +767,7 @@ fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
         json!({"messages": history}).to_string()
     };
     let cache = ScanCache::new();
-    let found = cache.scan_unresolved(&many(30), &rules);
+    let found = cache.kept(&many(30), &rules, Scope::Whole).unwrap();
     assert_eq!(found.len(), 90_000);
     assert!(
         cache.hits_stored() <= HITS_BUDGET,
@@ -778,7 +779,7 @@ fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
         "content": vec![key; ENTRY_HITS_MAX + 1].join(" ")}]})
     .to_string();
     let cache = ScanCache::new();
-    cache.scan_unresolved(&huge, &rules);
+    cache.kept(&huge, &rules, Scope::Whole);
     assert_eq!(cache.len(), 0);
 }
 
@@ -932,8 +933,10 @@ fn every_rule_alone_agrees_on_adversarial_bodies() {
             let rules = RuleSet::only(&[b.id]).with_saved(saved(&[SAVED]));
             let whole = crate::redact::rules::scan(&text, &rules);
             let cache = ScanCache::new();
-            let got = crate::redact::rules::resolve(cache.scan_unresolved(&text, &rules), &rules);
-            assert_eq!(whole, got, "{}\n{text}", b.id);
+            for scope in [Scope::Whole, Scope::Written(shape(Dialect::Anthropic))] {
+                let got = flow::hits_in_with(&text, &rules, scope, Some(&cache));
+                assert_eq!(flow::hits_in(&text, &rules, scope), got, "{}\n{text}", b.id);
+            }
             cached += usize::from(cache.len() > 0);
             if piecewise(&text, &rules) != whole {
                 piecewise_differs.insert(b.id);

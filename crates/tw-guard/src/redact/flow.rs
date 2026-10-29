@@ -85,25 +85,43 @@ pub fn hits_in(text: &str, rules: &RuleSet, scope: Scope) -> Vec<Hit> {
     hits_in_with(text, rules, scope, None)
 }
 
-/// [`hits_in`]，没变的段取 `cache` 里上次扫的（见模块说明）。找出来的一模一样
+/// [`hits_in`]，没变的段取 `cache` 里上次找的（见模块说明）。找出来的一模一样
 pub fn hits_in_with(
     text: &str,
     rules: &RuleSet,
     scope: Scope,
     cache: Option<&ScanCache>,
 ) -> Vec<Hit> {
-    let mut hits = match cache {
-        Some(c) => c.scan_unresolved(text, rules),
-        None => crate::redact::rules::scan_unresolved(text, rules),
+    let hits = match cache.and_then(|c| c.kept(text, rules, scope)) {
+        Some(hits) => hits,
+        None => kept(
+            text,
+            crate::redact::rules::scan_unresolved(text, rules),
+            match scope {
+                Scope::Written(shape) => Some(move || tw_dialect::written::ranges(shape, text)),
+                Scope::Whole => None,
+            },
+        ),
     };
+    crate::redact::rules::resolve(hits, rules)
+}
+
+/// [`hits_in`] 里合并之前的那几步：在 `text` 上按规则找到的 `hits` 去掉不算的 —— 压在占位符上
+/// 的、`written` 交出的正文区间外面的（`None` 是整段都算，交出 `None` 是请求体不是 JSON，一处都
+/// 不算）、键和 base64 载荷上的。每一步只留不删、各看各的，所以一段一段地做（扫描缓存，
+/// [`ScanCache`]）和整段一起做，留下的是同一批
+pub(crate) fn kept<W>(text: &str, mut hits: Vec<Hit>, written: Option<W>) -> Vec<Hit>
+where
+    W: FnOnce() -> Option<Vec<Range<usize>>>,
+{
     if hits.is_empty() {
         return hits;
     }
     off_placeholders(text, &mut hits);
     if !hits.is_empty()
-        && let Scope::Written(shape) = scope
+        && let Some(written) = written
     {
-        match tw_dialect::written::ranges(shape, text) {
+        match written() {
             Some(written) => within(&mut hits, &written),
             None => hits.clear(),
         }
@@ -111,7 +129,7 @@ pub fn hits_in_with(
     if !hits.is_empty() {
         outside(&mut hits, untouched(text));
     }
-    crate::redact::rules::resolve(hits, rules)
+    hits
 }
 
 /// 去掉压在我们自己的占位符上的命中（见 [`hits`]）。在解码过的正文上找的调用方（桌面版的

@@ -47,6 +47,16 @@
 //! 拿不准就整段扫：结果和不缓存时**一模一样**，是这一层唯一的要求（对照测试拿多轮对话两条路
 //! 各走一遍比）。
 //!
+//! # 存的是去掉不算的之后的命中
+//!
+//! 找完之后那几步 —— 去掉压在占位符上的、只留正文里的、去掉键和 base64 载荷上的
+//! （[`super::flow::kept`]）—— 每一步只看命中落在哪儿，一段一段地做和整段一起做留下的一样。
+//! 它们也按段做、跟着存下来：不然有命中的请求（历史里贴过一把密钥，之后每一轮都有）每轮还得
+//! 把整段请求体解析一遍认正文。哪些字符串算正文只看这一段自己和它在哪个数组里
+//! （[`tw_dialect::written`] 按协议的结构一项一项、一个元素一个元素地认），所以数组里的元素
+//! 装进一个只有它的同名数组里认（`{"messages":[元素]}`），键里带上是哪个数组、按哪种形状认。
+//! 合并重叠的命中（[`super::rules::resolve`]）在整个请求上做。
+//!
 //! # 键、存什么、存多少
 //!
 //! 键是 SHA-256（规则集的指纹 + 今天的日期 + 这一段的原文）。指纹见
@@ -69,6 +79,7 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
+use super::flow::Scope;
 use super::rules::{Hit, RuleSet};
 
 /// 最多记多少段
@@ -125,16 +136,17 @@ impl std::fmt::Debug for ScanCache {
 
 type Key = [u8; 32];
 
-/// 一段扫出来的（[`Scanned`]）和它最近一次用到的时刻
+/// 一段找出来的（[`Found`]）和它最近一次用到的时刻
 struct Entry {
-    scanned: Scanned,
+    found: Found,
     tick: u64,
 }
 
-/// 一段单拿出来扫的结果
+/// 一段单拿出来找的结果
 #[derive(Clone)]
-struct Scanned {
-    /// 命中，区间是这一段单拿出来扫时的位置（套了花括号的从那个 `{` 算起）
+struct Found {
+    /// 去掉不算的之后、合并之前的命中（[`super::flow::kept`]），区间是这一段单拿出来时的位置
+    /// （套了花括号的从那个 `{` 算起）
     hits: Arc<[Hit]>,
     /// 这一段里有一条命令到结尾都没结束（[`super::secrets::place::command_open_at_end`]）：
     /// 整段请求体里它会接着认后面的选项，要看一眼后面
@@ -152,30 +164,30 @@ struct Lru {
 }
 
 impl Lru {
-    fn get(&mut self, k: &Key) -> Option<Scanned> {
+    fn get(&mut self, k: &Key) -> Option<Found> {
         let e = self.map.get_mut(k)?;
         self.order.remove(&e.tick);
         self.tick += 1;
         e.tick = self.tick;
         self.order.insert(e.tick, *k);
-        Some(e.scanned.clone())
+        Some(e.found.clone())
     }
 
-    fn put(&mut self, k: Key, scanned: Scanned) {
-        if scanned.hits.len() > ENTRY_HITS_MAX {
+    fn put(&mut self, k: Key, found: Found) {
+        if found.hits.len() > ENTRY_HITS_MAX {
             return;
         }
         if let Some(old) = self.map.remove(&k) {
             self.order.remove(&old.tick);
-            self.hits -= old.scanned.hits.len();
+            self.hits -= old.found.hits.len();
         }
         self.tick += 1;
-        self.hits += scanned.hits.len();
+        self.hits += found.hits.len();
         self.order.insert(self.tick, k);
         self.map.insert(
             k,
             Entry {
-                scanned,
+                found,
                 tick: self.tick,
             },
         );
@@ -184,7 +196,7 @@ impl Lru {
                 break;
             };
             if let Some(e) = self.map.remove(&old) {
-                self.hits -= e.scanned.hits.len();
+                self.hits -= e.found.hits.len();
             }
         }
     }
@@ -222,96 +234,78 @@ impl ScanCache {
         self.lock().hits
     }
 
-    /// 和 [`super::rules::scan_unresolved`] 一样（每条规则各自的命中，还没合并），**结果
-    /// 一模一样**，只是没变的段取上次扫的。顺序可以不同：之后都要排序、合并
-    pub(crate) fn scan_unresolved(&self, text: &str, rules: &RuleSet) -> Vec<Hit> {
-        let whole = || super::rules::scan_unresolved(text, rules);
-        if rules.is_empty() {
-            return Vec::new();
+    /// [`super::flow::hits_in`] 合并之前的样子（[`super::flow::kept`]：按规则找到、去掉了占位符
+    /// 上的、正文外面的、键和载荷上的），**结果一模一样**，只是没变的段取上次的。顺序可以
+    /// 不同：之后要排序、合并。`None`：这个请求不按段走（见模块说明），调用方照旧整段做
+    pub(crate) fn kept(&self, text: &str, rules: &RuleSet, scope: Scope) -> Option<Vec<Hit>> {
+        if rules.is_empty() || text.len() < BODY_MIN || !cacheable(rules) {
+            return None;
         }
-        if text.len() < BODY_MIN || !cacheable(rules) {
-            return whole();
-        }
-        let Some(pieces) = split(text) else {
-            return whole();
-        };
+        let pieces = split(text)?;
         let fp = rules.fingerprint();
         let day = super::rules::today_ymd();
+        let scope_tag = match scope {
+            Scope::Whole => String::new(),
+            Scope::Written(shape) => format!("{shape:?}"),
+        };
         let keys: Vec<Option<Key>> = pieces
             .iter()
             .map(|p| {
                 (MIN_BYTES..=MAX_BYTES)
                     .contains(&p.range.len())
-                    .then(|| key(&fp, day, p, text))
+                    .then(|| key(&fp, day, &scope_tag, p, text))
             })
             .collect();
-        // 锁里只查表；没存着的在锁外面扫，扫完再一起存进去
-        let mut got: Vec<Option<Scanned>> = {
+        // 锁里只查表；没存着的在锁外面找，找完再一起存进去
+        let mut got: Vec<Option<Found>> = {
             let mut lru = self.lock();
             keys.iter()
                 .map(|k| k.as_ref().and_then(|k| lru.get(k)))
                 .collect()
         };
         let cmdline = rules.is_on("command-line-password");
-        let mut fresh: Vec<(Key, Scanned)> = Vec::new();
+        let mut fresh: Vec<(Key, Found)> = Vec::new();
         for (i, p) in pieces.iter().enumerate() {
             if got[i].is_some() {
                 continue;
             }
-            let piece = p.text(text);
-            // 整段是 JSON、单拿出来却不是的话（这一段本身就坏了），两边扫法不一样
-            if !super::rules::json_like(&piece) {
-                return whole();
-            }
-            let scanned = Scanned {
-                hits: super::rules::scan_unresolved(&piece, rules).into(),
-                open: cmdline && super::secrets::place::command_open_at_end(&text[p.range.clone()]),
-            };
+            let found = find(text, p, rules, scope, cmdline)?;
             if let Some(k) = keys[i] {
                 #[cfg(test)]
                 self.misses
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                fresh.push((k, scanned.clone()));
+                fresh.push((k, found.clone()));
             }
-            got[i] = Some(scanned);
+            got[i] = Some(found);
         }
         if !fresh.is_empty() {
             let mut lru = self.lock();
-            for (k, scanned) in fresh {
-                lru.put(k, scanned);
+            for (k, found) in fresh {
+                lru.put(k, found);
             }
         }
         let mut out = Vec::new();
         // 没结束的命令往后看到了哪儿：后一段的命令结束在这之前的话，那一截已经看过了
         let mut looked = 0;
-        for (p, scanned) in pieces.iter().zip(got) {
-            let Some(Scanned { hits, open }) = scanned else {
-                return whole();
-            };
+        for (p, found) in pieces.iter().zip(got) {
+            let Found { hits, open } = found?;
             // 一条命令跨出了这一段：整段扫的时候，它一直认到后面第一个命令分隔为止。那一截里
             // 有选项的开头的话，后面那一段单拿出来扫的结果不作数
             if open && p.range.end >= looked {
                 let (option, end) =
                     super::secrets::place::option_before_command_end(text.as_bytes(), p.range.end);
                 if option {
-                    return whole();
+                    return None;
                 }
                 looked = end;
             }
-            let len = p.text_len();
-            for h in hits.iter() {
-                // 套上去的那对花括号不是原文：落在它上面的命中（不该有）对不回原文，整段扫
-                if p.wrapped && (h.bytes.start == 0 || h.bytes.end >= len) {
-                    return whole();
-                }
-                out.push(Hit {
-                    bytes: p.to_body(h.bytes.start)..p.to_body(h.bytes.end),
-                    rule: h.rule.clone(),
-                    label: h.label.clone(),
-                });
-            }
+            out.extend(hits.iter().map(|h| Hit {
+                bytes: p.to_body(h.bytes.start)..p.to_body(h.bytes.end),
+                rule: h.rule.clone(),
+                label: h.label.clone(),
+            }));
         }
-        out
+        Some(out)
     }
 }
 
@@ -323,14 +317,72 @@ pub(crate) fn cacheable(rules: &RuleSet) -> bool {
             .is_some_and(|s| s.values().any(|v| v.contains('"')))
 }
 
-/// 一段的键：指纹、日期、套没套花括号、原文
-fn key(fp: &[u8; 32], day: u32, p: &Piece, text: &str) -> Key {
+/// 一段的键：指纹、日期、在哪儿找（整段，还是哪种形状的正文）、是哪个数组里的元素（还是
+/// 套了花括号的几项）、原文
+fn key(fp: &[u8; 32], day: u32, scope: &str, p: &Piece, text: &str) -> Key {
+    let b = text.as_bytes();
     let mut h = Sha256::new();
     h.update(fp);
     h.update(day.to_le_bytes());
-    h.update([u8::from(p.wrapped)]);
-    h.update(&text.as_bytes()[p.range.clone()]);
+    h.update((scope.len() as u64).to_le_bytes());
+    h.update(scope.as_bytes());
+    match &p.parent {
+        Some(k) => {
+            h.update([1]);
+            h.update((k.len() as u64).to_le_bytes());
+            h.update(&b[k.clone()]);
+        }
+        None => h.update([0]),
+    }
+    h.update(&b[p.range.clone()]);
     h.finalize().into()
+}
+
+/// 单拿出来找一段：扫、去掉不算的（[`super::flow::kept`]）。哪些是正文按这一段在请求体里
+/// 的位置认：数组里的元素装进一个只有它的同名数组（`{"messages":[元素]}`）再认 —— 一个元素
+/// 里哪些字符串算正文只看它自己和它在哪个数组里，不看它是第几个、旁边是谁。`None`：这一段
+/// 单拿出来不是 JSON、正文认不出、或者命中落在套上去的花括号上，整个请求照旧整段做
+fn find(text: &str, p: &Piece, rules: &RuleSet, scope: Scope, cmdline: bool) -> Option<Found> {
+    let piece = p.text(text);
+    // 整段是 JSON、单拿出来却不是的话（这一段本身就坏了），两边扫法不一样
+    if !super::rules::json_like(&piece) {
+        return None;
+    }
+    let raw = super::rules::scan_unresolved(&piece, rules);
+    // 套上去的那对花括号不是原文：落在它上面的命中（不该有）对不回原文
+    let len = piece.len();
+    if p.wrapped && raw.iter().any(|h| h.bytes.start == 0 || h.bytes.end >= len) {
+        return None;
+    }
+    let open = cmdline && super::secrets::place::command_open_at_end(&text[p.range.clone()]);
+    let mut lost = false;
+    let hits = match scope {
+        Scope::Whole => super::flow::kept(&piece, raw, None::<fn() -> _>),
+        Scope::Written(shape) => super::flow::kept(
+            &piece,
+            raw,
+            Some(|| {
+                let found = match &p.parent {
+                    None => tw_dialect::written::ranges(shape, &piece),
+                    Some(k) => {
+                        let head = format!("{{\"{}\":[", &text[k.clone()]);
+                        let alone = format!("{head}{piece}]}}");
+                        tw_dialect::written::ranges(shape, &alone).map(|rs| {
+                            rs.into_iter()
+                                .map(|r| r.start - head.len()..r.end - head.len())
+                                .collect()
+                        })
+                    }
+                };
+                lost = found.is_none();
+                found
+            }),
+        ),
+    };
+    (!lost).then(|| Found {
+        hits: hits.into(),
+        open,
+    })
 }
 
 /// 请求体里的一段（见模块说明）。
@@ -338,9 +390,11 @@ fn key(fp: &[u8; 32], day: u32, p: &Piece, text: &str) -> Key {
 pub(crate) struct Piece {
     /// 在原文里的字节区间
     pub range: Range<usize>,
-    /// 是顶层的一项（`"key": value`），单拿出来扫的时候外面套一对花括号；不是的话是数组里的
-    /// 一个对象，原样扫
+    /// 是挨着的几个顶层项（`"key": value, …`），单拿出来扫的时候外面套一对花括号；不是的话
+    /// 是数组里的一个对象，原样扫
     pub wrapped: bool,
+    /// 数组里的元素：那个数组是哪个顶层键的值（键在原文里引号之间的那一段）
+    pub parent: Option<Range<usize>>,
 }
 
 impl Piece {
@@ -356,10 +410,6 @@ impl Piece {
         } else {
             Cow::Borrowed(raw)
         }
-    }
-
-    fn text_len(&self) -> usize {
-        self.range.len() + if self.wrapped { 2 } else { 0 }
     }
 
     /// 单拿出来扫时的位置 → 原文里的位置
@@ -452,7 +502,7 @@ pub(crate) fn split(text: &str) -> Option<Vec<Piece>> {
     }
     i = skip_ws(b, i + 1);
     let mut out = Vec::new();
-    let mut keys: Vec<&[u8]> = Vec::new();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
     // 正在接的几个挨着的、不拆开的顶层项
     let mut group: Option<Range<usize>> = None;
     if b.get(i) == Some(&b'}') {
@@ -466,11 +516,18 @@ pub(crate) fn split(text: &str) -> Option<Vec<Piece>> {
         let member = i;
         let key_end = string_end(b, i)?;
         let key = &b[i + 1..key_end - 1];
-        // 重复的键：解析时后一个盖住前一个，哪些字符串算正文跟着变，按段扫说不清
-        if keys.contains(&key) {
+        // 重复的键：解析时后一个盖住前一个，哪些字符串算正文跟着变，按段扫说不清。只差在
+        // 大小写和下划线上的也算重复：Gemini 的 `systemInstruction` 和 `system_instruction`
+        // 是同一项，两个都写着时只认一个
+        let norm: Vec<u8> = key
+            .iter()
+            .filter(|&&c| c != b'_')
+            .map(u8::to_ascii_lowercase)
+            .collect();
+        if keys.contains(&norm) {
             return None;
         }
-        keys.push(key);
+        keys.push(norm);
         i = skip_ws(b, key_end);
         if b.get(i) != Some(&b':') {
             return None;
@@ -486,11 +543,13 @@ pub(crate) fn split(text: &str) -> Option<Vec<Piece>> {
                 out.extend(group.take().map(|range| Piece {
                     range,
                     wrapped: true,
+                    parent: None,
                 }));
                 for r in items {
                     out.push(Piece {
                         range: r,
                         wrapped: false,
+                        parent: Some(member + 1..key_end - 1),
                     });
                 }
             }
@@ -511,6 +570,7 @@ pub(crate) fn split(text: &str) -> Option<Vec<Piece>> {
     out.extend(group.map(|range| Piece {
         range,
         wrapped: true,
+        parent: None,
     }));
     (skip_ws(b, i + 1) == b.len()).then_some(out)
 }
