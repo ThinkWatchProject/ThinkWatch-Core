@@ -480,3 +480,216 @@ fn the_new_credential_rules_ship_on() {
         );
     }
 }
+
+// ---------------------------------------------------------------- 曾经漏掉、换坏的写法
+
+/// `.env` 写法的宽扫描没认出来（括号不配对）时，同一段里后面的赋值照样要看（曾经整个跳过）
+#[test]
+fn a_failed_env_value_does_not_hide_the_next_assignment() {
+    let set = RuleSet::only(&["config-assignment"]);
+    for text in [
+        "login(token=tok,password=Xk9mQ2pLz7wR)",
+        "cfg(api_key=k1,secret=Zx9QkLmN0p2rT)",
+    ] {
+        let out = sent(&set, text);
+        assert!(
+            !out.contains("Xk9mQ2pLz7wR") && !out.contains("Zx9QkLmN0p2rT"),
+            "{text} → {out}"
+        );
+    }
+}
+
+/// 超过 4 KB 的值整段换掉（曾经整个原样发出去）
+#[test]
+fn long_placed_values_are_not_sent_whole() {
+    let tok = rnd(7, 5000, ALNUM);
+    let mut leaked = Vec::new();
+    for text in [
+        format!("Authorization: Bearer {tok}"),
+        format!("{{\"api_key\": \"{tok}\"}}"),
+        format!("https://x.example/cb?access_token={tok}"),
+        format!("DB_PASSWORD={tok}"),
+    ] {
+        let out = sent(&RuleSet::defaults(), &text);
+        if out.contains(&tok[..64]) {
+            leaked.push(text[..20].to_string());
+        }
+    }
+    assert!(leaked.is_empty(), "{leaked:?}");
+}
+
+/// `-d` 带着一大段数据时，后面的 `-u` 口令照样认得出（曾经命令只看前 4 KB）
+#[test]
+fn a_curl_password_after_a_long_data_option_is_found() {
+    let data = "x".repeat(5000);
+    let text =
+        format!("curl -X POST https://api.example.com/x -d '{data}' -u admin:S3cr3tPassw0rd");
+    let out = sent(&RuleSet::defaults(), &text);
+    assert!(!out.contains("S3cr3tPassw0rd"), "口令原样发出去了");
+}
+
+/// Go 的 encoding/json 缺省把 `&` 写成 `\u0026`：URL 里 `\u0026access_token=` 照样认得出，
+/// `=` 写成 `\u003d` 的也一样
+#[test]
+fn url_params_after_a_json_escaped_ampersand() {
+    let tok = "ya29.a0AfB_byCq9Xk2QzLp8RtVw3Mn";
+    let body = serde_json::json!({"messages": [{"role": "user",
+        "content": format!("https://h.example/cb?state=1&access_token={tok}")}]})
+    .to_string()
+    .replace('&', "\\u0026");
+    let got: Vec<&str> = scan(&body, &RuleSet::only(&["url-token"]))
+        .into_iter()
+        .map(|h| &body[h.bytes])
+        .collect();
+    assert_eq!(got, [tok], "{body}");
+    let body = body.replace("access_token=", "access_token\\u003d");
+    let got: Vec<&str> = scan(&body, &RuleSet::only(&["url-token"]))
+        .into_iter()
+        .map(|h| &body[h.bytes])
+        .collect();
+    assert_eq!(got, [tok], "{body}");
+}
+
+/// 逗号隔开的两条 Slack Webhook：两条的令牌都换掉（曾经第一条原样发出去）
+#[test]
+fn comma_separated_slack_webhooks_are_each_replaced() {
+    let a = "Ab12Cd34Ef56Gh78Ij90Kl12";
+    let b = "Zz98Yy76Xx54Ww32Vv10Uu98";
+    let text = format!(
+        "SLACK_HOOKS=https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/{a},https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/{b}"
+    );
+    let out = sent(&RuleSet::defaults(), &text);
+    assert!(
+        !out.contains(a) && !out.contains(b),
+        "a 留着 {} b 留着 {}",
+        out.contains(a),
+        out.contains(b)
+    );
+}
+
+/// 请求头的几种写法：大小写、CRLF、两个空格、冒号或鉴权方式后面的制表符、Proxy-Authorization
+#[test]
+fn header_spellings_and_blanks() {
+    let tok = "Zx9QkLmN0p2rT5vW8yB1cD4fG7hJ";
+    let set = RuleSet::only(&["auth-header-credential"]);
+    for text in [
+        format!("AUTHORIZATION: BEARER {tok}"),
+        format!("curl -H 'authorization:bearer {tok}' https://x"),
+        format!("GET / HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nHost: x\r\n"),
+        format!("Authorization: Bearer  {tok}"),
+        format!("Authorization: Bearer\t{tok}"),
+        format!("Authorization:\t{tok}"),
+        format!("x-api-key:\t{tok}"),
+        format!("X-Api-Key: {tok}"),
+        format!("Proxy-Authorization: Basic {tok}"),
+    ] {
+        let out = sent(&set, &text);
+        assert!(!out.contains(tok), "{text:?} → {out}");
+    }
+}
+
+/// 随机拼接标记、转义、引号：换完必须仍是合法 JSON、还原一字不差（`sent` 里断言）。
+/// `TW_FUZZ_ROUNDS` 改轮数
+#[test]
+fn random_marker_soup_stays_json_and_restores() {
+    const F: &[&str] = &[
+        "Authorization: Bearer ",
+        "authorization:\tbasic ",
+        "x-api-key: ",
+        "DB_PASSWORD=",
+        "TOKEN=\"",
+        "\"password\": \"",
+        "'secret': '",
+        "?access_token=",
+        "&sig=",
+        "curl -u admin:",
+        "mysql -p",
+        "PGPASSWORD=",
+        "hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/",
+        "\\",
+        "\"",
+        "'",
+        "\n",
+        "\r\n",
+        "\t",
+        " ",
+        "/",
+        "\\/",
+        "&",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        ",",
+        ";",
+        ":",
+        "=",
+        ".",
+        "-",
+        "_",
+        "ops@acme-mail.com",
+        "13812345678",
+        "Xk9mQ2pLz7wR",
+        "Zx9QkLmN0p2rT5vW8yB1cD4fG7hJ",
+        "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123ghiJKL456",
+        "密码：",
+        "账号: ",
+        "\u{2028}",
+        "é",
+        "%2F",
+        "\\n",
+        "\\\"",
+        "\\\\",
+    ];
+    let sets = [
+        RuleSet::defaults(),
+        all(),
+        RuleSet::defaults().recording(Rule::Builtin("jwt")),
+    ];
+    let mut seed: u64 = 0x9e3779b97f4a7c15;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let rounds = std::env::var("TW_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    for _ in 0..rounds {
+        let n = 3 + (next() % 12) as usize;
+        let text: String = (0..n)
+            .map(|_| F[(next() % F.len() as u64) as usize])
+            .collect();
+        for set in &sets {
+            let r = std::panic::catch_unwind(|| sent(set, &text));
+            assert!(r.is_ok(), "{text:?}");
+            let nested = serde_json::json!({"command": text}).to_string();
+            let r = std::panic::catch_unwind(|| sent(set, &nested));
+            assert!(r.is_ok(), "{nested:?}");
+        }
+    }
+}
+
+/// 超过 4 KB 的 JWT（Azure AD 带一长串 groups 的访问令牌）放在请求头里：`jwt` 只记录时由
+/// 请求头那条整段换掉
+#[test]
+fn a_long_jwt_in_a_header_is_replaced_even_if_jwt_only_records() {
+    let payload = rnd(9, 6000, ALNUM);
+    let jwt = format!("eyJhbGciOiJSUzI1NiJ9.eyJ{payload}.{}", rnd(3, 342, ALNUM));
+    for set in [
+        RuleSet::defaults(),
+        RuleSet::defaults().recording(Rule::Builtin("jwt")),
+    ] {
+        let out = sent(&set, &format!("Authorization: Bearer {jwt}"));
+        assert!(
+            !out.contains(&payload[..64]),
+            "jwt 记录模式={}",
+            set.records(&Rule::Builtin("jwt"))
+        );
+    }
+}
