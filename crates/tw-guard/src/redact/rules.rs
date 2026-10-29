@@ -1143,8 +1143,26 @@ pub(super) const JWT_ANCHORS: Anchors = Anchors {
         forbid: 0,
     },
     list: &[Anchor::First(ALNUM.or(Bytes::of(b"-_")), 12, ANY_LEN)],
-    fine: Some(|t| t.iter().filter(|&&c| c == b'.').count() == 2),
+    fine: Some(jwt_shaped),
 };
+
+/// 正好两个点、三段都不空、头一段至少 8 个字符：token 里只有 base64url 的字符和点，
+/// [`looks_like_jwt`] 在解码之前看的就是这些。源码里 `self.config.name`、`a.b.c.d` 这类
+/// 带点的标识符成千上万，只数点的话个个都要再进 [`looks_like_jwt`] 切一遍
+fn jwt_shaped(t: &[u8]) -> bool {
+    let mut dots = [0usize; 2];
+    let mut n = 0;
+    for (i, &c) in t.iter().enumerate() {
+        if c == b'.' {
+            if n == 2 {
+                return false;
+            }
+            dots[n] = i;
+            n += 1;
+        }
+    }
+    n == 2 && dots[0] >= 8 && dots[1] > dots[0] + 1 && dots[1] + 1 < t.len()
+}
 
 fn is_b64url(s: &str) -> bool {
     !s.is_empty()

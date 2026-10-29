@@ -3,10 +3,10 @@
 //! 规则扩充到一百多条之后，「每个 token 上把每条规则问一遍」的耗时跟着条数线性涨。现在
 //! 每个判据声明自己的锚点（[`super::anchor`]，写在判据旁边），扫描分两段：
 //!
-//! 1. **预筛**（[`prescan`]）：切 token 的那一遍里，每个 token 查几张表 —— 头一个字节、最后
-//!    一个字节、长度各一张，字面量锚点走一个锚定在 token 开头的 Aho-Corasick 自动机 —— 得出
-//!    它可能是哪几组判据的候选。绝大多数 token 一张表就打发了。助记词另外数「连着几个像词的
-//!    token」，不到 12 个的一串整串不要；
+//! 1. **预筛**（[`prescan`]）：切 token 的那一遍里，每个 token 查几张表 —— 头一个字节 × 长度、
+//!    最后一个字节 × 长度各一张，字面量锚点走一个锚定在 token 开头的 Aho-Corasick 自动机 ——
+//!    得出它可能是哪几组判据的候选。绝大多数 token 一张表就打发了。助记词另外数「连着几个像词
+//!    的 token」，不到 12 个的一串整串不要；
 //! 2. **校验**（[`scan_tokens`]）：只在候选上跑各组原来的判据，顺序和老写法一样。
 //!
 //! **结果和逐条扫描一模一样**。锚点是命中的必要条件；跨 token 接起来看的几种（分组写的卡号、
@@ -21,7 +21,7 @@ use aho_corasick::automaton::Automaton;
 use aho_corasick::dfa::DFA;
 use aho_corasick::{Anchored, MatchKind, StartKind};
 
-use super::anchor::{ANY_CHARS, Anchor, Chars, Fine, Near, class};
+use super::anchor::{ANY_CHARS, Anchor, Bytes, Chars, Fine, Near, class};
 use super::rules::{
     Hit, RuleSet, Spaced, builtin_hit, classify_token, internal_token, looks_like_jwt,
     mobile_phones, personal_token, today_ymd,
@@ -61,7 +61,7 @@ struct Group {
     literal: bool,
     /// 其余的锚点
     shapes: Vec<Anchor>,
-    /// 查表就已经说准了：没有字面量、只有一个头一个（最后一个）字节加长度的锚点，长度表
+    /// 查表就已经说准了：没有字面量、只有一个头一个（最后一个）字节加长度的锚点，长度档
     /// 也分得清它的上下限
     exact: bool,
     fine: Fine,
@@ -80,9 +80,21 @@ struct Lit {
 /// 编好的锚点。**和规则开没开无关**，一个进程编一次；开着哪几组每次扫描问一次（[`enabled`]）
 struct Tables {
     groups: Vec<Group>,
-    first: [u32; 256],
-    last: [u32; 256],
-    len: [u32; LENS],
+    /// token 长度落在第几档（[`Tables::first`]、[`Tables::last`] 的列）。档的分界是各个
+    /// [`Anchor::First`]、[`Anchor::Last`]、[`Anchor::Prefix`] 的长度上下限，所以同一档里的长度
+    /// 对每个锚点都是一样的答案
+    bucket: [u8; LENS],
+    buckets: usize,
+    /// 头一个字节 × 长度档：对上了哪几组的 [`Anchor::First`]、[`Anchor::Prefix`]。
+    ///
+    /// 字节和长度**一起**查，不是各查一张表再相与：一组里有几个锚点的（`place` 的「以 `m`
+    /// 结尾、至少 18 个字符」和「以 `Q` 结尾、多长都行」），分开查就成了「以 `m` 结尾、多长都
+    /// 行」—— 正文里以 `m` 结尾的词（`from`、`them`、`system`）个个都进了第二段
+    first: Vec<u32>,
+    /// 最后一个字节 × 长度档：[`Anchor::Last`]
+    last: Vec<u32>,
+    /// [`Anchor::Ends`] 的长度下限
+    ends_len: [u32; LENS],
     /// [`Anchor::Word`]：头一个字母（小写）× 长度
     word: [u32; 26 * 32],
     /// [`Anchor::Word`]：头两个字符（[`word2_key`]）
@@ -217,9 +229,11 @@ fn build() -> Tables {
                 chars: ANY_CHARS,
             })
             .collect(),
-        first: [0; 256],
-        last: [0; 256],
-        len: [0; LENS],
+        bucket: [0; LENS],
+        buckets: 0,
+        first: Vec::new(),
+        last: Vec::new(),
+        ends_len: [0; LENS],
         word: [0; 26 * 32],
         word2: [0; 26 * 28],
         ends: [0; 26 * 26],
@@ -229,11 +243,31 @@ fn build() -> Tables {
         dfa: DFA::new(["\u{0}"]).expect("一个字面量"),
         lits: Vec::new(),
     };
-    let lens = |t: &mut Tables, g: u32, lo: usize, hi: usize| {
-        for l in lo.min(LENS - 1)..=hi.min(LENS - 1) {
-            t.len[l] |= g;
+    // 长度分档：每个锚点的下限、上限加一是一个分界，再长的都落在最后一格（判据自己再看）
+    let mut cuts: Vec<usize> = vec![0];
+    for (_, list, ..) in &decl {
+        for a in list {
+            match *a {
+                Anchor::Prefix(p, min_len) => cuts.push(min_len.max(p.len())),
+                Anchor::First(_, lo, hi) => {
+                    cuts.push(lo);
+                    cuts.push(hi.saturating_add(1));
+                }
+                Anchor::Last(_, lo) => cuts.push(lo),
+                Anchor::Word(_) | Anchor::Ends(..) => {}
+            }
         }
-    };
+    }
+    let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(LENS - 1)).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    assert!(cuts.len() <= 256, "长度分档放得进一个字节");
+    for (l, b) in t.bucket.iter_mut().enumerate() {
+        *b = (cuts.partition_point(|&c| c <= l) - 1) as u8;
+    }
+    t.buckets = cuts.len();
+    t.first = vec![0; 256 * t.buckets];
+    t.last = vec![0; 256 * t.buckets];
     for (g, list, fine, near, chars) in decl {
         let k = g.trailing_zeros() as usize;
         t.groups[k].fine = fine;
@@ -244,8 +278,8 @@ fn build() -> Tables {
                 Anchor::Prefix(p, min_len) => {
                     t.groups[k].literal = true;
                     t.literal |= g;
-                    t.first[usize::from(p.as_bytes()[0])] |= g;
-                    lens(&mut t, g, min_len.max(p.len()), usize::MAX);
+                    let first = Bytes::of(&p.as_bytes()[..1]);
+                    t.mark(false, first, g, min_len.max(p.len()), usize::MAX);
                     t.lits.push(Lit {
                         group: g,
                         text: p,
@@ -268,21 +302,11 @@ fn build() -> Tables {
                     });
                 }
                 Anchor::First(set, lo, hi) => {
-                    for b in 0..=255u8 {
-                        if set.has(b) {
-                            t.first[usize::from(b)] |= g;
-                        }
-                    }
-                    lens(&mut t, g, lo, hi);
+                    t.mark(false, set, g, lo, hi);
                     t.groups[k].shapes.push(a);
                 }
                 Anchor::Last(set, lo) => {
-                    for b in 0..=255u8 {
-                        if set.has(b) {
-                            t.last[usize::from(b)] |= g;
-                        }
-                    }
-                    lens(&mut t, g, lo, usize::MAX);
+                    t.mark(true, set, g, lo, usize::MAX);
                     t.groups[k].shapes.push(a);
                 }
                 Anchor::Ends(list, lo) => {
@@ -290,7 +314,9 @@ fn build() -> Tables {
                         let e = &w.as_bytes()[w.len() - 2..];
                         t.ends[ends_key(e[0], e[1]).expect("两个字母")] |= g;
                     }
-                    lens(&mut t, g, lo, usize::MAX);
+                    for l in t.ends_len.iter_mut().skip(lo.min(LENS - 1)) {
+                        *l |= g;
+                    }
                     t.groups[k].shapes.push(a);
                 }
             }
@@ -323,6 +349,25 @@ fn build() -> Tables {
 }
 
 impl Tables {
+    /// 头一个（`last`：最后一个）字节在 `set` 里、长度在 `lo..=hi` 里的 token，记上 `g` 这一组
+    fn mark(&mut self, last: bool, set: Bytes, g: u32, lo: usize, hi: usize) {
+        let (lo, hi) = (lo.min(LENS - 1), hi.min(LENS - 1));
+        let (from, to) = (usize::from(self.bucket[lo]), usize::from(self.bucket[hi]));
+        let nb = self.buckets;
+        let table = if last {
+            &mut self.last
+        } else {
+            &mut self.first
+        };
+        for b in 0..=255u8 {
+            if set.has(b) {
+                for k in from..=to {
+                    table[usize::from(b) * nb + k] |= g;
+                }
+            }
+        }
+    }
+
     /// 这个 token 的开头对上了哪几组的字面量锚点
     #[inline]
     fn literals(&self, t: &[u8]) -> u32 {
@@ -490,10 +535,7 @@ fn prescan(text: &str, json: bool, on: u32, quotes: bool) -> Pre {
             }
             if c >= 0x80 {
                 let s = i;
-                i += 1;
-                while i < n && b[i] >= 0x80 {
-                    i += 1;
-                }
+                i = high_end(b, i + 1);
                 pre.has_high = true;
                 if words_on {
                     high.push(s..i, &mut pre.high);
@@ -517,10 +559,7 @@ fn prescan(text: &str, json: bool, on: u32, quotes: bool) -> Pre {
                     if b[i] >= 0x80 {
                         // 转义掉的是一个多字节字符的头一个字节：它仍是一段非 ASCII 的开头
                         let s = i;
-                        i += 1;
-                        while i < n && b[i] >= 0x80 {
-                            i += 1;
-                        }
+                        i = high_end(b, i + 1);
                         pre.has_high = true;
                         if words_on {
                             high.push(s..i, &mut pre.high);
@@ -564,8 +603,9 @@ fn prescan(text: &str, json: bool, on: u32, quotes: bool) -> Pre {
                 pre.last_cut = Some(k);
             }
         }
-        let mut m = (tab.first[usize::from(t[0])] | tab.last[usize::from(t[l - 1])])
-            & tab.len[l.min(LENS - 1)];
+        let bk = usize::from(tab.bucket[l.min(LENS - 1)]);
+        let mut m = tab.first[usize::from(t[0]) * tab.buckets + bk]
+            | tab.last[usize::from(t[l - 1]) * tab.buckets + bk];
         let c = t[0] | 0x20;
         if l < 32
             && c.is_ascii_lowercase()
@@ -576,13 +616,15 @@ fn prescan(text: &str, json: bool, on: u32, quotes: bool) -> Pre {
         if l >= 2
             && let Some(e) = ends_key(t[l - 2], t[l - 1])
         {
-            m |= tab.ends[e] & tab.len[l.min(LENS - 1)];
+            m |= tab.ends[e] & tab.ends_len[l.min(LENS - 1)];
         }
         m &= on & tab.chars[usize::from(cls)];
         if words_on {
-            // 只数连着的、形状对得上的（3 到 8 个小写字母，或者编号）：一串里小写的不到 12 个的
-            // 整串不要，够数的才逐个查像不像词（[`word_runs`]）
-            if m & WORDS != 0 {
+            // 连着的、像词的（或者编号）当场数：一串里小写的不到 12 个的整串不要。
+            // 像不像词按字符类分流（`crypto::run_member_by_class`），全小写的只查两次表 ——
+            // 先按形状圈一串、够数再切一遍 token 逐个查的老办法，在英文正文上几乎每一串都
+            // 够数（12 个连着的小写短词再平常不过），等于整段切两遍
+            if m & WORDS != 0 && super::secrets::crypto::run_member_by_class(t, cls) {
                 let from = run.map_or(start, |r| r.0);
                 run = Some((from, i));
                 if t[0].is_ascii_lowercase() {
@@ -590,7 +632,7 @@ fn prescan(text: &str, json: bool, on: u32, quotes: bool) -> Pre {
                 }
             } else if let Some(r) = run.take() {
                 if shaped >= 12 {
-                    word_runs(text, r.0..r.1, &mut pre.word_runs);
+                    pre.word_runs.push(r.0..r.1);
                 }
                 shaped = 0;
             }
@@ -630,11 +672,30 @@ fn prescan(text: &str, json: bool, on: u32, quotes: bool) -> Pre {
     if let Some((s, e)) = run
         && shaped >= 12
     {
-        word_runs(text, s..e, &mut pre.word_runs);
+        pre.word_runs.push(s..e);
     }
     high.flush(&mut pre.high);
     esc.flush(&mut pre.escapes);
     pre
+}
+
+/// 从 `i` 起连着的非 ASCII 字节到哪儿为止。八个字节一读：中文正文（和源码里的中文注释）
+/// 一段动辄几十上百个字节，逐字节比是第一段里最热的一个循环
+#[inline]
+fn high_end(b: &[u8], mut i: usize) -> usize {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    while let Some(c) = b.get(i..).and_then(<[u8]>::first_chunk::<8>) {
+        // 小端读：第一个不是非 ASCII 的字节，就是最低的那个没置高位的字节
+        let ascii = !u64::from_le_bytes(*c) & HIGH;
+        if ascii != 0 {
+            return i + (ascii.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < b.len() && b[i] >= 0x80 {
+        i += 1;
+    }
+    i
 }
 
 /// 中文助记词的候选，边扫边接：连着 12 段以上、相邻两段之间隔着不到 13 个字节的非 ASCII 段（或者
@@ -663,35 +724,6 @@ impl Streak {
         }
         self.cur.clear();
     }
-}
-
-/// 一串形状对得上的 token（`streak`，从一个 token 的开头到一个 token 的结尾）里，连着的、
-/// 像 BIP39 词的（[`super::secrets::crypto::WORD_ANCHORS`]）有 12 个以上的那几段
-fn word_runs(text: &str, streak: Range<usize>, out: &mut Vec<Range<usize>>) {
-    let off = streak.start;
-    let mut run: Option<Range<usize>> = None;
-    let mut shaped = 0;
-    let mut close = |run: &mut Option<Range<usize>>, shaped: &mut usize| {
-        if let Some(r) = run.take()
-            && *shaped >= 12
-        {
-            out.push(r);
-        }
-        *shaped = 0;
-    };
-    super::rules::for_each_token(&text[streak], |tok, r, _| {
-        let t = tok.as_bytes();
-        if super::secrets::crypto::run_member(t) {
-            let from = run.as_ref().map_or(off + r.start, |x| x.start);
-            run = Some(from..off + r.end);
-            if t[0].is_ascii_lowercase() {
-                shaped += 1;
-            }
-        } else {
-            close(&mut run, &mut shaped);
-        }
-    });
-    close(&mut run, &mut shaped);
 }
 
 // ---------------------------------------------------------------- 第二段
@@ -836,6 +868,36 @@ mod tests {
             assert!(!t.groups[PERSONAL_SHIFT as usize + i].shapes.is_empty());
         }
         assert!(t.lits.len() > 100);
+    }
+
+    /// 头一个（最后一个）字节和长度一起查：`place` 的「以 `m` 结尾、至少 18 个字符」不能因为同组
+    /// 还有「以 `Q` 结尾、多长都行」，就变成「以 `m` 结尾、多长都行」—— 正文里的 `from`、
+    /// `them`、`system` 不该是候选；长度对的照样是
+    #[test]
+    fn byte_and_length_are_looked_up_together() {
+        let cands = |text: &str, on: u32| -> Vec<String> {
+            prescan(text, false, on, false)
+                .cands
+                .iter()
+                .map(|c| text[c.span.clone()].to_string())
+                .collect()
+        };
+        assert!(cands("from them system lorem ipsum", PLACE).is_empty());
+        assert_eq!(
+            cands("from x.webhook.office.com them", PLACE),
+            ["x.webhook.office.com"]
+        );
+        assert_eq!(cands("abcQ them", PLACE), ["abcQ"]);
+        // 助记词那一组只有 3 到 8 个小写字母（或者 1 到 3 个字符的编号）：`a`、`is` 不算
+        let t = tables();
+        for w in ["a", "is", "to"] {
+            let bk = usize::from(t.bucket[w.len()]);
+            assert_eq!(
+                t.first[usize::from(w.as_bytes()[0]) * t.buckets + bk] & WORDS,
+                0,
+                "{w}"
+            );
+        }
     }
 
     #[test]

@@ -410,6 +410,43 @@ fn the_wordlists_are_the_official_ones() {
     assert_eq!((zh[0], zh[2047]), ("的", "歇"));
 }
 
+/// 第一段按字符类分流的「像不像词」和逐字节看的那一个（[`super::crypto::run_member`]）
+/// 说法一样：词表里的词、它们改一个字母、截短加长、大小写、编号、带点带横线的都试一遍
+#[test]
+fn run_member_by_class_agrees_with_run_member() {
+    use crate::redact::anchor::class;
+    let check = |t: &str| {
+        let b = t.as_bytes();
+        let cls = b.iter().fold(0, |c, &x| c | class(x));
+        assert_eq!(
+            super::crypto::run_member_by_class(b, cls),
+            super::crypto::run_member(b),
+            "{t}"
+        );
+    };
+    let mut toks: Vec<String> = Vec::new();
+    for w in super::crypto::english() {
+        toks.push(w.to_string());
+        toks.push(w.to_ascii_uppercase());
+        toks.push(format!("{w}s"));
+        toks.push(format!("{w}."));
+        toks.push(format!("{w}-x"));
+        toks.push(w[..w.len() - 1].to_string());
+        toks.push(format!("{}z", &w[..w.len() - 1]));
+        toks.push(format!("q{w}"));
+    }
+    for t in [
+        "1", "12", "123", "1.", "12.", "123.", "1..", ".1", "1.2", "..", ".", "a", "ab", "a1",
+        "1a", "_", "-", "abc_", "lorem", "ipsum", "dolor", "sit", "amet", "the", "zoo", "zoos",
+        "abandon", "abandons",
+    ] {
+        toks.push(t.to_string());
+    }
+    for t in &toks {
+        check(t);
+    }
+}
+
 /// BIP39 官方测试向量（entropy 9e885d952ad362caeb4efe34a8e91bd2）：校验和照标准算
 #[test]
 fn an_official_test_vector_checks_out() {
