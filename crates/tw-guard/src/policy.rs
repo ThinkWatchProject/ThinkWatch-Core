@@ -1775,10 +1775,12 @@ content:
             rule: String::new(),
             added_at: 0,
         };
-        let mut p = RedactPolicy::default();
-        p.exceptions = (0..EXCEPTIONS_MAX)
-            .map(|i| one(&crate::redact::exceptions::sha256_hex(&i.to_string())))
-            .collect();
+        let mut p = RedactPolicy {
+            exceptions: (0..EXCEPTIONS_MAX)
+                .map(|i| one(&crate::redact::exceptions::sha256_hex(&i.to_string())))
+                .collect(),
+            ..Default::default()
+        };
         p.check().unwrap();
         p.exceptions
             .push(one(&crate::redact::exceptions::sha256_hex("x")));
