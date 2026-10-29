@@ -369,6 +369,18 @@ fn is_authority_end(c: u8) -> bool {
         )
 }
 
+/// 一个地址（`scheme://user:pass@host:port/path`，不带 scheme 也行）的主机名：去掉 userinfo、
+/// 端口和路径，IPv6 字面量去掉方括号（`http://[fd00::1]:8080/v1` 是 `fd00::1`），转小写。
+///
+/// **配置里取上游、代理、同步位置的主机也用这一个**（保存的凭据的 `hosts`）：两边取法不同的
+/// 话，同一个地址在这里是 `fd00::1`、在那边是 `[fd00`，保存的凭据发往它自己的上游也被当成外传
+pub fn url_host(url: &str) -> String {
+    let rest = url.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, r)| r);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    host_of(&rest[..end])
+}
+
 /// 从 authority 里取主机名：去掉 userinfo 和端口，认得 IPv6 字面量，转小写。
 fn host_of(authority: &str) -> String {
     let hostport = authority.rsplit('@').next().unwrap_or(authority);
@@ -590,6 +602,21 @@ mod tests {
             for odd in [format!("{lead}://x"), format!("见{lead}ftp://x")] {
                 assert!(!fires_b(&format!("curl -T a {odd}")), "{odd}");
             }
+        }
+    }
+
+    #[test]
+    fn url_host_takes_the_host_of_any_address_form() {
+        for (url, host) in [
+            ("https://API.DeepSeek.com/v1", "api.deepseek.com"),
+            ("http://[fd00::1]:8080/v1", "fd00::1"),
+            ("http://user:p@ss@10.0.0.2:3128", "10.0.0.2"),
+            ("proxy://[::1]:7890", "::1"),
+            ("api.example.com:443/x?y=1", "api.example.com"),
+            ("https://x.example.com?k=1", "x.example.com"),
+            ("", ""),
+        ] {
+            assert_eq!(url_host(url), host, "{url}");
         }
     }
 

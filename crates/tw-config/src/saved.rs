@@ -232,4 +232,19 @@ mod tests {
             ]
         );
     }
+
+    /// IPv6 字面量的上游地址：主机是 `fd00::1`，和工具调用审查取出的一样（曾经取成 `[fd00`）
+    #[test]
+    fn an_ipv6_literal_base_url_gives_the_bare_address() {
+        let cfg = Config {
+            providers: vec![Provider {
+                name: "lan".into(),
+                base_url: "http://[fd00::1]:8080/v1".into(),
+                key: Some(Secret::new("0123456789abcdef0123456789abcdef")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(cfg.saved_secrets()[0].hosts, ["fd00::1"]);
+    }
 }
