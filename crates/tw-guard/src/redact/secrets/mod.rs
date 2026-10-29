@@ -69,6 +69,8 @@ pub(super) struct Want {
     mnemonic: Option<crypto::Words>,
     /// 按位置认的命中先攒着，扫完再看有没有别的规则认了同一处
     placed: Vec<Hit>,
+    /// 配置赋值上一回往后看到了哪儿：名字落在这之前的不再看（见 [`place::MAX_SPAN`]）
+    assign_seen: usize,
 }
 
 impl Want {
@@ -83,6 +85,7 @@ impl Want {
             place: place::Want::new(set),
             mnemonic: set.is_on("crypto-mnemonic").then(crypto::Words::default),
             placed: Vec::new(),
+            assign_seen: 0,
         }
     }
 
@@ -134,8 +137,9 @@ impl Want {
         if b.len() < 3 {
             return;
         }
-        if self.assign && assign::name_ends_right(tok) {
-            assign::after_name(text, span.clone(), &mut self.placed);
+        if self.assign && span.start >= self.assign_seen && assign::name_ends_right(tok) {
+            let seen = assign::after_name(text, span.clone(), &mut self.placed);
+            self.assign_seen = self.assign_seen.max(seen);
         }
         if b.len() < 35 {
             return;

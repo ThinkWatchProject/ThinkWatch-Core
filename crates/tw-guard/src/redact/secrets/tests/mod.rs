@@ -306,6 +306,26 @@ fn placed_values_are_replaced_whole_unless_a_replacing_rule_covers_all_of_them()
     assert_eq!(got[0].rule.id(), "jwt");
 }
 
+/// 值最多看 4 KB：几 KB 的令牌（Azure AD 的访问令牌）照样认，再长的一段是数据，不是凭据
+#[test]
+fn placed_values_up_to_a_few_kilobytes_are_found_and_longer_runs_are_not() {
+    let set = RuleSet::only(&["auth-header-credential", "url-token", "config-assignment"]);
+    for n in [3000, 4096] {
+        let tok = rnd(7, n, ALNUM);
+        for text in [
+            format!("Authorization: Bearer {tok}"),
+            format!("https://x.example/cb?access_token={tok}"),
+            format!("API_TOKEN={tok}"),
+        ] {
+            let got = scan(&text, &set);
+            assert_eq!(got.len(), 1, "{n}");
+            assert_eq!(&text[got[0].bytes.clone()], tok);
+        }
+    }
+    let tok = rnd(7, 4097, ALNUM);
+    assert!(scan(&format!("Authorization: Bearer {tok}"), &set).is_empty());
+}
+
 #[test]
 fn placed_values_report_only_their_last_four_and_phrases_nothing() {
     let r = Rule::Builtin("config-assignment");

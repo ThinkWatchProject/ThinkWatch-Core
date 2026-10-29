@@ -156,13 +156,15 @@ fn closes(b: &[u8], i: usize) -> bool {
 }
 
 /// 名字（`name` 是它在原文里的区间）后面：可以先是引号（JSON 的键），然后是 `=`、`:`、
-/// `=>`、`:=`，然后是一个字面量值。找得到就把值记下来
-pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) {
-    use super::place::{quote_at, run, skip_blank};
+/// `=>`、`:=`，然后是一个字面量值。找得到就把值记下来。返回往后看到了哪儿（值最多看
+/// [`super::place::MAX_SPAN`] 个字节，见那里）
+pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) -> usize {
+    use super::place::{quote_at, skip_blank, value_run};
     let b = text.as_bytes();
+    let none = name.end;
     // `$TOKEN = …`、`${TOKEN}` 是在用一个变量；`?token=` 是 URL 参数
     if name.start > 0 && matches!(b[name.start - 1], b'$' | b'?' | b'&' | b'{') {
-        return;
+        return none;
     }
     let mut i = name.end;
     if let Some((n, _)) = quote_at(b, i) {
@@ -171,32 +173,38 @@ pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) 
     i = skip_blank(b, i);
     match (b.get(i), b.get(i + 1)) {
         (Some(b'='), Some(b'>')) | (Some(b':'), Some(b'=')) => i += 2,
-        (Some(b'='), Some(b'=' | b'~')) | (Some(b':'), Some(b':')) => return,
+        (Some(b'='), Some(b'=' | b'~')) | (Some(b':'), Some(b':')) => return none,
         (Some(b'=' | b':'), _) => i += 1,
-        _ => return,
+        _ => return none,
     }
     i = skip_blank(b, i);
     let (from, to) = if let Some((n, q)) = quote_at(b, i) {
         let from = i + n;
-        let to = run(b, from, |c| {
+        let (to, seen) = value_run(b, from, |c| {
             c.is_ascii_graphic() && !matches!(c, b'"' | b'\'' | b'`' | b'\\')
         });
+        let Some(to) = to else {
+            return seen;
+        };
         // 同一种引号收尾，后面这一句就完了：`"…" + x`、`"…" % x` 是一段表达式
         if quote_at(b, to) != Some((n, q)) || !closes(b, skip_blank(b, to + n)) {
-            return;
+            return to;
         }
         (from, to)
     } else {
-        let to = run(b, i, bare);
+        let (to, seen) = value_run(b, i, bare);
+        let Some(to) = to else {
+            return seen;
+        };
         if !closes(b, skip_blank(b, to)) {
-            return;
+            return to;
         }
         (i, to)
     };
     let v = &text[from..to];
     // 路径、URL、引用（`$X`、`%X%`、`@Value`、`!Ref`、`*alias`）不是口令
     if v.starts_with(['/', '~', '.', '$', '%', '@', '!', '*', '&']) || v.contains("://") {
-        return;
+        return to;
     }
     if super::credible(v, 8) {
         placed.push(super::super::rules::builtin_hit(
@@ -204,4 +212,5 @@ pub(super) fn after_name(text: &str, name: Range<usize>, placed: &mut Vec<Hit>) 
             from..to,
         ));
     }
+    to
 }

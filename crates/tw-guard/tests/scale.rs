@@ -193,3 +193,48 @@ fn nested_values_are_hidden_in_time_linear_in_the_text() {
         "十六倍的正文花了 {ratio:.1} 倍（{small:?} → {large:?}）：一个套一个的原值在一处处地列"
     );
 }
+
+/// 按位置认的规则（请求头、命令行、URL 参数、环境变量口令、配置赋值、Webhook 地址）从标记往后
+/// 找值。同一个标记连着写上几万遍、中间不断开时，每个标记都把后面整段看一遍就是平方级的 ——
+/// 曾经 100 KB 的 `api-key=` 要 2 秒、400 KB 要 39 秒。每一种各占一条消息
+fn repeated_markers(len: usize) -> Duration {
+    const UNITS: &[&str] = &[
+        "api-key=",
+        "x-api-key: ",
+        "TOKEN=",
+        "\"apiKey\": \"",
+        "?sig=",
+        "&access_token=",
+        "PGPASSWORD=",
+        "curl ",
+        "curl -u ",
+        "mysql ",
+        "mysql -p",
+        "hooks.slack.com/",
+        "x.webhook.office.com/",
+    ];
+    let messages: Vec<Value> = UNITS
+        .iter()
+        .map(|u| json!({"role": "user", "content": u.repeat(len / u.len())}))
+        .collect();
+    let body = json!({ "messages": messages }).to_string();
+    let ids: Vec<&str> = tw_guard::redact::rules::BUILTINS
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    let rules = RuleSet::only(&ids);
+    let started = Instant::now();
+    let _ = tw_guard::redact::rules::scan(&body, &rules);
+    started.elapsed()
+}
+
+#[test]
+fn repeated_position_markers_cost_linear_time() {
+    let (small, large) = medians(|| repeated_markers(20_000), || repeated_markers(80_000));
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // 线性的是 4 倍上下，平方级的是 16 倍
+    assert!(
+        ratio < 10.0,
+        "四倍长的标记串花了 {ratio:.1} 倍（{small:?} → {large:?}）：按位置认的规则不再是线性的"
+    );
+}

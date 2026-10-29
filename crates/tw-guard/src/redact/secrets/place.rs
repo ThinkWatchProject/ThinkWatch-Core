@@ -127,7 +127,23 @@ fn mark_of(tok: &str) -> Option<Mark> {
         .map(|&(_, m)| m)
 }
 
-/// 这一组里每条开没开（扫之前问一次）
+/// 一个值、一条命令最多看多长。
+///
+/// 最长的真凭据是放进请求头、URL 里的 JWT（Azure AD、Google 的 ID 令牌）和签名，两三 KB；
+/// 再长的是一段数据，不是凭据。不设上限的话，`api-key=api-key=…`、`curl curl …` 这样的一串
+/// 里每个标记都要把后面整段看一遍，几百 KB 就是几十秒（平方级）。有了上限，再加上「落在已经
+/// 看过的那一段里的标记不再看」（[`Want::seen`]），整遍扫描是线性的
+pub(super) const MAX_SPAN: usize = 4096;
+
+/// 按位置认的几种各自看到了哪儿（[`Want::seen`] 的下标）
+const HEADER: usize = 0;
+const CURL: usize = 1;
+const MYSQL: usize = 2;
+const ENV: usize = 3;
+const URL: usize = 4;
+const PATH: usize = 5;
+
+/// 这一组里每条开没开（扫之前问一次），和每一种看到了哪儿
 pub(super) struct Want {
     header: bool,
     cmdline: bool,
@@ -137,6 +153,9 @@ pub(super) struct Want {
     azure: bool,
     qianfan: bool,
     any: bool,
+    /// 每一种上一回往后看到了哪儿：标记落在这之前的，它的值就在上一回看过的那一段里，不再
+    /// 看一遍（见 [`MAX_SPAN`]）
+    seen: [usize; 6],
 }
 
 impl Want {
@@ -150,6 +169,7 @@ impl Want {
             azure: set.is_on("azure-ad-client-secret"),
             qianfan: set.is_on("qianfan-api-key"),
             any: false,
+            seen: [0; 6],
         };
         w.any = w.header || w.cmdline || w.url || w.webhook || w.telegram || w.azure || w.qianfan;
         w
@@ -163,7 +183,7 @@ impl Want {
     /// `placed` 收按位置认的（扫完再看有没有让给别的规则，见 [`super::Want::finish`]）
     #[inline]
     pub(super) fn token(
-        &self,
+        &mut self,
         text: &str,
         tok: &str,
         span: Range<usize>,
@@ -191,14 +211,31 @@ impl Want {
         {
             out.push(builtin_hit("azure-ad-client-secret", r));
         }
-        if self.webhook && t.len() >= 18 && t[t.len() - 1] == b'm' && teams_host(tok) {
-            teams(b, span.end, out);
+        let (s, e) = (span.start, span.end);
+        if self.webhook
+            && t.len() >= 18
+            && t[t.len() - 1] == b'm'
+            && s >= self.seen[PATH]
+            && teams_host(tok)
+        {
+            self.seen[PATH] = teams(b, e, out);
         }
         let Some(mark) = mark_of(tok) else {
             return;
         };
-        let (s, e) = (span.start, span.end);
-        match mark {
+        let k = match mark {
+            Mark::Header => HEADER,
+            Mark::Curl => CURL,
+            Mark::Mysql => MYSQL,
+            Mark::EnvPassword => ENV,
+            Mark::UrlParam => URL,
+            Mark::Slack => PATH,
+            _ => usize::MAX,
+        };
+        if k != usize::MAX && s < self.seen[k] {
+            return;
+        }
+        let seen = match mark {
             Mark::Header if self.header => header(text, s, e, placed),
             Mark::Curl if self.cmdline && command_word(b, e) => curl(text, e, placed),
             Mark::Mysql if self.cmdline && command_word(b, e) => mysql(text, e, placed),
@@ -206,21 +243,31 @@ impl Want {
             Mark::UrlParam if self.url => url_param(text, s, e, placed),
             Mark::Feishu if self.webhook => {
                 webhook_value(b, e, b"/bot/v2/hook/", 16, true, out);
+                0
             }
             Mark::Dingtalk if self.webhook => {
                 webhook_value(b, e, b"/robot/send?access_token=", 32, false, out);
+                0
             }
             Mark::Wecom if self.webhook => {
                 webhook_value(b, e, b"/cgi-bin/webhook/send?key=", 32, true, out);
+                0
             }
             Mark::Slack if self.webhook => slack(b, e, out),
-            Mark::Discord if self.webhook => discord(b, e, out),
+            Mark::Discord if self.webhook => {
+                discord(b, e, out);
+                0
+            }
             Mark::Qianfan if self.qianfan => {
                 if let Some(r) = shapes::qianfan(b, s) {
                     out.push(builtin_hit("qianfan-api-key", r));
                 }
+                0
             }
-            _ => {}
+            _ => 0,
+        };
+        if k != usize::MAX {
+            self.seen[k] = self.seen[k].max(seen);
         }
     }
 }
@@ -253,6 +300,22 @@ pub(super) fn run(b: &[u8], mut i: usize, ok: impl Fn(u8) -> bool) -> usize {
         i += 1;
     }
     i
+}
+
+/// 同 [`run`]，最多看到 `lim` 之前
+pub(super) fn run_to(b: &[u8], mut i: usize, lim: usize, ok: impl Fn(u8) -> bool) -> usize {
+    let lim = lim.min(b.len());
+    while i < lim && ok(b[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// 从 `i` 起一个值：一段 `ok` 的字节，最多看 [`MAX_SPAN`] 个。返回终点，超长的是 `None`
+/// （第二项总是看到了哪儿）
+pub(super) fn value_run(b: &[u8], i: usize, ok: impl Fn(u8) -> bool) -> (Option<usize>, usize) {
+    let end = run_to(b, i, i + MAX_SPAN + 1, ok);
+    ((end - i <= MAX_SPAN).then_some(end), end)
 }
 
 /// token68（RFC 7235）：Bearer、Basic 后面那一段能有的字符
@@ -289,8 +352,9 @@ const SCHEMES: &[&str] = &["bearer", "basic", "token", "bot"];
 ///
 /// 认的写法：HTTP 原文和 `curl -H` 里的 `名: 值`，代码里的字典（`"Authorization": "Bearer …"`、
 /// `headers['x-api-key'] = '…'`），Go 的 `Header.Set("Authorization", "Bearer …")`。值紧跟
-/// 在冒号、等号或逗号后面（中间可以有空格和一个引号）；其余写法（隔着别的词、换了行）不认
-fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) {
+/// 在冒号、等号或逗号后面（中间可以有空格和一个引号）；其余写法（隔着别的词、换了行）不认。
+/// 返回往后看到了哪儿
+fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
     let auth = e - s == "authorization".len();
     let mut i = e;
@@ -304,14 +368,15 @@ fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) {
     match b.get(i) {
         Some(b':' | b',') => i += 1,
         Some(b'=') if b.get(i + 1) != Some(&b'=') => i += 1,
-        _ => return,
+        _ => return e,
     }
     i = skip_blank(b, i);
     if let Some((n, _)) = quote_at(b, i) {
         i += n;
     }
     if auth {
-        let w = run(b, i, |c| c.is_ascii_alphabetic());
+        // 鉴权方式的词都很短，多看几个字母就够了
+        let w = run_to(b, i, i + 16, |c| c.is_ascii_alphabetic());
         if w > i
             && b.get(w) == Some(&b' ')
             && SCHEMES.iter().any(|x| x.eq_ignore_ascii_case(&text[i..w]))
@@ -319,10 +384,13 @@ fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) {
             i = skip_blank(b, w);
         }
     }
-    let end = run(b, i, token68);
+    let (end, seen) = value_run(b, i, token68);
+    let Some(end) = end else {
+        return seen;
+    };
     // 后面紧跟着模板、调用、下标的是一段表达式的开头，不是一个值
     if matches!(b.get(end), Some(b'{' | b'(' | b'$' | b'[')) {
-        return;
+        return end;
     }
     push_if(
         text,
@@ -331,6 +399,7 @@ fn header(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) {
         "auth-header-credential",
         placed,
     );
+    end
 }
 
 // ---------------------------------------------------------------- 命令行
@@ -343,10 +412,11 @@ fn command_word(b: &[u8], e: usize) -> bool {
 }
 
 /// 从 `from` 起这条命令在哪儿结束：`;`、`|`、`&`、`)`、反引号、换行，和字符串里转义的
-/// 换行（JSON 和代码里的 `\n`）
+/// 换行（JSON 和代码里的 `\n`）。最多看 [`MAX_SPAN`] 个字节：再往后的选项不看了
 fn command_end(b: &[u8], from: usize) -> usize {
+    let lim = (from + MAX_SPAN).min(b.len());
     let mut i = from;
-    while i < b.len() {
+    while i < lim {
         match b[i] {
             b';' | b'|' | b'&' | b')' | b'`' | b'\n' | b'\r' => return i,
             b'\\' if b.get(i + 1) == Some(&b'\\') => i += 2,
@@ -354,7 +424,7 @@ fn command_end(b: &[u8], from: usize) -> usize {
             _ => i += 1,
         }
     }
-    b.len()
+    lim
 }
 
 /// 一个选项的开头：`-` 前面是空白或者引号（`"-u"` 是数组里的一项）
@@ -364,8 +434,8 @@ fn option_at(b: &[u8], k: usize) -> bool {
 
 /// `curl -u 用户:口令`、`--user 用户:口令`、`-u用户:口令` 里的口令。`e` 是 `curl` 的终点。
 /// 只有用户名的（`-u user`、`-u sk_…:`，口令为空）不算 —— 后者的密钥在用户名那一段，归
-/// 前缀规则
-fn curl(text: &str, e: usize, placed: &mut Vec<Hit>) {
+/// 前缀规则。返回这条命令在哪儿结束
+fn curl(text: &str, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
     let end = command_end(b, e);
     let mut k = e;
@@ -392,9 +462,9 @@ fn curl(text: &str, e: usize, placed: &mut Vec<Hit>) {
         if let Some((n, _)) = quote_at(b, i) {
             i += n;
         }
-        let colon = run(b, i, |c| arg_char(c) && c != b':');
+        let colon = run_to(b, i, end, |c| arg_char(c) && c != b':');
         if colon > i && b.get(colon) == Some(&b':') {
-            let pass_end = run(b, colon + 1, arg_char).min(end);
+            let pass_end = run_to(b, colon + 1, end, arg_char);
             push_if(
                 text,
                 colon + 1..pass_end,
@@ -405,11 +475,12 @@ fn curl(text: &str, e: usize, placed: &mut Vec<Hit>) {
         }
         k = at;
     }
+    end
 }
 
 /// `mysql -p口令`、`--password=口令`（mysqldump、mariadb 这一家都一样）。**`-p` 后面隔着空格
-/// 的是库名**（`mysql -p mydb` 是「提示输入口令、连 mydb」），不算
-fn mysql(text: &str, e: usize, placed: &mut Vec<Hit>) {
+/// 的是库名**（`mysql -p mydb` 是「提示输入口令、连 mydb」），不算。返回这条命令在哪儿结束
+fn mysql(text: &str, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
     let end = command_end(b, e);
     let mut k = e;
@@ -430,43 +501,50 @@ fn mysql(text: &str, e: usize, placed: &mut Vec<Hit>) {
         if let Some((n, _)) = quote_at(b, i) {
             i += n;
         }
-        let v_end = run(b, i, arg_char).min(end);
+        let v_end = run_to(b, i, end, arg_char);
         push_if(text, i..v_end, 4, "command-line-password", placed);
         k = at;
     }
+    end
 }
 
 /// `PGPASSWORD=口令 psql …`、`MYSQL_PWD=口令`
-fn env_password(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) {
+fn env_password(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
     if b.get(e) != Some(&b'=') || (s > 0 && b[s - 1] == b'$') {
-        return;
+        return e;
     }
     let mut i = e + 1;
     if let Some((n, _)) = quote_at(b, i) {
         i += n;
     }
-    let end = run(b, i, arg_char);
-    push_if(text, i..end, 4, "command-line-password", placed);
+    let (end, seen) = value_run(b, i, arg_char);
+    if let Some(end) = end {
+        push_if(text, i..end, 4, "command-line-password", placed);
+    }
+    seen
 }
 
 // ---------------------------------------------------------------- URL 参数
 
 /// URL 里 `?access_token=…`、`&sig=…` 的值。参数名前面要是 `?`、`&` 或者 `#`（OAuth 的隐式
 /// 授权把令牌放在片段里）：光有 `api_key=` 的是一句赋值，归配置赋值那条
-fn url_param(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) {
+fn url_param(text: &str, s: usize, e: usize, placed: &mut Vec<Hit>) -> usize {
     let b = text.as_bytes();
     if s == 0 || !matches!(b[s - 1], b'?' | b'&' | b'#') || b.get(e) != Some(&b'=') {
-        return;
+        return e;
     }
-    let end = run(b, e + 1, |c| {
+    let (end, seen) = value_run(b, e + 1, |c| {
         c.is_ascii_graphic()
             && !matches!(
                 c,
                 b'&' | b'#' | b'"' | b'\'' | b'\\' | b'<' | b'>' | b')' | b']' | b'}' | b','
             )
     });
-    push_if(text, trimmed(b, e + 1, end), 8, "url-token", placed);
+    if let Some(end) = end {
+        push_if(text, trimmed(b, e + 1, end), 8, "url-token", placed);
+    }
+    seen
 }
 
 // ---------------------------------------------------------------- 机器人 Webhook
@@ -492,20 +570,25 @@ fn webhook_value(b: &[u8], e: usize, path: &[u8], min: usize, dash: bool, out: &
     }
 }
 
-/// URL 的路径在哪儿结束：空白、引号、反斜杠、尖括号、查询串
-fn path_end(b: &[u8], from: usize) -> usize {
-    run(b, from, |c| {
+/// URL 的路径在哪儿结束：空白、引号、反斜杠、尖括号、查询串。超过 [`MAX_SPAN`] 的不算
+/// 路径（第二项是看到了哪儿）
+fn path_end(b: &[u8], from: usize) -> (Option<usize>, usize) {
+    value_run(b, from, |c| {
         c.is_ascii_graphic()
             && !matches!(c, b'"' | b'\'' | b'\\' | b'<' | b'>' | b'?' | b'#' | b')')
     })
 }
 
-/// `hooks.slack.com/services/T…/B…/令牌`（`workflows`、`triggers` 同理）：最后一段是令牌
-fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) {
+/// `hooks.slack.com/services/T…/B…/令牌`（`workflows`、`triggers` 同理）：最后一段是令牌。
+/// 返回往后看到了哪儿
+fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
     if b.get(e) != Some(&b'/') {
-        return;
+        return e;
     }
-    let end = path_end(b, e);
+    let (end, seen) = path_end(b, e);
+    let Some(end) = end else {
+        return seen;
+    };
     let path = &b[e..end];
     let last = path
         .iter()
@@ -518,6 +601,7 @@ fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) {
     {
         out.push(builtin_hit("bot-webhook", last..end));
     }
+    end
 }
 
 /// `discord.com/api/webhooks/<数字 id>/<令牌>`：令牌那一段
@@ -547,19 +631,24 @@ fn teams_host(tok: &str) -> bool {
         && (n == HOST.len() || tok.as_bytes()[n - HOST.len() - 1] == b'.')
 }
 
-/// Teams 的传入 Webhook：`….webhook.office.com/webhookb2/…/IncomingWebhook/<令牌>/…`
-fn teams(b: &[u8], e: usize, out: &mut Vec<Hit>) {
+/// Teams 的传入 Webhook：`….webhook.office.com/webhookb2/…/IncomingWebhook/<令牌>/…`。
+/// 返回往后看到了哪儿
+fn teams(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
     const SEG: &[u8] = b"/IncomingWebhook/";
     if b.get(e) != Some(&b'/') {
-        return;
+        return e;
     }
-    let end = path_end(b, e);
+    let (end, seen) = path_end(b, e);
+    let Some(end) = end else {
+        return seen;
+    };
     let Some(p) = memchr::memmem::find(&b[e..end], SEG) else {
-        return;
+        return end;
     };
     let from = e + p + SEG.len();
-    let to = run(b, from, |c| c.is_ascii_alphanumeric()).min(end);
+    let to = run_to(b, from, end, |c| c.is_ascii_alphanumeric());
     if real_token(&b[from..to], 16) {
         out.push(builtin_hit("bot-webhook", from..to));
     }
+    end
 }
