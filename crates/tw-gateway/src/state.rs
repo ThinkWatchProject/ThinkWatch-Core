@@ -96,8 +96,18 @@ impl Runtime {
         let bad = |e: tw_config::PolicyError| {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         };
-        let redact = sec.redact.rules().map_err(bad)?;
-        let tools = sec.inspect_tools.rules().map_err(bad)?;
+        // 保存的凭据（上游密钥、访问密钥、代理口令……）按值认，跟着配置一起换。工具调用审查的
+        // 「凭据发往陌生主机」用同一份，和脱敏那条规则开没开无关
+        let redact = sec
+            .redact
+            .rules()
+            .map_err(bad)?
+            .with_saved(config.saved_secrets());
+        let tools = sec
+            .inspect_tools
+            .rules()
+            .map_err(bad)?
+            .with_saved(redact.saved().cloned());
         let content = sec.content.rules().map_err(bad)?;
         let answer = tw_guard::content::answer::Answer::build(&content);
         let plugins = Arc::new(plugins.build(&config));

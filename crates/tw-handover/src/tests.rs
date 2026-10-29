@@ -480,10 +480,9 @@ async fn token_gate_is_not_held_up() {
     }
     let mut wrong = raw_connect(dir.path()).await;
     wrong.write_all(&frame(b"guess!")).await.unwrap();
-    wrong
-        .write_all(&frame(br#"{"m":{"t":"fallback"}}"#))
-        .await
-        .unwrap();
+    // 门读完错口令就关掉这条连接：第二帧可能撞上已经关掉的连接（Broken pipe），那正是
+    // 它该有的样子，不算失败
+    let _ = wrong.write_all(&frame(br#"{"m":{"t":"fallback"}}"#)).await;
 
     let mut right = raw_connect(dir.path()).await;
     right.write_all(&frame(b"secret")).await.unwrap();

@@ -27,13 +27,16 @@ pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 pub use tw_guard::content::Outcome as ContentOutcome;
 pub use tw_guard::locate::{Direction as SecurityDirection, Part as HitPart};
 pub use tw_guard::policy::{ContentMatch, ContentScope, Guard, Mode as GuardMode};
+/// 保存的凭据是哪一项（出站脱敏的 `thinkwatch-saved-secret`）。定义在 tw-guard：企业版只依赖
+/// 第一层，也要用它
+pub use tw_guard::redact::rules::{SavedSource, SavedSourceKind};
 pub use tw_guard::trial::{
     TrialHit as SecurityTestHit, TrialRequest as SecurityTestRequest,
     TrialResult as SecurityTestResult,
 };
 pub use tw_guard::view::{
-    CardNetwork, CardPrefix, GuardDetail, Matcher, RuleAction, RuleView as SecurityRuleView,
-    SecurityDetail,
+    CardNetwork, CardPrefix, GuardDetail, KindView as SecurityKindView, Matcher, RuleAction,
+    RuleView as SecurityRuleView, SecurityDetail,
 };
 
 /// 取值是一个固定集合的字段：线上是 slug，类型是枚举。
@@ -292,12 +295,27 @@ slug_enum! {
 slug_enum! {
     /// 出站脱敏找到的东西属于哪一类。
     pub enum SecretKind {
-        ApiKeys = "api-keys",
+        /// 用户在 ThinkWatch 里保存的凭据，按值认
+        Saved = "saved",
+        AiServices = "ai-services",
+        DevPlatforms = "dev-platforms",
+        Cloud = "cloud",
+        Business = "business",
         PrivateKeys = "private-keys",
         Jwt = "jwt",
         ConnStrings = "conn-strings",
-        /// 身份证号、银行卡号、邮箱、手机号：个人信息，不是凭据
-        Personal = "personal",
+        /// 请求头、命令行、URL 参数、机器人 Webhook、配置赋值里按位置认的凭据
+        InContext = "in-context",
+        Crypto = "crypto",
+        /// 以下八类是个人信息，不是凭据
+        IdDocuments = "id-documents",
+        ForeignIds = "foreign-ids",
+        Financial = "financial",
+        Contact = "contact",
+        Location = "location",
+        Vehicle = "vehicle",
+        Device = "device",
+        LabeledPersonal = "labeled-personal",
         /// 内网地址
         Internal = "internal",
         /// 自定义规则找到的
@@ -1088,7 +1106,17 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **55 起有用量历史**：`GET /summary/history`（[`BucketQuery`] → [`UsageHistory`]），很长一段时间
 /// 里的用量按格合计，概览上「最近一年」用。按整点另存在数据目录的 `usage.db` 里，请求库重建、
 /// 请求记录过了保留期都不丢
-pub const CONTROL_API_VERSION: u32 = 55;
+///
+/// **56 起出站脱敏规则扩充**：[`SecretKind`] 拆成服务类别和个人信息各类（`api-keys`、`personal`
+/// 不再有）；新增约四十条凭据规则，规则视图的 `matcher` 多了 `prefixes`（多前缀，每项带
+/// `prefix`、`min_tail`、`tail`：`any` / `hex` / `alnum`）、`saved`、`assignment`（`suffixes`）、
+/// `labeled`（`names`），代码实现的规则是 `builtin`（`check` 就是规则 id）。新规则
+/// `thinkwatch-saved-secret` 按值认用户保存的凭据：[`SecretItem`]、[`SecurityEventView`] 和
+/// 「测试…」的命中（`TrialHit`）多了 `source`（[`SavedSource`]：`kind` 是 [`SavedSourceKind`]
+/// 的 `upstream-key` / `upstream-header` / `access-key` / `proxy-password` / `control-key` /
+/// `sync-credential`，`name` 是上游名、密钥名、代理名，控制面密钥和同步凭据是空的），这时打码
+/// 后的值是空串。按位置认的（`in-context` 一类）打码只留最后四位
+pub const CONTROL_API_VERSION: u32 = 56;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -6203,6 +6231,9 @@ pub struct SecretItem {
     pub replaced: bool,
     /// 每一处在哪儿、当时的规则、具体做了什么（见 [`SecurityHitDetail`]）
     pub detail: SecurityHitDetail,
+    /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`：这时 `masked` 是空的）。别的规则没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SavedSource>,
 }
 
 /// 各项防护在一段时间里各留下了几条记录。
@@ -6300,6 +6331,9 @@ pub struct SecurityEventView {
     pub rule_snapshot: RuleSnapshot,
     /// 具体做了什么：换成了哪个占位符、切断的是哪个调用、客户端收到了什么
     pub outcome_detail: OutcomeDetail,
+    /// 出站脱敏认出的是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）。别的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SavedSource>,
 }
 
 /// 一条安全记录最多列几处命中（[`SecurityEventView::locations`]）。再多的只数个数
@@ -6348,7 +6382,7 @@ pub struct RuleSnapshot {
     pub builtin: bool,
     /// 内置规则的 id，或者自定义规则的名字
     pub id: String,
-    /// 显示的名字：内置规则的英文名（界面按 id 查自己的名称表），自定义规则就是它的名字
+    /// 显示的名字：内置规则的英文名（中文名按 id 在规则视图里取 `name_zh`），自定义规则就是它的名字
     pub name: String,
     /// 自定义规则写的样子，原样（正则、关键词、码位）。内置规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]

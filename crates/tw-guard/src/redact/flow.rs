@@ -164,7 +164,7 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape) -> Vec<Findi
 /// 没有只记录的规则时就是 `found` 的那些
 pub fn reported(text: &str, rules: &RuleSet, found: &[Hit], scope: Scope) -> Vec<Finding> {
     let Some(rec) = rules.recording_only() else {
-        return crate::redact::rules::findings(text, found);
+        return crate::redact::rules::findings_in(text, found, rules);
     };
     // 只记录的规则的命中在 `found` 里可能被截成了几截（让开要换的那几处，见
     // `crate::redact::rules::scan`）：报的是它整个认出来的那一处，另找一遍
@@ -175,7 +175,7 @@ pub fn reported(text: &str, rules: &RuleSet, found: &[Hit], scope: Scope) -> Vec
         .collect();
     all.extend(hits_in(text, &rec, scope));
     all.sort_by_key(|h| h.bytes.start);
-    crate::redact::rules::findings(text, &all)
+    crate::redact::rules::findings_in(text, &all, rules)
 }
 
 /// 一本新账，让开 `body` 里已经写着的占位符（见 [`Ledger::avoiding`]）。

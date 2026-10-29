@@ -1,0 +1,1066 @@
+# 出站脱敏的内置规则目录。
+#
+# **规则的名字、说明、分组只在这里写一份**，桌面版和企业版的界面都显示规则视图里带过去的
+# 文字（`name` / `name_zh`、`about` / `about_zh`，分组见 `kinds`），不再各存一张名称表 ——
+# 三处各存一份时，每加一条规则要改四处，漏一处界面上就只剩一个 id。
+#
+# 编译时由 build.rs 读进来，生成 `rules::BUILTINS`（`&'static [Builtin]`）：快速排除的
+# `KEY_MIN` / `KEY_FIRST` 是对着 BUILTINS 在编译期算的常量，目录必须在编译期就定下来。
+# 写错了（字段拼错、少写说明、判据不认识）是编译错误，不会等到运行时。
+#
+# # 分组（`kinds`）
+#
+# 界面按这个顺序分组，和 `Kind` 的定义顺序一致（测试钉着）。`custom` 是用户自己写的规则，
+# 三项防护的「自定义」组都用这里的名字。
+#
+# # 规则（`rules`）
+#
+# **顺序有意义**：同一组里界面按这里的顺序排；前缀表也按这里的顺序比，先对上的那条算数。
+#
+# - `id`：配置按它引用、命中之后报出去的也是它，**改了就是另一条规则**；
+# - `kind`：分组，`kinds` 里的一个；
+# - `on_by_default`：出厂开不开，不写是关。**写漏了是「没开」**，宁可漏，不可吵；
+# - `label`：占位符里的标签（`TW_ID_NUMBER`），不写用账本的默认标签；
+# - `name` / `name_zh`：英文名、中文名；
+# - `about` / `about_zh`：认什么，给人看的一句话。按位置认的写明只换哪一段。反引号括起来的
+#   一段界面按代码样式显示；
+# - `hosts`：这把凭据正当地会送往哪些服务商域名（后缀匹配，含子域）。危险命令「凭据发往
+#   陌生主机」用它：没写的（私钥、加密货币私钥）送往任何非本机地址都算外传。**别写人人都能
+#   开一个子域的共享域名**（对象存储的 bucket、云函数、Webhook 都在服务商的大域名下）：写了
+#   就等于放行发往别人的 bucket。有专门 API 主机的写那个主机；
+#   **仍按大域名放行、尚未收窄的**（服务本身就用到大域名下的各个产品，或者正当的去处就是
+#   用户自己的子域，收窄了天天误切）：`amazonaws.com`（S3、API Gateway）、`aliyuncs.com`
+#   （阿里云 AccessKey，OSS）、`googleapis.com` / `google.com`（Cloud Storage、Apps Script）、
+#   `slack.com`（hooks.slack.com 的 Webhook）、`myshopify.com`、`atlassian.net`、
+#   `supabase.co`、`grafana.net`、`jfrog.io`、`sentry.io`、`databricks.com` /
+#   `azuredatabricks.net`、`hashicorp.cloud`（每个用户一个子域）；
+# - 判据，三选一：
+#   - `prefix: { prefix, min_tail }`：以 `prefix` 开头、其后至少 `min_tail` 个字符；
+#   - `prefixes: [{ prefix, min_tail, tail }]`：以其中任一个开头，`tail` 是尾巴允许的字符，
+#     `any`（不写）/ `hex` / `alnum`。同一家服务的几种令牌写成一条；
+#   - 两样都不写：判据在代码里（校验位、词表、位置……），按 `id` 在 `rules::DETECTORS`
+#     里找。数据和代码两边对不上是编译错误 / 测试失败。
+#
+#   **前缀类的规则不写 `about`**：说明由 build.rs 按前缀和长度生成，和判据不会说两样。
+#   加一条前缀类的规则只改这个文件。
+#
+# 每一条内置规则都要求「前缀明确」或者「结构上无法误认」。代码里的 hash、base64 的图片、
+# UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
+
+kinds:
+  - slug: saved
+    name: Saved credentials
+    name_zh: 保存的密钥
+  - slug: ai-services
+    name: AI services
+    name_zh: AI 服务
+  - slug: dev-platforms
+    name: Code hosting and publishing
+    name_zh: 代码托管与软件发布
+  - slug: cloud
+    name: Cloud and infrastructure
+    name_zh: 云服务与基础设施
+  - slug: business
+    name: Payments, messaging and collaboration
+    name_zh: 支付、通信与协作
+  - slug: private-keys
+    name: Private keys
+    name_zh: 私钥
+  - slug: jwt
+    name: JWTs
+    name_zh: JWT
+  - slug: conn-strings
+    name: Connection strings
+    name_zh: 连接串
+  - slug: in-context
+    name: Credentials by position
+    name_zh: 固定位置的凭据
+  - slug: crypto
+    name: Cryptocurrency
+    name_zh: 加密货币
+  - slug: id-documents
+    name: ID documents
+    name_zh: 证件号码
+  - slug: foreign-ids
+    name: Foreign ID numbers
+    name_zh: 境外证件号码
+  - slug: financial
+    name: Financial accounts
+    name_zh: 金融账户
+  - slug: contact
+    name: Contact details
+    name_zh: 联系方式
+  - slug: location
+    name: Addresses and locations
+    name_zh: 住址与位置
+  - slug: vehicle
+    name: Vehicles
+    name_zh: 车辆
+  - slug: device
+    name: Device and network identifiers
+    name_zh: 设备与网络标识
+  - slug: labeled-personal
+    name: Personal information by field name
+    name_zh: 带字段名的个人信息
+  - slug: internal
+    name: Internal addresses
+    name_zh: 内网地址
+  - slug: custom
+    name: Custom
+    name_zh: 自定义
+
+rules:
+
+  # ---- 最早的那一批
+  - id: anthropic-api-key
+    kind: ai-services
+    on_by_default: true
+    name: Anthropic API key
+    name_zh: Anthropic API 密钥
+    prefix: { prefix: 'sk-ant-', min_tail: 20 }
+    hosts: [anthropic.com]
+  - id: openai-project-key
+    kind: ai-services
+    on_by_default: true
+    name: OpenAI project key
+    name_zh: OpenAI 项目密钥
+    prefix: { prefix: 'sk-proj-', min_tail: 20 }
+    hosts: [openai.com]
+  - id: openai-api-key
+    kind: ai-services
+    on_by_default: true
+    name: OpenAI API key
+    name_zh: OpenAI API 密钥
+    about: 'Starts with `sk-`, at least 40 characters, with both letters and digits'
+    about_zh: '`sk-` 开头，全长至少 40 个字符，同时含字母和数字'
+    hosts: [openai.com]
+  - id: github-personal-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitHub personal access token
+    name_zh: GitHub 个人令牌
+    prefix: { prefix: 'ghp_', min_tail: 30 }
+    hosts: [github.com, githubusercontent.com]
+  - id: github-oauth-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitHub OAuth token
+    name_zh: GitHub OAuth 令牌
+    prefix: { prefix: 'gho_', min_tail: 30 }
+    hosts: [github.com, githubusercontent.com]
+  - id: github-server-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitHub server token
+    name_zh: GitHub 服务器令牌
+    prefix: { prefix: 'ghs_', min_tail: 30 }
+    hosts: [github.com, githubusercontent.com]
+  - id: github-user-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitHub user token
+    name_zh: GitHub 用户令牌
+    prefix: { prefix: 'ghu_', min_tail: 30 }
+    hosts: [github.com, githubusercontent.com]
+  - id: github-fine-grained-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitHub fine-grained token
+    name_zh: GitHub 细粒度令牌
+    prefix: { prefix: 'github_pat_', min_tail: 30 }
+    hosts: [github.com, githubusercontent.com]
+  - id: slack-bot-token
+    kind: business
+    on_by_default: true
+    name: Slack bot token
+    name_zh: Slack 机器人令牌
+    prefix: { prefix: 'xoxb-', min_tail: 20 }
+    hosts: [slack.com]
+  - id: slack-user-token
+    kind: business
+    on_by_default: true
+    name: Slack user token
+    name_zh: Slack 用户令牌
+    prefix: { prefix: 'xoxp-', min_tail: 20 }
+    hosts: [slack.com]
+  - id: slack-app-token
+    kind: business
+    on_by_default: true
+    name: Slack app token
+    name_zh: Slack 应用令牌
+    prefix: { prefix: 'xoxa-', min_tail: 20 }
+    hosts: [slack.com]
+  - id: aws-access-key-id
+    kind: cloud
+    on_by_default: true
+    name: AWS access key ID
+    name_zh: AWS 访问密钥 ID
+    prefix: { prefix: 'AKIA', min_tail: 12 }
+    hosts: [amazonaws.com]
+  - id: aws-temporary-key-id
+    kind: cloud
+    on_by_default: true
+    name: AWS temporary access key ID
+    name_zh: AWS 临时访问密钥 ID
+    prefix: { prefix: 'ASIA', min_tail: 12 }
+    hosts: [amazonaws.com]
+  - id: google-api-key
+    kind: cloud
+    on_by_default: true
+    name: Google API key
+    name_zh: Google API 密钥
+    prefix: { prefix: 'AIza', min_tail: 30 }
+    hosts: [googleapis.com, google.com]
+  - id: google-oauth-token
+    kind: cloud
+    on_by_default: true
+    name: Google OAuth token
+    name_zh: Google OAuth 令牌
+    prefix: { prefix: 'ya29.', min_tail: 20 }
+    hosts: [googleapis.com, google.com]
+  - id: gitlab-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitLab token
+    name_zh: GitLab 令牌
+    prefix: { prefix: 'glpat-', min_tail: 15 }
+    hosts: [gitlab.com]
+  - id: stripe-live-key
+    kind: business
+    on_by_default: true
+    name: Stripe live key
+    name_zh: Stripe 生产密钥
+    prefix: { prefix: 'sk_live_', min_tail: 20 }
+    hosts: [stripe.com]
+  - id: stripe-restricted-key
+    kind: business
+    on_by_default: true
+    name: Stripe restricted key
+    name_zh: Stripe 受限密钥
+    prefix: { prefix: 'rk_live_', min_tail: 20 }
+    hosts: [stripe.com]
+  - id: npm-token
+    kind: dev-platforms
+    on_by_default: true
+    name: npm token
+    name_zh: npm 令牌
+    prefix: { prefix: 'npm_', min_tail: 30 }
+    hosts: [npmjs.org, npmjs.com]
+  - id: digitalocean-token
+    kind: cloud
+    on_by_default: true
+    name: DigitalOcean token
+    name_zh: DigitalOcean 令牌
+    prefix: { prefix: 'dop_v1_', min_tail: 30 }
+    hosts: [digitalocean.com]
+  - id: sendgrid-key
+    kind: business
+    on_by_default: true
+    name: SendGrid key
+    name_zh: SendGrid 密钥
+    prefix: { prefix: 'SG.', min_tail: 30 }
+    hosts: [sendgrid.com]
+  - id: private-key
+    kind: private-keys
+    on_by_default: true
+    name: Private key
+    name_zh: 私钥
+    about: 'From `-----BEGIN … PRIVATE KEY-----` to its END, as a whole'
+    about_zh: '`-----BEGIN … PRIVATE KEY-----` 至对应的 END，整段'
+  - id: jwt
+    kind: jwt
+    on_by_default: true
+    name: 'JWT'
+    name_zh: 'JWT'
+    about: 'Three base64url parts; the first decodes to text containing `"alg"`'
+    about_zh: '三段 base64url，首段解码后含 `"alg"`'
+  - id: conn-string-password
+    kind: conn-strings
+    on_by_default: true
+    name: Connection string password
+    name_zh: 连接串口令
+    about: 'The password in `scheme://user:password@host`; only the password is replaced'
+    about_zh: '`协议://用户:口令@主机` 中的口令；只换口令'
+  - id: cn-resident-id
+    kind: id-documents
+    on_by_default: true
+    label: TW_ID_NUMBER
+    name: Chinese resident ID number
+    name_zh: 居民身份证号
+    about: 'An 18-character resident ID number, including residence permits for Hong Kong, Macau and Taiwan residents and foreign permanent residence ID cards, whose region code, birth date since 1900 and check character all check out'
+    about_zh: '18 位居民身份证号（含港澳台居民居住证、外国人永久居留身份证）：地区码、1900 年以来的出生日期和校验码都对得上'
+  - id: bank-card
+    kind: financial
+    on_by_default: true
+    label: TW_CARD_NUMBER
+    name: Bank card number
+    name_zh: 银行卡号
+    about: 'A UnionPay, Visa, Mastercard, American Express, JCB, Discover or Diners Club card number whose prefix and length match and that passes the Luhn check; public test card numbers excepted'
+    about_zh: '银联、Visa、Mastercard、American Express、JCB、Discover、Diners Club 的卡号：号段、位数对得上并通过 Luhn 校验；公开的测试卡号除外'
+  - id: email
+    kind: contact
+    label: TW_EMAIL
+    name: Email address
+    name_zh: 邮箱地址
+    about: 'Email addresses: `name@domain`'
+    about_zh: '邮箱地址：`名称@域名`'
+  - id: cn-mobile-phone
+    kind: contact
+    label: TW_PHONE
+    name: Chinese mainland mobile number
+    name_zh: 中国大陆手机号
+    about: 'Chinese mainland mobile numbers: 11 digits starting with `1`, the second 3 to 9, not run together with other digits; a `+86`, `0086` or `86-` prefix and 3-4-4 groups separated by spaces or hyphens are allowed'
+    about_zh: '中国大陆手机号：`1` 开头的 11 位数字，第二位为 3 到 9，前后不紧挨其他数字；可带 `+86`、`0086`、`86-` 前缀，可按 3-4-4 以空格或连字符分隔'
+  - id: internal-ip
+    kind: internal
+    name: Internal IP address
+    name_zh: 内网地址
+    about: 'Addresses starting with `10.`, `172.16–31.`, `192.168.` or `100.64–127.`, and IPv6 addresses in `fc00::/7`; not 127.0.0.1'
+    about_zh: '`10.`、`172.16–31.`、`192.168.`、`100.64–127.` 开头的地址与 `fc00::/7` 内的 IPv6 地址，不含 127.0.0.1'
+  - id: internal-domain
+    kind: internal
+    name: Internal domain
+    name_zh: 内部域名
+    about: 'Domains ending in `.local`, `.internal`, `.lan`, `.corp`, `.home.arpa` or `.intranet`'
+    about_zh: '以 `.local`、`.internal`、`.lan`、`.corp`、`.home.arpa`、`.intranet` 结尾的域名'
+
+  # ---- 扩充的凭据规则（判据在 src/redact/secrets/）
+  - id: thinkwatch-saved-secret
+    kind: saved
+    on_by_default: true
+    name: Credentials saved in ThinkWatch
+    name_zh: ThinkWatch 中保存的密钥
+    about: 'Recognized by value, whatever the format: credentials saved in ThinkWatch, namely upstream keys and header values, gateway keys, proxy passwords, the remote control key, and sync and backup credentials. Values shorter than 12 characters are not matched'
+    about_zh: '按值识别 ThinkWatch 中保存的密钥，与格式无关：上游密钥与请求头中的值、网关密钥、代理密码、远程控制密钥、同步与备份凭据。不足 12 个字符的值不识别'
+
+  # AI 服务
+  - id: openai-service-key
+    kind: ai-services
+    on_by_default: true
+    name: OpenAI service account or admin key
+    name_zh: OpenAI 服务账号与管理密钥
+    prefixes:
+      - { prefix: 'sk-svcacct-', min_tail: 58 }
+      - { prefix: 'sk-admin-', min_tail: 58 }
+    hosts: [openai.com]
+  - id: openrouter-key
+    kind: ai-services
+    on_by_default: true
+    name: OpenRouter API key
+    name_zh: OpenRouter API 密钥
+    prefixes:
+      - { prefix: 'sk-or-v1-', min_tail: 64, tail: hex }
+    hosts: [openrouter.ai]
+  - id: xai-key
+    kind: ai-services
+    on_by_default: true
+    name: xAI API key
+    name_zh: xAI API 密钥
+    prefixes:
+      - { prefix: 'xai-', min_tail: 70, tail: alnum }
+    hosts: [x.ai]
+  - id: groq-key
+    kind: ai-services
+    on_by_default: true
+    name: Groq API key
+    name_zh: Groq API 密钥
+    prefixes:
+      - { prefix: 'gsk_', min_tail: 52, tail: alnum }
+    hosts: [groq.com]
+  - id: huggingface-token
+    kind: ai-services
+    on_by_default: true
+    name: Hugging Face token
+    name_zh: Hugging Face 令牌
+    prefixes:
+      - { prefix: 'hf_', min_tail: 34, tail: alnum }
+      - { prefix: 'api_org_', min_tail: 34, tail: alnum }
+    hosts: [huggingface.co, hf.co]
+  - id: replicate-token
+    kind: ai-services
+    on_by_default: true
+    name: Replicate token
+    name_zh: Replicate 令牌
+    prefixes:
+      - { prefix: 'r8_', min_tail: 37, tail: alnum }
+    hosts: [replicate.com]
+  - id: perplexity-key
+    kind: ai-services
+    on_by_default: true
+    name: Perplexity API key
+    name_zh: Perplexity API 密钥
+    prefixes:
+      - { prefix: 'pplx-', min_tail: 48, tail: alnum }
+    hosts: [perplexity.ai]
+  - id: bedrock-api-key
+    kind: ai-services
+    on_by_default: true
+    name: Amazon Bedrock API key
+    name_zh: Amazon Bedrock API 密钥
+    prefixes:
+      - { prefix: 'ABSK', min_tail: 100 }
+    hosts: [amazonaws.com]
+  - id: fireworks-key
+    kind: ai-services
+    on_by_default: true
+    name: Fireworks AI API key
+    name_zh: Fireworks AI API 密钥
+    prefixes:
+      - { prefix: 'fw_', min_tail: 20, tail: alnum }
+    hosts: [fireworks.ai]
+  - id: cerebras-key
+    kind: ai-services
+    on_by_default: true
+    name: Cerebras API key
+    name_zh: Cerebras API 密钥
+    prefixes:
+      - { prefix: 'csk-', min_tail: 48, tail: alnum }
+    hosts: [cerebras.ai]
+  - id: langsmith-key
+    kind: ai-services
+    on_by_default: true
+    name: LangSmith API key
+    name_zh: LangSmith API 密钥
+    prefixes:
+      - { prefix: 'lsv2_pt_', min_tail: 43 }
+      - { prefix: 'lsv2_sk_', min_tail: 43 }
+    hosts: [langchain.com, smith.langchain.com]
+  - id: langfuse-secret-key
+    kind: ai-services
+    on_by_default: true
+    name: Langfuse secret key
+    name_zh: Langfuse 私密密钥
+    prefixes:
+      - { prefix: 'sk-lf-', min_tail: 36 }
+    hosts: [langfuse.com]
+  - id: pinecone-key
+    kind: ai-services
+    on_by_default: true
+    name: Pinecone API key
+    name_zh: Pinecone API 密钥
+    prefixes:
+      - { prefix: 'pcsk_', min_tail: 69 }
+    hosts: [pinecone.io]
+  - id: tavily-key
+    kind: ai-services
+    on_by_default: true
+    name: Tavily API key
+    name_zh: Tavily API 密钥
+    prefixes:
+      - { prefix: 'tvly-', min_tail: 32 }
+    hosts: [tavily.com]
+  - id: minimax-key
+    kind: ai-services
+    on_by_default: true
+    name: MiniMax API key
+    name_zh: MiniMax API 密钥
+    prefixes:
+      - { prefix: 'sk-api-', min_tail: 100 }
+    hosts: [minimax.io, minimaxi.com, minimax.chat]
+  - id: zhipu-api-key
+    kind: ai-services
+    on_by_default: true
+    name: Zhipu API key
+    name_zh: 智谱 API 密钥
+    about: '32 hex characters, `.` and 16 letters or digits, run together'
+    about_zh: '32 个十六进制字符、`.` 与 16 个字母或数字相连'
+    hosts: [bigmodel.cn, z.ai]
+  - id: qianfan-api-key
+    kind: ai-services
+    on_by_default: true
+    name: Baidu Qianfan API key
+    name_zh: 百度千帆 API 密钥
+    about: 'Starts with `bce-v3/ALTAK-`, followed by 21 letters or digits, `/` and 40 hex characters, as a whole'
+    about_zh: '`bce-v3/ALTAK-` 开头，其后为 21 个字母或数字、`/` 与 40 个十六进制字符，整段'
+    # 只发往千帆的 API 主机：`baidubce.com` 下还有人人可开的云函数（`*.cfc-execute.*.baidubce.com`）
+    hosts: [qianfan.baidubce.com]
+
+  # 兼容格式的几家各有各的域名，按格式猜不出是哪家：发往这几家的 API 主机都算正当 ——
+  # DeepSeek（api.deepseek.com）、阿里云百炼 / DashScope（国内、国际、美国三个地域）、硅基流动
+  # （国内、国际）。**只写 API 主机，不写 `aliyuncs.com`**：那下面有人人可开的 OSS bucket，写了
+  # 就等于放行把密钥传进别人的 bucket。中转站的密钥同一个形状，保存过的按它自己的上游主机放行
+  - id: sk-compat-key
+    kind: ai-services
+    on_by_default: true
+    name: OpenAI-compatible API key
+    name_zh: OpenAI 兼容格式 API 密钥
+    about: 'Starts with `sk-`, followed by exactly 32 letters and digits (both present) or exactly 48 lowercase letters'
+    about_zh: '`sk-` 开头，其后恰为 32 个字母和数字（两者都有），或恰为 48 个小写字母'
+    hosts:
+      - api.deepseek.com
+      - dashscope.aliyuncs.com
+      - dashscope-intl.aliyuncs.com
+      - dashscope-us.aliyuncs.com
+      - api.siliconflow.cn
+      - api.siliconflow.com
+
+  # 代码托管与软件发布
+  - id: github-refresh-token
+    kind: dev-platforms
+    on_by_default: true
+    name: GitHub refresh token
+    name_zh: GitHub 刷新令牌
+    prefixes:
+      - { prefix: 'ghr_', min_tail: 36, tail: alnum }
+    hosts: [github.com]
+  - id: gitlab-other-token
+    kind: dev-platforms
+    on_by_default: true
+    name: Other GitLab token
+    name_zh: GitLab 其他令牌
+    prefixes:
+      - { prefix: 'glptt-', min_tail: 20 }
+      - { prefix: 'gldt-', min_tail: 20 }
+      - { prefix: 'glrt-', min_tail: 20 }
+      - { prefix: 'gloas-', min_tail: 20 }
+      - { prefix: 'glcbt-', min_tail: 20 }
+      - { prefix: 'glft-', min_tail: 20 }
+      - { prefix: 'glsoat-', min_tail: 20 }
+      - { prefix: 'glimt-', min_tail: 20 }
+      - { prefix: 'glagent-', min_tail: 20 }
+    hosts: [gitlab.com]
+  - id: pypi-token
+    kind: dev-platforms
+    on_by_default: true
+    name: PyPI token
+    name_zh: PyPI 令牌
+    prefixes:
+      - { prefix: 'pypi-AgEIcHlwaS5vcmc', min_tail: 50 }
+    hosts: [pypi.org]
+  - id: rubygems-token
+    kind: dev-platforms
+    on_by_default: true
+    name: RubyGems token
+    name_zh: RubyGems 令牌
+    prefixes:
+      - { prefix: 'rubygems_', min_tail: 48, tail: hex }
+    hosts: [rubygems.org]
+  - id: clojars-token
+    kind: dev-platforms
+    on_by_default: true
+    name: Clojars token
+    name_zh: Clojars 令牌
+    prefixes:
+      - { prefix: 'CLOJARS_', min_tail: 60, tail: alnum }
+    hosts: [clojars.org]
+  - id: docker-hub-token
+    kind: dev-platforms
+    on_by_default: true
+    name: Docker Hub token
+    name_zh: Docker Hub 令牌
+    prefixes:
+      - { prefix: 'dckr_pat_', min_tail: 27 }
+      - { prefix: 'dckr_oat_', min_tail: 32 }
+    hosts: [docker.com, docker.io]
+  - id: artifactory-key
+    kind: dev-platforms
+    on_by_default: true
+    name: JFrog Artifactory key
+    name_zh: JFrog Artifactory 密钥
+    prefixes:
+      - { prefix: 'AKCp', min_tail: 69, tail: alnum }
+    hosts: [jfrog.io]
+  - id: databricks-token
+    kind: dev-platforms
+    on_by_default: true
+    name: Databricks token
+    name_zh: Databricks 令牌
+    prefixes:
+      - { prefix: 'dapi', min_tail: 32, tail: hex }
+    hosts: [databricks.com, azuredatabricks.net]
+  - id: sentry-token
+    kind: dev-platforms
+    on_by_default: true
+    name: Sentry token
+    name_zh: Sentry 令牌
+    prefixes:
+      - { prefix: 'sntrys_', min_tail: 40 }
+      - { prefix: 'sntryu_', min_tail: 64, tail: hex }
+    hosts: [sentry.io]
+  - id: grafana-token
+    kind: dev-platforms
+    on_by_default: true
+    name: Grafana token
+    name_zh: Grafana 令牌
+    prefixes:
+      - { prefix: 'glsa_', min_tail: 41 }
+      - { prefix: 'glc_', min_tail: 32 }
+    hosts: [grafana.net, grafana.com]
+  - id: postman-key
+    kind: dev-platforms
+    on_by_default: true
+    name: Postman API key
+    name_zh: Postman API 密钥
+    prefixes:
+      - { prefix: 'PMAK-', min_tail: 59 }
+    hosts: [getpostman.com, postman.com]
+
+  # 云服务与基础设施
+  - id: aws-other-key-id
+    kind: cloud
+    on_by_default: true
+    name: Other AWS access key ID
+    name_zh: AWS 其他访问密钥 ID
+    prefixes:
+      - { prefix: 'ABIA', min_tail: 16, tail: alnum }
+      - { prefix: 'ACCA', min_tail: 16, tail: alnum }
+    hosts: [amazonaws.com]
+  - id: alibaba-access-key-id
+    kind: cloud
+    on_by_default: true
+    name: Alibaba Cloud AccessKey ID
+    name_zh: 阿里云 AccessKey ID
+    prefixes:
+      - { prefix: 'LTAI', min_tail: 12, tail: alnum }
+    hosts: [aliyuncs.com]
+  - id: tencent-secret-id
+    kind: cloud
+    on_by_default: true
+    name: Tencent Cloud SecretId
+    name_zh: 腾讯云 SecretId
+    prefixes:
+      - { prefix: 'AKID', min_tail: 32, tail: alnum }
+    hosts: [tencentcloudapi.com]
+  - id: volcengine-access-key-id
+    kind: cloud
+    on_by_default: true
+    name: Volcengine AccessKey ID
+    name_zh: 火山引擎 AccessKey ID
+    prefixes:
+      - { prefix: 'AKLT', min_tail: 40 }
+      - { prefix: 'AKTP', min_tail: 40 }
+    hosts: [volcengineapi.com]
+  - id: azure-ad-client-secret
+    kind: cloud
+    on_by_default: true
+    name: Azure AD client secret
+    name_zh: Azure AD 客户端密码
+    about: 'Three characters, a digit and `Q~`, followed by 31 to 34 characters'
+    about_zh: '3 个字符、1 位数字与 `Q~`，其后 31 至 34 个字符'
+    hosts: [microsoftonline.com]
+  - id: digitalocean-other-token
+    kind: cloud
+    on_by_default: true
+    name: Other DigitalOcean token
+    name_zh: DigitalOcean 其他令牌
+    prefixes:
+      - { prefix: 'doo_v1_', min_tail: 64, tail: hex }
+      - { prefix: 'dor_v1_', min_tail: 64, tail: hex }
+    hosts: [digitalocean.com]
+  - id: cloudflare-origin-ca-key
+    kind: cloud
+    on_by_default: true
+    name: Cloudflare Origin CA key
+    name_zh: Cloudflare Origin CA 密钥
+    prefixes:
+      - { prefix: 'v1.0-', min_tail: 171 }
+    hosts: [cloudflare.com]
+  - id: vault-token
+    kind: cloud
+    on_by_default: true
+    name: HashiCorp Vault token
+    name_zh: HashiCorp Vault 令牌
+    prefixes:
+      - { prefix: 'hvs.', min_tail: 90 }
+      - { prefix: 'hvb.', min_tail: 138 }
+    hosts: [hashicorp.cloud]
+  - id: terraform-token
+    kind: cloud
+    on_by_default: true
+    name: Terraform Cloud token
+    name_zh: Terraform Cloud 令牌
+    about: '14 letters or digits and `.atlasv1.`, followed by 60 to 70 characters'
+    about_zh: '14 个字母或数字与 `.atlasv1.`，其后 60 至 70 个字符'
+    hosts: [terraform.io, hashicorp.cloud]
+  - id: doppler-token
+    kind: cloud
+    on_by_default: true
+    name: Doppler token
+    name_zh: Doppler 令牌
+    prefixes:
+      - { prefix: 'dp.pt.', min_tail: 43, tail: alnum }
+    hosts: [doppler.com]
+  - id: pulumi-token
+    kind: cloud
+    on_by_default: true
+    name: Pulumi token
+    name_zh: Pulumi 令牌
+    prefixes:
+      - { prefix: 'pul-', min_tail: 40, tail: hex }
+    hosts: [pulumi.com]
+  - id: heroku-key
+    kind: cloud
+    on_by_default: true
+    name: Heroku API key
+    name_zh: Heroku API 密钥
+    prefixes:
+      - { prefix: 'HRKU-AA', min_tail: 58 }
+    hosts: [heroku.com]
+  - id: flyio-token
+    kind: cloud
+    on_by_default: true
+    name: Fly.io token
+    name_zh: Fly.io 令牌
+    prefixes:
+      - { prefix: 'fo1_', min_tail: 43 }
+    hosts: [fly.io, machines.dev]
+  - id: supabase-key
+    kind: cloud
+    on_by_default: true
+    name: Supabase key
+    name_zh: Supabase 密钥
+    prefixes:
+      - { prefix: 'sbp_', min_tail: 40, tail: alnum }
+      - { prefix: 'sb_secret_', min_tail: 31 }
+    hosts: [supabase.co, supabase.com]
+  - id: age-secret-key
+    kind: cloud
+    on_by_default: true
+    name: age secret key
+    name_zh: age 私钥
+    prefixes:
+      - { prefix: 'AGE-SECRET-KEY-1', min_tail: 58, tail: alnum }
+  - id: onepassword-token
+    kind: cloud
+    on_by_default: true
+    name: 1Password service account token
+    name_zh: 1Password 服务账号令牌
+    prefixes:
+      - { prefix: 'ops_eyJ', min_tail: 200 }
+    hosts: [1password.com]
+
+  # 支付、通信与协作
+  - id: stripe-webhook-secret
+    kind: business
+    on_by_default: true
+    name: Stripe webhook signing secret
+    name_zh: Stripe Webhook 签名密钥
+    prefixes:
+      - { prefix: 'whsec_', min_tail: 32 }
+    hosts: [stripe.com]
+  - id: shopify-token
+    kind: business
+    on_by_default: true
+    name: Shopify token
+    name_zh: Shopify 令牌
+    prefixes:
+      - { prefix: 'shpat_', min_tail: 32, tail: hex }
+      - { prefix: 'shpca_', min_tail: 32, tail: hex }
+      - { prefix: 'shppa_', min_tail: 32, tail: hex }
+      - { prefix: 'shpss_', min_tail: 32, tail: hex }
+    hosts: [myshopify.com, shopify.com]
+  - id: twilio-api-key
+    kind: business
+    on_by_default: true
+    name: Twilio API key
+    name_zh: Twilio API 密钥
+    prefixes:
+      - { prefix: 'SK', min_tail: 32, tail: hex }
+    hosts: [twilio.com]
+  - id: brevo-key
+    kind: business
+    on_by_default: true
+    name: Brevo API key
+    name_zh: Brevo API 密钥
+    prefixes:
+      - { prefix: 'xkeysib-', min_tail: 81 }
+    hosts: [brevo.com, sendinblue.com]
+  - id: slack-other-token
+    kind: business
+    on_by_default: true
+    name: Other Slack token
+    name_zh: Slack 其他令牌
+    prefixes:
+      - { prefix: 'xapp-', min_tail: 20 }
+      - { prefix: 'xoxe-', min_tail: 20 }
+      - { prefix: 'xoxe.xoxp-', min_tail: 20 }
+      - { prefix: 'xoxe.xoxb-', min_tail: 20 }
+      - { prefix: 'xoxr-', min_tail: 20 }
+    hosts: [slack.com]
+  - id: linear-key
+    kind: business
+    on_by_default: true
+    name: Linear API key
+    name_zh: Linear API 密钥
+    prefixes:
+      - { prefix: 'lin_api_', min_tail: 40, tail: alnum }
+    hosts: [linear.app]
+  - id: notion-token
+    kind: business
+    on_by_default: true
+    name: Notion token
+    name_zh: Notion 令牌
+    prefixes:
+      - { prefix: 'ntn_', min_tail: 46, tail: alnum }
+    hosts: [notion.com, notion.so]
+
+  # Atlassian 的令牌在 186 位左右，**末尾九位前面隔着一个 `=`**（不是 token 里的字符）：
+  # 切出来的 token 只有 180 上下，下限放在 150
+  - id: atlassian-token
+    kind: business
+    on_by_default: true
+    name: Atlassian API token
+    name_zh: Atlassian API 令牌
+    prefixes:
+      - { prefix: 'ATATT3', min_tail: 150 }
+    hosts: [atlassian.net, atlassian.com]
+
+  # 按位置认的：只换值那一段
+  - id: auth-header-credential
+    kind: in-context
+    on_by_default: true
+    name: Credential in a request header
+    name_zh: 请求头中的凭据
+    about: 'The value of an `Authorization`, `X-Api-Key`, `Api-Key` or `X-Goog-Api-Key` header, in curl `-H`, raw HTTP or code; only the value is replaced'
+    about_zh: '`Authorization`、`X-Api-Key`、`Api-Key`、`X-Goog-Api-Key` 请求头的值，包括 curl 的 `-H`、HTTP 原文与代码中的写法；只换值'
+  - id: command-line-password
+    kind: in-context
+    on_by_default: true
+    name: Password on a command line
+    name_zh: 命令行中的口令
+    about: 'Passwords on a command line: `curl -u user:password`, `--user`, `mysql -ppassword`, `PGPASSWORD=… psql`; only the password is replaced'
+    about_zh: '命令行中的口令：`curl -u 用户:口令`、`--user`、`mysql -p口令`、`PGPASSWORD=… psql`；只换口令'
+  - id: url-token
+    kind: in-context
+    on_by_default: true
+    name: Token in a URL
+    name_zh: URL 中的令牌
+    about: 'The value of the URL query parameter `access_token`, `api_key`, `apikey`, `client_secret`, `sig`, `X-Amz-Signature` or `X-Goog-Signature`; only the parameter value is replaced'
+    about_zh: 'URL 查询参数 `access_token`、`api_key`、`apikey`、`client_secret`、`sig`、`X-Amz-Signature`、`X-Goog-Signature` 的值；只换参数值'
+  - id: bot-webhook
+    kind: in-context
+    on_by_default: true
+    name: Bot webhook
+    name_zh: 机器人 Webhook
+    about: 'The token in a Feishu / Lark, DingTalk, WeCom, Slack, Discord or Microsoft Teams bot webhook URL; only the token is replaced'
+    about_zh: '飞书 / Lark、钉钉、企业微信、Slack、Discord、Microsoft Teams 机器人 Webhook 地址中的令牌；只换令牌段'
+  - id: telegram-bot-token
+    kind: in-context
+    on_by_default: true
+    name: Telegram bot token
+    name_zh: Telegram 机器人令牌
+    about: '8 to 10 digits and `:AA`, followed by 33 characters'
+    about_zh: '8 至 10 位数字与 `:AA`，其后 33 个字符'
+  - id: config-assignment
+    kind: in-context
+    on_by_default: true
+    name: Secret assigned in a config file
+    name_zh: 配置文件中的密钥赋值
+    about: 'Assignments in `.env`, YAML, TOML, INI or JSON whose variable name ends in `SECRET`, `SECRET_KEY`, `PASSWORD`, `PASSWD`, `PWD`, `TOKEN`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `PRIVATE_KEY` or `CLIENT_SECRET` (ignoring case) and whose value is a literal of at least 8 characters; only the value is replaced. Expressions, variable references and placeholders do not count'
+    about_zh: '`.env`、YAML、TOML、INI、JSON 中变量名以 `SECRET`、`SECRET_KEY`、`PASSWORD`、`PASSWD`、`PWD`、`TOKEN`、`API_KEY`、`APIKEY`、`ACCESS_KEY`、`PRIVATE_KEY`、`CLIENT_SECRET` 结尾（不区分大小写）、值为至少 8 个字符的字面量的赋值；只换值，表达式、变量引用和占位写法不算'
+
+  # 加密货币
+  - id: crypto-mnemonic
+    kind: crypto
+    on_by_default: true
+    name: Recovery phrase
+    name_zh: 助记词
+    about: '12, 15, 18, 21 or 24 consecutive words from the BIP39 English or Simplified Chinese word list that pass the checksum; numbering allowed, replaced as a whole'
+    about_zh: '连续 12、15、18、21 或 24 个 BIP39 英文或简体中文词表中的词，并通过校验和；可带编号，整段'
+  - id: crypto-wif-key
+    kind: crypto
+    on_by_default: true
+    name: WIF private key
+    name_zh: WIF 私钥
+    about: 'A WIF private key of 51 or 52 characters that passes Base58Check with a valid version byte'
+    about_zh: '51 或 52 个字符的 WIF 私钥：Base58Check 校验通过，版本字节对得上'
+  - id: crypto-extended-key
+    kind: crypto
+    on_by_default: true
+    name: Extended private key
+    name_zh: 扩展私钥
+    about: 'Starts with `xprv`, `tprv`, `yprv` or `zprv` and passes Base58Check'
+    about_zh: '`xprv`、`tprv`、`yprv`、`zprv` 开头，Base58Check 校验通过'
+
+  # ---- 扩充的个人信息规则（判据在 src/redact/personal/）
+  - id: cn-resident-id-15
+    kind: id-documents
+    label: TW_ID_NUMBER
+    name: 15-digit legacy resident ID number
+    name_zh: 15 位旧身份证号
+    about: 'A 15-digit legacy resident ID number with a valid region code and 6-digit birth date, followed by a 3-digit sequence'
+    about_zh: '15 位旧身份证号：地区码、6 位出生日期都对得上，其后 3 位顺序码'
+  - id: passport-mrz
+    kind: id-documents
+    on_by_default: true
+    label: TW_PASSPORT
+    name: Passport machine-readable zone
+    name_zh: 护照机读区
+    about: 'Two lines of 44 characters starting with `P`, with all four check digits and the composite check digit correct; replaced as a whole'
+    about_zh: '两行各 44 个字符、以 `P` 开头，四处校验位与综合校验位都对得上；整段'
+  - id: cn-passport
+    kind: id-documents
+    label: TW_PASSPORT
+    name: Chinese passport number
+    name_zh: 中国护照号
+    about: 'Starts with `E`, or `E` and a letter, followed by 7 or 8 digits, with “护照” or “passport” in the 20 characters before it'
+    about_zh: '`E` 或 `E` 加一个字母开头、其后 7 至 8 位数字，且前 20 个字符内出现「护照」或「passport」'
+  - id: hk-macau-taiwan-id
+    kind: id-documents
+    label: TW_ID_NUMBER
+    name: Hong Kong, Macau or Taiwan ID number
+    name_zh: 港澳台身份证号
+    about: 'Hong Kong, Macau and Taiwan ID numbers: Hong Kong and Taiwan ones with a correct check character; Macau ones only when the document is named just before'
+    about_zh: '香港、澳门、台湾身份证号：香港、台湾的校验码对得上；澳门的须前文写明证件名称'
+  - id: mainland-travel-permit
+    kind: id-documents
+    label: TW_ID_NUMBER
+    name: Mainland travel permit number
+    name_zh: 港澳台往来内地通行证号
+    about: 'Mainland travel permits for Hong Kong and Macau residents (`H` or `M` and 8 digits) and for Taiwan residents (8 digits), with “通行证”, “回乡证” or “台胞证” in the 20 characters before it'
+    about_zh: '港澳居民来往内地通行证（`H` 或 `M` 加 8 位数字）与台湾居民来往大陆通行证（8 位数字），且前 20 个字符内出现「通行证」「回乡证」或「台胞证」'
+  - id: us-ssn
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: US Social Security number
+    name_zh: 美国社会安全号
+    about: 'A US Social Security number written as `ddd-dd-dddd`, excluding area, group and serial numbers never issued'
+    about_zh: '`ddd-dd-dddd` 写法的美国社会安全号，不会分配的区号、组号与序号除外'
+  - id: uk-nino
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: UK National Insurance number
+    name_zh: 英国国民保险号
+    about: 'A UK National Insurance number: 2 letters, 6 digits and one of A to D, excluding letter pairs never issued'
+    about_zh: '2 个字母、6 位数字与 A 至 D 之一组成的英国国民保险号，不会分配的字母组合除外'
+  - id: sg-nric
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: Singapore NRIC / FIN
+    name_zh: 新加坡 NRIC / FIN
+    about: 'Starts with S, T, F or G, followed by 7 digits and a correct check letter'
+    about_zh: 'S、T、F、G 之一开头，7 位数字加校验字母，校验字母对得上'
+  - id: kr-rrn
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: Korean resident registration number
+    name_zh: 韩国居民登录号
+    about: 'A 6-digit birth date, `-` and 7 digits, with a valid date and an 8th digit from 1 to 8'
+    about_zh: '6 位出生日期、`-` 与 7 位数字，日期有效、第 8 位为 1 至 8'
+  - id: jp-my-number
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: Japanese My Number
+    name_zh: 日本个人番号
+    about: '12 digits with a correct check digit, with “マイナンバー”, “個人番号” or “My Number” in the 20 characters before it'
+    about_zh: '12 位数字，校验位对得上，且前 20 个字符内出现「マイナンバー」「個人番号」或「My Number」'
+  - id: in-aadhaar
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: Indian Aadhaar number
+    name_zh: 印度 Aadhaar 号码
+    about: '12 digits (optionally in groups of four), the first from 2 to 9, passing the Verhoeff check'
+    about_zh: '12 位数字（可四位一组），首位为 2 至 9，Verhoeff 校验通过'
+  - id: br-cpf
+    kind: foreign-ids
+    label: TW_ID_NUMBER
+    name: Brazilian CPF
+    name_zh: 巴西 CPF
+    about: 'A Brazilian CPF written as `ddd.ddd.ddd-dd`, with both check digits correct'
+    about_zh: '`ddd.ddd.ddd-dd` 写法的巴西 CPF，两位校验码对得上'
+  - id: iban
+    kind: financial
+    on_by_default: true
+    label: TW_ACCOUNT_NUMBER
+    name: 'IBAN'
+    name_zh: 国际银行账号（IBAN）
+    about: 'A country code, two check digits and the account number length set for that country, passing MOD 97-10; written in one run or in groups of four'
+    about_zh: '国家代码、两位校验码与该国规定位数的账号，MOD 97-10 校验通过；连写或四位一组'
+  - id: cn-landline
+    kind: contact
+    label: TW_PHONE
+    name: Chinese mainland landline number
+    name_zh: 中国大陆固定电话
+    about: 'A 2- or 3-digit area code starting with `0` and a 7- or 8-digit number, with a valid area code and brackets or a hyphen (`010-12345678`, `(0755)1234567`)'
+    about_zh: '`0` 开头的 2 至 3 位区号加 7 至 8 位号码，区号有效，须带括号或连字符（`010-12345678`、`(0755)1234567`）'
+  - id: intl-phone
+    kind: contact
+    label: TW_PHONE
+    name: International phone number
+    name_zh: 国际电话号码
+    about: 'Starts with `+`, with a valid country code and the length set for that country; spaces and hyphens allowed'
+    about_zh: '`+` 开头，国家码有效、位数与该国规定一致；可带空格与连字符'
+  - id: cn-address
+    kind: location
+    label: TW_ADDRESS
+    name: Chinese mainland street address
+    name_zh: 中国大陆详细地址
+    about: 'A Chinese mainland street address: administrative area names, a street, road, lane or village, and a house number; addresses that stop at the district do not count'
+    about_zh: '行政区划名称、街道路巷村之一与门牌号（号、栋、单元、室）组成的中国大陆详细地址；只到区县的不算'
+  - id: geo-coordinates
+    kind: location
+    label: TW_LOCATION
+    name: Precise coordinates
+    name_zh: 精确坐标
+    about: 'A latitude and longitude pair within range, each with at least 5 decimal places'
+    about_zh: '成对出现、在取值范围内、小数不少于 5 位的纬度与经度'
+  - id: cn-license-plate
+    kind: vehicle
+    label: TW_PLATE
+    name: Chinese mainland license plate
+    name_zh: 中国大陆车牌号
+    about: 'A province abbreviation, a letter and 5 letters or digits (6 for new-energy vehicles), without I or O'
+    about_zh: '省份简称、字母与 5 位字母或数字（新能源车为 6 位），不含 I、O'
+  - id: vin
+    kind: vehicle
+    label: TW_VIN
+    name: Vehicle identification number (VIN)
+    name_zh: 车辆识别代号（VIN）
+    about: '17 characters without I, O or Q, with a correct check character in position 9'
+    about_zh: '17 个字符、不含 I、O、Q，第 9 位校验码对得上'
+  - id: imei
+    kind: device
+    label: TW_DEVICE_ID
+    name: 'IMEI'
+    name_zh: 'IMEI'
+    about: '15 digits passing the Luhn check, with “IMEI” in the 20 characters before it'
+    about_zh: '15 位数字，Luhn 校验通过，且前 20 个字符内出现「IMEI」'
+  - id: mac-address
+    kind: device
+    label: TW_DEVICE_ID
+    name: MAC address
+    name_zh: MAC 地址
+    about: '6 pairs of hex characters separated by `:` or `-`; all-zero, broadcast and multicast addresses excepted'
+    about_zh: '6 组两位十六进制字符，以 `:` 或 `-` 分隔；全零、广播与组播地址除外'
+  - id: public-ip
+    kind: device
+    label: TW_IP
+    name: Public IP address
+    name_zh: 公网 IP 地址
+    about: 'Public IPv4 and IPv6 addresses; private, loopback, link-local, carrier-grade NAT, documentation and multicast addresses excepted'
+    about_zh: '公网 IPv4、IPv6 地址；私有、回环、链路本地、运营商级 NAT、文档示例与组播地址除外'
+  - id: labeled-name
+    kind: labeled-personal
+    label: TW_NAME
+    name: Name by field name
+    name_zh: 带字段名的姓名
+    about: 'The value of a field named `姓名`, `真实姓名`, `联系人`, `收件人`, `收货人`, `real_name`, `full_name`, `legal_name`, `first_name`, `last_name`, `given_name`, `family_name` or `name`, written as `name: value`, `"name": "value"` or under a table header; only the value is replaced'
+    about_zh: '字段名为 `姓名`、`真实姓名`、`联系人`、`收件人`、`收货人`、`real_name`、`full_name`、`legal_name`、`first_name`、`last_name`、`given_name`、`family_name`、`name` 的值，包括 `字段名: 值`、`"字段名": "值"` 与表格表头的写法；只换值'
+  - id: labeled-address
+    kind: labeled-personal
+    label: TW_ADDRESS
+    name: Address by field name
+    name_zh: 带字段名的住址
+    about: 'The value of a field named `住址`, `家庭住址`, `收货地址`, `联系地址`, `home_address`, `shipping_address`, `residential_address` or `address`, written as `name: value`, `"name": "value"` or under a table header; only the value is replaced'
+    about_zh: '字段名为 `住址`、`家庭住址`、`收货地址`、`联系地址`、`home_address`、`shipping_address`、`residential_address`、`address` 的值，包括 `字段名: 值`、`"字段名": "值"` 与表格表头的写法；只换值'
+  - id: labeled-birth-date
+    kind: labeled-personal
+    label: TW_BIRTH_DATE
+    name: Birth date by field name
+    name_zh: 带字段名的出生日期
+    about: 'The value of a field named `出生日期`, `生日`, `birthday`, `birth_date`, `date_of_birth` or `dob`, written as `name: value`, `"name": "value"` or under a table header; only the value is replaced'
+    about_zh: '字段名为 `出生日期`、`生日`、`birthday`、`birth_date`、`date_of_birth`、`dob` 的值，包括 `字段名: 值`、`"字段名": "值"` 与表格表头的写法；只换值'
+  - id: labeled-account
+    kind: labeled-personal
+    label: TW_ACCOUNT_NUMBER
+    name: Bank account by field name
+    name_zh: 带字段名的银行账号
+    about: 'The value of a field named `银行账号`, `开户账号`, `银行卡号`, `account_number`, `bank_account` or `bank_account_number`, written as `name: value`, `"name": "value"` or under a table header; only the value is replaced'
+    about_zh: '字段名为 `银行账号`、`开户账号`、`银行卡号`、`account_number`、`bank_account`、`bank_account_number` 的值，包括 `字段名: 值`、`"字段名": "值"` 与表格表头的写法；只换值'
+  - id: labeled-health
+    kind: labeled-personal
+    label: TW_HEALTH
+    name: Health information by field name
+    name_zh: 带字段名的健康信息
+    about: 'The value of a field named `病历号`, `住院号`, `诊断`, `病史`, `medical_record_number` or `diagnosis`, written as `name: value`, `"name": "value"` or under a table header; only the value is replaced'
+    about_zh: '字段名为 `病历号`、`住院号`、`诊断`、`病史`、`medical_record_number`、`diagnosis` 的值，包括 `字段名: 值`、`"字段名": "值"` 与表格表头的写法；只换值'

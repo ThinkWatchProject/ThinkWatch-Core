@@ -432,6 +432,7 @@ impl Recorder {
                         // 请求还没发出去
                         sent_model: None,
                         detail: it.detail.clone(),
+                        source: it.source.clone(),
                     });
                 }
             }
@@ -484,6 +485,7 @@ impl Recorder {
                             .filter(|m| !m.is_empty()),
                     },
                     detail: detail.clone(),
+                    source: None,
                 });
             }
             /*
@@ -528,6 +530,7 @@ impl Recorder {
                     session,
                     sent_model,
                     detail: detail.clone(),
+                    source: None,
                 });
             }
             Event::RequestHeaders {
@@ -2098,11 +2101,12 @@ mod security_tests {
                 tw_api::SecretItem {
                     rule: "anthropic-api-key".into(),
                     custom: false,
-                    kind: tw_api::SecretKind::ApiKeys,
+                    kind: tw_api::SecretKind::AiServices,
                     masked: "sk-an…AAAA".into(),
                     count: 2,
                     replaced,
                     detail: Default::default(),
+                    source: None,
                 },
                 tw_api::SecretItem {
                     rule: "公司令牌".into(),
@@ -2112,6 +2116,7 @@ mod security_tests {
                     count: 1,
                     replaced,
                     detail: Default::default(),
+                    source: None,
                 },
             ],
             at_ms: 10,
@@ -2327,6 +2332,7 @@ mod security_detail_tests {
                 count: 8,
                 replaced: true,
                 detail,
+                source: None,
             }],
             at_ms: 10,
         }

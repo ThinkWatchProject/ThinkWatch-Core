@@ -92,6 +92,7 @@ fn app(
         session: None,
         sent_model: None,
         detail: Default::default(),
+        source: None,
     })
     .unwrap();
     let rec = tw_store::Recorder::new(
