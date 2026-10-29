@@ -321,7 +321,7 @@ fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usiz
     Some((i, to, to))
 }
 
-/// `b` 以一个 shell 的关键字开头（后面不再接名字里的字符）：`TOKEN=abc;fi` 的 `fi`
+/// `b` 以一个 shell 的关键字开头，后面是结尾或者 `;`：`TOKEN=abc;fi` 的 `fi`
 fn shell_keyword(b: &[u8]) -> bool {
     const WORDS: &[&[u8]] = &[
         b"fi", b"done", b"then", b"do", b"else", b"elif", b"esac", b"export", b"echo", b"unset",
@@ -330,11 +330,14 @@ fn shell_keyword(b: &[u8]) -> bool {
         .iter()
         .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
         .count();
-    WORDS.contains(&&b[..n])
+    // 关键字后面是值的结尾或者下一个 `;`：`then#…`、`do!…` 是口令里的一段
+    WORDS.contains(&&b[..n]) && matches!(b.get(n), None | Some(b';'))
 }
 
 /// 一段带着括号、尖括号的值是不是一个字面量：不以括号开头，括号都配对，不像一次调用、一次
-/// 下标（`cfg[key2]`、`arr[i+1]`）或者一个泛型类型（`Map<String,V2>`）
+/// 下标（`cfg[key2]`、`arr[i+1]`）或者一个泛型类型（`Map<String,V2>`）。下标、泛型的前面是个
+/// 名字；那一段本身就像口令（`S3cret[2024]…`、`Xk9mQ2pLz7wR<3>`，字母数字都有）时拿不准，
+/// 当成字面量换掉 —— 宁可多换一处代码，不可漏掉一个口令
 fn literal(v: &[u8]) -> bool {
     if matches!(v.first(), Some(b'(' | b'[' | b'{' | b'<')) {
         return false;
@@ -343,11 +346,16 @@ fn literal(v: &[u8]) -> bool {
         .iter()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.'))
         .count();
-    if ident > 0
-        && (v[0].is_ascii_alphabetic() || v[0] == b'_')
-        && matches!(v.get(ident), Some(b'(' | b'[' | b'<'))
-    {
-        return false;
+    if ident > 0 && (v[0].is_ascii_alphabetic() || v[0] == b'_') {
+        match v.get(ident) {
+            Some(b'(') => return false,
+            Some(b'[' | b'<')
+                if !std::str::from_utf8(&v[..ident]).is_ok_and(|x| super::credible(x, 4)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
     }
     let mut depth = [0i32; 4];
     for &c in v {
