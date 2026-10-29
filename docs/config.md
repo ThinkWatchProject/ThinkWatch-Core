@@ -37,6 +37,17 @@ through the control plane cannot change it
 ([`listen.control`](#cfg-listen-control)), not to keep it from local
 programs; upstream and gateway keys are shown as written.
 
+Redaction exceptions
+([`security.redact.exceptions`](#cfg-security-redact-exceptions)) are stored
+as a plain, unsalted SHA-256 of each value. That is no secret from anyone
+who can read the file: a short value such as a phone number can be recovered
+from its hash by trying every number. The file already holds upstream keys in
+plain text, so the hash adds nothing to what it gives away; but it travels
+with exports, sync and backups, so list only values that are not sensitive.
+The request database holds no hash of any value found: the hashes behind the
+security log's "list as exception" are kept in memory for the most recent
+20,000 entries and dropped when core restarts.
+
 Tool-call inspection has a built-in rule for this directory,
 `thinkwatch-data`. A tool call whose path or command points into one of the
 default locations above, or into `/var/lib/thinkwatch` or `/etc/thinkwatch`
@@ -1036,9 +1047,15 @@ test fixture, a sample key in documentation) can be listed under
 `exceptions`. The rules keep working; only that value is left alone, under
 every rule, in both `observe` and `enforce`. Each entry holds the SHA-256 of
 the value, never the value itself, so the list can travel with exports,
-sync and backups. The app adds entries from the security log or from a
-pasted value; written by hand, `sha256` is the hash of the value as it
-appears in the message, with no surrounding quotes or JSON escapes.
+sync and backups (see the note on the plain SHA-256 under
+[where the file is](#where-the-file-is)). The app adds entries from the
+security log or from a pasted value; written by hand, `sha256` is the hash of
+the value as it appears in the message, with no surrounding quotes or JSON
+escapes. Only recent log entries can be listed from the log: the hash of each
+value is kept in memory for the last 20,000 entries and not across a restart,
+and a value made of overlapping matches joined into one cannot be listed at
+all. Older entries show neither the button nor the exception tag; paste the
+value instead.
 
 <!-- generated: table security.redact.exceptions[] -->
 <a id="cfg-security-redact-exceptions"></a>

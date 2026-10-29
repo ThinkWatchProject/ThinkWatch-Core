@@ -571,6 +571,7 @@ security.bad_content_pattern
 security.bad_label
 security.bad_pattern
 security.content_action_bad
+security.exception_forgotten
 security.exception_not_exceptable
 security.exception_saved_secret
 security.exception_value_empty

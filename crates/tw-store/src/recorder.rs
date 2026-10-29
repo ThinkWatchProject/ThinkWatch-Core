@@ -103,6 +103,41 @@ pub struct Recorder {
     /// **直接调，不走总线。**总线上丢了事件的话，这一行也就不在库里，重启之后从库里
     /// 加回来的数和此刻内存里的数对得上；走总线再绕一圈，两边丢的不是同一批。
     settled: Option<SettleHook>,
+    /// 最近几行出站脱敏的安全日志，各自命中的值的哈希（见 [`Hashes`]）
+    hashes: Hashes,
+}
+
+/// 最近 [`Hashes::CAP`] 行出站脱敏的安全日志：日志的号 → 那个值的 SHA-256（不能列为例外的是
+/// `None`）。「列为例外」和日志上的「例外」标签靠它。
+///
+/// **只在内存里，不落盘，重启就没了。**库里不存任何值的哈希：一个不加盐的 SHA-256 对手机号、
+/// 身份证号这种短的值，配上打码后留下的那几位，是能穷举回去的 —— 存进请求库等于把号码本身
+/// 存了一份，而请求库会被导出、拷走、附在问题报告里。只留最近的一批，是因为要列为例外的
+/// 多半就是刚看到的那几条；更早的没有按钮，用户照样可以粘贴那个值手动加入。
+#[derive(Debug, Default)]
+struct Hashes {
+    by_id: HashMap<i64, Option<String>>,
+    order: std::collections::VecDeque<i64>,
+}
+
+impl Hashes {
+    /// 留多少行。一行几十个字节，两万行一两 MB
+    const CAP: usize = 20_000;
+
+    fn put(&mut self, id: i64, hash: Option<String>) {
+        if self.by_id.insert(id, hash).is_none() {
+            self.order.push_back(id);
+        }
+        while self.order.len() > Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.by_id.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, id: i64) -> Option<Option<&str>> {
+        self.by_id.get(&id).map(Option::as_deref)
+    }
 }
 
 /// 记下的一行里，密钥和上游的用量上限要的那几样（见 `tw_gateway::key_limits`、
@@ -165,6 +200,7 @@ impl Recorder {
             bus: None,
             transcripts: Default::default(),
             settled: None,
+            hashes: Hashes::default(),
         }
     }
 
@@ -180,11 +216,24 @@ impl Recorder {
         self
     }
 
-    /// 记一条安全日志。**写不进去只记一行日志** —— 观测挂了，代理照跑。
-    fn record_security(&self, e: crate::db::SecurityEvent) {
-        if let Err(err) = self.db.insert_security_event(&e) {
-            tracing::debug!("the security record could not be written: {err}");
+    /// 记一条安全日志，返回它的号。**写不进去只记一行日志** —— 观测挂了，代理照跑。
+    fn record_security(&self, e: crate::db::SecurityEvent) -> Option<i64> {
+        match self.db.insert_security_event(&e) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::debug!("the security record could not be written: {err}");
+                None
+            }
         }
+    }
+
+    /// 安全日志第 `id` 条（出站脱敏的）命中的值的 SHA-256，「列为例外」照它加（见 [`Hashes`]）。
+    ///
+    /// - `None`：这一条不在内存里 —— 不是出站脱敏的、core 重启之前记的、或者早已被后来的挤掉了；
+    /// - `Some(None)`：在内存里，但不能列为例外（保存的凭据、几处重叠合成的一段）；
+    /// - `Some(Some(哈希))`：能列为例外。
+    pub fn value_hash(&self, id: i64) -> Option<Option<&str>> {
+        self.hashes.get(id)
     }
 
     pub fn db(&self) -> &Db {
@@ -413,7 +462,7 @@ impl Recorder {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
                 let session = self.inflight.get(id).and_then(|p| p.session.clone());
                 for it in items {
-                    self.record_security(crate::db::SecurityEvent {
+                    let row = self.record_security(crate::db::SecurityEvent {
                         at_ms: *at_ms as i64,
                         request_id: *id as i64,
                         guard: tw_api::Guard::Redact,
@@ -433,8 +482,10 @@ impl Recorder {
                         sent_model: None,
                         detail: it.detail.clone(),
                         source: it.source.clone(),
-                        value_sha256: it.value_sha256.clone(),
                     });
+                    if let Some(row) = row {
+                        self.hashes.put(row, it.value_sha256.clone());
+                    }
                 }
             }
             // 内容过滤：一条规则一条，`count` 是几处（码位规则是几个字符）。回答里的在回答结束时报
@@ -487,7 +538,6 @@ impl Recorder {
                     },
                     detail: detail.clone(),
                     source: None,
-                    value_sha256: None,
                 });
             }
             /*
@@ -533,7 +583,6 @@ impl Recorder {
                     sent_model,
                     detail: detail.clone(),
                     source: None,
-                    value_sha256: None,
                 });
             }
             Event::RequestHeaders {
@@ -2098,6 +2147,20 @@ mod security_tests {
     /// 一个值的哈希（随便哪个，这里测的是它记下、读回、不出进程）
     const HASH: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
+    /// 内存里只留最近的那些：多出来的从最早的挤掉
+    #[test]
+    fn only_the_latest_value_hashes_are_kept() {
+        let mut h = super::Hashes::default();
+        let cap = super::Hashes::CAP as i64;
+        for id in 1..=cap + 5 {
+            h.put(id, Some(format!("{id}")));
+        }
+        assert_eq!(h.get(5), None);
+        assert_eq!(h.get(6), Some(Some("6")));
+        assert_eq!(h.get(cap + 5), Some(Some(&*format!("{}", cap + 5))));
+        assert_eq!(h.by_id.len(), super::Hashes::CAP);
+    }
+
     fn secrets(replaced: bool) -> tw_api::Event {
         tw_api::Event::SecretsFound {
             id: 1,
@@ -2158,24 +2221,33 @@ mod security_tests {
             // 密钥和模型取自请求那一行
             assert_eq!(got[0].client, "claude-code");
             assert_eq!(got[0].model, "claude-sonnet-4-5");
-            // 值的哈希记下了、读得回来，但不出进程：事件和视图写成 JSON 都不带它
-            assert_eq!(got[1].value_sha256.as_deref(), Some(HASH));
-            assert_eq!(got[0].value_sha256, None);
-            assert_eq!(
-                r.db()
-                    .exception_source(got[1].id)
-                    .unwrap()
-                    .unwrap()
-                    .value_sha256
-                    .as_deref(),
-                Some(HASH)
-            );
+            // 值的哈希只在记录器的内存里：库里没有，事件写成 JSON 也不带它
+            assert_eq!(r.value_hash(got[1].id), Some(Some(HASH)));
+            assert_eq!(r.value_hash(got[0].id), Some(None), "不能列为例外的也记着");
+            assert_eq!(r.value_hash(999), None);
             assert!(!serde_json::to_string(&got).unwrap().contains(HASH));
             assert!(
                 !serde_json::to_string(&secrets(replaced))
                     .unwrap()
                     .contains(HASH)
             );
+            let mut st = r
+                .db()
+                .conn
+                .prepare("SELECT * FROM security_events")
+                .unwrap();
+            let n = st.column_count();
+            let dump: Vec<String> = st
+                .query_map([], |row| {
+                    Ok((0..n)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(!dump.join("\n").contains(HASH), "库里有哈希");
         }
     }
 

@@ -1382,7 +1382,6 @@ mod tests {
                 sent_model: None,
                 detail: Default::default(),
                 source: None,
-                value_sha256: None,
             })
             .unwrap();
         }

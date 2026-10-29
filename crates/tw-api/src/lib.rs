@@ -1121,7 +1121,8 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 例外的值在任何规则下都不换、不记。新端点 `GET /security/exceptions`（→
 /// [`RedactExceptions`]）、`POST /security/exceptions`（[`ExceptionAdd`]：交原值，core 当场
 /// 算哈希、按认出它的规则打码 → [`ExceptionAdded`]）、`POST /security/events/{id}/exception`
-/// （把安全日志的那一行列为例外，[`BaseVersion`] → [`ExceptionAdded`]）、
+/// （把安全日志的那一行列为例外，[`BaseVersion`] → [`ExceptionAdded`]；值的哈希只在 core 的内存里
+/// 留最近两万行，更早的、重启之前的是 409 `security.exception_forgotten`）、
 /// `DELETE /security/exceptions/{sha256}`（→ [`ConfigWritten`]）。[`SecurityEventView`] 多了
 /// `excepted`（这个值此刻是例外）和 `exceptable`（这一条能列为例外），「测试…」的命中
 /// （`SecurityTestHit`）多了 `excepted`（例外的值照样标出来，`action` 是空的）。新码：
@@ -6270,10 +6271,10 @@ pub struct SecretItem {
     /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`：这时 `masked` 是空的）。别的规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SavedSource>,
-    /// 值的 SHA-256（[`tw_guard::redact::rules::Finding::sha256`]），给安全日志记下，日后
-    /// 「列为例外」照它加。**只在进程里走**：事件流、在途快照都不带它 —— 界面要列为例外时
-    /// 交回的是日志那一行的号，用不着哈希；一个不需要它的地方拿到它，对短的值（手机号）
-    /// 就是一张可以穷举的答案
+    /// 值的 SHA-256（[`tw_guard::redact::rules::Finding::sha256`]），给记录器留在内存里，日后
+    /// 「列为例外」照它加；不能列为例外的（保存的凭据、几处重叠合成的一段）没有。**只在进程里
+    /// 走**：事件流、在途快照都不带它，请求库也不存 —— 界面要列为例外时交回的是日志那一行的号，
+    /// 用不着哈希；一个不需要它的地方拿到它，对短的值（手机号）就是一张可以穷举的答案
     #[serde(skip)]
     #[cfg_attr(feature = "ts", ts(skip))]
     pub value_sha256: Option<String>,
@@ -6381,15 +6382,14 @@ pub struct SecurityEventView {
     /// 读的时候按现在的例外表算，不是记下时的
     #[serde(default)]
     pub excepted: bool,
-    /// 出站脱敏：这一条能「列为例外」（`POST /security/events/{id}/exception`）。保存的
-    /// 凭据、别的防护的记录不能；已经是例外的也是 false
+    /// 出站脱敏：这一条能「列为例外」（`POST /security/events/{id}/exception`）。保存的凭据、
+    /// 几处重叠合成的一段、别的防护的记录不能；已经是例外的也是 false。
+    ///
+    /// **这两样只对最近的记录算得出**：值的哈希不进请求库，只在 core 的内存里留最近两万行
+    /// （重启就没了）。更早的记录两样都是 false —— 界面上不给按钮也不标「例外」，那个值可以
+    /// 粘贴进「添加例外」手动加入
     #[serde(default)]
     pub exceptable: bool,
-    /// 记下时值的 SHA-256。**不出进程**（同 [`SecretItem::value_sha256`]）：控制面读出来之后
-    /// 照它算 `excepted`、`exceptable`，列为例外时按这一行的号从库里取
-    #[serde(skip)]
-    #[cfg_attr(feature = "ts", ts(skip))]
-    pub value_sha256: Option<String>,
 }
 
 /// 一条安全记录最多列几处命中（[`SecurityEventView::locations`]）。再多的只数个数

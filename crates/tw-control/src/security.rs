@@ -30,11 +30,15 @@
 //!
 //! - 手动加入时界面交原值，这里当场算哈希、按认出它的规则打码，写进配置的只有这两样；
 //!   原值不进日志（[`tw_api::ExceptionAdd`] 的 `Debug` 不打它）、不进回答。
-//! - 从安全日志加入时界面交的是**那一行的号**，不是哈希：日志那一行记着值的哈希
-//!   （`security_events.value_sha256`），这里从库里取。哈希只在 core 的进程和库里，事件流、
-//!   日志视图都不带它 —— 对手机号这种短的值，一个不加盐的 SHA-256 是能穷举回去的，没理由
-//!   交给不需要它的界面。界面要的「这一条已经是例外」「这一条能列为例外」读的时候在这里
-//!   照现在的例外表算好（[`annotate`]）。
+//! - 从安全日志加入时界面交的是**那一行的号**，不是哈希。值的哈希**不进请求库**，只在记录器
+//!   的内存里留最近两万行（[`tw_store::Recorder::value_hash`]），重启就没了：对手机号这种短的
+//!   值，一个不加盐的 SHA-256 配上打码后留下的几位是能穷举回去的，存进库等于把号码存了一份，
+//!   也没理由交给不需要它的界面（事件流、日志视图都不带它）。更早的记录没法从日志加入（409），
+//!   粘贴那个值手动加入。界面要的「这一条已经是例外」「这一条能列为例外」读的时候在这里
+//!   照内存里的哈希和现在的例外表算好（[`annotate`]），不在内存里的两样都是 false。
+//! - 几处重叠的命中合成的一段、只记录的规则让开之后剩下的几截没有哈希
+//!   （[`tw_guard::redact::rules::Finding::sha256`]）：没有哪条规则认过那一段，列为例外挡不住
+//!   什么。
 //! - 移出按哈希：例外表本身（`GET /security/exceptions`）就是配置里的那一份，界面
 //!   拿得到配置原文，哈希在这里不多泄露什么。
 
@@ -228,7 +232,7 @@ async fn events(
         )
         .map_err(crate::records)?;
     let mut page = page;
-    annotate(&s.config(), &mut page.events);
+    annotate(&s.config(), &g, &mut page.events);
     Ok(Json(page))
 }
 
@@ -735,16 +739,20 @@ const EXCEPTIONS: edit::Section = edit::Section {
 };
 
 /// 安全日志的记录按现在的例外表标上 `excepted`、`exceptable`（见文件头）。**每个返回日志
-/// 记录的端点都要过一遍**：库里只有哈希，这两样是读的时候算的
+/// 记录的端点都要过一遍**：哈希不在库里，在记录器的内存里，只有最近的那些行有
+/// （[`tw_store::Recorder::value_hash`]）；不在内存里的两样都是 false
 pub(crate) fn annotate<'a>(
     cfg: &tw_config::Config,
+    rec: &tw_store::Recorder,
     views: impl IntoIterator<Item = &'a mut tw_api::SecurityEventView>,
 ) {
     let set = cfg.security.redact.exception_set();
     for v in views {
-        let hash = match (v.guard, v.value_sha256.as_deref()) {
-            (Guard::Redact, Some(h)) => h,
-            _ => continue,
+        if v.guard != Guard::Redact {
+            continue;
+        }
+        let Some(Some(hash)) = rec.value_hash(v.id) else {
+            continue;
         };
         v.excepted = set.as_ref().is_some_and(|ex| ex.contains_hex(hash));
         v.exceptable = !v.excepted;
@@ -782,31 +790,50 @@ async fn add_exception_from_event(
     Json(req): Json<tw_api::BaseVersion>,
 ) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
     let store = crate::need_store(&s)?;
-    let src = store
-        .lock()
-        .await
-        .db()
-        .exception_source(id)
-        .map_err(crate::records)?
-        .ok_or_else(|| {
-            fail(
-                StatusCode::NOT_FOUND,
-                msg!(
-                    "security.unknown_event", id = id.to_string() =>
-                    "There is no security log entry {id}; it may have passed the retention period."
-                ),
-            )
-        })?;
-    let sha256 = match (src.guard, src.value_sha256) {
-        (Guard::Redact, Some(h)) => h,
-        // 保存的凭据、工具调用审查和内容过滤的记录：没有可以例外的「值」
-        _ => {
+    let (src, hash) = {
+        let g = store.lock().await;
+        let src = g
+            .db()
+            .exception_source(id)
+            .map_err(crate::records)?
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::NOT_FOUND,
+                    msg!(
+                        "security.unknown_event", id = id.to_string() =>
+                        "There is no security log entry {id}; it may have passed the retention \
+                         period."
+                    ),
+                )
+            })?;
+        let hash = g.value_hash(id).map(|h| h.map(str::to_string));
+        (src, hash)
+    };
+    let not_exceptable = || {
+        fail(
+            StatusCode::BAD_REQUEST,
+            msg!(
+                "security.exception_not_exceptable" =>
+                "Only a value found by outbound redaction can be an exception, and a saved \
+                 secret or a span joined from overlapping matches cannot."
+            ),
+        )
+    };
+    let sha256 = match (src.guard, hash) {
+        (Guard::Redact, Some(Some(h))) => h,
+        // 工具调用审查、内容过滤的记录没有可以例外的「值」；保存的凭据、几处重叠合成的一段
+        // 列为例外也挡不住什么
+        (Guard::Redact, Some(None)) | (Guard::InspectTools | Guard::Content, _) => {
+            return Err(not_exceptable());
+        }
+        // 记下时的哈希只在内存里留最近的一批，重启就没了（见 `tw_store::Recorder::value_hash`）
+        (Guard::Redact, None) => {
             return Err(fail(
-                StatusCode::BAD_REQUEST,
+                StatusCode::CONFLICT,
                 msg!(
-                    "security.exception_not_exceptable" =>
-                    "Only a value found by outbound redaction can be an exception, and a saved \
-                     secret cannot."
+                    "security.exception_forgotten" =>
+                    "This entry is too old to be listed as an exception from the log; paste the \
+                     value into Add exception instead."
                 ),
             ));
         }
@@ -821,43 +848,64 @@ async fn add_exception_from_event(
 }
 
 /// 写进例外表。**已经在表里的不再写一次**（不论是哪条规则加的）：回那一项和现在的版本。
-/// 满了是 409
+/// 满了是 409。
+///
+/// 两样都在写入那一步里、对着那一刻的配置查：两个「列为例外」同时到，后写的那个读到的是先写
+/// 完的那一份。写的时候磁盘上的配置被别人改了（[`tw_config::StoreError::Conflict`]）、而调用方
+/// 没带版本时重来一次，重来时就看见了先写进去的那一项
 async fn put_exception(
     s: &ControlState,
     e: tw_config::RedactException,
     base_version: Option<&str>,
 ) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
-    let cur = s.cfg.current().map_err(crate::unreadable_config)?;
-    if let Ok(cfg) = tw_config::try_parse(&cur.text) {
-        let list = &cfg.security.redact.exceptions;
-        if let Some(have) = list.iter().find(|x| x.sha256 == e.sha256) {
-            return Ok(Json(tw_api::ExceptionAdded {
-                version: cur.version(),
-                exception: have.clone(),
-            }));
+    let m = item(&e)?;
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        // 已经在表里：那一项和没改动的那一版
+        let mut have: Option<(tw_config::RedactException, String)> = None;
+        let r = s
+            .cfg
+            .transform(base_version, Origin::Ui, |text, cfg| {
+                let list = &cfg.security.redact.exceptions;
+                if let Some(x) = list.iter().find(|x| x.sha256 == e.sha256) {
+                    have = Some((x.clone(), tw_config::version_of(text)));
+                    return Err(ApplyError::InUse(already_listed()));
+                }
+                if list.len() >= tw_guard::policy::EXCEPTIONS_MAX {
+                    return Err(ApplyError::InUse(msg!(
+                        "security.exceptions_full", max = tw_guard::policy::EXCEPTIONS_MAX.to_string() =>
+                        "There are already {max} exceptions; remove one before adding another."
+                    )));
+                }
+                Ok(edit::upsert(text, EXCEPTIONS, None, &m)?)
+            })
+            .await;
+        if let Some((exception, version)) = have {
+            return Ok(Json(tw_api::ExceptionAdded { version, exception }));
         }
-        if list.len() >= tw_guard::policy::EXCEPTIONS_MAX {
-            return Err(fail(
-                StatusCode::CONFLICT,
-                msg!(
-                    "security.exceptions_full", max = tw_guard::policy::EXCEPTIONS_MAX.to_string() =>
-                    "There are already {max} exceptions; remove one before adding another."
-                ),
-            ));
+        match r {
+            Ok(version) => {
+                return Ok(Json(tw_api::ExceptionAdded {
+                    version,
+                    exception: e,
+                }));
+            }
+            Err(ApplyError::Store(tw_config::StoreError::Conflict { .. }))
+                if base_version.is_none() && tries < 3 => {}
+            Err(err) => return Err(apply_fail(err)),
         }
     }
-    let m = item(&e)?;
-    let version = s
-        .cfg
-        .transform(base_version, Origin::Ui, |text, _| {
-            Ok(edit::upsert(text, EXCEPTIONS, None, &m)?)
-        })
-        .await
-        .map_err(apply_fail)?;
-    Ok(Json(tw_api::ExceptionAdded {
-        version,
-        exception: e,
-    }))
+}
+
+/// 只在 [`put_exception`] 里头用来停下那次写入，不会到界面上（已经在表里的回 200），所以
+/// 没有码
+fn already_listed() -> tw_types::Msg {
+    tw_types::Msg {
+        code: String::new(),
+        args: Default::default(),
+        text: String::new(),
+    }
 }
 
 async fn remove_exception(
