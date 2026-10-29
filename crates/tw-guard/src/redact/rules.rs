@@ -826,6 +826,64 @@ impl RuleSet {
     pub fn is_empty(&self) -> bool {
         self.on.is_empty() && self.custom.is_empty()
     }
+
+    /// 这套规则的指纹（SHA-256）：**找出来的命中可能因之而变的每一样**都在里面 —— 开着哪些
+    /// 内置规则、每条自定义规则（顺序、写法、怎么认、标签）、哪些只记录、保存的凭据的值。
+    /// 两套规则指纹一样，在同一段文字上找出来的就一样。扫描缓存（[`super::cache`]）拿它做键的
+    /// 一部分：改了规则、改了保存的密钥，以前存下的结果整个不作数。
+    ///
+    /// **字段一个一个拆开写、不留 `..`**：往 [`RuleSet`] 里加一样会影响命中的东西（例外值……）
+    /// 时，这里编译不过，逼着把它也喂进指纹 —— 漏了的话，缓存会把改之前的结果当成改之后的。
+    /// 只影响报法、不影响命中的（编好的预筛）写成 `_`
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let RuleSet {
+            on,
+            custom,
+            record,
+            saved,
+            index: _,
+        } = self;
+        let mut h = Sha256::new();
+        // 每一段先写长度：`ab` + `c` 和 `a` + `bc` 不是同一个指纹
+        let mut put = |tag: &[u8], b: &[u8]| {
+            h.update(tag);
+            h.update((b.len() as u64).to_le_bytes());
+            h.update(b);
+        };
+        // HashSet 的顺序每个实例都不一样，排好再写
+        let mut ids: Vec<&str> = on.iter().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            put(b"on", id.as_bytes());
+        }
+        // 自定义规则的顺序算数：同一处两条都认得时，合成一处后报的是先记下的那条
+        for c in custom {
+            put(b"custom", c.name.as_bytes());
+            put(b"pattern", c.pattern.text.as_bytes());
+            put(
+                b"how",
+                &[
+                    u8::from(c.pattern.regex),
+                    u8::from(c.pattern.case_sensitive),
+                ],
+            );
+            put(b"label", c.label.as_deref().unwrap_or("").as_bytes());
+            put(b"labeled", &[u8::from(c.label.is_some())]);
+        }
+        let mut rec: Vec<(bool, &str)> = record.iter().map(|r| (r.custom(), r.id())).collect();
+        rec.sort_unstable();
+        for (custom, id) in rec {
+            put(b"record", &[u8::from(custom)]);
+            put(b"record-id", id.as_bytes());
+        }
+        if let Some(saved) = saved {
+            for v in saved.values() {
+                put(b"saved", v.as_bytes());
+            }
+        }
+        h.finalize().into()
+    }
 }
 
 /// 一个字节是不是 token 的一部分。**token 只由 ASCII 组成**，所以按字节切和按字符切切出来的

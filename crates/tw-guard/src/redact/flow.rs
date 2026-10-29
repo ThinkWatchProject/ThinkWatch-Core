@@ -36,12 +36,20 @@
 //! 替换档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换。
 //! 各跳各起一本账的话，转换过格式、字段换了顺序的那一跳，同一把密钥可能是 2 号，而
 //! 上一跳、存下来的那份请求里它是 1 号 —— 请求和回答对不上号。
+//!
+//! # 没变的历史不再扫
+//!
+//! 带 `_with` 的几个入口多收一个扫描缓存（[`ScanCache`]，网关运行时一份）：客户端每一轮都把
+//! 整段历史发上来，没变的消息取上一轮扫出来的命中，只扫新增的。**找出来的和不带缓存时一模
+//! 一样**（缓存只替掉「按规则扫一遍」那一步，之后去掉占位符、只留正文、合并照旧在整个请求
+//! 体上做），所以编号、报法、换法都不变。不带缓存的入口（`None`）就是原来的样子。
 
 use std::ops::Range;
 
 pub use tw_dialect::written::Shape;
 
 use crate::policy::Mode;
+pub use crate::redact::cache::ScanCache;
 use crate::redact::replace::{Ledger, Scheme};
 use crate::redact::rules::{Finding, Hit, RuleSet};
 
@@ -74,7 +82,20 @@ pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
 /// **先在整段上找、再看落在哪儿**：大多数请求一处都不命中，正文和载荷在哪儿等有了命中
 /// 再找 —— 认正文要把请求体解析一遍。
 pub fn hits_in(text: &str, rules: &RuleSet, scope: Scope) -> Vec<Hit> {
-    let mut hits = crate::redact::rules::scan_unresolved(text, rules);
+    hits_in_with(text, rules, scope, None)
+}
+
+/// [`hits_in`]，没变的段取 `cache` 里上次扫的（见模块说明）。找出来的一模一样
+pub fn hits_in_with(
+    text: &str,
+    rules: &RuleSet,
+    scope: Scope,
+    cache: Option<&ScanCache>,
+) -> Vec<Hit> {
+    let mut hits = match cache {
+        Some(c) => c.scan_unresolved(text, rules),
+        None => crate::redact::rules::scan_unresolved(text, rules),
+    };
     if hits.is_empty() {
         return hits;
     }
@@ -163,6 +184,17 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape) -> Vec<Findi
 /// 几截（存下来时照样打码）。报的时候它整个算一处、照样报 —— 用户要看得见它在认哪些值。
 /// 没有只记录的规则时就是 `found` 的那些
 pub fn reported(text: &str, rules: &RuleSet, found: &[Hit], scope: Scope) -> Vec<Finding> {
+    reported_with(text, rules, found, scope, None)
+}
+
+/// [`reported`]，另找的那一遍也走 `cache`（只记录的那几条规则是另一套，指纹不同，各存各的）
+pub fn reported_with(
+    text: &str,
+    rules: &RuleSet,
+    found: &[Hit],
+    scope: Scope,
+    cache: Option<&ScanCache>,
+) -> Vec<Finding> {
     let Some(rec) = rules.recording_only() else {
         return crate::redact::rules::findings_in(text, found, rules);
     };
@@ -173,7 +205,7 @@ pub fn reported(text: &str, rules: &RuleSet, found: &[Hit], scope: Scope) -> Vec
         .filter(|h| !rules.records(&h.rule))
         .cloned()
         .collect();
-    all.extend(hits_in(text, &rec, scope));
+    all.extend(hits_in_with(text, &rec, scope, cache));
     all.sort_by_key(|h| h.bytes.start);
     crate::redact::rules::findings_in(text, &all, rules)
 }
@@ -233,6 +265,18 @@ pub struct Look {
 
 /// [`look_from`]，把找到的命中一起交回去（见 [`Look::hits`]）。
 pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape, seed: Ledger) -> Look {
+    look_hits_with(mode, rules, body, shape, seed, None)
+}
+
+/// [`look_hits`]，没变的段取 `cache` 里上次扫的（见模块说明）
+pub fn look_hits_with(
+    mode: Mode,
+    rules: &RuleSet,
+    body: &[u8],
+    shape: Shape,
+    seed: Ledger,
+    cache: Option<&ScanCache>,
+) -> Look {
     let empty = || Look {
         found: Vec::new(),
         ledger: Ledger::new(Scheme::SECRET),
@@ -245,8 +289,8 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], shape: Shape, seed: L
         return empty();
     };
     let scope = Scope::Written(shape);
-    let hits = hits_in(text, rules, scope);
-    let found = reported(text, rules, &hits, scope);
+    let hits = hits_in_with(text, rules, scope, cache);
+    let found = reported_with(text, rules, &hits, scope, cache);
     let ledger = if !mode.acts() {
         Ledger::new(Scheme::SECRET)
     } else {
@@ -270,6 +314,18 @@ pub fn replace(
     ledger: &Ledger,
     shape: Shape,
 ) -> (bytes::Bytes, Ledger) {
+    replace_with(mode, rules, body, ledger, shape, None)
+}
+
+/// [`replace`]，没变的段取 `cache` 里上次扫的（见模块说明）
+pub fn replace_with(
+    mode: Mode,
+    rules: &RuleSet,
+    body: bytes::Bytes,
+    ledger: &Ledger,
+    shape: Shape,
+    cache: Option<&ScanCache>,
+) -> (bytes::Bytes, Ledger) {
     if !mode.acts() || rules.is_empty() {
         return (body, ledger.clone());
     }
@@ -277,7 +333,7 @@ pub fn replace(
     let Ok(text) = std::str::from_utf8(&body) else {
         return (body, ledger.clone());
     };
-    let found = hits_in(text, rules, Scope::Written(shape));
+    let found = hits_in_with(text, rules, Scope::Written(shape), cache);
     // 只记录的规则命中的不换
     let hits = rules.to_replace(&found);
     if hits.is_empty() {

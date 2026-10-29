@@ -472,6 +472,62 @@ fn option_at(b: &[u8], k: usize) -> bool {
     b[k] == b'-' && k > 0 && (b[k - 1].is_ascii_whitespace() || matches!(b[k - 1], b'"' | b'\''))
 }
 
+/// 扫描缓存（[`crate::redact::cache`]）用：`text` 里有没有一条命令（`curl`、`mysql`……）到结尾
+/// 都没结束。**命令跨得过字符串**（`["curl","-u","用户:口令"]` 是数组里的几项，见
+/// [`command_end`]），在整段请求体里它会接着往后，把后面一段开头的选项也认成它的 —— 这一段
+/// 单拿出来扫就看不到了。
+///
+/// 宁可多报：最后一个命令分隔之后，以命令名**结尾**的一串 token 字符就算（前面粘着转义的尾巴，
+/// 切 token 时会切掉的，也算上）
+pub(in crate::redact) fn command_open_at_end(text: &str) -> bool {
+    let b = text.as_bytes();
+    // 最后一个命令分隔之后从哪儿起。和 `command_end` 一样两个反斜杠一对跳过：一串 token 的结尾
+    // 不会落在一串反斜杠中间，从头数和从 token 的结尾数，对得上的是同一些分隔
+    let (mut from, mut i) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            b';' | b'|' | b'&' | b')' | b'`' | b'\n' | b'\r' => {
+                i += 1;
+                from = i;
+            }
+            b'\\' if b.get(i + 1) == Some(&b'\\') => i += 2,
+            b'\\' if matches!(b.get(i + 1), Some(b'n' | b'r')) => {
+                i += 2;
+                from = i;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut k = from;
+    while k < b.len() {
+        if !tok_byte(b[k]) {
+            k += 1;
+            continue;
+        }
+        let s = k;
+        while k < b.len() && tok_byte(b[k]) {
+            k += 1;
+        }
+        let run = &text[s..k];
+        let named = WORDS.iter().any(|&(w, m)| {
+            matches!(m, Mark::Curl | Mark::Mysql)
+                && run.len() >= w.len()
+                && run[run.len() - w.len()..].eq_ignore_ascii_case(w)
+        });
+        if named && command_word(b, k) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 扫描缓存用：从 `from` 起到这条命令结束（[`command_end`]）之前，有没有一个选项的开头。一条
+/// 没结束的命令（[`command_open_at_end`]）在后面这一截里认得出的口令，都从一个选项开头
+pub(in crate::redact) fn option_before_command_end(b: &[u8], from: usize) -> (bool, usize) {
+    let end = command_end(b, from);
+    ((from.max(1)..end).any(|k| option_at(b, k)), end)
+}
+
 /// `curl -u 用户:口令`、`--user 用户:口令`、`-u用户:口令` 里的口令。`e` 是 `curl` 的终点。
 /// 只有用户名的（`-u user`、`-u sk_…:`，口令为空）不算 —— 后者的密钥在用户名那一段，归
 /// 前缀规则。返回这条命令在哪儿结束
