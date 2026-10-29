@@ -579,7 +579,8 @@ fn path_end(b: &[u8], from: usize) -> (Option<usize>, usize) {
     })
 }
 
-/// `hooks.slack.com/services/T…/B…/令牌`（`workflows`、`triggers` 同理）：最后一段是令牌。
+/// `hooks.slack.com/services/T…/B…/令牌`（`workflows`、`triggers` 同理）：最后一段开头的那串
+/// 字母数字是令牌。句末的标点、结尾的 `/` 不算路径（`…/令牌.`、`…/令牌, 然后`、`…/令牌/`）。
 /// 返回往后看到了哪儿
 fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
     if b.get(e) != Some(&b'/') {
@@ -589,17 +590,19 @@ fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
     let Some(end) = end else {
         return seen;
     };
-    let path = &b[e..end];
+    let mut stop = end;
+    while stop > e && matches!(b[stop - 1], b'.' | b',' | b';' | b':' | b'!' | b'/') {
+        stop -= 1;
+    }
+    let path = &b[e..stop];
     let last = path
         .iter()
         .rposition(|&c| c == b'/')
         .map_or(e, |p| e + p + 1);
     let segments = path.iter().filter(|&&c| c == b'/').count();
-    if segments >= 3
-        && b[last..end].iter().all(u8::is_ascii_alphanumeric)
-        && real_token(&b[last..end], 16)
-    {
-        out.push(builtin_hit("bot-webhook", last..end));
+    let tok = run_to(b, last, stop, |c| c.is_ascii_alphanumeric());
+    if segments >= 3 && real_token(&b[last..tok], 16) {
+        out.push(builtin_hit("bot-webhook", last..tok));
     }
     end
 }

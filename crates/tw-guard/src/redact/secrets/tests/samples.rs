@@ -344,6 +344,19 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                         ),
                         uuid(2),
                     ),
+                    // 句末的标点、结尾的 `/` 不算令牌
+                    (
+                        format!(
+                            "post to https://hooks.slack.com/services/T0123ABCD/B0123ABCD/{slack}."
+                        ),
+                        slack.clone(),
+                    ),
+                    (
+                        format!(
+                            "https://hooks.slack.com/services/T0123ABCD/B0123ABCD/{slack}/, ok"
+                        ),
+                        slack.clone(),
+                    ),
                     (
                         format!("https://hooks.slack.com/services/T0123ABCD/B0123ABCD/{slack}"),
                         slack,
