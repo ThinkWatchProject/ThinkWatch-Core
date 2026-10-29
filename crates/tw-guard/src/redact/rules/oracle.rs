@@ -86,7 +86,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
         }
     });
     spaced.finish(text, &mut out);
-    secrets.finish(text, &mut out);
+    secrets.finish(text, set, &mut out);
     personal.finish(text, &mut out);
     custom_hits(text, set, json, &mut out);
     out

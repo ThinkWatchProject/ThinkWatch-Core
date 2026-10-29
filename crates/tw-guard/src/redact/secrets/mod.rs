@@ -183,8 +183,13 @@ impl Want {
     ///
     /// **按位置认的让给别的规则**：请求头里的一个 JWT、赋值里的一把 `sk-ant-…`，报成「JWT」
     /// 「Anthropic API 密钥」比报成「请求头中的凭据」说得更清楚，危险命令那一层也只认后者。
-    /// 机器人 Webhook、Telegram 令牌不在此列：它们本身就是一种凭据
-    pub(super) fn finish(&mut self, text: &str, out: &mut Vec<Hit>) {
+    /// 机器人 Webhook、Telegram 令牌不在此列：它们本身就是一种凭据。
+    ///
+    /// **只让给把它整段盖住、而且要换成占位符的命中。**只盖住一截的（令牌中间像手机号的一段、
+    /// 口令里像邮箱的一段）让了的话，换掉的只是那一截，其余照样发出去；只记录的规则（`jwt`
+    /// 设成仅记录）根本不换，让给它等于整个值原样发出去。这两种都留着它，由 `resolve` 合成
+    /// 一处、整段换掉
+    pub(super) fn finish(&mut self, text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
         if let Some(words) = &mut self.mnemonic {
             words.finish(text, out);
         }
@@ -193,21 +198,21 @@ impl Want {
         }
         let mut taken: Vec<Range<usize>> = out
             .iter()
-            .filter(|h| !PLACED.contains(&h.rule.id()))
+            .filter(|h| !PLACED.contains(&h.rule.id()) && !set.records(&h.rule))
             .map(|h| h.bytes.clone())
             .collect();
         taken.sort_by_key(|r| r.start);
-        // reach[i]：前 i + 1 段里最远的终点
-        let reach: Vec<usize> = taken
-            .iter()
-            .scan(0, |far, r| {
-                *far = r.end.max(*far);
-                Some(*far)
-            })
-            .collect();
+        // 并成互不相交的几段：首尾相接的也并上，两处挨着的命中一样把它整段盖住
+        let mut cover: Vec<Range<usize>> = Vec::with_capacity(taken.len());
+        for r in taken {
+            match cover.last_mut() {
+                Some(c) if r.start <= c.end => c.end = c.end.max(r.end),
+                _ => cover.push(r),
+            }
+        }
         for h in self.placed.drain(..) {
-            let before = taken.partition_point(|r| r.start < h.bytes.end);
-            if before == 0 || reach[before - 1] <= h.bytes.start {
+            let at = cover.partition_point(|r| r.start <= h.bytes.start);
+            if at == 0 || cover[at - 1].end < h.bytes.end {
                 out.push(h);
             }
         }

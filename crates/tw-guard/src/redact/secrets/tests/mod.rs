@@ -250,6 +250,62 @@ fn placed_rules_give_way_to_rules_that_say_what_the_value_is() {
     assert_eq!(got[0].rule.id(), "anthropic-api-key");
 }
 
+/// 这段话放进一个请求体、按 `set` 换完之后发出去的样子（只记录的规则不换）。换完还是合法的
+/// JSON、还原回来一字不差
+fn sent(set: &RuleSet, text: &str) -> String {
+    let body = serde_json::json!({"messages": [{"role": "user", "content": text}]}).to_string();
+    let hits = scan(&body, set);
+    let r =
+        crate::redact::replace::apply(&body, &set.to_replace(&hits), Ledger::new(Scheme::SECRET));
+    serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
+    assert_eq!(restore(&r.text, &r.ledger), body);
+    r.text
+}
+
+/// 按位置认的值只让给把它整段盖住、要换掉的命中：只盖住一截的（令牌中间像手机号、口令里
+/// 像邮箱），或者那条规则只记录不换的，整段照样换掉
+#[test]
+fn placed_values_are_replaced_whole_unless_a_replacing_rule_covers_all_of_them() {
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    let set = RuleSet::defaults().recording(Rule::Builtin("jwt"));
+    let out = sent(&set, &format!("Authorization: Bearer {jwt}"));
+    assert!(!out.contains(jwt), "{out}");
+    let with_phone: Vec<&str> = BUILTINS
+        .iter()
+        .filter(|b| b.on_by_default || b.id == "cn-mobile-phone")
+        .map(|b| b.id)
+        .collect();
+    for set in [RuleSet::only(&with_phone), all()] {
+        for (text, rest) in [
+            (
+                "Authorization: Bearer Zx9QkLmN13812345678kLmNoPqRsTuVw",
+                ["Zx9QkLmN", "kLmNoPqRsTuVw"],
+            ),
+            ("DB_PASSWORD=Xk9_13812345678_qZ", ["Xk9_", "_qZ"]),
+            (
+                "SMTP_PASSWORD=\"ops@acme-mail.com#Q7x!\"",
+                ["ops@", "#Q7x!"],
+            ),
+            (
+                "https://h.example/x?access_token=ya29.a0AfB_byC@corp-sso.com.9xk2QzLp",
+                ["ya29.a0AfB_byC", "9xk2QzLp"],
+            ),
+        ] {
+            let out = sent(&set, text);
+            for r in rest {
+                assert!(!out.contains(r), "{text} → {out}");
+            }
+        }
+    }
+    // 整段盖住的照样让：报成 JWT
+    let got = scan(
+        &format!("Authorization: Bearer {jwt}"),
+        &RuleSet::defaults(),
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].rule.id(), "jwt");
+}
+
 #[test]
 fn placed_values_report_only_their_last_four_and_phrases_nothing() {
     let r = Rule::Builtin("config-assignment");

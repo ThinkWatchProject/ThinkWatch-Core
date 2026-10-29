@@ -805,7 +805,7 @@ pub(super) fn scan_tokens(
         secrets.word_run(text, r.clone(), out);
     }
     spaced.finish(text, out);
-    secrets.finish(text, out);
+    secrets.finish(text, set, out);
     personal.finish(text, out);
     spans
 }
