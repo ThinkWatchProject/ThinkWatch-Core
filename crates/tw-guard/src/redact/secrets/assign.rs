@@ -246,19 +246,39 @@ fn env_value(b: &[u8], i: usize, seen: &mut usize) -> Option<(usize, usize, usiz
     use super::place::{quote_at, run, skip_blank};
     if let Some((n, q)) = quote_at(b, i) {
         let from = i + n;
+        // 反斜杠**按一整串数一次**：在串里每隔一个字节问一次 `quote_at`（它把剩下的反斜杠再数一遍）
+        // 是平方级的，`TOKEN="` 后面跟着几百 KB 的反斜杠就要几秒
         let mut j = from;
         let mut closed = false;
         while j < b.len() {
-            if quote_at(b, j) == Some((n, q)) {
-                closed = true;
-                break;
-            }
             match b[j] {
+                b'\\' => {
+                    let k = run(b, j, |c| c == b'\\');
+                    let count = k - j;
+                    // 收尾的引号前面带着 n - 1 个反斜杠，再往前的成对，是正文里的反斜杠
+                    if b.get(k) == Some(&q) && count + 1 >= n && (count + 1 - n) % 2 == 0 {
+                        j = k + 1 - n;
+                        closed = true;
+                        break;
+                    }
+                    // 奇数个：最后一个转义了后面那个字符。转义的换行是这一行完了
+                    if count % 2 == 1 {
+                        if matches!(b.get(k), Some(b'n' | b'r')) {
+                            j = k;
+                            break;
+                        }
+                        j = k + 1;
+                    } else {
+                        j = k;
+                    }
+                }
+                c if c == q && n == 1 => {
+                    closed = true;
+                    break;
+                }
                 b'\n' | b'\r' => break,
                 // 转义过的引号收尾时，一个原样的 `"` 是装着这段话的 JSON 字符串结束了
                 b'"' if n > 1 => break,
-                b'\\' if matches!(b.get(j + 1), Some(b'n' | b'r')) => break,
-                b'\\' => j += 2,
                 _ => j += 1,
             }
         }

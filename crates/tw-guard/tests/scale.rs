@@ -240,3 +240,29 @@ fn repeated_position_markers_cost_linear_time() {
         "四倍长的标记串花了 {ratio:.1} 倍（{small:?} → {large:?}）：按位置认的规则不再是线性的"
     );
 }
+
+/// `TOKEN="` 后面跟着一长串反斜杠。曾经在串里每隔一个字节就把剩下的反斜杠再数一遍：平方级的，
+/// 400 KB 的请求体要 9 秒
+fn backslashes_after_env_quote(len: usize) -> Duration {
+    let body = json!({"messages": [{"role": "user",
+        "content": format!("TOKEN=\"{}", "\\".repeat(len))}]})
+    .to_string();
+    let rules = RuleSet::defaults();
+    let started = Instant::now();
+    let _ = tw_guard::redact::rules::scan(&body, &rules);
+    started.elapsed()
+}
+
+#[test]
+fn backslashes_after_an_env_quote_cost_linear_time() {
+    let (small, large) = medians(
+        || backslashes_after_env_quote(5_000),
+        || backslashes_after_env_quote(20_000),
+    );
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // 线性的是 4 倍上下，平方级的是 16 倍
+    assert!(
+        ratio < 10.0,
+        "四倍长的反斜杠串花了 {ratio:.1} 倍（{small:?} → {large:?}）"
+    );
+}
