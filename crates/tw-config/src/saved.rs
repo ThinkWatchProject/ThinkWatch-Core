@@ -9,8 +9,8 @@
 
 use tw_guard::redact::rules::{SavedSecret, SavedSource, SavedSourceKind};
 
-use crate::Config;
 use crate::credential::host_of;
+use crate::{Bind, Config};
 
 /// 请求头的名字里带着这些词的，值才算凭据：`HTTP-Referer`、`X-Title`、`anthropic-version`
 /// 这些是标识和版本，不是秘密，按值去找只会把正文里同样的网址、名字换掉
@@ -43,6 +43,38 @@ fn header_value(v: &str) -> &str {
 }
 
 impl Config {
+    /// 网关自己在本机以外听着的地址：网关端口，和开着的远程控制端口。访问密钥、控制面密钥发往
+    /// 这些地址是在用它（局域网里另一台机器上的客户端、远程连进来的桌面端），不是外传。
+    ///
+    /// 只放行地址，别的一概不加：配置里没有主机名这一项。绑全部网卡、按名字绑网卡的现问系统，
+    /// 配置一换跟着重算；网络变了而配置没变时，要等下一次重载才跟上
+    fn own_hosts(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |bind: &Bind| {
+            let addrs: Vec<std::net::IpAddr> = match bind {
+                // 回环本来就算本机
+                Bind::Loopback => Vec::new(),
+                Bind::All => crate::nics::list().into_iter().map(|n| n.addr).collect(),
+                Bind::Nic(_) | Bind::Addr(_) => bind.resolve().into_iter().collect(),
+            };
+            out.extend(
+                addrs
+                    .into_iter()
+                    .filter(|a| !a.is_loopback() && !a.is_unspecified())
+                    .map(|a| a.to_string()),
+            );
+        };
+        add(&self.listen.gateway.bind);
+        if let Some(r) = &self.listen.control.remote
+            && r.enabled
+        {
+            add(&r.bind);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// 配置里保存着的凭据，按出现的先后
     pub fn saved_secrets(&self) -> Vec<SavedSecret> {
         let mut out = Vec::new();
@@ -110,13 +142,15 @@ impl Config {
                 }
             }
         }
-        // 访问密钥、控制面密钥只该发往本机：哪儿都不列，发往本机以外的地方都算外传
+        // 访问密钥、控制面密钥只该发往网关自己：本机，和它在本机以外听着的地址（见
+        // `own_hosts`）。发往别的地方都算外传
+        let own = self.own_hosts();
         for c in &self.clients {
             out.push(item(
                 c.key.clone(),
                 SavedSourceKind::AccessKey,
                 &c.name,
-                &[],
+                &own,
             ));
         }
         for x in &self.proxies {
@@ -128,7 +162,7 @@ impl Config {
             }
         }
         if let Some(k) = &self.listen.control.key {
-            out.push(item(k.clone(), SavedSourceKind::ControlKey, "", &[]));
+            out.push(item(k.clone(), SavedSourceKind::ControlKey, "", &own));
         }
         if let Some(s) = &self.sync {
             if let Some(p) = &s.passphrase {
@@ -246,5 +280,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.saved_secrets()[0].hosts, ["fd00::1"]);
+    }
+
+    /// 网关听着局域网地址时，访问密钥和控制面密钥可以发往那个地址；上游的密钥不跟着放宽
+    #[test]
+    fn access_and_control_keys_may_go_to_the_gateways_own_listen_address() {
+        let mut cfg = Config {
+            providers: vec![Provider {
+                name: "up".into(),
+                base_url: "https://api.example.com/v1".into(),
+                key: Some(Secret::new("0123456789abcdef0123456789abcdef")),
+                ..Default::default()
+            }],
+            clients: vec![Client {
+                name: "default".into(),
+                key: "tw-access-key-value".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.listen.gateway.bind = crate::Bind::Addr("192.168.1.5".parse().unwrap());
+        cfg.listen.control.key = Some("c".repeat(64));
+        let got: Vec<(SavedSourceKind, Vec<String>)> = cfg
+            .saved_secrets()
+            .into_iter()
+            .map(|s| (s.source.kind, s.hosts))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (SavedSourceKind::UpstreamKey, vec!["api.example.com".into()]),
+                (SavedSourceKind::AccessKey, vec!["192.168.1.5".into()]),
+                (SavedSourceKind::ControlKey, vec!["192.168.1.5".into()]),
+            ]
+        );
     }
 }

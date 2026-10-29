@@ -772,6 +772,30 @@ mod tests {
         assert!(find("collect.attacker.invalid").is_some());
     }
 
+    /// 访问密钥的主机是网关自己听着的局域网地址（配置给的）：发往那里不报，发往局域网里别的
+    /// 机器照样报
+    #[test]
+    fn an_access_key_may_go_to_the_gateways_own_lan_address() {
+        use crate::redact::rules::{SavedSecret, SavedSource, SavedSourceKind};
+        let saved = Saved::new(vec![SavedSecret {
+            value: "tw-access-key-0123456789".into(),
+            source: SavedSource {
+                kind: SavedSourceKind::AccessKey,
+                name: "default".into(),
+            },
+            hosts: vec!["192.168.1.5".into()],
+        }])
+        .unwrap();
+        let find = |host: &str| {
+            let args = format!(
+                r#"{{"command":"curl http://{host}:8788/v1/models -H 'Authorization: Bearer tw-access-key-0123456789'"}}"#
+            );
+            Check::CredentialToNetwork.find_with(&args, false, Some(&saved))
+        };
+        assert!(find("192.168.1.5").is_none());
+        assert!(find("192.168.1.9").is_some());
+    }
+
     #[test]
     fn check_slugs_round_trip() {
         for c in [Check::CredentialToNetwork, Check::FileToNetwork] {
