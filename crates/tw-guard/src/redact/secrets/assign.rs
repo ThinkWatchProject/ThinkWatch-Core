@@ -158,21 +158,26 @@ fn closes(b: &[u8], i: usize) -> bool {
 /// 名字（`name` 是它在原文里的区间）后面：可以先是引号（JSON 的键），然后是 `=`、`:`、
 /// `=>`、`:=`，然后是一个字面量值。找得到就把值记下来。返回往后看到了哪儿（值多长都看，
 /// 线性靠调用方跳过落在看过的那一段里的名字）。`env_seen` 是 `.env` 写法的宽扫描看到了哪儿，
-/// 见 [`env_value`]
+/// 见 [`env_value`]。`url_token`：「URL 中的令牌」那条开着没有
 pub(super) fn after_name(
     text: &str,
     name: Range<usize>,
     placed: &mut Vec<Hit>,
     env_seen: &mut usize,
+    url_token: bool,
 ) -> usize {
-    use super::place::{quote_at, run, skip_blank};
+    use super::place::{amp_before, quote_at, run, skip_blank};
     let b = text.as_bytes();
     let none = name.end;
-    // `$TOKEN = …`、`${TOKEN}` 是在用一个变量；`?token=`、`&token=` 是 URL 参数（`&` 也可以是
-    // 转义过的 `\u0026`）
-    if name.start > 0 && matches!(b[name.start - 1], b'$' | b'?' | b'&' | b'{')
-        || super::place::amp_before(b, name.start)
-    {
+    // `$TOKEN = …`、`${TOKEN}` 是在用一个变量
+    if name.start > 0 && matches!(b[name.start - 1], b'$' | b'{') {
+        return none;
+    }
+    // `?password=…`、`&token=…`（`&` 也可以是转义过的 `\u0026`）是 URL 参数。「URL 中的令牌」
+    // 认得的那几个名字（`access_token`、`api_key`……）让给它；别的名字它不认，这里照样认，值到
+    // 下一个 `&` 为止 —— 两边都让的话就谁都不认了
+    let url = (name.start > 0 && b[name.start - 1] == b'?') || amp_before(b, name.start);
+    if url && url_token && super::place::url_param_name(&text[name.clone()]) {
         return none;
     }
     let mut i = name.end;
@@ -188,7 +193,9 @@ pub(super) fn after_name(
     }
     // `.env`、shell 的写法：名字、`=`、值紧挨着（`DB_PASSWORD=…`）。这种写法里的值就是一个
     // 字面量，引号里可以有空格，不加引号的可以带着代码里才是分隔的标点，见 [`env_value`]
-    let env = b[name.end] == b'=' && i == name.end + 1 && skip_blank(b, i) == i;
+    let env = !url && b[name.end] == b'=' && i == name.end + 1 && skip_blank(b, i) == i;
+    // URL 参数的值到下一个参数（`&`、`\u0026`）为止
+    let closes = |b: &[u8], at: usize| closes(b, at) || (url && amp_at(b, at));
     i = skip_blank(b, i);
     // 宽扫描没认出来时，它看过的那一段**不算**看过：那一段里后面的名字（`f(token=x,password=…)`
     // 的 `password`）照样要按通常的写法看。它自己另记一份，同一段不再宽扫第二遍
@@ -216,6 +223,17 @@ pub(super) fn after_name(
         (i, to)
     };
     push(text, from, to, placed)
+}
+
+/// `at` 处是一个 `&`：原样的，或者转义过的 `\u0026`
+fn amp_at(b: &[u8], at: usize) -> bool {
+    match b.get(at) {
+        Some(b'&') => true,
+        Some(b'\\') => b
+            .get(at + 1..at + 6)
+            .is_some_and(|x| x.eq_ignore_ascii_case(b"u0026")),
+        _ => false,
+    }
 }
 
 /// 找到的值像不像口令，像就记下来。返回 `to`

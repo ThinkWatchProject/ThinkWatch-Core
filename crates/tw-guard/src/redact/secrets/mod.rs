@@ -141,7 +141,13 @@ impl Want {
             return;
         }
         if self.assign && span.start >= self.assign_seen && assign::name_ends_right(tok) {
-            let seen = assign::after_name(text, span.clone(), &mut self.placed, &mut self.env_seen);
+            let seen = assign::after_name(
+                text,
+                span.clone(),
+                &mut self.placed,
+                &mut self.env_seen,
+                self.place.url_on(),
+            );
             self.assign_seen = self.assign_seen.max(seen);
         }
         if b.len() < 35 {
