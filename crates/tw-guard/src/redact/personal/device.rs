@@ -2,8 +2,29 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use super::super::anchor::{ANY_LEN, Anchor, Anchors, Bytes, C_DASH, C_UNDER, Chars, DIGIT, body};
 use super::super::rules::{Hit, builtin_hit};
 use super::{escape_before, near};
+
+/// 冒号分隔的 MAC 地址（[`MacRun`]）的锚点：两位十六进制
+pub(in crate::redact) const MAC_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: 0,
+        forbid: C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(
+        DIGIT
+            .or(Bytes::range(b'a', b'f'))
+            .or(Bytes::range(b'A', b'F')),
+        2,
+        ANY_LEN,
+    )],
+    fine: Some(|t| {
+        let b = body(t);
+        b.len() == 2 && b.iter().all(u8::is_ascii_hexdigit)
+    }),
+};
 
 // ---------------------------------------------------------------- VIN
 

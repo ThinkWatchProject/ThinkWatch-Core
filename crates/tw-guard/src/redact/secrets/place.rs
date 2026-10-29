@@ -12,6 +12,7 @@
 
 use std::ops::Range;
 
+use super::super::anchor::{Anchor, Bytes};
 use super::super::rules::{Hit, RuleSet, builtin_hit};
 use super::{credible, shapes, tok_byte};
 
@@ -66,6 +67,23 @@ const WORDS: &[(&str, Mark)] = &[
     ("canary.discord.com", Mark::Discord),
     ("bce-v3", Mark::Qianfan),
 ];
+
+/// 这一组的锚点：标记词整个 token 对上（不分大小写）；Telegram 的令牌以 `AA` 开头、至少 35 个
+/// 字符；Azure 的客户端密码在 `Q~` 处被切开，前一个 token 以 `Q` 结尾；Teams 的主机名以
+/// `webhook.office.com` 结尾（最后一个字母 `m`），至少 18 个字符
+pub(in crate::redact) const ANCHORS: &[Anchor] = &{
+    const N: usize = WORDS.len();
+    let mut a = [Anchor::Word(""); N + 3];
+    let mut i = 0;
+    while i < N {
+        a[i] = Anchor::Word(WORDS[i].0);
+        i += 1;
+    }
+    a[N] = Anchor::Prefix("AA", 35);
+    a[N + 1] = Anchor::Last(Bytes::of(b"Q"), 1);
+    a[N + 2] = Anchor::Last(Bytes::of(b"m"), 18);
+    a
+};
 
 /// [`WORDS`] 里出现过的「头一个字母 × 长度」：别的组合的 token 一个字节都不用比。按位存，
 /// 第 `字母 * 32 + 长度` 位
@@ -135,6 +153,10 @@ impl Want {
         };
         w.any = w.header || w.cmdline || w.url || w.webhook || w.telegram || w.azure || w.qianfan;
         w
+    }
+
+    pub(super) fn any(&self) -> bool {
+        self.any
     }
 
     /// 每个 token 一次。`out` 收本身就是一种凭据的（Webhook、Telegram、Azure、千帆），

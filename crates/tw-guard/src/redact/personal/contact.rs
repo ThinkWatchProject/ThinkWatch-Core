@@ -1,8 +1,58 @@
 //! IBAN、手机号的几种写法、固定电话、国际电话；和几种分组写的号码（跨 token 接起来看）。
 
+use super::super::anchor::{
+    ANY_LEN, Anchor, Anchors, C_DASH, C_LETTER, C_LOWER, C_UNDER, Chars, DIGIT, UPPER, body,
+};
 use super::super::rules::{Hit, builtin_hit};
 use super::data::{AREA_CODES, CALLING, IBAN};
 use super::{On, escape_before, ids, near};
+
+/// IBAN 的锚点：头两个字节是大写字母、至少四个字符（连写的整个号码，或者分组写的头一组），
+/// 或者去掉句末句号后 1 到 4 个大写字母、数字（分组写的后几组）。别的 token 只会让在接的一串
+/// 作罢
+pub(in crate::redact) const IBAN_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: 0,
+        forbid: C_LOWER | C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(DIGIT.or(UPPER), 1, ANY_LEN)],
+    fine: Some(|t| {
+        let b = body(t);
+        (t.len() >= 4 && t[0].is_ascii_uppercase() && t[1].is_ascii_uppercase())
+            || ((1..=4).contains(&b.len())
+                && b.iter()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()))
+    }),
+};
+
+/// 分组写的号码（[`Groups`]）的锚点：一组数字，或者英国保险号头尾的两个、一个大写字母。别的
+/// token 接进去也凑不成任何一种写法，和截断一样
+pub(in crate::redact) const GROUP_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: 0,
+        forbid: C_LOWER | C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(DIGIT.or(UPPER), 1, ANY_LEN)],
+    fine: Some(|t| {
+        let b = body(t);
+        digits(b)
+            || (b.len() == 2 && b.iter().all(u8::is_ascii_uppercase))
+            || (b.len() == 1 && (b'A'..=b'D').contains(&b[0]))
+    }),
+};
+
+/// 括号里区号的固定电话（[`LandlineParen`]）的锚点：区号、号码都是一串数字
+pub(in crate::redact) const LANDLINE_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: 0,
+        forbid: C_LETTER | C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(DIGIT, 1, ANY_LEN)],
+    fine: Some(|t| digits(body(t))),
+};
 
 fn digits(d: &[u8]) -> bool {
     !d.is_empty() && d.iter().all(u8::is_ascii_digit)

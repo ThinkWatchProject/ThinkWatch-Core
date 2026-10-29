@@ -410,25 +410,52 @@ fn key_text(raw: &str) -> std::borrow::Cow<'_, str> {
 /// 一段文本里所有的分隔符：`:`、`=`、全角冒号 `：`。返回它的位置和字节数
 fn separators(b: &[u8], range: Range<usize>) -> impl Iterator<Item = (usize, usize)> + '_ {
     let base = range.start;
-    memchr::memchr3_iter(b':', b'=', 0xEF, &b[range.clone()]).filter_map(move |i| {
+    let ascii = memchr::memchr2_iter(b':', b'=', &b[range.clone()]).filter_map(move |i| {
         let p = base + i;
-        match b[p] {
-            0xEF => (b.get(p + 1..p + 3) == Some(&[0xBC, 0x9A][..])).then_some((p, 3)),
-            b':' => {
-                // `std::fmt`、`https://`
-                let next = b.get(p + 1).copied();
-                (next != Some(b':') && next != Some(b'/') && !(p > 0 && b[p - 1] == b':'))
-                    .then_some((p, 1))
-            }
-            _ => {
-                // `==`、`!=`、`<=`、`>=`、`=>`
-                let next = b.get(p + 1).copied();
-                (!matches!(next, Some(b'=' | b'>'))
-                    && !(p > 0 && matches!(b[p - 1], b'=' | b'!' | b'<' | b'>')))
+        let next = b.get(p + 1).copied();
+        if b[p] == b':' {
+            // `std::fmt`、`https://`
+            (next != Some(b':') && next != Some(b'/') && !(p > 0 && b[p - 1] == b':'))
                 .then_some((p, 1))
-            }
+        } else {
+            // `==`、`!=`、`<=`、`>=`、`=>`
+            (!matches!(next, Some(b'=' | b'>'))
+                && !(p > 0 && matches!(b[p - 1], b'=' | b'!' | b'<' | b'>')))
+            .then_some((p, 1))
         }
-    })
+    });
+    // 全角冒号另找：它的头一个字节（0xEF）是所有全角标点共用的，混进上面一起找的话，中文
+    // 正文里每个逗号、括号都要停下来看一眼。起点在 `range` 里就算，和逐字节找的一样
+    let wide_end = (range.end + 2).min(b.len());
+    let wide = memchr::memmem::find_iter(&b[base..wide_end], "：".as_bytes())
+        .map(move |i| (base + i, 3))
+        .filter(move |&(p, _)| p < range.end);
+    Merged {
+        a: ascii.peekable(),
+        b: wide.peekable(),
+    }
+}
+
+/// 两串按位置排好的分隔符并成一串，仍按位置
+struct Merged<A: Iterator<Item = (usize, usize)>, B: Iterator<Item = (usize, usize)>> {
+    a: std::iter::Peekable<A>,
+    b: std::iter::Peekable<B>,
+}
+
+impl<A, B> Iterator for Merged<A, B>
+where
+    A: Iterator<Item = (usize, usize)>,
+    B: Iterator<Item = (usize, usize)>,
+{
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        match (self.a.peek(), self.b.peek()) {
+            (Some(x), Some(y)) if y.0 < x.0 => self.b.next(),
+            (Some(_), _) => self.a.next(),
+            _ => self.b.next(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 取值
@@ -787,13 +814,24 @@ pub(in crate::redact) fn scan(
     text: &str,
     json: bool,
     on: &[bool; RULES.len()],
+    given: Option<&[Range<usize>]>,
     out: &mut Vec<Hit>,
 ) {
     let b = text.as_bytes();
-    let spans = if json {
-        json_string_spans(text)
-    } else {
-        Vec::new()
+    // 字符串的区间只有字段名查得到的时候才要（一个请求体里没几处）：切 token 时记下了的直接用，
+    // 没有就用到了再算
+    let spans_cell = std::cell::OnceCell::new();
+    let spans = || -> &[Range<usize>] {
+        if let Some(g) = given {
+            return g;
+        }
+        spans_cell.get_or_init(|| {
+            if json {
+                json_string_spans(text)
+            } else {
+                Vec::new()
+            }
+        })
     };
     for (p, len) in separators(b, 0..b.len()) {
         let Some((key, quote)) = key_before(text, p) else {
@@ -810,13 +848,13 @@ pub(in crate::redact) fn scan(
             continue;
         }
         let field = RULES[rule].field;
-        let in_string = json && inside(&spans, p);
+        let in_string = json && inside(spans(), p);
         let structural = json && !in_string;
         // 请求体本身的字段名得是一个字符串
         if structural && quote != Quote::Plain {
             continue;
         }
-        let Some((val, quoted)) = value_after(text, p + len, structural, &spans, field) else {
+        let Some((val, quoted)) = value_after(text, p + len, structural, spans(), field) else {
             continue;
         };
         let shown = key_text(&text[val.clone()]);
@@ -828,13 +866,13 @@ pub(in crate::redact) fn scan(
                 .start
                 .saturating_sub(if quote == Quote::Escaped { 2 } else { 1 });
             let within = if in_string {
-                let k = spans.partition_point(|s| s.end < p);
-                spans[k].clone()
+                let k = spans().partition_point(|s| s.end < p);
+                spans()[k].clone()
             } else {
                 0..b.len()
             };
             let ok = if structural {
-                object_has_witness(text, &spans, open)
+                object_has_witness(text, spans(), open)
             } else if quote == Quote::None {
                 lines_have_witness(text, five_lines(b, p, within), p, key.start)
             } else {

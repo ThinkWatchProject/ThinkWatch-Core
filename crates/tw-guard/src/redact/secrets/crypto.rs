@@ -18,7 +18,29 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
+use super::super::anchor::{Anchor, Anchors, Bytes, C_DASH, C_UNDER, C_UPPER, Chars, DIGIT, LOWER};
 use super::super::rules::{Hit, builtin_hit};
+
+/// WIF 私钥、扩展私钥的锚点：51、52 位，以 `5` `9` `K` `L` `c` 开头；`xprv` 一类开头的 111 位
+pub(in crate::redact) const KEY_ANCHORS: &[Anchor] = &[
+    Anchor::First(Bytes::of(b"59KLc"), 51, 52),
+    Anchor::Prefix("xprv", 111),
+    Anchor::Prefix("tprv", 111),
+    Anchor::Prefix("yprv", 111),
+    Anchor::Prefix("zprv", 111),
+];
+
+/// 英文助记词的锚点：一个像 BIP39 词的 token（[`qualifies`]），或者一个编号。第一段数的是
+/// **连着的**这种 token，一串里不到 12 个像词的就不往下看（见 `engine`）
+pub(in crate::redact) const WORD_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: 0,
+        forbid: C_UPPER | C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(LOWER, 3, 8), Anchor::First(DIGIT, 1, 3)],
+    fine: Some(run_member),
+};
 
 const ENGLISH: &str = include_str!("bip39/english.txt");
 pub(super) const CHINESE: &str = include_str!("bip39/chinese_simplified.txt");
@@ -51,7 +73,7 @@ fn lexicon() -> &'static Lexicon {
 
 /// 英文词表
 #[cfg(test)]
-pub(super) fn english() -> &'static [&'static str] {
+pub(in crate::redact) fn english() -> &'static [&'static str] {
     &lexicon().words
 }
 
@@ -345,6 +367,48 @@ fn word_shaped(t: &[u8]) -> bool {
     HEADS[k / 64] & (1 << (k % 64)) != 0
 }
 
+/// 词表里每个词的「头四个字母」（不足四个的，三个字母加一个结束符），按位存。**BIP39 的词
+/// 头四个字母各不相同**，所以一个 token 的头四个字母对得上一个词，它多半就是那个词 ——
+/// 比只看头三个字母（[`HEADS`]）挡掉的多得多，又不用真的去查词表
+fn heads4() -> &'static [u64] {
+    static T: OnceLock<Vec<u64>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = vec![0u64; 27 * 27 * 27 * 27 / 64 + 1];
+        for w in ENGLISH.lines() {
+            let k = key4(w.as_bytes());
+            t[k / 64] |= 1 << (k % 64);
+        }
+        t
+    })
+}
+
+fn key4(w: &[u8]) -> usize {
+    let c = |i: usize| w.get(i).map_or(26, |&b| usize::from(b - b'a'));
+    ((c(0) * 27 + c(1)) * 27 + c(2)) * 27 + c(3)
+}
+
+/// 像一个 BIP39 的词：形状对（[`word_shaped`]），头四个字母是词表里某个词的头四个字母。
+///
+/// 词表里的词都满足它，满足它的也都满足 [`word_shaped`]：拿它代替 [`word_shaped`] 把一串词
+/// 切开，认出来的助记词不变 —— 被它挡掉的 token 本来也会在查表时打断那一串
+pub(in crate::redact) fn qualifies(t: &[u8]) -> bool {
+    if !word_shaped(t) {
+        return false;
+    }
+    let k = key4(t);
+    heads4()[k / 64] & (1 << (k % 64)) != 0
+}
+
+/// 一串助记词里的一员：像词的，或者编号
+#[inline]
+pub(in crate::redact) fn run_member(t: &[u8]) -> bool {
+    if t[0].is_ascii_lowercase() {
+        qualifies(t)
+    } else {
+        numbering(t)
+    }
+}
+
 fn numbering(t: &[u8]) -> bool {
     let t = t.strip_suffix(b".").unwrap_or(t);
     (1..=2).contains(&t.len()) && t.iter().all(u8::is_ascii_digit)
@@ -419,6 +483,7 @@ impl Words {
 }
 
 /// `b[i..i + 16]` 读成一个整数（调用方保证够长）
+#[cfg(test)]
 #[inline(always)]
 fn word16(b: &[u8], i: usize) -> u128 {
     b[i..]
@@ -426,41 +491,99 @@ fn word16(b: &[u8], i: usize) -> u128 {
         .map_or(0, |c| u128::from_le_bytes(*c))
 }
 
-/// 简体中文助记词：汉字不是 token 里的字符，整段另走一遍。
+/// 简体中文助记词：汉字不是 token 里的字符，不走切 token 那一遍。
 ///
-/// 一段纯 ASCII 的文本里只可能是 `\uXXXX` 写的（Python 的客户端默认这么转义）：先看有没有
-/// `\u`，没有就一个字节都不用再看。
+/// 一段纯 ASCII 的文本里只可能是 `\uXXXX` 写的（Python 的客户端默认这么转义）：只看每个
+/// `\u`（[`Chinese::escape`]）。
 ///
-/// 不是纯 ASCII 的，**按「一段连着的非 ASCII 字节」看**：助记词的词和词之间隔着 ASCII 的分隔
-/// （钱包导出的就是空格），所以一个词自己就是一段，只有一段的头尾挨着分隔的那个字可能是词。
-/// 中文正文里字挨着字，中间那些一个都不用解码、查表。全角逗号、顿号隔开的不认：它们在中文
-/// 正文里到处都是，挨个查表的代价落在每一个中文请求上
+/// 不是纯 ASCII 的，**按「一段连着的非 ASCII 字节」看**（[`Chinese::high_run`]）：助记词的词和
+/// 词之间隔着 ASCII 的分隔（钱包导出的就是空格），所以一个词自己就是一段，只有一段的头尾挨着
+/// 分隔的那个字可能是词。中文正文里字挨着字，中间那些一个都不用解码、查表。全角逗号、顿号
+/// 隔开的不认：它们在中文正文里到处都是，挨个查表的代价落在每一个中文请求上。
+///
+/// 这几段在哪儿由切 token 的那一遍顺手记下（见 `engine`），不另扫一遍；[`chinese`] 是自己
+/// 找的老写法，对照测试用
+#[derive(Default)]
+pub(in crate::redact) struct Chinese {
+    run: Run,
+}
+
+impl Chinese {
+    fn feed(&mut self, b: &[u8], cp: u32, at: Range<usize>, out: &mut Vec<Hit>) {
+        if let Some(w) = chinese_word(cp) {
+            if self.run.idx.is_empty() || !separated(&b[self.run.last..at.start]) {
+                self.run.settle("crypto-mnemonic", out);
+            }
+            self.run.push(w, at);
+        }
+    }
+
+    /// `at` 处是一个 `\u`（前面是偶数个反斜杠），后面跟着四位十六进制
+    pub(in crate::redact) fn escape(&mut self, b: &[u8], at: usize, out: &mut Vec<Hit>) {
+        let cp = b
+            .get(at + 2..at + 6)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u32::from_str_radix(h, 16).ok());
+        if let Some(cp) = cp {
+            self.feed(b, cp, at..at + 6, out);
+        }
+    }
+
+    /// `start..end` 是一段连着的非 ASCII 字节（前后都是 ASCII 或者文本的头尾）
+    pub(in crate::redact) fn high_run(
+        &mut self,
+        b: &[u8],
+        start: usize,
+        end: usize,
+        out: &mut Vec<Hit>,
+    ) {
+        // 可能是词的只有这一段的头一个字和最后一个字（词和词之间隔着 ASCII 的分隔）
+        let mut done = start;
+        let mut try_at = |p: usize, me: &mut Self, out: &mut Vec<Hit>| {
+            if p < done || p + 3 > end || !(0xE4..=0xE9).contains(&b[p]) {
+                return;
+            }
+            let cp = (u32::from(b[p] & 0x0F) << 12)
+                | (u32::from(b[p + 1] & 0x3F) << 6)
+                | u32::from(b[p + 2] & 0x3F);
+            me.feed(b, cp, p..p + 3, out);
+            done = p + 3;
+        };
+        // 头一个字前面、最后一个字后面要是分隔（ASCII 的空白、逗号，或者 JSON 里的 `\n`）
+        if start > 0
+            && matches!(
+                b[start - 1],
+                b' ' | b',' | b'\t' | b'\n' | b'\r' | b')' | b'n' | b't' | b'r'
+            )
+        {
+            try_at(start, self, out);
+        }
+        if b.get(end)
+            .is_none_or(|c| matches!(c, b' ' | b',' | b'\t' | b'\n' | b'\r' | b'\\'))
+        {
+            try_at(end.saturating_sub(3).max(start), self, out);
+        }
+    }
+
+    pub(in crate::redact) fn finish(&mut self, out: &mut Vec<Hit>) {
+        self.run.settle("crypto-mnemonic", out);
+    }
+}
+
+/// [`Chinese`] 自己找 `\u` 和非 ASCII 的段（老写法，对照测试用）
+#[cfg(test)]
 pub(super) fn chinese(text: &str, out: &mut Vec<Hit>) {
     let b = text.as_bytes();
-    let mut run = Run::default();
-    let mut feed = |run: &mut Run, cp: u32, at: Range<usize>| {
-        if let Some(w) = chinese_word(cp) {
-            if run.idx.is_empty() || !separated(&b[run.last..at.start]) {
-                run.settle("crypto-mnemonic", out);
-            }
-            run.push(w, at);
-        }
-    };
+    let mut zh = Chinese::default();
     if text.is_ascii() {
         for at in memchr::memmem::find_iter(b, b"\\u") {
-            let cp = b
-                .get(at + 2..at + 6)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u32::from_str_radix(h, 16).ok());
             // 前面是奇数个反斜杠才是转义（`\\u4e00` 是一个反斜杠加 `u4e00`）
             let mut n = 0;
             while at > n && b[at - 1 - n] == b'\\' {
                 n += 1;
             }
-            if let Some(cp) = cp
-                && n % 2 == 0
-            {
-                feed(&mut run, cp, at..at + 6);
+            if n % 2 == 0 {
+                zh.escape(b, at, out);
             }
         }
     } else {
@@ -503,34 +626,8 @@ pub(super) fn chinese(text: &str, out: &mut Vec<Hit>) {
                 }
                 i += 16;
             }
-            let end = i;
-            // 可能是词的只有这一段的头一个字和最后一个字（词和词之间隔着 ASCII 的分隔）
-            let mut done = start;
-            let mut try_at = |p: usize, run: &mut Run| {
-                if p < done || p + 3 > end || !(0xE4..=0xE9).contains(&b[p]) {
-                    return;
-                }
-                let cp = (u32::from(b[p] & 0x0F) << 12)
-                    | (u32::from(b[p + 1] & 0x3F) << 6)
-                    | u32::from(b[p + 2] & 0x3F);
-                feed(run, cp, p..p + 3);
-                done = p + 3;
-            };
-            // 头一个字前面、最后一个字后面要是分隔（ASCII 的空白、逗号，或者 JSON 里的 `\n`）
-            if start > 0
-                && matches!(
-                    b[start - 1],
-                    b' ' | b',' | b'\t' | b'\n' | b'\r' | b')' | b'n' | b't' | b'r'
-                )
-            {
-                try_at(start, &mut run);
-            }
-            if b.get(end)
-                .is_none_or(|c| matches!(c, b' ' | b',' | b'\t' | b'\n' | b'\r' | b'\\'))
-            {
-                try_at(end.saturating_sub(3).max(start), &mut run);
-            }
+            zh.high_run(b, start, i, out);
         }
     }
-    run.settle("crypto-mnemonic", out);
+    zh.finish(out);
 }

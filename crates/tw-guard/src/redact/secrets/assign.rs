@@ -11,6 +11,7 @@
 
 use std::ops::Range;
 
+use super::super::anchor::{Anchor, Anchors};
 use super::super::rules::Hit;
 
 /// [`super::ASSIGNMENT_SUFFIXES`] 去掉分隔符、小写（测试钉着两张表一致）
@@ -75,14 +76,21 @@ fn ends_norm(b: &[u8], s: &[u8]) -> Option<usize> {
     Some(i)
 }
 
-/// 这个 token 作为变量名，结尾是不是口令、密钥那几个词之一，而且词前面是名字里的分界：开头、
-/// `_`、`-`、`.`，或者驼峰（`dbPassword`）。`compassword`、`mytokens` 不算
+/// 锚点：变量名以 `secret`、`key`、`password`、`passwd`、`pwd`、`token` 的最后三个字母结尾
+/// （不分大小写），至少三个字符（[`ends_like_name`]）
+pub(in crate::redact) const ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: super::super::anchor::ANY_CHARS,
+    list: &[Anchor::Ends(&["ret", "key", "ord", "swd", "pwd", "ken"], 3)],
+    fine: Some(ends_like_name),
+};
+
+/// 最后三个字母是那几个词之一的结尾。[`name_ends_right`] 头一步看的就是它：绝大多数 token 在
+/// 这里就回去了
 #[inline]
-pub(super) fn name_ends_right(tok: &str) -> bool {
-    let b = tok.as_bytes();
-    // 先看最后三个字母：每个词的结尾只有这几种。绝大多数 token 在这里就回去了
+pub(in crate::redact) fn ends_like_name(b: &[u8]) -> bool {
     let n = b.len();
-    if !matches!(b[n - 1] | 0x20, b't' | b'y' | b'd' | b'n') {
+    if n < 3 || !matches!(b[n - 1] | 0x20, b't' | b'y' | b'd' | b'n') {
         return false;
     }
     let last3 = [
@@ -90,7 +98,16 @@ pub(super) fn name_ends_right(tok: &str) -> bool {
         b[n - 2].to_ascii_lowercase(),
         b[n - 1].to_ascii_lowercase(),
     ];
-    if !matches!(&last3, b"ret" | b"key" | b"ord" | b"swd" | b"pwd" | b"ken") {
+    matches!(&last3, b"ret" | b"key" | b"ord" | b"swd" | b"pwd" | b"ken")
+}
+
+/// 这个 token 作为变量名，结尾是不是口令、密钥那几个词之一，而且词前面是名字里的分界：开头、
+/// `_`、`-`、`.`，或者驼峰（`dbPassword`）。`compassword`、`mytokens` 不算
+#[inline]
+pub(super) fn name_ends_right(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    // 先看最后三个字母：每个词的结尾只有这几种
+    if !ends_like_name(b) {
         return false;
     }
     let hit = SUFFIXES.iter().any(|s| {

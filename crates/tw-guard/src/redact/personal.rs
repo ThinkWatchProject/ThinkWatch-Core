@@ -24,8 +24,32 @@ mod place;
 
 use std::ops::Range;
 
+use super::anchor::{Anchor, Anchors, Bytes, DIGIT, UPPER};
 use super::common;
 use super::rules::{Builtin, Hit, Kind, Matcher, RuleSet, builtin_hit};
+
+/// 这一组每个判据（每串）的锚点。**每一个都要是那个判据会看的 token 的全集**：没对上的 token
+/// 在老写法里要么什么都不做，要么只是把在接的那一串截断（见 [`Want::token_at`]）
+pub(super) const ANCHORS: [Anchors; 7] = [
+    contact::IBAN_ANCHORS,
+    contact::GROUP_ANCHORS,
+    contact::LANDLINE_ANCHORS,
+    device::MAC_ANCHORS,
+    place::GEO_ANCHORS,
+    place::PLATE_ANCHORS,
+    // 一个 token 自己认得出的那些（[`single`]）：数字或者大写字母开头；车辆识别代号、连字符
+    // 写的 MAC 地址是 17 位（后者可以是小写的十六进制）。
+    // 去掉句末句号后 7 到 18 个字符（最短的是澳门身份证号，最长的是 `0086-` 开头的手机号）
+    Anchors {
+        near: None,
+        chars: super::anchor::ANY_CHARS,
+        list: &[
+            Anchor::First(DIGIT.or(UPPER), 7, super::anchor::ANY_LEN),
+            Anchor::First(Bytes::range(b'a', b'f'), 17, super::anchor::ANY_LEN),
+        ],
+        fine: Some(|t| (7..=18).contains(&super::anchor::body(t).len())),
+    },
+];
 
 pub(super) use data::nationality;
 pub(super) use labeled::{
@@ -162,8 +186,6 @@ impl On {
 /// 这一组规则在一次扫描里的状态：扫之前问一次哪几条开着，扫的过程中攒着跨 token 的东西。
 pub(super) struct Want {
     on: On,
-    /// 有没有一条要看 token 的开着。出厂只开 IBAN 这一条
-    tokens: bool,
     /// IBAN 以外还有要看 token 的开着
     rest: bool,
     single: bool,
@@ -181,7 +203,6 @@ impl Want {
         let on = On::of(set);
         let single = on.single();
         Want {
-            tokens: single || on.iban || on.spaced() || on.mac || on.geo || on.plate,
             rest: single || on.spaced() || on.mac || on.geo || on.plate,
             single,
             today: if on.id15 || on.kr {
@@ -200,7 +221,14 @@ impl Want {
     }
 
     /// 整段文本过一遍的判据（跨 token 的、按位置找的）
-    pub(super) fn text(&mut self, text: &str, json: bool, out: &mut Vec<Hit>) {
+    /// `spans`：JSON 字符串的区间，切 token 时顺手记下了的话（没有就自己找）
+    pub(super) fn text(
+        &mut self,
+        text: &str,
+        json: bool,
+        spans: Option<&[Range<usize>]>,
+        out: &mut Vec<Hit>,
+    ) {
         let on = &self.on;
         if on.mrz {
             ids::mrz(text, out);
@@ -215,11 +243,12 @@ impl Want {
             device::ipv6(text, on.public_ip, on.internal_ip, out);
         }
         if on.labeled.iter().any(|&b| b) {
-            labeled::scan(text, json, &on.labeled, out);
+            labeled::scan(text, json, &on.labeled, spans, out);
         }
     }
 
-    /// 每个 token 一次。`quoted`：在 JSON 字符串里面（`json` 为真时才有意义）
+    /// 每个 token 一次（逐条扫描的老写法，对照测试用）。`quoted`：在 JSON 字符串里面
+    #[cfg(test)]
     pub(super) fn token(
         &mut self,
         text: &str,
@@ -229,7 +258,7 @@ impl Want {
         json: bool,
         out: &mut Vec<Hit>,
     ) {
-        if !self.tokens {
+        if !self.anchors_on().contains(&true) {
             return;
         }
         if json && !quoted {
@@ -240,6 +269,51 @@ impl Want {
             }
             return;
         }
+        self.feed(text, tok, span, json, out);
+    }
+
+    /// 一个对得上本组锚点（[`ANCHORS`]）的 token，在 JSON 字符串里面（或者文本不是 JSON）。
+    ///
+    /// 没对上锚点的 token 不进来，它们在老写法里的作用只有一个：**把在接的几串截断**（它们
+    /// 自己接不上任何一串，见各个锚点的说明）。`gap`：和上一个进来的之间隔着这样的 token 时是
+    /// `Some`，里面是「隔着的里面有 JSON 字符串外面的」—— 那会连坐标也截断，别的 token 不会
+    /// （两个数之间隔着 `"lng":` 照样成对）
+    pub(super) fn token_at(
+        &mut self,
+        text: &str,
+        tok: &str,
+        span: Range<usize>,
+        json: bool,
+        gap: Option<bool>,
+        out: &mut Vec<Hit>,
+    ) {
+        if let Some(unquoted) = gap {
+            self.cut(text, unquoted, out);
+        }
+        self.feed(text, tok, span, json, out);
+    }
+
+    /// 别的 token 截断在接的几串。`unquoted`：截断的是 JSON 字符串外面的东西，坐标也断
+    pub(super) fn cut(&mut self, text: &str, unquoted: bool, out: &mut Vec<Hit>) {
+        if unquoted {
+            self.iban.reset();
+            if self.rest {
+                self.finish(text, out);
+            }
+            return;
+        }
+        self.iban.reset();
+        if !self.rest {
+            return;
+        }
+        self.groups.finish(text, &self.on, out);
+        self.landline = contact::LandlineParen::default();
+        self.mac.finish(text, out);
+        self.plate = place::PlatePending::default();
+    }
+
+    /// 一个引号里（或者不是 JSON）的 token
+    fn feed(&mut self, text: &str, tok: &str, span: Range<usize>, json: bool, out: &mut Vec<Hit>) {
         // 出厂只开着 IBAN 这一条要看 token：在接着一串的，或者头两个字节是大写字母的才往下看
         let b = tok.as_bytes();
         if self.on.iban
@@ -277,6 +351,25 @@ impl Want {
         if self.single {
             single(text, body, at, json, on, self.today, out);
         }
+    }
+
+    /// 按字段名认的开着一条以上（它要 JSON 字符串的区间）
+    pub(super) fn labeled_on(&self) -> bool {
+        self.on.labeled.contains(&true)
+    }
+
+    /// 哪几组锚点要看，按 [`ANCHORS`] 的顺序
+    pub(super) fn anchors_on(&self) -> [bool; ANCHORS.len()] {
+        let on = &self.on;
+        [
+            on.iban,
+            on.spaced(),
+            on.landline,
+            on.mac,
+            on.geo,
+            on.plate,
+            self.single,
+        ]
     }
 
     /// 扫完了：攒着没交出去的交出去
