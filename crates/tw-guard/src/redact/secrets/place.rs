@@ -302,6 +302,31 @@ pub(super) fn run(b: &[u8], mut i: usize, ok: impl Fn(u8) -> bool) -> usize {
     i
 }
 
+/// `i` 处是不是一个 `/`：原样的，或者 JSON 里转义过的 `\/`（PHP 的 `json_encode` 缺省就这么
+/// 写，合法的 JSON）。返回它占几个字节。地址、路径按 `/` 认的几条都用它 —— 只认原样的话，
+/// 一个 PHP 写的服务转发过来的请求体里，Webhook 地址、千帆的密钥一个都认不出
+pub(super) fn slash_at(b: &[u8], i: usize) -> Option<usize> {
+    match b.get(i) {
+        Some(b'/') => Some(1),
+        Some(b'\\') if b.get(i + 1) == Some(&b'/') => Some(2),
+        _ => None,
+    }
+}
+
+/// `b[i..]` 开头是 `pat`，其中的 `/` 也可以写成 `\/`（见 [`slash_at`]）。返回对上的终点
+pub(super) fn path_at(b: &[u8], mut i: usize, pat: &[u8]) -> Option<usize> {
+    for &c in pat {
+        if c == b'/' {
+            i += slash_at(b, i)?;
+        } else if b.get(i) == Some(&c) {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(i)
+}
+
 /// 同 [`run`]，最多看到 `lim` 之前
 pub(super) fn run_to(b: &[u8], mut i: usize, lim: usize, ok: impl Fn(u8) -> bool) -> usize {
     let lim = lim.min(b.len());
@@ -558,10 +583,9 @@ fn real_token(v: &[u8], min: usize) -> bool {
 
 /// 主机名 token 之后紧跟着 `path`，再往后的那一段（字母数字，`dash` 时也可以有 `-`）是令牌
 fn webhook_value(b: &[u8], e: usize, path: &[u8], min: usize, dash: bool, out: &mut Vec<Hit>) {
-    if !b[e..].starts_with(path) {
+    let Some(from) = path_at(b, e, path) else {
         return;
-    }
-    let from = e + path.len();
+    };
     let end = run(b, from, |c| {
         c.is_ascii_alphanumeric() || (dash && c == b'-')
     });
@@ -570,20 +594,27 @@ fn webhook_value(b: &[u8], e: usize, path: &[u8], min: usize, dash: bool, out: &
     }
 }
 
-/// URL 的路径在哪儿结束：空白、引号、反斜杠、尖括号、查询串。超过 [`MAX_SPAN`] 的不算
-/// 路径（第二项是看到了哪儿）
+/// URL 的路径在哪儿结束：空白、引号、反斜杠（转义过的 `\/` 除外）、尖括号、查询串。超过
+/// [`MAX_SPAN`] 的不算路径（第二项是看到了哪儿）
 fn path_end(b: &[u8], from: usize) -> (Option<usize>, usize) {
-    value_run(b, from, |c| {
-        c.is_ascii_graphic()
-            && !matches!(c, b'"' | b'\'' | b'\\' | b'<' | b'>' | b'?' | b'#' | b')')
-    })
+    let lim = (from + MAX_SPAN + 1).min(b.len());
+    let mut i = from;
+    while i < lim {
+        match b[i] {
+            b'\\' if b.get(i + 1) == Some(&b'/') => i += 2,
+            b'"' | b'\'' | b'\\' | b'<' | b'>' | b'?' | b'#' | b')' => break,
+            c if c.is_ascii_graphic() => i += 1,
+            _ => break,
+        }
+    }
+    ((i - from <= MAX_SPAN).then_some(i), i)
 }
 
 /// `hooks.slack.com/services/T…/B…/令牌`（`workflows`、`triggers` 同理）：最后一段开头的那串
 /// 字母数字是令牌。句末的标点、结尾的 `/` 不算路径（`…/令牌.`、`…/令牌, 然后`、`…/令牌/`）。
 /// 返回往后看到了哪儿
 fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
-    if b.get(e) != Some(&b'/') {
+    if slash_at(b, e).is_none() {
         return e;
     }
     let (end, seen) = path_end(b, e);
@@ -591,7 +622,8 @@ fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
         return seen;
     };
     let mut stop = end;
-    while stop > e && matches!(b[stop - 1], b'.' | b',' | b';' | b':' | b'!' | b'/') {
+    // 路径里的反斜杠只会是 `\/` 的前一半：结尾的 `\/` 一起去掉
+    while stop > e && matches!(b[stop - 1], b'.' | b',' | b';' | b':' | b'!' | b'/' | b'\\') {
         stop -= 1;
     }
     let path = &b[e..stop];
@@ -609,20 +641,22 @@ fn slack(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
 
 /// `discord.com/api/webhooks/<数字 id>/<令牌>`：令牌那一段
 fn discord(b: &[u8], e: usize, out: &mut Vec<Hit>) {
-    const PATH: &[u8] = b"/api/webhooks/";
-    if !b[e..].starts_with(PATH) {
+    let Some(id) = path_at(b, e, b"/api/webhooks/") else {
         return;
-    }
-    let id = e + PATH.len();
+    };
     let slash = run(b, id, |c| c.is_ascii_digit());
-    if slash - id < 15 || b.get(slash) != Some(&b'/') {
+    if slash - id < 15 {
         return;
     }
-    let end = run(b, slash + 1, |c| {
+    let Some(n) = slash_at(b, slash) else {
+        return;
+    };
+    let from = slash + n;
+    let end = run(b, from, |c| {
         c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
     });
-    if real_token(&b[slash + 1..end], 60) {
-        out.push(builtin_hit("bot-webhook", slash + 1..end));
+    if real_token(&b[from..end], 60) {
+        out.push(builtin_hit("bot-webhook", from..end));
     }
 }
 
@@ -637,18 +671,22 @@ fn teams_host(tok: &str) -> bool {
 /// Teams 的传入 Webhook：`….webhook.office.com/webhookb2/…/IncomingWebhook/<令牌>/…`。
 /// 返回往后看到了哪儿
 fn teams(b: &[u8], e: usize, out: &mut Vec<Hit>) -> usize {
-    const SEG: &[u8] = b"/IncomingWebhook/";
-    if b.get(e) != Some(&b'/') {
+    const SEG: &[u8] = b"IncomingWebhook";
+    if slash_at(b, e).is_none() {
         return e;
     }
     let (end, seen) = path_end(b, e);
     let Some(end) = end else {
         return seen;
     };
-    let Some(p) = memchr::memmem::find(&b[e..end], SEG) else {
+    // 前后都是 `/`（或者 `\/`）的那一段
+    let Some(from) = memchr::memmem::find_iter(&b[e..end], SEG)
+        .map(|p| e + p)
+        .filter(|&p| b[p - 1] == b'/')
+        .find_map(|p| slash_at(b, p + SEG.len()).map(|n| p + SEG.len() + n))
+    else {
         return end;
     };
-    let from = e + p + SEG.len();
     let to = run_to(b, from, end, |c| c.is_ascii_alphanumeric());
     if real_token(&b[from..to], 16) {
         out.push(builtin_hit("bot-webhook", from..to));

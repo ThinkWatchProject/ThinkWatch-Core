@@ -326,6 +326,24 @@ fn placed_values_up_to_a_few_kilobytes_are_found_and_longer_runs_are_not() {
     assert!(scan(&format!("Authorization: Bearer {tok}"), &set).is_empty());
 }
 
+/// PHP 的 `json_encode` 缺省把 `/` 写成 `\/`：这样的请求体里，按路径认的几条（千帆、各家
+/// Webhook）照样认得出，换掉的那一段带着转义
+#[test]
+fn path_rules_read_escaped_slashes() {
+    for id in ["qianfan-api-key", "bot-webhook"] {
+        for (text, value) in sample(id).unwrap().hits {
+            let body = serde_json::json!({"messages": [{"role": "user", "content": text}]})
+                .to_string()
+                .replace('/', "\\/");
+            let got: Vec<&str> = scan(&body, &RuleSet::only(&[id]))
+                .into_iter()
+                .map(|h| &body[h.bytes])
+                .collect();
+            assert_eq!(got, [value.replace('/', "\\/")], "{id}：{body}");
+        }
+    }
+}
+
 #[test]
 fn placed_values_report_only_their_last_four_and_phrases_nothing() {
     let r = Rule::Builtin("config-assignment");

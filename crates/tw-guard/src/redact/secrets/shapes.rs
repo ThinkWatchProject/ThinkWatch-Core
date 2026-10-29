@@ -102,23 +102,22 @@ pub(super) fn azure(b: &[u8], q: usize) -> Option<Range<usize>> {
 }
 
 /// 百度智能云千帆的 API Key：`bce-v3/ALTAK-`、21 位字母数字、`/`、40 位十六进制，**整段**。
-/// `at` 是 `bce-v3/ALTAK-` 的起点
+/// `at` 是 `bce-v3/ALTAK-` 的起点。两个 `/` 都可以是 JSON 里转义过的 `\/`（见
+/// [`super::place::slash_at`]）
 pub(super) fn qianfan(b: &[u8], at: usize) -> Option<Range<usize>> {
-    const MARK: &[u8] = b"bce-v3/ALTAK-";
-    if !b[at..].starts_with(MARK)
-        || (at > 0
-            && (super::tok_byte(b[at - 1]) || b[at - 1] == b'/')
-            && !super::after_escape(b, at))
-    {
+    use super::place::{path_at, slash_at};
+    if at > 0 && (super::tok_byte(b[at - 1]) || b[at - 1] == b'/') && !super::after_escape(b, at) {
         return None;
     }
-    let ak = at + MARK.len();
+    let ak = path_at(b, at, b"bce-v3/ALTAK-")?;
     let slash = ak + 21;
-    let end = slash + 1 + 40;
+    if b.len() < slash || !b[ak..slash].iter().all(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    let hex = slash + slash_at(b, slash)?;
+    let end = hex + 40;
     let ok = b.len() >= end
-        && b[ak..slash].iter().all(u8::is_ascii_alphanumeric)
-        && b[slash] == b'/'
-        && b[slash + 1..end].iter().all(u8::is_ascii_hexdigit)
+        && b[hex..end].iter().all(u8::is_ascii_hexdigit)
         && b.get(end).is_none_or(|c| !c.is_ascii_alphanumeric());
     ok.then_some(at..end)
 }
