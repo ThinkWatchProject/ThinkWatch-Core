@@ -460,13 +460,17 @@ where
 
 // ---------------------------------------------------------------- 取值
 
-/// 分隔符后面的值：字节区间（引号里面那一段，或者没有引号时到行尾为止）和它带没带引号
+/// 分隔符后面的值：字节区间（引号里面那一段，或者没有引号时到行尾为止）和它带没带引号。
+///
+/// `lim` 是装着这段话的 JSON 字符串的终点（不是 JSON 的是文本结尾）：**值不出这个字符串。**
+/// 往后找收尾的引号时越过它的话，值会从下一个字符串里取，替换会吃掉中间的结构
 fn value_after(
     text: &str,
     from: usize,
     structural: bool,
     spans: &[Range<usize>],
     field: Field,
+    lim: usize,
 ) -> Option<(Range<usize>, bool)> {
     let b = text.as_bytes();
     let mut v = from;
@@ -484,24 +488,35 @@ fn value_after(
         let i = spans.binary_search_by_key(&(v + 1), |s| s.start).ok()?;
         return Some((spans[i].clone(), true));
     }
-    let rest = &b[v..];
-    let find = |pat: &[u8], from: usize| {
-        memchr::memmem::find(&b[from..(from + 400).min(b.len())], pat).map(|i| from + i)
-    };
+    if v >= lim {
+        return None;
+    }
+    let rest = &b[v..lim];
     if rest.starts_with(b"\\\"") {
+        // JSON 字符串里转义过的引号 `\"…\"`：**反斜杠成对地跳**。`\\` 是一个反斜杠，后面紧跟
+        // 的引号是字符串的终点，不是收尾的那个 `\"` —— 把那里当成收尾，值的末尾会落在 `\\`
+        // 两个字节中间，换掉之后请求体就不是 JSON 了
         let s = v + 2;
-        let e = find(b"\\\"", s)?;
-        return Some((s..e, true));
+        let end = lim.min(s + 400);
+        let mut e = s;
+        while e + 1 < end {
+            match (b[e], b[e + 1]) {
+                (b'\\', b'"') => return Some((s..e, true)),
+                (b'\\', _) => e += 2,
+                _ => e += 1,
+            }
+        }
+        return None;
     }
     if rest.first() == Some(&b'"') || rest.first() == Some(&b'\'') {
         let q = rest[0];
         let s = v + 1;
-        let e = s + memchr::memchr(q, &b[s..(s + 400).min(b.len())])?;
+        let e = s + memchr::memchr(q, &b[s..lim.min(s + 400)])?;
         return Some((s..e, true));
     }
     // 没有引号：到行尾、字符串结尾、`&`、中文的逗号分号句号为止
     let mut e = v;
-    while e < b.len() && e - v < 400 {
+    while e < lim && e - v < 400 {
         let c = b[e];
         if c == b'\\' {
             // `\uXXXX` 是正文里的一个字，别的转义（`\n`、`\"`、`\t`）是边界
@@ -529,7 +544,7 @@ fn value_after(
         }
         e += 1;
     }
-    let e = e.min(b.len());
+    let e = e.min(lim);
     if !text.is_char_boundary(e) {
         return None;
     }
@@ -854,7 +869,14 @@ pub(in crate::redact) fn scan(
         if structural && quote != Quote::Plain {
             continue;
         }
-        let Some((val, quoted)) = value_after(text, p + len, structural, spans(), field) else {
+        // 值不出这段话所在的那个字符串
+        let lim = if in_string {
+            spans()[spans().partition_point(|s| s.end < p)].end
+        } else {
+            b.len()
+        };
+        let Some((val, quoted)) = value_after(text, p + len, structural, spans(), field, lim)
+        else {
             continue;
         };
         let shown = key_text(&text[val.clone()]);

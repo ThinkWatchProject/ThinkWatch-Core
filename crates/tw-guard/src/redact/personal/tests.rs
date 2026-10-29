@@ -1126,6 +1126,36 @@ fn birth_dates_accounts_and_health_by_field_name() {
     );
 }
 
+/// 字段值不出它所在的那个 JSON 字符串，收尾的引号前面是 `\\` 时也不停在那两个字节中间：
+/// 不然换掉之后请求体就不是 JSON 了，或者把后面一个字符串连同中间的结构一起换掉
+#[test]
+fn labeled_values_stay_inside_their_json_string() {
+    let id = "labeled-birth-date";
+    for content in [
+        serde_json::json!(["DOB: \"1990-01-02\\"]),
+        serde_json::json!(["DOB: \"1990-01-02", "\"x"]),
+        serde_json::json!(["DOB: '1990-01-02", "x'"]),
+        serde_json::json!(["DOB: ", "1990-01-02"]),
+    ] {
+        let body =
+            serde_json::json!({"messages": [{"role": "user", "content": content}]}).to_string();
+        assert!(
+            got_raw(id, &body).is_empty(),
+            "{body} → {:?}",
+            got_raw(id, &body)
+        );
+    }
+    // 收尾的 `\"` 前面是一个转义过的反斜杠：值带着那一对反斜杠
+    let body = serde_json::json!({"content": "DOB: \"1990-01-02\\\\\" ok"}).to_string();
+    assert_eq!(got_raw(id, &body), [r"1990-01-02\\\\"]);
+    let r = crate::redact::replace::redact(
+        &body,
+        &RuleSet::only(&[id]),
+        crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+    );
+    serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
+}
+
 #[test]
 fn every_new_personal_rule_ships_with_the_agreed_label_and_default() {
     use super::super::rules::{Kind, builtin};
