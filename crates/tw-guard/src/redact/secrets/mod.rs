@@ -19,13 +19,20 @@
 
 use std::ops::Range;
 
+use super::anchor::Anchor;
 use super::rules::{Hit, RuleSet};
 
-mod assign;
-mod crypto;
-mod place;
+pub(super) mod assign;
+pub(super) mod crypto;
+pub(super) mod place;
 pub(crate) mod saved;
 mod shapes;
+
+pub(super) use place::ANCHORS as PLACE_ANCHORS;
+
+/// 要看整个 token 形状的几条（`sk-` 短格式、智谱、Terraform、WIF、扩展私钥）的锚点：都至少
+/// 35 个字符
+pub(super) const SHAPE_ANCHORS: [&[Anchor]; 2] = [shapes::ANCHORS, crypto::KEY_ANCHORS];
 
 /// 配置赋值认哪些变量名结尾（不分大小写，`_`、`-` 不算）。**界面上的说明和判据用的是同一张表**
 pub(super) const ASSIGNMENT_SUFFIXES: &[&str] = &[
@@ -79,27 +86,47 @@ impl Want {
         }
     }
 
-    /// 整段文本过一遍的判据（跨 token 的、按位置找的）
+    /// 中文助记词，自己找汉字（逐条扫描的老写法，对照测试用；两段式扫描的见 `engine`）
+    #[cfg(test)]
     pub(super) fn text(&mut self, text: &str, _json: bool, out: &mut Vec<Hit>) {
         if self.mnemonic.is_some() {
             crypto::chinese(text, out);
         }
     }
 
-    /// 每个 token 一次。`quoted`：在 JSON 字符串里面（`json` 为真时才有意义）
+    /// 每个 token 一次（逐条扫描的老写法，对照测试用）
+    #[cfg(test)]
+    pub(super) fn token(&mut self, text: &str, tok: &str, span: Range<usize>, out: &mut Vec<Hit>) {
+        if let Some(words) = &mut self.mnemonic {
+            words.feed(text, tok, span.clone(), out);
+        }
+        self.at_token(text, tok, span, out);
+    }
+
+    /// 一串助记词候选：第一段数出来的、连着 12 个以上像 BIP39 词的 token（见
+    /// [`crypto::WORD_ANCHORS`]）从第一个的起点到最后一个的终点。前后都是断开的地方，从头
+    /// 切 token、喂进去、喂完收尾 —— 这一段从一个 token 的开头起，切出来的和整段切的一样
+    pub(super) fn word_run(&mut self, text: &str, run: Range<usize>, out: &mut Vec<Hit>) {
+        if let Some(words) = &mut self.mnemonic {
+            let off = run.start;
+            super::rules::for_each_token(&text[run], |tok, r, _| {
+                words.feed(text, tok, off + r.start..off + r.end, out);
+            });
+            words.finish(text, out);
+        }
+    }
+
+    /// 助记词以外的几种：一个 token 自己认得出的，和从 token 出发找值的。**只在对得上
+    /// [`PLACE_ANCHORS`]、[`assign::ANCHORS`]、[`SHAPE_ANCHORS`] 之一的 token 上跑**；别的
+    /// token 在这里一样什么都不会认出来
     #[inline]
-    pub(super) fn token(
+    pub(super) fn at_token(
         &mut self,
         text: &str,
         tok: &str,
         span: Range<usize>,
-        _quoted: bool,
-        _json: bool,
         out: &mut Vec<Hit>,
     ) {
-        if let Some(words) = &mut self.mnemonic {
-            words.feed(text, tok, span.clone(), out);
-        }
         self.place
             .token(text, tok, span.clone(), out, &mut self.placed);
         let b = tok.as_bytes();
@@ -132,6 +159,24 @@ impl Want {
         if self.xprv && crypto::extended_key(tok) {
             out.push(super::rules::builtin_hit("crypto-extended-key", span));
         }
+    }
+
+    /// 按位置认的几条开着哪些：请求头、命令行、URL 参数、Webhook、Telegram、Azure、千帆
+    pub(super) fn place_on(&self) -> bool {
+        self.place.any()
+    }
+
+    pub(super) fn assign_on(&self) -> bool {
+        self.assign
+    }
+
+    /// 要看整个 token 形状的几条开着没有
+    pub(super) fn shapes_on(&self) -> bool {
+        self.compat || self.zhipu || self.terraform || self.wif || self.xprv
+    }
+
+    pub(super) fn mnemonic_on(&self) -> bool {
+        self.mnemonic.is_some()
     }
 
     /// 扫完了：攒着没交出去的交出去。

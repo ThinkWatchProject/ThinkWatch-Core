@@ -10,13 +10,15 @@
 //!   Rust 文件从 `#[cfg(test)]` 起不看，`*.test.ts` 一类不看。
 //! - `perf`：把这些文件拼成一个聊天请求体（每个文件一条消息，最多 4 MiB），出厂规则扫
 //!   十一遍取中位数（`RX_ROUNDS` 改遍数）。改规则前后各跑一次比；`RX_OFF=规则,规则` 关掉
-//!   这几条再量，看每一条各花多少。
+//!   这几条再量，看每一条各花多少。`RX_SET` 换一组规则：`defaults`（出厂，缺省）、`all`
+//!   （内置的全开）、`custom`（内置的全关，只有 20 条「包含」加 20 条正则的自定义规则）。
+//!   只用公开的接口，拷到别的版本上照样跑，前后比的是同一份语料。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use tw_guard::redact::rules::{BUILTINS, RuleSet, masked, scan, scan_plain};
+use tw_guard::redact::rules::{BUILTINS, Pattern, RuleSet, masked, scan, scan_plain};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -176,19 +178,89 @@ fn body_of(args: &[String]) -> String {
     serde_json::json!({"model": "m", "messages": msgs}).to_string()
 }
 
+/// `RX_SET=custom` 用的自定义规则：20 条按原样找的（一半不分大小写），20 条正则（有固定文字
+/// 的、没有的、带 `^` `$` 的都有）。挑的是源码里会出现、也不会出现的几种
+fn custom_set() -> RuleSet {
+    const CONTAINS: &[&str] = &[
+        "ACME-INTERNAL",
+        "project-nightingale",
+        "do not distribute",
+        "confidential",
+        "TODO(security)",
+        "hunter2",
+        "internal.example.com",
+        "x-internal-token",
+        "PRIVATE BUILD",
+        "staging-db",
+        "corp-vpn",
+        "employee_id",
+        "salary",
+        "ssn_last4",
+        "customer_secret",
+        "PROD_ONLY",
+        "redacted-by-legal",
+        "codename",
+        "unreleased",
+        "Sapphire",
+    ];
+    const REGEX: &[&str] = &[
+        r"MYCORP-\d{6}",
+        r"\bEMP\d{5}\b",
+        r"(?i)secret_[a-z]+",
+        r"\d{6}",
+        r"[A-Z]{3}-\d{4}-[A-Z]{2}",
+        r"^#!.*$",
+        r"(?m)^\s*password\s*=.*$",
+        r"ticket #\d+",
+        r"\bINV-\d{8}\b",
+        r"(?i)api[_-]?secret",
+        r"[a-f0-9]{40}",
+        r"\bCASE-[0-9]{5}\b",
+        r"(?i)\binternal only\b",
+        r"user_[0-9]{7}",
+        r"\b10\.0\.\d+\.\d+\b",
+        r"proj_[A-Za-z0-9]{24}",
+        r"(?i)passphrase:\s*\S+",
+        r"[A-Z][a-z]+ [A-Z][a-z]+, Esq\.",
+        r"acct-\d{4}-\d{4}",
+        r"\$\{SECRET_[A-Z_]+\}",
+    ];
+    let mut set = RuleSet::none();
+    for (i, t) in CONTAINS.iter().enumerate() {
+        let p = Pattern {
+            text: (*t).to_string(),
+            regex: false,
+            case_sensitive: i % 2 == 0,
+        };
+        set = set.with_rule(&format!("contains-{i}"), p, None).unwrap();
+    }
+    for (i, t) in REGEX.iter().enumerate() {
+        set = set.with_custom(&format!("regex-{i}"), t).unwrap();
+    }
+    set
+}
+
 fn perf(args: &[String]) {
     let body = body_of(args);
     let off: Vec<String> = std::env::var("RX_OFF")
         .map(|v| v.split(',').map(str::to_string).collect())
         .unwrap_or_default();
-    let set = RuleSet::build(&[], &off, []).unwrap_or_default();
+    let set = match std::env::var("RX_SET").as_deref() {
+        Ok("all") => {
+            let all: Vec<String> = BUILTINS.iter().map(|b| b.id.to_string()).collect();
+            RuleSet::build(&all, &off, []).unwrap_or_default()
+        }
+        Ok("custom") => custom_set(),
+        _ => RuleSet::build(&[], &off, []).unwrap_or_default(),
+    };
     let mut times: Vec<Duration> = Vec::new();
     let mut found = 0;
     let rounds: usize = std::env::var("RX_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(11);
-    for _ in 0..rounds.max(11) {
+        .unwrap_or(11)
+        .max(11);
+    for _ in 0..rounds {
         let t = Instant::now();
         found = scan(&body, &set).len();
         times.push(t.elapsed());
@@ -198,9 +270,9 @@ fn perf(args: &[String]) {
         "body {} KiB, {} hits, median {:?} (min {:?}, max {:?})",
         body.len() / 1024,
         found,
-        times[5],
+        times[rounds / 2],
         times[0],
-        times[10]
+        times[rounds - 1]
     );
 }
 

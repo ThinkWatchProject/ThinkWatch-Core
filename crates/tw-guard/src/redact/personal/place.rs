@@ -4,15 +4,77 @@ use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
 
+use super::super::anchor::{
+    ANY_LEN, Anchor, Anchors, Bytes, C_DASH, C_DOT, C_LOWER, C_UNDER, C_UPPER, Chars, DIGIT, UPPER,
+    body,
+};
 use super::super::rules::{Hit, builtin_hit};
 use super::data::DIVISIONS;
+
+/// 坐标（[`GeoChain`]）的锚点：数字或负号开头、至少七个字符（一位整数、小数点、五位小数）。
+/// 别的 token 不截断一对坐标（`"lat":31.2,"lng":121.4` 中间隔着 `lng`）
+pub(in crate::redact) const GEO_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: C_UPPER | C_LOWER | C_UNDER,
+    },
+    list: &[Anchor::First(DIGIT.or(Bytes::of(b"-")), 7, ANY_LEN)],
+    fine: Some(|t| t.contains(&b'.')),
+};
+
+/// 车牌号（[`PlatePending`]）的锚点：前面紧挨着省份简称、发牌机关的那个字母开头的，或者 5、6
+/// 位的号码（中间隔着 `·`、空格时号码是下一个 token）
+pub(in crate::redact) const PLATE_ANCHORS: Anchors = Anchors {
+    list: &[Anchor::First(DIGIT.or(UPPER), 1, ANY_LEN)],
+    // 车牌的字母、数字都是大写的
+    chars: Chars {
+        need: 0,
+        forbid: C_LOWER | C_DASH | C_UNDER,
+    },
+    fine: Some(|t| {
+        let b = body(t);
+        (plate_char(t[0]) && t[0].is_ascii_uppercase())
+            || ((5..=6).contains(&b.len()) && b.iter().all(|&c| plate_char(c)))
+    }),
+    near: Some(|text, s, e| {
+        let b = body(&text[s..e]);
+        ((5..=6).contains(&b.len()) && b.iter().all(|&c| plate_char(c)))
+            || (s >= 3
+                && std::str::from_utf8(&text[s - 3..s]).is_ok_and(|c| PLATE_PROVINCES.contains(c)))
+    }),
+};
 
 // ---------------------------------------------------------------- 详细地址
 
 /// 行政区划名称以这几个字结尾：县级的「区」「县」「市」「旗」，地级的「市」「州」「盟」
 /// 「地区」。在正文里先找这几个字，再往前查表 —— 不必拿三千多个名称挨个去找
-static ADMIN_END: LazyLock<AhoCorasick> =
-    LazyLock::new(|| AhoCorasick::new(["区", "县", "市", "旗", "州", "盟"]).expect("固定的几个字"));
+const ADMIN_CHARS: [&str; 6] = ["区", "县", "市", "旗", "州", "盟"];
+
+/// 找 [`ADMIN_CHARS`] 的：用 SIMD 的打包查找（Teddy），一般的多模式自动机在几 MB 的请求体上
+/// 慢十倍。几个字都是完整的 UTF-8 字符，彼此不会重叠，两种找法找到的一样
+enum AdminEnd {
+    Packed(aho_corasick::packed::Searcher),
+    Ac(AhoCorasick),
+}
+
+impl AdminEnd {
+    fn ends(&self, text: &str) -> Vec<usize> {
+        match self {
+            AdminEnd::Packed(s) => s.find_iter(text).map(|m| m.end()).collect(),
+            AdminEnd::Ac(a) => a.find_iter(text).map(|m| m.end()).collect(),
+        }
+    }
+}
+
+static ADMIN_END: LazyLock<AdminEnd> = LazyLock::new(|| {
+    let mut b = aho_corasick::packed::Config::new().builder();
+    b.extend(ADMIN_CHARS);
+    match b.build() {
+        Some(s) => AdminEnd::Packed(s),
+        None => AdminEnd::Ac(AhoCorasick::new(ADMIN_CHARS).expect("固定的几个字")),
+    }
+});
 
 /// 街路巷村：门牌前面得有一个
 const ROADS: &[&str] = &[
@@ -85,8 +147,11 @@ fn door_at(text: &str, at: usize) -> Option<usize> {
 /// 前面紧挨着的省、市名称一起换（`广东省深圳市南山区…`）
 pub(in crate::redact) fn addresses(text: &str, out: &mut Vec<Hit>) {
     let mut covered = 0;
-    for m in ADMIN_END.find_iter(text) {
-        let end = m.end();
+    // 纯 ASCII 的文本里一个汉字都没有
+    if text.is_ascii() {
+        return;
+    }
+    for end in ADMIN_END.ends(text) {
         if end <= covered {
             continue;
         }

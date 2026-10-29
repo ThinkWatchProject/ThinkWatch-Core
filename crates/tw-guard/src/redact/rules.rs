@@ -30,10 +30,13 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use super::anchor::{
+    ALNUM, ANY_LEN, Anchor, Anchors, Bytes, C_DASH, C_DIGIT, C_DOT, C_LETTER, C_UNDER, Chars, DIGIT,
+};
 use super::secrets::ASSIGNMENT_SUFFIXES;
 pub use super::secrets::saved::{
     SAVED_MIN_CHARS, Saved, SavedSecret, SavedSource, SavedSourceKind,
@@ -621,6 +624,8 @@ pub struct RuleSet {
     /// 用户在 ThinkWatch 里保存的凭据（见 [`RuleSet::with_saved`]）。规则 `thinkwatch-saved-secret`
     /// 开着才按它找
     saved: Option<Arc<Saved>>,
+    /// 自定义规则编成的预筛（[`CustomIndex`]），头一次扫的时候编。改了自定义规则就作废
+    index: OnceLock<Arc<CustomIndex>>,
 }
 
 impl Default for RuleSet {
@@ -641,6 +646,7 @@ impl RuleSet {
             custom: Vec::new(),
             record: HashSet::new(),
             saved: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -651,6 +657,7 @@ impl RuleSet {
             custom: Vec::new(),
             record: HashSet::new(),
             saved: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -665,6 +672,7 @@ impl RuleSet {
             custom: Vec::new(),
             record: HashSet::new(),
             saved: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -718,6 +726,7 @@ impl RuleSet {
             pattern,
             label: label.map(Arc::from),
         });
+        self.index = OnceLock::new();
         Ok(self)
     }
 
@@ -781,6 +790,7 @@ impl RuleSet {
                 .collect(),
             record: self.record.clone(),
             saved: self.saved.clone(),
+            index: OnceLock::new(),
         })
     }
 
@@ -805,6 +815,11 @@ impl RuleSet {
             .iter()
             .find(|c| &*c.name == name)
             .map(|c| &c.pattern)
+    }
+
+    /// 有自定义规则
+    pub(super) fn has_custom(&self) -> bool {
+        !self.custom.is_empty()
     }
 
     /// 一条都没开。**调用方据此整条短路** —— 没有规则的话，找都不用找。
@@ -924,7 +939,7 @@ fn tail_fits(tail: Tail, t: &str) -> bool {
 ///
 /// 太短的、开头哪条前缀都对不上的直接回去：[`classify_prefixed`] 认得出的 token 都过得了
 /// 这两关（[`KEY_MIN`]、[`KEY_FIRST`]）。
-fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
+pub(super) fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
     if tok.len() < KEY_MIN || !KEY_FIRST[usize::from(tok.as_bytes()[0])] {
         return None;
     }
@@ -964,6 +979,36 @@ fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static 
     None
 }
 
+/// 前缀规则（单前缀、多前缀）和 OpenAI 老式密钥的锚点：前缀本身，整个 token 至少是「前缀 +
+/// 至少要有的尾巴」那么长。**从规则表上的 [`Matcher`] 算出来**，不另写一份
+pub(super) fn key_anchors() -> Vec<Anchor> {
+    let mut v = vec![Anchor::Prefix("sk-", OPENAI_MIN)];
+    for b in BUILTINS {
+        match b.matcher {
+            Matcher::Prefix { prefix, min_tail } => {
+                v.push(Anchor::Prefix(prefix, prefix.len() + min_tail));
+            }
+            Matcher::Prefixes { list } => {
+                v.extend(
+                    list.iter()
+                        .map(|p| Anchor::Prefix(p.prefix, p.prefix.len() + p.min_tail)),
+                );
+            }
+            _ => {}
+        }
+    }
+    v
+}
+
+/// 前缀规则或 OpenAI 老式密钥开着一条以上
+pub(super) fn any_key_on(set: &RuleSet) -> bool {
+    set.is_on("openai-api-key")
+        || BUILTINS.iter().any(|b| {
+            matches!(b.matcher, Matcher::Prefix { .. } | Matcher::Prefixes { .. })
+                && set.is_on(b.id)
+        })
+}
+
 /// 把文本切成 token，回调每个 token 的区间。
 ///
 /// **在 token 边界上匹配。**`xsk-ant-…` 里的 `sk-ant-…` 不是一把密钥，
@@ -983,7 +1028,7 @@ fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static 
 /// 的字节在这里只是分隔。反斜杠后面跟着的是一个多字节字符时，跳过的只是它的头一个字节，
 /// 剩下的几个照样只是分隔 —— 切出来的和按字符切的一样（测试拿两种切法对过）。token 的两头
 /// 都落在 ASCII 字节上，切片一定在字符边界上。
-fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
+pub(super) fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
     let b = text.as_bytes();
     let mut start: Option<usize> = None;
     let mut quoted = false;
@@ -1090,6 +1135,17 @@ fn private_keys(text: &str, json: bool, out: &mut Vec<Hit>) {
 
 // ---------------------------------------------------------------- JWT
 
+/// JWT 的锚点：12 个字符以上、base64url 的字符开头、正好两个点（三段）
+pub(super) const JWT_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: 0,
+    },
+    list: &[Anchor::First(ALNUM.or(Bytes::of(b"-_")), 12, ANY_LEN)],
+    fine: Some(|t| t.iter().filter(|&&c| c == b'.').count() == 2),
+};
+
 fn is_b64url(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -1100,7 +1156,7 @@ fn is_b64url(s: &str) -> bool {
 ///
 /// 那个解码是必需的：光看「三段用点分开的 base64」会把版本号、文件路径、
 /// 甚至 `a.b.c` 这种普通标识符全算上。
-fn looks_like_jwt(tok: &str) -> bool {
+pub(super) fn looks_like_jwt(tok: &str) -> bool {
     // 首段至少 8 个字符，后两段各至少一个，加两个点：短于 12 的不可能是
     if tok.len() < 12 {
         return false;
@@ -1168,6 +1224,28 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
 
 // ---------------------------------------------------------------- 内网标识
 
+/// 内网 IPv4 地址的锚点：数字开头、至少 7 个字符、正好三个点
+pub(super) const IP_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: C_LETTER | C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(DIGIT, 7, ANY_LEN)],
+    fine: Some(|t| t.iter().filter(|&&c| c == b'.').count() == 3),
+};
+
+/// 内部域名的锚点：以 [`INTERNAL_SUFFIXES`] 之一的最后一个字母结尾（不分大小写），8 个字符以上
+pub(super) const DOMAIN_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: 0,
+    },
+    list: &[Anchor::Last(Bytes::of(b"lLnNpPaAtT"), 8)],
+    fine: None,
+};
+
 fn is_rfc1918(tok: &str) -> bool {
     // 四段读进一个定长数组，不收集：开着这条时每个 token 都要过一遍
     let mut nums = [0u16; 4];
@@ -1198,7 +1276,7 @@ fn is_rfc1918(tok: &str) -> bool {
 /// 本身藏起来了。何况我们的网关自己就住在那儿。
 ///
 /// `ip`、`domain`：那两条开没开（扫之前问一次，不在每个 token 上查一遍表）。
-fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
+pub(super) fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
     if ip && is_rfc1918(tok) {
         return Some("internal-ip");
     }
@@ -1478,7 +1556,7 @@ fn card_number(s: &str, sep: Option<u8>) -> bool {
 /// 号码。看的是接起来最长的那一整串 —— 从里面截一段去对的话，一张四位数的
 /// 表里每隔几行就「有」一张卡。
 #[derive(Default)]
-struct Spaced {
+pub(super) struct Spaced {
     /// 第一组的起点。`None`：眼下没有在接的
     start: Option<usize>,
     /// 最后一组的起点
@@ -1492,7 +1570,14 @@ struct Spaced {
 
 impl Spaced {
     /// 下一个 token。`body` 是它去掉句末句号的那一段，从 `at` 开始。
-    fn feed(&mut self, text: &str, at: usize, body: &str, dotted: bool, out: &mut Vec<Hit>) {
+    pub(super) fn feed(
+        &mut self,
+        text: &str,
+        at: usize,
+        body: &str,
+        dotted: bool,
+        out: &mut Vec<Hit>,
+    ) {
         // 一组最多六位：4-6-5 中间那组
         let group = (1..=6).contains(&body.len()) && body.bytes().all(|b| b.is_ascii_digit());
         if group
@@ -1524,7 +1609,7 @@ impl Spaced {
     /// 不是的话，末尾那组不足四位时去掉它再看一次：卡号后面紧跟着的月份、安全码
     /// （`6222 0212 3456 7894 12/28`）不是号码的一部分。整串先看 —— 19 位的卡号
     /// 最后一组本来就只有三位。
-    fn finish(&mut self, text: &str, out: &mut Vec<Hit>) {
+    pub(super) fn finish(&mut self, text: &str, out: &mut Vec<Hit>) {
         let Some(start) = self.start.take() else {
             return;
         };
@@ -1542,9 +1627,28 @@ impl Spaced {
     }
 }
 
+/// 身份证号、卡号的锚点：数字开头（连写的号码；分组写的卡号的每一组）
+pub(super) const CARD_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: super::anchor::ANY_CHARS,
+    list: &[Anchor::First(DIGIT, 1, ANY_LEN)],
+    fine: None,
+};
+
+/// 一个 token 里的手机号的锚点：11 个字符以上、其中至少 11 位数字
+pub(super) const PHONE_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DIGIT,
+        forbid: 0,
+    },
+    list: &[Anchor::First(super::anchor::TOKEN, 11, ANY_LEN)],
+    fine: Some(|t| t.iter().filter(|c| c.is_ascii_digit()).count() >= 11),
+};
+
 /// 一个 token 是不是身份证号，或者连着写、用连字符分组写的卡号。`body` 是
 /// 去掉了句末句号的那一段，从 `at` 开始。
-fn personal_token(
+pub(super) fn personal_token(
     body: &str,
     at: usize,
     want_id: bool,
@@ -1573,7 +1677,7 @@ fn personal_token(
 ///
 /// **前后不紧挨别的数字**：看的是一整串连着的数字，从更长的数字串里截一段去对的话，
 /// 订单号、时间戳里每隔几位就「有」一个手机号。字母挨着没关系（`tel13800138000`）。
-fn mobile_phones(tok: &str, at: usize, out: &mut Vec<Hit>) {
+pub(super) fn mobile_phones(tok: &str, at: usize, out: &mut Vec<Hit>) {
     let b = tok.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -1716,54 +1820,233 @@ pub(crate) fn json_like(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(&spaced).is_ok()
 }
 
-/// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
+/// 一段 JSON 原文里每个字符串引号里面的那一段，按先后。
+///
+/// 按 SIMD 跳着找：字符串外面只找引号，里面找引号和反斜杠（反斜杠连同它转义的那个字符跳过）。
+/// 一段请求体里字符串之间、字符串里面的大段文字一个字节都不用逐个看
 pub(crate) fn json_string_spans(text: &str) -> Vec<Range<usize>> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
+    while let Some(q) = memchr::memchr(b'"', &b[i.min(b.len())..]) {
+        let start = i + q + 1;
         let mut j = start;
-        while j < b.len() && b[j] != b'"' {
-            j += if b[j] == b'\\' { 2 } else { 1 };
+        loop {
+            match memchr::memchr2(b'"', b'\\', &b[j.min(b.len())..]) {
+                Some(k) if b[j + k] == b'\\' => j += k + 2,
+                Some(k) => {
+                    j += k;
+                    break;
+                }
+                None => {
+                    j = b.len();
+                    break;
+                }
+            }
         }
         let end = j.min(b.len());
         out.push(start..end);
         i = end + 1;
+        if i > b.len() {
+            break;
+        }
     }
     out
 }
 
-fn custom_hits(text: &str, set: &RuleSet, json: bool, out: &mut Vec<Hit>) {
+/// 自定义规则的预筛。**每条自定义规则在每个正文字符串上各跑一遍**的话，条数一多就和内置规则
+/// 一样线性变慢。所以：
+///
+/// - 按原样找的（「包含」）编进**一个** Aho-Corasick 自动机，整段文本过一遍，所有规则一起找。
+///   不分大小写的照不分大小写编 —— 只收纯 ASCII、且不含 `k`、`s` 的：正则的不分大小写按
+///   Unicode 折叠，`k` 还认开尔文符号 `K`、`s` 还认长 s `ſ`，自动机的 ASCII 不分大小写认不出
+///   它们（测试钉着只有这两个字母这样）。收不进的和正则一起走下面那条路；
+/// - 正则合成一个 [`regex::RegexSet`]，每个正文字符串先过一遍集合，得知哪几条在这一段里有
+///   命中，只对这几条求位置。正则引擎对固定文字本来就有预筛，没有固定文字的（`\d{6}`）耗时
+///   和逐条跑一样。合不成集合（太大、写法放进分组里不成立）就逐条跑。
+///
+/// 写法、匹配语义（逐个正文字符串、`^` `$`、大小写）不变：命中的还是同一条正则在同一段上
+/// `find_iter` 的结果，按规则的顺序记下来
+#[derive(Debug)]
+struct CustomIndex {
+    /// 自动机，和它的第几个字面量是第几条规则、分不分大小写
+    contains: Option<(aho_corasick::AhoCorasick, Vec<(usize, bool)>)>,
+    /// 正则集合，和它的第几个是第几条规则
+    set: Option<(regex::RegexSet, Vec<usize>)>,
+    /// 逐条跑的
+    each: Vec<usize>,
+}
+
+/// 按原样找、能并进自动机的那几条
+fn lit_rules_of(custom: &[Custom]) -> impl Iterator<Item = usize> + '_ {
+    custom.iter().enumerate().filter_map(|(i, c)| {
+        let p = &c.pattern;
+        (!p.regex && (p.case_sensitive || ascii_fold_safe(&p.text))).then_some(i)
+    })
+}
+
+/// 一条正则放进 [`regex::RegexSet`] 不吃亏：没有 Unicode 的词边界（`\b`）。集合要一次答出
+/// 每一条有没有命中，只能整段跑一遍；带 Unicode 词边界的正则遇到非 ASCII 的正文时快的那种
+/// 引擎跑不了、退到慢的那种，整个集合跟着慢上百倍。单独跑的时候它有固定文字可以预筛（`\bEMP`），
+/// 慢的引擎只在候选附近跑，所以这种留着逐条跑
+fn set_friendly(p: &Pattern) -> bool {
+    let src = if p.regex {
+        p.text.clone()
+    } else {
+        regex::escape(&p.text)
+    };
+    regex_syntax::ParserBuilder::new()
+        .case_insensitive(!p.case_sensitive)
+        .build()
+        .parse(&src)
+        .is_ok_and(|h| !h.properties().look_set().contains_word_unicode())
+}
+
+/// 一段按原样找、不分大小写的文字，按 ASCII 不分大小写找和按正则找结果一样
+fn ascii_fold_safe(text: &str) -> bool {
+    text.is_ascii() && !text.bytes().any(|c| matches!(c, b'k' | b'K' | b's' | b'S'))
+}
+
+impl CustomIndex {
+    fn new(custom: &[Custom]) -> Self {
+        let mut lits: Vec<&str> = Vec::new();
+        let mut lit_rules = Vec::new();
+        let mut rest = Vec::new();
+        let mut each = Vec::new();
+        for (i, c) in custom.iter().enumerate() {
+            let p = &c.pattern;
+            if !p.regex && (p.case_sensitive || ascii_fold_safe(&p.text)) {
+                lits.push(&p.text);
+                lit_rules.push((i, p.case_sensitive));
+            } else if set_friendly(p) {
+                rest.push(i);
+            } else {
+                each.push(i);
+            }
+        }
+        let contains = if lits.is_empty() {
+            None
+        } else {
+            aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(lit_rules.iter().any(|&(_, cs)| !cs))
+                .build(&lits)
+                .ok()
+                .map(|ac| (ac, lit_rules))
+        };
+        // 自动机编不成（不该发生）就把它的那几条也逐条跑
+        if contains.is_none() {
+            each.extend(lit_rules_of(custom));
+        }
+        let set = (rest.len() > 1)
+            .then(|| {
+                let sources = rest.iter().map(|&i| {
+                    let p = &custom[i].pattern;
+                    let src = if p.regex {
+                        p.text.clone()
+                    } else {
+                        regex::escape(&p.text)
+                    };
+                    if p.case_sensitive {
+                        src
+                    } else {
+                        format!("(?i:{src})")
+                    }
+                });
+                // 每一条单独编都在上限以内（[`compile`]）；合起来的上限按条数放宽
+                let limit = (1usize << 20) * rest.len();
+                regex::RegexSetBuilder::new(sources)
+                    .size_limit(limit)
+                    .dfa_size_limit(limit)
+                    .build()
+                    .ok()
+            })
+            .flatten();
+        match set {
+            Some(set) => CustomIndex {
+                contains,
+                set: Some((set, rest)),
+                each,
+            },
+            None => {
+                each.extend(rest);
+                each.sort_unstable();
+                CustomIndex {
+                    contains,
+                    set: None,
+                    each,
+                }
+            }
+        }
+    }
+}
+
+fn custom_hits(
+    text: &str,
+    set: &RuleSet,
+    json: bool,
+    spans: Option<Vec<Range<usize>>>,
+    out: &mut Vec<Hit>,
+) {
     if set.custom.is_empty() {
         return;
     }
+    let index = set
+        .index
+        .get_or_init(|| Arc::new(CustomIndex::new(&set.custom)));
     // 是 JSON 的话（请求体、编成 JSON 字符串的一段正文）**一个字符串一个字符串地找**：
     // 用户的正则（`\S+`）在整段原文上会从 `{`、`:` 这些结构上的字开始，一路吃过引号 ——
     // 换掉结构上的字，请求体就不是 JSON 了；而它吃掉的那一段里真正该换的字也就没换
-    let spans = if json {
-        json_string_spans(text)
-    } else {
-        std::iter::once(0..text.len()).collect()
+    let spans = match spans {
+        Some(s) if json => s,
+        _ if json => json_string_spans(text),
+        _ => std::iter::once(0..text.len()).collect(),
     };
-    for c in &set.custom {
-        for span in &spans {
-            let Some(piece) = text.get(span.clone()) else {
+    let mut found: Vec<Vec<Range<usize>>> = vec![Vec::new(); set.custom.len()];
+    if let Some((ac, rules)) = &index.contains {
+        let b = text.as_bytes();
+        // 每条规则上一处命中的终点：和正则一样，一处命中之后从它的终点往后接着找
+        let mut next = vec![0usize; set.custom.len()];
+        for m in ac.find_overlapping_iter(text) {
+            let (r, cs) = rules[m.pattern().as_usize()];
+            if (cs && &b[m.range()] != set.custom[r].pattern.text.as_bytes()) || m.start() < next[r]
+            {
                 continue;
-            };
-            for m in c.re.find_iter(piece) {
-                let m = span.start + m.start()..span.start + m.end();
-                if let Some(bytes) = json_safe(text, m) {
-                    out.push(Hit {
-                        bytes,
-                        rule: Rule::Custom(c.name.clone()),
-                        label: c.label.clone(),
-                    });
-                }
+            }
+            // 整个落在一个正文字符串里
+            let k = spans.partition_point(|s| s.end < m.end());
+            if spans.get(k).is_none_or(|s| s.start > m.start()) {
+                continue;
+            }
+            next[r] = m.end();
+            found[r].push(m.range());
+        }
+    }
+    let each = |r: usize, span: &Range<usize>, piece: &str, found: &mut Vec<Vec<Range<usize>>>| {
+        for m in set.custom[r].re.find_iter(piece) {
+            found[r].push(span.start + m.start()..span.start + m.end());
+        }
+    };
+    for span in &spans {
+        let Some(piece) = text.get(span.clone()) else {
+            continue;
+        };
+        if let Some((rs, rules)) = &index.set {
+            for k in rs.matches(piece).iter() {
+                each(rules[k], span, piece, &mut found);
+            }
+        }
+        for &r in &index.each {
+            each(r, span, piece, &mut found);
+        }
+    }
+    for (c, ms) in set.custom.iter().zip(found) {
+        for m in ms {
+            if let Some(bytes) = json_safe(text, m) {
+                out.push(Hit {
+                    bytes,
+                    rule: Rule::Custom(c.name.clone()),
+                    label: c.label.clone(),
+                });
             }
         }
     }
@@ -1787,7 +2070,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_empty() {
         return out;
     }
-    // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
+    // **个人号码只在 JSON 的字符串里找**（见 `engine`），私钥块不跨出它所在的那个字符串。不是
     // JSON 的文本（直接拿来扫的一段话）不分里外
     let json = json_like(text);
     // 保存的凭据最先找：同一处另一条规则也认得出时（一把保存的 `sk-ant-…`、连接串里的代理
@@ -1797,6 +2080,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     {
         saved.find(text, &mut out);
     }
+    // 不看 token 边界的几条：锚点（`-----BEGIN `、`://`、`@`）用 SIMD 找，找到再往两边看
     if set.is_on("private-key") {
         private_keys(text, json, &mut out);
     }
@@ -1806,60 +2090,10 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_on("email") {
         emails(text, &mut out);
     }
-    // 每个 token 都要问的几条开没开，扫之前问一次：在每个 token 上查一遍表，光哈希就占了
-    // 整遍扫描的两成
-    let want_openai = set.is_on("openai-api-key");
-    let want_ip = set.is_on("internal-ip");
-    let want_domain = set.is_on("internal-domain");
-    let want_jwt = set.is_on("jwt");
-    let want_id = set.is_on("cn-resident-id");
-    let want_card = set.is_on("bank-card");
-    let want_phone = set.is_on("cn-mobile-phone");
-    // 一次扫描问一次时钟。只开卡号那条时也要问：认出是身份证号的不当卡号换
-    let today = if want_id || want_card { today_ymd() } else { 0 };
-    // **个人号码只在 JSON 的字符串里找。**字符串外面的数字是 JSON 的数值：工具
-    // 调用的参数（`"input":{"order_id":6222…}`）、`seed`。凭据规则在那儿天然认
-    // 不出东西，号码规则却认得出 —— 而把一个数值换成占位符，整个请求体就不是
-    // JSON 了
-    let mut spaced = Spaced::default();
-    // 扩充的两组规则各有自己的一份「开没开、扫到哪了」，见各自的模块
-    let mut secrets = super::secrets::Want::new(set);
-    let mut personal = super::personal::Want::new(set);
-    secrets.text(text, json, &mut out);
-    personal.text(text, json, &mut out);
-    for_each_token(text, |tok, span, quoted| {
-        secrets.token(text, tok, span.clone(), quoted, json, &mut out);
-        personal.token(text, tok, span.clone(), quoted, json, &mut out);
-        if want_phone && (quoted || !json) {
-            mobile_phones(tok, span.start, &mut out);
-        }
-        if (want_id || want_card) && (quoted || !json) {
-            // 句末的句号不是号码的一部分：`…卡号是 6222 0212 3456 7894.`
-            let body = tok.trim_end_matches('.');
-            if want_card {
-                spaced.feed(text, span.start, body, body.len() < tok.len(), &mut out);
-            }
-            personal_token(body, span.start, want_id, want_card, today, &mut out);
-        } else if want_card {
-            // 字符串外面的东西把在接的那一串截断
-            spaced.finish(text, &mut out);
-        }
-        if let Some(id) = classify_token(tok, set, want_openai) {
-            out.push(builtin_hit(id, span));
-            return;
-        }
-        if want_jwt && looks_like_jwt(tok) {
-            out.push(builtin_hit("jwt", span));
-            return;
-        }
-        if let Some(id) = internal_token(tok, want_ip, want_domain) {
-            out.push(builtin_hit(id, span));
-        }
-    });
-    spaced.finish(text, &mut out);
-    secrets.finish(text, &mut out);
-    personal.finish(text, &mut out);
-    custom_hits(text, set, json, &mut out);
+    // 按 token 认的：先预筛、再校验。切 token 时顺手记下了 JSON 字符串的区间的话，自定义规则
+    // 接着用
+    let spans = super::engine::scan_tokens(text, set, json, &mut out);
+    custom_hits(text, set, json, spans, &mut out);
     out
 }
 
@@ -1992,6 +2226,7 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
         custom: Vec::new(),
         record: set.record.clone(),
         saved: set.saved.clone(),
+        index: OnceLock::new(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
@@ -2144,6 +2379,9 @@ fn findings_with(text: &str, hits: &[Hit], set: Option<&RuleSet>) -> Vec<Finding
         })
         .collect()
 }
+
+#[cfg(test)]
+mod oracle;
 
 #[cfg(test)]
 mod tests {

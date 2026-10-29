@@ -5,6 +5,16 @@
 
 use std::ops::Range;
 
+use super::super::anchor::{ALNUM, Anchor, Bytes, DIGIT};
+
+/// 前三种的锚点：`sk-` 开头的 35 位以上；49 位、以小写十六进制开头的（智谱）；83 到 93 位、以
+/// 字母数字开头的（Terraform）
+pub(in crate::redact) const ANCHORS: &[Anchor] = &[
+    Anchor::Prefix("sk-", 35),
+    Anchor::First(DIGIT.or(Bytes::range(b'a', b'f')), 49, 49),
+    Anchor::First(ALNUM, 83, 93),
+];
+
 /// `sk-` 开头的 OpenAI 兼容格式：`sk-` 加**恰好** 32 位字母数字、两样都有（DeepSeek、阿里云
 /// 百炼的旧式），或者 `sk-` 加恰好 48 个小写字母（硅基流动）。
 ///
