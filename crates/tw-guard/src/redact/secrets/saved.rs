@@ -161,11 +161,21 @@ impl Saved {
         self.secrets.is_empty()
     }
 
-    /// 在 `text` 里找每一项，两头要在 token 边界上
+    /// 在 `text` 里找每一项，两头紧挨着的不是字母数字。
+    ///
+    /// **不按 token 边界**：`.`、`-`、`_` 在 token 里，但挨着一个保存的值时它们只是标点和
+    /// 分隔 —— 句末的句号（`My key is <值>.`）、`MISTRAL_KEY_<值>`、`<值>_old`。按 token 边界的话
+    /// 这几处整值就在那里却认不出，原样发出去。值是整个对上的，不会是别的东西的一截；只有
+    /// 两头粘着字母数字的（`x<值>`）才可能是另一个更长的串。前面是转义的尾巴（`\n<值>`）也算断开
     pub(crate) fn find(&self, text: &str, out: &mut Vec<Hit>) {
         let b = text.as_bytes();
         for m in self.ac.find_iter(text) {
-            if super::bounded(b, m.start(), m.end()) {
+            let (start, end) = (m.start(), m.end());
+            let head = start == 0
+                || !b[start - 1].is_ascii_alphanumeric()
+                || super::after_escape(b, start);
+            let tail = b.get(end).is_none_or(|c| !c.is_ascii_alphanumeric());
+            if head && tail {
                 out.push(builtin_hit("thinkwatch-saved-secret", m.range()));
             }
         }

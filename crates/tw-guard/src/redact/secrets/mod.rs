@@ -245,15 +245,6 @@ fn after_escape(b: &[u8], at: usize) -> bool {
             && odd(at - 5))
 }
 
-/// `start..end` 两头都在 token 边界上：前一个字节不和它粘成一个 token（或者是转义的尾巴），
-/// 后一个字节也不
-fn bounded(b: &[u8], start: usize, end: usize) -> bool {
-    let head =
-        start == 0 || !tok_byte(b[start]) || !tok_byte(b[start - 1]) || after_escape(b, start);
-    let tail = end >= b.len() || !tok_byte(b[end - 1]) || !tok_byte(b[end]);
-    head && tail
-}
-
 /// 一个按位置认到的值像不像真值：够长、不是占位写法、字母和数字都有，或者带着
 /// base64、URL 编码、口令里才有的符号。**全是字母的一串是变量名、类型名、说明文字**
 /// （`password: string`、`token = accessToken`），不是口令

@@ -185,6 +185,12 @@ fn saved_secrets_are_found_by_value_and_reported_by_source() {
         format!("key={key}"),
         format!("line\\n{key}\\nnext"),
         format!("\"{key}\""),
+        // 挨着的标点、分隔不算粘在一起：句末的句号、名字里的下划线、连字符
+        format!("My key is {key}."),
+        format!("see {key}... done"),
+        format!("key={key}_old"),
+        format!("MISTRAL_KEY_{key}"),
+        format!("old-{key}-2"),
     ] {
         let got = scan(&text, &set);
         assert_eq!(got.len(), 1, "{text}");
