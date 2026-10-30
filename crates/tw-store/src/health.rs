@@ -63,7 +63,8 @@ impl Db {
                     cancelled OR COALESCE(error_code = ?3, 0),
                     error IS NOT NULL AND NOT COALESCE(error_code = ?3, 0),
                     input_tokens, COALESCE(cache_read_tokens, 0),
-                    COALESCE(cache_write_tokens, 0), input_estimate, ttft_ms, tokens_per_sec
+                    COALESCE(cache_write_tokens, 0), input_estimate, ttft_ms,
+                    CASE WHEN error IS NULL THEN tokens_per_sec END
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
              ORDER BY at_ms, id",
@@ -962,8 +963,8 @@ mod tests {
     }
 
     /// 延迟和速度和按上游分的那两个查询（`latency_by_provider`、`token_rate_by_provider`）
-    /// **口径一样**：同一批行，同样的中位数和样本数。取消的、失败的照样进样本，和那两页
-    /// 一样
+    /// **口径一样**：同一批行，同样的中位数和样本数。取消的、失败的照样进延迟的样本，和那两页
+    /// 一样；速度只算没失败的（失败的只有生成太慢被结束的才有速度，量的是判定窗口）
     #[test]
     fn latency_and_speed_match_the_per_upstream_queries() {
         let db = Db::in_memory().unwrap();
@@ -979,6 +980,16 @@ mod tests {
             r.cancelled = cancelled;
             db.insert(&r).unwrap();
         }
+        // 因为生成太慢被结束的：带着结束那一刻判定窗口里的速度，是另一个量，不进样本
+        let mut slow = on(5, T0 + 5, "中转", "claude-sonnet-4-5");
+        slow.ttft_ms = None;
+        slow.tokens_per_sec = Some(3);
+        slow.error = Some(tw_api::Msg {
+            code: "gw.upstream.too_slow".into(),
+            args: Default::default(),
+            text: "too slow".into(),
+        });
+        db.insert(&slow).unwrap();
         let mut quiet = on(9, T0 + 9, "官方", "claude-sonnet-4-5");
         quiet.ttft_ms = None;
         quiet.tokens_per_sec = None;

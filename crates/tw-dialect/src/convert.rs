@@ -525,6 +525,18 @@ impl Parser {
         }
     }
 
+    /// 看得见的推理是不是摘要式的：隔几秒一段，不代表模型想得多快。Anthropic（Claude 4 起）、
+    /// Gemini 的思考摘要、Bedrock 上的 Claude 是；OpenAI Chat 的 `reasoning_content` 是原样
+    /// 流出来的；Responses 看它发的是摘要还是原文。**拿不准的按摘要算**：转发 Anthropic 格式的
+    /// 开源模型推理其实是原样的，按摘要算只是少判断一段，不会冤枉它
+    fn summarizes_reasoning(&self) -> bool {
+        match self {
+            Parser::Chat(_) => false,
+            Parser::Responses(p) => p.summarizes_reasoning(),
+            Parser::Anthropic(_) | Parser::Gemini(_) | Parser::Bedrock(_) => true,
+        }
+    }
+
     fn finish(&mut self, out: &mut Vec<Event>) {
         match self {
             Parser::Anthropic(_) => {}
@@ -704,6 +716,12 @@ impl Reader {
             self.parser.frame(f, &mut out);
         }
         out
+    }
+
+    /// 这条流里看得见的推理是不是摘要式的（隔几秒一段，见 `Parser::summarizes_reasoning`）。
+    /// Responses 要读到推理的字才知道
+    pub fn summarizes_reasoning(&self) -> bool {
+        self.parser.summarizes_reasoning()
     }
 
     /// 流结束了：最后一帧后面不带空行的上游也要读到（见 [`frame::Decoder::flush`]）
