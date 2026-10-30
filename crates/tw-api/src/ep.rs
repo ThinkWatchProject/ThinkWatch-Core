@@ -198,6 +198,8 @@ endpoints! {
     // ─────────────────────────────────────────────── 安全
     Security: GET "/security", () => api::SecurityDetail;
     SecurityEvents: GET "/security/events", api::SecurityEventsQuery => api::SecurityEventsPage;
+    /// 一项防护从某个时刻起每条规则命中了几次（记录的 `count` 加起来），按规则排
+    SecurityRuleCounts: GET "/security/counts", api::SecurityRuleHitsQuery => Vec<api::SecurityRuleHits>;
     SetSecurityMode: PUT "/security/{guard}/mode" [guard], api::ModeSave => api::ConfigWritten;
     ToggleBuiltinRule: PUT "/security/{guard}/builtin/{id}" [guard, id], api::RuleToggle => api::ConfigWritten;
     SetBuiltinRuleAction: PUT "/security/{guard}/builtin/{id}/action" [guard, id], api::ActionSave => api::ConfigWritten;
@@ -207,6 +209,12 @@ endpoints! {
     UpdateCustomRule: PUT "/security/{guard}/custom/{name}" [guard, name], api::CustomRuleSave => api::ConfigWritten;
     DeleteCustomRule: DELETE "/security/{guard}/custom/{name}" [guard, name], api::BaseVersion => api::ConfigWritten;
     TestSecurity: POST "/security/{guard}/test" [guard], api::SecurityTestRequest => api::SecurityTestResult;
+    /// 出站脱敏的例外值：列出、手动加入（交原值，core 当场算哈希）、把安全日志的一条列为例外
+    /// （按那一行的号）、移出（按哈希）。加入时已经在表里的不再写一次
+    RedactExceptions: GET "/security/exceptions", () => api::RedactExceptions;
+    AddRedactException: POST "/security/exceptions", api::ExceptionAdd => api::ExceptionAdded;
+    ExceptSecurityEvent: POST "/security/events/{id}/exception" [id], api::BaseVersion => api::ExceptionAdded;
+    RemoveRedactException: DELETE "/security/exceptions/{sha256}" [sha256], api::BaseVersion => api::ConfigWritten;
 
     // ─────────────────────────────────────────────── 脚本插件
     //

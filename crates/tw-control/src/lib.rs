@@ -823,6 +823,7 @@ async fn history(
         (Some(from), Some(to)) => g.db().security_of_requests(from, to).map_err(records)?,
         _ => Default::default(),
     };
+    security::annotate(&s.config(), &g, security.values_mut().flatten());
     // 插件改过的那些，同样一次取完
     let changed = match (
         rows.iter().map(|r| r.id).min(),
@@ -873,10 +874,9 @@ async fn history_search(
     let ids: Vec<i64> = found.rows.iter().map(|r| r.id).collect();
     let (mut security, changed) = {
         let g = store.lock().await;
-        (
-            g.db().security_of(&ids).map_err(records)?,
-            g.db().changed_by_plugins(&ids).map_err(records)?,
-        )
+        let mut security = g.db().security_of(&ids).map_err(records)?;
+        security::annotate(&s.config(), &g, security.values_mut().flatten());
+        (security, g.db().changed_by_plugins(&ids).map_err(records)?)
     };
     Ok(Json(tw_api::HistorySearchPage {
         rows: found
@@ -1125,12 +1125,13 @@ async fn request_detail(
             truncated: original_len > stored,
         })
     };
-    let security = g
+    let mut security = g
         .db()
         .security_of_requests(id, id)
         .map_err(records)?
         .remove(&id)
         .unwrap_or_default();
+    security::annotate(&s.config(), &g, &mut security);
     // 插件的每一次运行。**还在跑的请求也有**：请求钩子在发往上游之前就记下了
     let plugins: Vec<tw_api::PluginRunView> = g
         .db()

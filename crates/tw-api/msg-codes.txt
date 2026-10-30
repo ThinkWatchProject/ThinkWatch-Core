@@ -101,6 +101,9 @@ config.plugin.duplicate
 config.plugin.file
 config.plugin.sha256
 config.provider_concurrency_range
+config.redact_exception_duplicate
+config.redact_exception_hash_bad
+config.redact_exceptions_too_many
 config.rejected
 config.rejected_at
 config.remote_port_is_gateway
@@ -568,6 +571,11 @@ security.bad_content_pattern
 security.bad_label
 security.bad_pattern
 security.content_action_bad
+security.exception_forgotten
+security.exception_not_exceptable
+security.exception_saved_secret
+security.exception_value_empty
+security.exceptions_full
 security.pattern_empty
 security.redact_action_unknown
 security.redact_match_bad
@@ -577,6 +585,7 @@ security.rule_scope_codepoints
 security.rule_scope_empty
 security.unknown_action
 security.unknown_custom_rule
+security.unknown_event
 security.unknown_guard
 security.unknown_rule
 sync.already_on

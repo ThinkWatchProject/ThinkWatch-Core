@@ -3,8 +3,12 @@
 //! 一个请求体怎么走（先看一遍、编号、每一跳换）在 [`flow`]，两个网关共用。
 
 mod anchor;
+pub mod cache;
 mod common;
 mod engine;
+#[cfg(test)]
+mod exception_tests;
+pub mod exceptions;
 pub mod flow;
 mod nest;
 mod personal;

@@ -22,8 +22,8 @@ mod usage;
 
 pub use blobs::{Blobs, Which};
 pub use db::{
-    Db, DbError, KeyUsage, Latency, PluginRunRow, RequestRow, SecurityEvent, Summary, TokenRate,
-    UpstreamUsage,
+    Db, DbError, ExceptionSource, KeyUsage, Latency, PluginRunRow, RequestRow, SecurityEvent,
+    Summary, TokenRate, UpstreamUsage,
 };
 pub use recorder::{Recorder, SettleHook, Settled, price_source};
 pub use task::StoredBody;

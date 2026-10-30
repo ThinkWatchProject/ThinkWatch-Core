@@ -679,8 +679,15 @@ pub(super) async fn try_upstreams<'a>(
                 Some(d) => Some(crate::guard::Shape::Generate(d)),
                 None => crate::client_api::ClientApi::written(&out.path),
             };
-            let (body, ledger) =
-                crate::guard::replace_found(mode, &rt.redact, unsealed, seed, shape, known);
+            let (body, ledger) = crate::guard::replace_found(
+                mode,
+                &rt.redact,
+                unsealed,
+                seed,
+                shape,
+                known,
+                Some(&rt.scan_cache),
+            );
             (body, ledger, differs)
         });
 

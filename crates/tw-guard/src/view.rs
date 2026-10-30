@@ -931,6 +931,7 @@ mod tests {
                         disabled: true,
                     },
                 ],
+                exceptions: Vec::new(),
             },
             inspect_tools: ToolPolicy {
                 mode: Mode::Off,
@@ -1066,6 +1067,8 @@ mod tests {
                     disabled: !r.enabled,
                 })
                 .collect(),
+            // 例外值不在规则视图里，有自己的接口
+            exceptions: Vec::new(),
         };
         let (enable, disable) = lists(&view.inspect_tools.rules);
         let inspect_tools = ToolPolicy {
