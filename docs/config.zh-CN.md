@@ -313,7 +313,7 @@ clients:
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
 | `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口、输出上限、会不会推理、收不收图，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
 | `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.wait_secs`。不写：不限。 |
-| `min_speed` | 对象，见 [`providers[].min_speed`](#cfg-providers-min_speed) | — | 流式回答生成得太慢时结束它：从第一个 token 起每秒看一次，最近 `window_secs` 秒的平均速度低于 `tokens_per_sec` 时，回答以一条客户端会重试的错误结束（503，Anthropic 格式的客户端收到 `overloaded_error`），这家记一次失败，计入 `failover.failures_to_pause`。中途 5 秒以上的停顿不算进平均速度，由无响应超时处理。不是流式的回答不管。不写：不管。 |
+| `min_speed` | 对象，见 [`providers[].min_speed`](#cfg-providers-min_speed) | — | 流式回答生成得太慢时结束它：从第一个 token 起每秒看一次，最近 `window_secs` 秒的平均速度低于 `tokens_per_sec` 时，回答以一条客户端会重试的错误结束（503，Anthropic 格式的客户端收到 `overloaded_error`），这家记一次失败，计入 `failover.failures_to_pause`。中途较长的停顿和摘要式的推理不算进平均速度，停顿由无响应超时处理。不是流式的回答不管。不写：不管。 |
 | `limits` | 对象列表，见 [`providers[].limits[]`](#cfg-providers-limits) | — | 这家上游的用量上限，照着它自己的限额写：每几分钟、每几小时、每天、每周或每月的请求数、token 数或费用。每一条都有余量才往这家发。滚动窗口满了，请求换下一家或者等它空出来；天、周、月用满了，到下一期之前请求换下一家。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | 从哪里读这家上游的余额，用它自己的密钥、走它自己的代理：`openrouter`、`deepseek`、`moonshot`、`sub2api`、`newapi`（New API 和 One API）或 `thinkwatch`（ThinkWatch 企业网关）。`auto`：OpenRouter、DeepSeek、Moonshot 按 `base_url` 识别；其他地址（Anthropic、OpenAI、Gemini 的官方地址除外）询问一次它是不是 Sub2API、ThinkWatch 企业网关或 New API 中转站，结果只保存在内存中。`off`：不读余额。ChatGPT、Z.ai 账号和 Bedrock 不读余额，与这里写什么无关。 |
