@@ -373,9 +373,10 @@ impl ScanCache {
         self.shared.lock()
     }
 
-    /// 存着几段
+    /// 存着几段。先等后台把交过去的存完（[`ScanCache::settle`]）：慢的机器上后台还没轮到
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
+        self.settle();
         self.lock().map.len()
     }
 
