@@ -51,6 +51,11 @@ pub enum Source {
     /// 上游没坏，是没在时限里回话 —— Anthropic 的格式里它是 `timeout_error`，Gemini 是
     /// `DEADLINE_EXCEEDED`。对外的词表里算 `upstream`
     Timeout,
+    /// 上游生成得比设定的最低速度慢（`providers[].min_speed`，见 [`crate::slow`]），回答被结束了。
+    /// **503**：Anthropic 的格式里是 `overloaded_error`，Responses 是 `server_error`，Gemini 是
+    /// `UNAVAILABLE` —— 都是客户端认作「上游此刻过载、可以重试」的那一种。504 在 Anthropic 里是
+    /// `timeout_error`，更少有客户端重试。对外的词表里算 `upstream`
+    Slow,
     /// 在界面上手动中止的（见 [`crate::abort`]）。**499**：客户端的 SDK 不重试 4xx
     /// （408、409、429 除外），不会把用户叫停的请求自己再发一遍；Google 的接口给「操作被
     /// 取消」用的也是它。对外的词表里是 `aborted`
@@ -74,7 +79,7 @@ impl Source {
             Source::RateLimited | Source::Busy => "rate_limited",
             Source::Denied => "denied",
             Source::NotSupported | Source::TooLarge => "request",
-            Source::Timeout => "upstream",
+            Source::Timeout | Source::Slow => "upstream",
             Source::Aborted => "aborted",
         }
     }
@@ -90,6 +95,7 @@ impl Source {
             Source::NotSupported => StatusCode::NOT_IMPLEMENTED,
             Source::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Source::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Source::Slow => StatusCode::SERVICE_UNAVAILABLE,
             Source::Aborted => StatusCode::from_u16(499).expect("499 is a valid status code"),
         }
     }
@@ -201,6 +207,10 @@ impl GatewayError {
     pub fn timeout(detail: Msg) -> Self {
         Self::new(Source::Timeout, detail)
     }
+    /// 生成太慢，回答被结束了（见 [`crate::slow`]）：503
+    pub fn slow(detail: Msg) -> Self {
+        Self::new(Source::Slow, detail)
+    }
     /// 手动中止（见 [`crate::abort`]）。句子只有一句，码是 [`tw_api::ABORTED`]
     pub fn aborted() -> Self {
         Self::new(
@@ -211,6 +221,11 @@ impl GatewayError {
 }
 
 impl GatewayError {
+    /// 这个错误的状态码：响应头上的，和流里错误帧按它写的那一个
+    pub fn status(&self) -> StatusCode {
+        self.source.status()
+    }
+
     /// 发给客户端的那句话。`[ThinkWatch]` 前缀不是装饰：没有它，用户看到
     /// 一个 401 会先去查上游的密钥 —— 而问题在中间这一层。
     fn client_message(&self) -> String {
@@ -315,6 +330,23 @@ mod tests {
                 .unwrap()
                 .starts_with("[ThinkWatch]")
         );
+    }
+
+    /// 生成太慢：503，客户端按「过载」重试；对外的词表里还是上游的事
+    #[tokio::test]
+    async fn too_slow_is_503_overloaded_and_counts_as_upstream() {
+        let e = GatewayError::slow(msg!("t.slow" => "too slow"));
+        assert!(e.sse_frame().contains("overloaded_error"));
+        let (status, slug, json) = body_of(e).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(slug, "upstream");
+        assert_eq!(json["error"]["type"], "overloaded_error");
+        let gemini = GatewayError::slow(msg!("t.slow" => "too slow")).in_dialect(Dialect::Gemini);
+        assert!(gemini.sse_frame().contains("UNAVAILABLE"));
+        let responses =
+            GatewayError::slow(msg!("t.slow" => "too slow")).in_dialect(Dialect::Responses);
+        let frame = responses.sse_frame();
+        assert!(frame.contains("response.failed") && frame.contains("server_error"));
     }
 
     #[tokio::test]

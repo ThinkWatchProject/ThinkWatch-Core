@@ -8,9 +8,9 @@
 //! 这些步骤要不要做、怎么做，在响应头到手的那一刻就全定了（[`Plan`]）；
 //! 流里每一块怎么处理在 [`Relay`] 上，`respond` 里的流只剩一个循环。
 //!
-//! 那个循环还看着两件事：上游多久没有内容（无响应超时，见 [`super::idle`]），和这个请求有
-//! 没有被手动中止（见 [`crate::abort`]）。哪一件到了都丢掉上游的流，按客户端的格式补一条
-//! 错误收尾。
+//! 那个循环还看着三件事：上游多久没有内容（无响应超时，见 [`super::idle`]），生成得够不够快
+//! （这一家设了最低生成速度时，见 [`crate::slow`]），和这个请求有没有被手动中止（见
+//! [`crate::abort`]）。哪一件到了都丢掉上游的流，按客户端的格式补一条错误收尾。
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -150,6 +150,15 @@ pub(super) fn respond(
             sent: sent_at,
         });
     }
+    // 最低生成速度（见 `crate::slow`）：这一家设了、回的是成功的流、客户端收的也是流才看。
+    // 客户端要整包的（上游的流收齐了再交）不管：它在结束之前什么都收不到，谈不上快慢
+    let slow = provider
+        .min_speed
+        .filter(|_| generates && plan.is_sse && status.is_success() && !plan.collect)
+        .map(|m| crate::slow::Watch::of(&m, state.speed_tick));
+    if let Some(w) = &slow {
+        ending.gauge(w.gauge());
+    }
     // 回的不是 2xx：原样交给客户端，**这个请求照样是失败的** —— 客户端拿到的是上游的
     // 错误，不是回答。原因在错误正文里，交完时读（见 `Ending::refused`）
     if !status.is_success() {
@@ -218,7 +227,40 @@ pub(super) fn respond(
         let mut aborted = false;
         // 这一家的成败还没记（最后一家不压开头时，见 `hop`）：第一段真内容到了记成功
         let mut unconfirmed = unconfirmed;
+        // 下一次看生成速度的时刻（这一家没设最低生成速度时用不到）
+        let mut pace_at = tokio::time::Instant::now() + pace_every(slow);
         loop {
+            // 每秒看一次生成速度：到点了就看（上游一直在发、计时那一支轮不上的时候也看得到）
+            if let Some(w) = slow
+                && tokio::time::Instant::now() >= pace_at
+            {
+                pace_at = tokio::time::Instant::now() + w.tick;
+                if let Some(rate) = w.judge(ending.pace_at(std::time::Instant::now())) {
+                    tracing::warn!(
+                        provider = %upstream_name, rate, min = w.min, secs = w.secs,
+                        "ended the response: the upstream generated below its minimum speed"
+                    );
+                    // 这是用户给这一家定的「不达标」：记一次失败（重发的请求先去别家，连着几次
+                    // 停用），这段对话这一轮不再留在它那儿
+                    crate::server::note_health(
+                        &bus,
+                        &health,
+                        &upstream_name,
+                        health.record_failure(&upstream_name),
+                    );
+                    ending.too_slow(rate);
+                    broke = Some(
+                        GatewayError::slow(crate::slow::too_slow(
+                            &upstream_name,
+                            rate,
+                            w.min,
+                            w.secs,
+                        ))
+                        .in_dialect(dialect),
+                    );
+                    break;
+                }
+            }
             // 补心跳的那一刻。不补的格式给一个不会用到的时刻，那一支不参与
             let ping_at = ping_every.map_or(quiet_by, |every| quiet_since + every);
             let next = tokio::select! {
@@ -247,6 +289,8 @@ pub(super) fn respond(
                     broke = Some(GatewayError::timeout(why).in_dialect(dialect));
                     break;
                 }
+                // 到了看生成速度的时候：回到开头去看
+                _ = tokio::time::sleep_until(pace_at), if slow.is_some() => continue,
                 _ = tokio::time::sleep_until(ping_at), if ping_every.is_some() => {
                     // 停在一帧中间时这一轮不补，也要重新计时，否则会原地空转
                     quiet_since = tokio::time::Instant::now();
@@ -369,8 +413,9 @@ pub(super) fn respond(
                 // 防火墙切断是 `denied` —— 后者不是上游坏了，是策略拦的。
                 // 码保持不变，只在句子前面点明它断在流里 —— 界面认的是码
                 // 手动中止的不是流断了：原句照报，记录里是那个码
+                // 生成太慢也一样：流没断，是网关按设定结束的
                 let mut why = err.detail.clone();
-                if !aborted {
+                if !aborted && err.source != crate::error::Source::Slow {
                     why.text = format!("the response stream broke: {}", why.text);
                 }
                 ending.failed(err.source.into(), why);
@@ -384,6 +429,11 @@ pub(super) fn respond(
     *resp.status_mut() = status;
     *resp.headers_mut() = out_headers;
     resp
+}
+
+/// 看生成速度的间隔：一「秒」。没设最低生成速度的给一个不会用到的数
+fn pace_every(slow: Option<crate::slow::Watch>) -> std::time::Duration {
+    slow.map_or(std::time::Duration::from_secs(3600), |w| w.tick)
 }
 
 /// 上游说的是哪种格式。转换过的看会话，直通的就是客户端那一种。
@@ -1187,8 +1237,13 @@ impl Relay {
 
     fn error_frame(&mut self, err: &GatewayError) -> Option<Vec<u8>> {
         if let Some(c) = self.back.as_mut() {
-            // 转换过的流按客户端的格式收尾
-            Some(c.fail(&format!("[ThinkWatch] {}", err.message())))
+            // 转换过的流按客户端的格式收尾。生成太慢的按它的状态码写（503：客户端认作过载、会
+            // 重试）；别的照旧
+            let said = format!("[ThinkWatch] {}", err.message());
+            Some(match err.source {
+                crate::error::Source::Slow => c.fail_with(err.status().as_u16(), &said),
+                _ => c.fail(&said),
+            })
         } else if let (true, Some(s)) = (self.plan.collect, self.session.as_ref()) {
             // 要收齐的整包一个字节都还没发：按客户端的格式回一个错误体
             Some(tw_dialect::convert::error_body(

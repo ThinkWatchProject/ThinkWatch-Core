@@ -200,6 +200,7 @@ impl Default for Provider {
             pricing: None,
             model_specs: std::collections::BTreeMap::new(),
             max_concurrent: None,
+            min_speed: None,
             limits: Vec::new(),
             disabled: false,
             balance: BalanceSetting::Auto,
@@ -850,6 +851,10 @@ pub struct Provider {
     /// 这家的对话等它空出来，别的请求换下一家（见 `tw_gateway::slots`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 最低生成速度：流式回答在第一个 token 之后持续低于它，就以一条可重试的错误结束回答（见
+    /// `tw_gateway::slow`）。不写就是不管
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_speed: Option<MinSpeed>,
     /// 用量上限：每 N 分钟、每 N 小时、每天、每周、每月最多发给这家多少个请求、多少 token、
     /// 花多少钱。**每一条都要过**，不写就不限。写法和密钥的一样（[`limits`]）。
     ///
@@ -957,6 +962,39 @@ impl From<tw_api::BalanceSetting> for BalanceSetting {
 
 /// 一家上游的并发上限最多写多少
 pub const MAX_PROVIDER_CONCURRENCY: u32 = 1000;
+
+/// 一家上游的最低生成速度（`providers[].min_speed`）。
+///
+/// **只管流式回答的生成阶段**：从第一个 token 起，每秒看一次最近 `window_secs` 秒的平均速度，
+/// 低于 `tokens_per_sec` 就结束这个回答，客户端收到一条可以重试的错误（503）。速度和流量页、
+/// 菜单栏上的实时速度是同一个估法；中途连续几秒没有内容的那一段不算进去，由无响应超时管。
+///
+/// ```yaml
+/// providers:
+///   - name: local-vllm
+///     min_speed: { tokens_per_sec: 15, window_secs: 20 }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MinSpeed {
+    /// 每秒至少多少 token，1 到 [`MIN_SPEED_MAX_RATE`]
+    pub tokens_per_sec: u32,
+    /// 按最近多少秒的平均速度判断，[`MIN_SPEED_WINDOW_SECS`] 之内。不写是
+    /// [`DEFAULT_MIN_SPEED_WINDOW_SECS`]；**写回配置时照写**，等于默认值也写，一眼看得出按多久判断
+    #[serde(default = "d_min_speed_window")]
+    pub window_secs: u32,
+}
+
+/// 最低生成速度最多写多少 token/秒
+pub const MIN_SPEED_MAX_RATE: u32 = 1000;
+/// 最低生成速度的判定时长能写的范围，秒
+pub const MIN_SPEED_WINDOW_SECS: (u32, u32) = (5, 120);
+/// 最低生成速度的判定时长不写时是多少秒
+pub const DEFAULT_MIN_SPEED_WINDOW_SECS: u32 = 20;
+
+fn d_min_speed_window() -> u32 {
+    DEFAULT_MIN_SPEED_WINDOW_SECS
+}
 
 /// 手动添加的一个模型 ID 最多多少个字符。最长的真名字是 Bedrock 应用推理配置的 ARN，
 /// 一百来个字符

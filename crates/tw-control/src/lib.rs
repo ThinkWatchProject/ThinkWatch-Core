@@ -530,6 +530,10 @@ fn provider_view(
             .collect(),
         pricing: p.pricing.clone(),
         max_concurrent: p.max_concurrent,
+        min_speed: p.min_speed.map(|m| tw_api::MinSpeedView {
+            tokens_per_sec: m.tokens_per_sec,
+            window_secs: m.window_secs,
+        }),
         limits: s.gateway.upstream_limits.view(&p.name, &p.limits),
         balance_setting: p.balance.into(),
         balance: s.gateway.balance_of(p),

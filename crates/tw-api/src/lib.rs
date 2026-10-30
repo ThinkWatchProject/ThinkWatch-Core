@@ -1131,7 +1131,18 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `security.unknown_event`。新端点 `GET /security/counts`（[`SecurityRuleHitsQuery`] →
 /// [`SecurityRuleHits`] 的列表）：一项防护从某个时刻起每条规则命中了几次，各条记录的 `count`
 /// 加起来，规则表的组头用
-pub const CONTROL_API_VERSION: u32 = 57;
+///
+/// **58 起上游可以设最低生成速度**（配置的 `providers[].min_speed`）：[`ProviderView`] 多了
+/// `min_speed`（[`MinSpeedView`]，不管是空），[`ProviderInput`] 多了 `min_speed`
+/// （[`MinSpeedInput`]，不给就是不管）。流式回答从第一个 token 起持续低于它（最近 `window_secs`
+/// 秒的平均速度，中途 5 秒以上的静默不算），回答以一条 503 的错误结束（Anthropic 的
+/// `overloaded_error`、Responses 的 `response.failed` / `server_error`、Gemini 的 `UNAVAILABLE`），
+/// 请求失败，来源 `upstream`，码 `gw.upstream.too_slow`（`upstream`、`rate`、`min`、`secs`），这家
+/// 记一次失败。[`Event::RequestFailed`] 多了 `tokens_per_sec`：只有这种失败带着，是结束那一刻的
+/// 速度，请求记录里照记。新码：`gw.upstream.too_slow`、`config.min_speed_range`（`upstream`、
+/// `field`、`value`、`min`、`max`）；一键修复修得了它：速度越界删掉 `min_speed`，判定时长越界改回
+/// 20。请求库 SCHEMA 不变
+pub const CONTROL_API_VERSION: u32 = 58;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1435,6 +1446,11 @@ pub enum Event {
         /// 失败之前上游在回答里写的模型名（见 `RequestFinished::answered_model`）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered_model: Option<String>,
+        /// 生成速度，token/秒。**失败的请求一般没有**，只有因为生成太慢被结束的
+        /// （`gw.upstream.too_slow`，见 [`MinSpeedView`]）有：那是结束那一刻判定窗口里的速度，
+        /// 估出来的，和 [`RunningView::tokens_per_sec`] 同一个估法
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_per_sec: Option<u32>,
     },
     /// 客户端没等到响应结束就走了（Claude Code 里按一下 Esc）。
     ///
@@ -2711,6 +2727,9 @@ pub struct ProviderView {
     /// 同时最多发给这家几个请求。不限是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 最低生成速度（配置里的 `min_speed`）。不管是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_speed: Option<MinSpeedView>,
     /// 用量上限，按配置里的顺序，各带此刻用了多少（发出去还没结束的按估算算）。没设的是空的
     pub limits: Vec<KeyLimitView>,
     /// 配置里的 `balance:`，原样：编辑对话框保存时交回去（[`ProviderInput::balance`]）
@@ -3691,6 +3710,9 @@ pub struct ProviderInput {
     /// 同时最多发给这家几个请求，1 到 1000。不给就是不限
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 最低生成速度。不给就是不管
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_speed: Option<MinSpeedInput>,
     /// 用量上限，整份替换。不给 = 一条都没有
     #[serde(default)]
     pub limits: Vec<KeyLimitInput>,
@@ -3700,6 +3722,31 @@ pub struct ProviderInput {
     /// 余额从哪儿读。不给就是 `auto`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceSetting>,
+}
+
+/// 一家上游的最低生成速度（配置的 `providers[].min_speed`）。
+///
+/// 流式回答从第一个 token 起，每秒看一次最近 `window_secs` 秒的平均生成速度（和
+/// [`RunningView::tokens_per_sec`] 同一个估法；中途连续 5 秒以上没有内容的那一段不算），低于
+/// `tokens_per_sec` 就结束回答：客户端收到一条 503 的错误（可以重试），请求失败，码是
+/// `gw.upstream.too_slow`，这家记一次失败。非流式的回答、WebSocket 上的不管
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MinSpeedView {
+    /// 每秒至少多少 token
+    pub tokens_per_sec: u32,
+    /// 按最近多少秒的平均速度判断。配置里没写的是 20
+    pub window_secs: u32,
+}
+
+/// 保存上游时交的最低生成速度（[`ProviderInput::min_speed`]）。`tokens_per_sec` 是 1 到 1000，
+/// `window_secs` 是 5 到 120（界面显式填好默认的 20）；越界的保存被拒，码是
+/// `config.min_speed_range`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MinSpeedInput {
+    pub tokens_per_sec: u32,
+    pub window_secs: u32,
 }
 
 /// 按接口地址自动识别的结果。给编辑中、还没保存的上游显示「自动识别」
@@ -7691,6 +7738,7 @@ mod tests {
                 answered_model: None,
             },
             Event::RequestFailed {
+                tokens_per_sec: None,
                 id: 7,
                 model: String::new(),
                 source: FailureSource::Upstream,
@@ -7842,6 +7890,7 @@ mod tests {
         ));
 
         let silent = Event::RequestFailed {
+            tokens_per_sec: None,
             id: 2,
             model: String::new(),
             source: FailureSource::Upstream,

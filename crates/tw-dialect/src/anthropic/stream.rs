@@ -237,12 +237,15 @@ impl Writer {
             Event::BlockStop { index } => self.stop_block(*index, &mut out),
             Event::Usage(u) => self.usage.merge(u),
             Event::Stop(s) => self.stop = Some(s.clone()),
-            Event::Error { message } => {
-                self.failed = true;
-                out.push_str(&error_frame(500, message));
-            }
+            Event::Error { message } => out.push_str(&self.fail(500, message)),
         }
         out
+    }
+
+    /// 中途出错：一条状态码 `status` 的错误帧（见 [`error_frame`]），之后不再写收尾
+    pub(crate) fn fail(&mut self, status: u16, message: &str) -> String {
+        self.failed = true;
+        error_frame(status, message)
     }
 
     fn stop_block(&mut self, index: usize, out: &mut String) {

@@ -561,6 +561,11 @@ fn to_provider(
         // 沿用原来的，改名时跟着这一项走
         model_specs: existing.map(|e| e.model_specs.clone()).unwrap_or_default(),
         max_concurrent: input.max_concurrent,
+        // 越界的由配置校验说（`config.min_speed_range`），和手写的同一套
+        min_speed: input.min_speed.map(|m| tw_config::MinSpeed {
+            tokens_per_sec: m.tokens_per_sec,
+            window_secs: m.window_secs,
+        }),
         // 写得对不对由配置校验说，和手写的同一套
         limits: input.limits.iter().map(crate::keys::limit).collect(),
         disabled: input.disabled,

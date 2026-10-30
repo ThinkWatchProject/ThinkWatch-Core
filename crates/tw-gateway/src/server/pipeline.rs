@@ -381,6 +381,10 @@ async fn answer_with(
             &served.provider.name,
         ));
     }
+    // 生成太慢被结束、上游还没报输入时按它记（见 `Ending::too_slow`）
+    if matches!(reading.decoded, Some(Ok(_))) {
+        ending.input_estimated(reading.facts.input_tokens);
+    }
     Ok(relay::respond(
         state,
         rt,

@@ -487,14 +487,19 @@ impl Writer {
             Event::BlockStop { index } => self.stop_item(*index, &mut out),
             Event::Usage(u) => self.usage.get_or_insert_default().merge(u),
             Event::Stop(s) => self.stop = Some(s.clone()),
-            Event::Error { message } => {
-                self.start(&mut out);
-                self.finished = true;
-                let mut r = envelope(&self.id, self.created, &self.model, "failed");
-                r["error"] = failure(500, message);
-                self.emit("response.failed", json!({ "response": r }), &mut out);
-            }
+            Event::Error { message } => out.push_str(&self.fail(500, message)),
         }
+        out
+    }
+
+    /// 中途出错：`response.failed`，错误码按状态码 `status` 定（见 [`failure`]）
+    pub(crate) fn fail(&mut self, status: u16, message: &str) -> String {
+        let mut out = String::new();
+        self.start(&mut out);
+        self.finished = true;
+        let mut r = envelope(&self.id, self.created, &self.model, "failed");
+        r["error"] = failure(status, message);
+        self.emit("response.failed", json!({ "response": r }), &mut out);
         out
     }
 

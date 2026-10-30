@@ -15,6 +15,7 @@ impl From<crate::error::Source> for FailureSource {
             Source::Denied => Self::Denied,
             Source::NotSupported | Source::TooLarge => Self::Request,
             Source::Timeout => Self::Upstream,
+            Source::Slow => Self::Upstream,
             Source::Aborted => Self::Aborted,
         }
     }

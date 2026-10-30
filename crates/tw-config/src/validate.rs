@@ -43,6 +43,15 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     ProviderConcurrency { name: String, value: u32 },
     #[error("{}", self.msg())]
+    MinSpeedRange {
+        name: String,
+        /// `tokens_per_sec` / `window_secs`
+        field: &'static str,
+        value: u32,
+        min: u32,
+        max: u32,
+    },
+    #[error("{}", self.msg())]
     Routing(#[from] tw_engine::RouteError),
     #[error("{}", self.msg())]
     NameCollision(String),
@@ -297,6 +306,18 @@ impl ValidationError {
                 max = crate::MAX_PROVIDER_CONCURRENCY =>
                 "upstream `{upstream}` has max_concurrent: {value}; it has to be between 1 and \
                  {max}. Leave max_concurrent out for no limit"
+            ),
+            MinSpeedRange {
+                name,
+                field,
+                value,
+                min,
+                max,
+            } => msg!(
+                "config.min_speed_range", upstream = name, field = field, value = value,
+                min = min, max = max =>
+                "upstream `{upstream}` has min_speed.{field}: {value}; it has to be between \
+                 {min} and {max}"
             ),
             // 路由那几句本身就说清了是哪条规则、哪个组，前面不用再垫一句
             Routing(e) => e.msg(),
@@ -675,6 +696,33 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 name: p.name.clone(),
                 value: n,
             });
+        }
+        // 最低生成速度：0 等于不管（那是不写），上千的话正常的回答也会被掐断；判定时长太短
+        // 是拿几秒的波动下结论，太长等于不管。**速度先查**：一键修复按它删掉整项，判定时长
+        // 跟着没了
+        if let Some(m) = p.min_speed {
+            let (lo, hi) = crate::MIN_SPEED_WINDOW_SECS;
+            let out = if !(1..=crate::MIN_SPEED_MAX_RATE).contains(&m.tokens_per_sec) {
+                Some((
+                    "tokens_per_sec",
+                    m.tokens_per_sec,
+                    1,
+                    crate::MIN_SPEED_MAX_RATE,
+                ))
+            } else if !(lo..=hi).contains(&m.window_secs) {
+                Some(("window_secs", m.window_secs, lo, hi))
+            } else {
+                None
+            };
+            if let Some((field, value, min, max)) = out {
+                return Err(ValidationError::MinSpeedRange {
+                    name: p.name.clone(),
+                    field,
+                    value,
+                    min,
+                    max,
+                });
+            }
         }
         // **空范围不是「全部」，也不是一个合理的「停用」。**两种读法各有
         // 人会当真，而停用有自己的开关
@@ -1506,6 +1554,61 @@ mod tests {
     }
 
     #[test]
+    fn a_minimum_speed_is_1_to_1000_tokens_per_second_over_5_to_120_seconds() {
+        let with = |m: Option<(u32, u32)>| {
+            let mut prov = p("relay", "https://relay.example");
+            prov.min_speed = m.map(|(tokens_per_sec, window_secs)| crate::MinSpeed {
+                tokens_per_sec,
+                window_secs,
+            });
+            validate(&cfg(vec![c("a", "tw-a")], vec![prov]))
+        };
+        assert!(with(None).is_ok(), "不写是不管");
+        for ok in [(1, 5), (1000, 120), (15, 20)] {
+            assert!(with(Some(ok)).is_ok(), "{ok:?}");
+        }
+        for (bad, field) in [
+            ((0, 20), "tokens_per_sec"),
+            ((1001, 20), "tokens_per_sec"),
+            ((15, 4), "window_secs"),
+            ((15, 121), "window_secs"),
+            // 两样都不对：先说速度（一键修复按它删掉整项）
+            ((0, 0), "tokens_per_sec"),
+        ] {
+            let e = with(Some(bad)).unwrap_err();
+            let m = e.msg();
+            assert_eq!(m.code, "config.min_speed_range", "{e}");
+            assert_eq!(m.arg("upstream"), "relay");
+            assert_eq!(m.arg("field"), field, "{bad:?}");
+            assert!(e.to_string().contains(&format!("min_speed.{field}")), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_minimum_speed_reads_with_a_default_window_and_writes_it_back_explicitly() {
+        let prov: crate::Provider = serde_yaml_ng::from_str(
+            "name: local\nbase_url: http://127.0.0.1:8000\nmin_speed: { tokens_per_sec: 15 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            prov.min_speed,
+            Some(crate::MinSpeed {
+                tokens_per_sec: 15,
+                window_secs: crate::DEFAULT_MIN_SPEED_WINDOW_SECS
+            })
+        );
+        let out = serde_yaml_ng::to_string(&prov).unwrap();
+        assert!(out.contains("window_secs: 20"), "{out}");
+        // 拼错的字段照样报出来
+        assert!(
+            serde_yaml_ng::from_str::<crate::Provider>(
+                "name: local\nbase_url: http://x\nmin_speed: { tokens_per_sec: 15, window: 20 }\n",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn an_empty_model_scope_is_refused_and_points_at_disabling_instead() {
         let mut prov = p("relay", "https://relay.example");
         prov.models_only = Some(vec![]);
@@ -2328,6 +2431,13 @@ mod msg_codes {
             ProviderConcurrency {
                 name: "a".into(),
                 value: 0,
+            },
+            MinSpeedRange {
+                name: "a".into(),
+                field: "window_secs",
+                value: 1,
+                min: 5,
+                max: 120,
             },
             NameCollision("a".into()),
             BadCidr { entry: "x".into() },

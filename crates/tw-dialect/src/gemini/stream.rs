@@ -320,11 +320,16 @@ impl Writer {
             }
             Event::Usage(u) => self.usage.get_or_insert_default().merge(u),
             Event::Stop(s) => self.stop = Some(s.clone()),
-            Event::Error { message } => {
-                self.write(&super::response::error_body(500, message), &mut out);
-                self.close(&mut out);
-            }
+            Event::Error { message } => out.push_str(&self.fail(500, message)),
         }
+        out
+    }
+
+    /// 中途出错：一个状态码 `status` 的错误元素，然后收尾
+    pub(crate) fn fail(&mut self, status: u16, message: &str) -> String {
+        let mut out = String::new();
+        self.write(&super::response::error_body(status, message), &mut out);
+        self.close(&mut out);
         out
     }
 

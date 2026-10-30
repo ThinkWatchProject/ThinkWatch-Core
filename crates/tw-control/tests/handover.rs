@@ -146,7 +146,7 @@ async fn status_reports_the_handover_phase_and_the_draining_count() {
     let st = status(&s).await;
     assert_eq!(st.handover, tw_api::HandoverState::Draining);
     assert_eq!(st.draining, 3);
-    assert_eq!(st.api_version, 57);
+    assert_eq!(st.api_version, 58);
 }
 
 /// arm 之后（以及接替者正在接管时）不开始新的账号登录：回调端口不交接。（平常、排空中的

@@ -566,6 +566,19 @@ impl Writer {
         }
     }
 
+    /// 中途出错，状态码 `status`。Bedrock 的异常帧不带状态码
+    fn fail(&mut self, status: u16, message: &str) -> String {
+        match self {
+            Writer::Anthropic(w) => w.fail(status, message),
+            Writer::Chat(w) => w.fail(status, message),
+            Writer::Responses(w) => w.fail(status, message),
+            Writer::Gemini(w) => w.fail(status, message),
+            Writer::Bedrock(w) => w.event(&Event::Error {
+                message: message.to_string(),
+            }),
+        }
+    }
+
     fn finish(&mut self) -> String {
         match self {
             Writer::Anthropic(w) => w.finish(),
@@ -794,13 +807,17 @@ impl StreamConverter {
     /// 流在中途出了错（上游断开、被策略切断）：按客户端的格式写一个错误收尾。之后
     /// [`StreamConverter::finish`] 什么都不再写
     pub fn fail(&mut self, message: &str) -> Vec<u8> {
+        self.fail_with(500, message)
+    }
+
+    /// 同 [`StreamConverter::fail`]，错误按状态码 `status` 写：Anthropic 的 503 是
+    /// `overloaded_error`、Gemini 的是 `UNAVAILABLE`，客户端认得出该不该重试
+    pub fn fail_with(&mut self, status: u16, message: &str) -> Vec<u8> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
-        let mut out = self.writer.event(&Event::Error {
-            message: message.to_string(),
-        });
+        let mut out = self.writer.fail(status, message);
         out.push_str(&self.writer.finish());
         out.into_bytes()
     }
@@ -1359,6 +1376,32 @@ mod tests {
         let out = String::from_utf8(c.fail("上游断开")).unwrap();
         assert!(out.contains("\"message\":\"上游断开\""), "{out}");
         assert!(c.finish().is_empty());
+    }
+
+    /// 带状态码的收尾：503 在每种客户端格式里都是「过载、可以重试」那一种
+    #[test]
+    fn a_failure_with_a_status_is_written_in_that_status() {
+        let ended = |client| {
+            let mut c = Session::for_test(client, Dialect::Chat).stream();
+            let out = String::from_utf8(c.fail_with(503, "too slow")).unwrap();
+            assert!(c.finish().is_empty());
+            out
+        };
+        let out = ended(Dialect::Anthropic);
+        assert!(out.contains("event: error"), "{out}");
+        assert!(out.contains("\"overloaded_error\""), "{out}");
+        let out = ended(Dialect::Responses);
+        assert!(out.contains("response.failed"), "{out}");
+        assert!(out.contains("\"server_error\""), "{out}");
+        let out = ended(Dialect::Gemini);
+        assert!(out.contains("\"UNAVAILABLE\""), "{out}");
+        let out = ended(Dialect::Chat);
+        assert!(out.contains("\"error\""), "{out}");
+        assert!(out.contains("too slow"), "{out}");
+        // 不带状态码的照旧是 500
+        let mut c = Session::for_test(Dialect::Anthropic, Dialect::Chat).stream();
+        let out = String::from_utf8(c.fail("broke")).unwrap();
+        assert!(out.contains("\"api_error\""), "{out}");
     }
 
     #[test]

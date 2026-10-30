@@ -90,6 +90,7 @@ config.manual_model_duplicate
 config.manual_model_padded
 config.manual_model_too_long
 config.manual_model_wildcard
+config.min_speed_range
 config.model_spec_blank_model
 config.model_spec_nothing_set
 config.model_spec_wildcard
@@ -458,6 +459,7 @@ gw.upstream.stream_error
 gw.upstream.stream_exception
 gw.upstream.stream_opening_error
 gw.upstream.timeout
+gw.upstream.too_slow
 gw.upstream.unreachable
 gw.upstream.window_full
 gw.wait.mixed
@@ -654,6 +656,7 @@ t.broke test
 t.limited test
 t.plugin_threw test
 t.prefs test
+t.slow test
 t.upstream test
 t.x test
 yaml.anchor_or_alias

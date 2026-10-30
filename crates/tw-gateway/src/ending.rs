@@ -95,6 +95,11 @@ pub struct Ending {
     /// 这个请求的报文记录（见 [`crate::content`]）。有它时，回答那一跳的回答攒在它身上
     /// （`tap` 不用）：实时内容和落盘看的是同一份
     capture: Option<crate::content::Capture>,
+    /// 回答因为生成太慢被结束了（见 [`crate::slow`]）：结束那一刻窗口里的速度。失败的结局带着它
+    slow: Option<u32>,
+    /// 网关估的输入 token（和开始事件的 `input_estimate` 同一个数）。生成太慢被结束、上游
+    /// 还没报用量时按它记（见 [`Ending::too_slow`]）
+    input_estimate: Option<u64>,
     /// 报过了。**只能报一次**
     told: bool,
 }
@@ -232,6 +237,10 @@ struct Stream {
     pace: std::sync::Arc<crate::pace::Pace>,
     provider: String,
     ratio: f64,
+    /// 最低生成速度的判定窗口（见 [`crate::slow`]）：这一家设了才有
+    gauge: Option<crate::slow::Gauge>,
+    /// 这一块里来了内容（有字的正文、推理、工具参数，或者一个工具调用开了头）
+    fresh: bool,
 }
 
 impl Stream {
@@ -241,7 +250,10 @@ impl Stream {
             ir::Event::Delta {
                 delta: ir::Delta::Text(t) | ir::Delta::ToolInput(t),
                 ..
-            } => self.text.add(t),
+            } => {
+                self.text.add(t);
+                self.fresh |= !t.is_empty();
+            }
             ir::Event::Delta {
                 delta: ir::Delta::Thinking(t),
                 ..
@@ -250,8 +262,13 @@ impl Stream {
                 if !t.is_empty() {
                     self.thought_text = true;
                     self.thought_pending = false;
+                    self.fresh = true;
                 }
             }
+            ir::Event::BlockStart {
+                kind: ir::BlockKind::ToolCall { .. },
+                ..
+            } => self.fresh = true,
             ir::Event::BlockStart {
                 kind: ir::BlockKind::Thinking,
                 ..
@@ -269,15 +286,24 @@ impl Stream {
 
     /// 这一块读完了：估到目前为止一共多少，多出来的记到速度表上。开口那一刻哪怕估出 0 个
     /// 也记一笔 —— 速度从那一刻算起
+    ///
+    /// 判定窗口（有的话）记的是同一个数，只在这一块来了内容时记（长静默按它认）
     fn tally(&mut self) {
         if !self.opened {
             return;
         }
         let estimated = (self.text.tokens() as f64 * self.ratio).round() as u64;
         let total = estimated.max(self.reported);
-        let Some(m) = &self.meter else { return };
+        let grew = total.saturating_sub(self.added);
+        if let Some(g) = self.gauge.as_mut()
+            && std::mem::take(&mut self.fresh)
+        {
+            g.content(Instant::now(), grew);
+        }
         if total > self.added || self.added == 0 {
-            m.add(total.saturating_sub(self.added));
+            if let Some(m) = &self.meter {
+                m.add(grew);
+            }
             self.added = total.max(self.added);
         }
     }
@@ -350,6 +376,8 @@ impl Ending {
             abort: None,
             delivered: false,
             capture: None,
+            slow: None,
+            input_estimate: None,
             told: false,
         }
     }
@@ -387,6 +415,8 @@ impl Ending {
             pace: pace.clone(),
             provider: provider.to_string(),
             ratio: pace.ratio(provider, &self.model),
+            gauge: None,
+            fresh: false,
         });
         self.watch = Some(Watch {
             provider: provider.to_string(),
@@ -467,6 +497,33 @@ impl Ending {
     pub fn serving(&mut self, attempt: u32, mirror: bool) {
         if let Some(c) = &self.capture {
             c.serving(attempt, self.redaction.clone().unwrap_or_default(), mirror);
+        }
+    }
+
+    /// 这一家设了最低生成速度（见 [`crate::slow`]）：从第一个 token 起记判定窗口。**在
+    /// [`Ending::streaming`] 之后才有用**，没有流的什么都不记
+    pub fn gauge(&mut self, g: crate::slow::Gauge) {
+        if let Some(s) = self.stream.as_mut() {
+            s.gauge = Some(g);
+        }
+    }
+
+    /// 此刻判定窗口里的速度（见 [`crate::slow::Gauge::rate`]）。没有判定窗口、说不出的是 `None`
+    pub fn pace_at(&mut self, now: Instant) -> Option<f64> {
+        self.stream.as_mut()?.gauge.as_mut()?.rate(now)
+    }
+
+    /// 网关估的输入 token（开始事件的 `input_estimate`）：生成太慢被结束时，上游没报输入就按它记
+    pub fn input_estimated(&mut self, tokens: u64) {
+        self.input_estimate = Some(tokens);
+    }
+
+    /// 回答因为生成太慢被结束了（见 [`crate::slow`]），`rate` 是结束那一刻窗口里的速度：这段对话
+    /// 这一轮不再留在这一家；失败的结局带着这个速度，已经生成的输出上游没报全的按估数记
+    pub fn too_slow(&mut self, rate: u32) {
+        self.slow = Some(rate);
+        if let Some(t) = self.answer.take() {
+            t.left();
         }
     }
 
@@ -696,6 +753,10 @@ impl Ending {
 
     fn fail(&mut self, source: tw_api::FailureSource, message: Msg) {
         let (usage, answered_model) = self.settle();
+        let usage = match self.slow {
+            Some(_) => self.estimated(usage),
+            None => usage,
+        };
         let (sent_bytes, received_bytes) = self.traffic_seen();
         self.close(if source == tw_api::FailureSource::Aborted {
             tw_api::LiveOutcome::Aborted
@@ -712,7 +773,32 @@ impl Ending {
             duration_ms: Some(self.duration_ms()),
             usage: usage.map(view),
             answered_model,
+            tokens_per_sec: self.slow,
         });
+    }
+
+    /// 生成太慢被结束的用量：上游报的为准，没报全的补上估数 —— 输出是流里估出来的（和速度同一个
+    /// 估法），输入是网关估的。Anthropic 在流的末尾才报累计输出，Responses、Chat 的用量也在
+    /// 末尾，断在中间时手里的数是个占位，或者干脆没有。按估数记的钱是估算（存储层对失败的
+    /// 一律这样记）
+    fn estimated(&self, usage: Option<Usage>) -> Option<Usage> {
+        let output = self.stream.as_ref().map_or(0, |s| s.added);
+        let input = self.input_estimate.unwrap_or(0);
+        match usage {
+            Some(mut u) => {
+                u.output = u.output.max(output);
+                if u.prompt_total() == 0 {
+                    u.input = input;
+                }
+                Some(u)
+            }
+            None if output > 0 || input > 0 => Some(Usage {
+                input,
+                output,
+                ..Usage::default()
+            }),
+            None => None,
+        }
     }
 
     /// 收尾：先把响应体交出去，再拿走用量和回答里写的模型名（两样是嗅探器在同一遍里
@@ -790,6 +876,7 @@ impl Drop for Ending {
         if self.abort.as_ref().is_some_and(|r| r.thrown()) {
             self.close(tw_api::LiveOutcome::Aborted);
             self.bus.emit(tw_api::Event::RequestFailed {
+                tokens_per_sec: None,
                 id: self.id,
                 model: std::mem::take(&mut self.model),
                 source: tw_api::FailureSource::Aborted,
@@ -807,6 +894,7 @@ impl Drop for Ending {
         if std::thread::panicking() {
             self.close(tw_api::LiveOutcome::Failed);
             self.bus.emit(tw_api::Event::RequestFailed {
+                tokens_per_sec: None,
                 id: self.id,
                 model: std::mem::take(&mut self.model),
                 source: tw_api::FailureSource::Internal,
