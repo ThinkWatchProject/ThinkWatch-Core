@@ -329,8 +329,17 @@ fn shape(d: Dialect) -> Shape {
     Shape::Generate(d)
 }
 
+/// 走一遍带缓存的，等后台把这一轮存完
+fn fill(cache: &ScanCache, text: &str, rules: &RuleSet, scope: Scope) -> Vec<Hit> {
+    let hits = flow::hits_in_with(text, rules, scope, Some(cache));
+    cache.settle();
+    hits
+}
+
 /// 同一份请求体两条路各走一遍：找到的、报出去的、账本、换过的那一份都一样
 fn agree(text: &str, rules: &RuleSet, d: Dialect, cache: &ScanCache, what: &str) {
+    // 上一回交给后台的先存完：取不取得到缓存不看时机
+    cache.settle();
     let s = shape(d);
     for scope in [Scope::Written(s), Scope::Whole] {
         let plain = flow::hits_in(text, rules, scope);
@@ -390,6 +399,7 @@ fn piecewise(text: &str, rules: &RuleSet) -> Vec<Hit> {
 fn multi_turn_conversations_find_exactly_what_a_full_scan_finds() {
     let mut r = Rng(0x5eed_cafe_f00d_1234);
     let sets = rule_sets();
+    let (mut used, mut cacheable_convs) = (0, 0);
     for conv in 0..36 {
         let d = [
             Dialect::Anthropic,
@@ -398,7 +408,7 @@ fn multi_turn_conversations_find_exactly_what_a_full_scan_finds() {
             Dialect::Gemini,
         ][conv % 4];
         let (name, rules) = &sets[r.next(sets.len())];
-        let cache = ScanCache::new();
+        let cache = ScanCache::for_tests();
         let system = prose(&mut r);
         // 顶层另外几项：不是正文的 metadata、名字像口令的一个数组（拆开的数组的键不在任何
         // 一段里）
@@ -450,20 +460,22 @@ fn multi_turn_conversations_find_exactly_what_a_full_scan_finds() {
             let text = body(d, &system, &history, &extra);
             agree(&text, rules, d, &cache, &format!("conv {conv} edited"));
         }
+        // 历史里有一条伸进下一段的命令（片段里有 `curl`、`-u …`）的对话整段做、不存
         if cacheable(rules) {
-            assert!(
-                cache.len() > 0,
-                "conv {conv} ({name}) 一段都没存：没用上缓存"
-            );
+            (used, cacheable_convs) = (used + usize::from(cache.warm() > 0), cacheable_convs + 1);
         }
     }
+    assert!(
+        used * 2 > cacheable_convs,
+        "只有 {used}/{cacheable_convs} 段对话用上了缓存"
+    );
 }
 
 /// 换了规则、同一份缓存接着用：取出来的是新规则扫的，不是旧的
 #[test]
 fn changing_the_rules_or_the_saved_keys_never_reuses_old_results() {
     let mut r = Rng(0xfeed_beef_0000_0042);
-    let cache = ScanCache::new();
+    let cache = ScanCache::for_tests();
     let mut history = Vec::new();
     for _ in 0..6 {
         history.extend(messages(&mut r, Dialect::Anthropic));
@@ -510,7 +522,7 @@ fn changing_the_rules_or_the_saved_keys_never_reuses_old_results() {
 /// 几个线程共用一份缓存、各扫各的对话：和不带缓存的一样
 #[test]
 fn concurrent_requests_share_one_cache_safely() {
-    let cache = Arc::new(ScanCache::new());
+    let cache = Arc::new(ScanCache::for_tests());
     let rules = Arc::new(all_but(CONTEXTUAL).with_saved(saved(&[SAVED])));
     let workers: Vec<_> = (0..4u64)
         .map(|t| {
@@ -545,7 +557,8 @@ fn concurrent_requests_share_one_cache_safely() {
 #[test]
 fn a_keyword_at_the_end_of_the_previous_message_is_why_some_rules_are_not_cached() {
     let rules = RuleSet::only(&["cn-passport"]);
-    let pad = "padding ".repeat(20);
+    // 够长，各成一段（短的几条攒成一段，见 `RUN_BYTES`）
+    let pad = "padding ".repeat(RUN_BYTES / 8);
     let text = json!({"messages": [
         {"content": format!("{pad} 护照")},
         {"content": "E12345678"},
@@ -559,7 +572,7 @@ fn a_keyword_at_the_end_of_the_previous_message_is_why_some_rules_are_not_cached
         &text,
         &rules,
         Dialect::Anthropic,
-        &ScanCache::new(),
+        &ScanCache::for_tests(),
         "passport",
     );
 }
@@ -580,7 +593,13 @@ fn neighbouring_top_level_fields_stay_in_one_piece() {
     assert_eq!(whole.len(), 2, "{text}");
     assert_eq!(piecewise(&text, &rules), whole);
     assert!(cacheable(&rules));
-    agree(&text, &rules, Dialect::Responses, &ScanCache::new(), "geo");
+    agree(
+        &text,
+        &rules,
+        Dialect::Responses,
+        &ScanCache::for_tests(),
+        "geo",
+    );
 }
 
 /// 一条消息末尾一条没结束的命令，整段扫的时候接着认下一条消息开头的选项：这时候整段扫；
@@ -588,7 +607,7 @@ fn neighbouring_top_level_fields_stay_in_one_piece() {
 #[test]
 fn a_command_left_open_at_the_end_of_a_message_reaches_into_the_next() {
     let rules = RuleSet::defaults();
-    let pad = "padding ".repeat(80);
+    let pad = "padding ".repeat(RUN_BYTES / 8);
     let msgs = |second: &str| {
         json!({"messages": [
             {"content": format!("{pad} run curl -s https://api.example.com")},
@@ -605,12 +624,12 @@ fn a_command_left_open_at_the_end_of_a_message_reaches_into_the_next() {
         "{whole:?}"
     );
     assert_ne!(piecewise(&text, &rules), whole, "单拿出来扫认不出");
-    let cache = ScanCache::new();
+    let cache = ScanCache::for_tests();
     agree(&text, &rules, Dialect::Anthropic, &cache, "open command");
-    assert!(text.len() > BODY_MIN);
+    assert!(text.len() > 1_024);
     // 后面那一条头一个换行之前没有选项：按段取
     let text = msgs(&format!("ok\n-u admin:S3cretPass99 {pad}"));
-    let cache = ScanCache::new();
+    let cache = ScanCache::for_tests();
     agree(
         &text,
         &rules,
@@ -652,18 +671,18 @@ fn contextual_rules_exist_and_are_off_by_default() {
 #[test]
 fn a_body_splits_into_members_and_array_elements() {
     let text = r#" {"model":"m", "messages" : [ {"role":"user","content":"a"} ,{"x":[1,{"y":"]"}]}],"system":"s\"}","tools":[],"n":[1,2]} "#;
-    let got: Vec<(&str, bool)> = split(text)
+    let got: Vec<(&str, char)> = split(text)
         .unwrap()
         .iter()
-        .map(|p| (&text[p.range.clone()], p.wrapped))
+        .map(|p| (&text[p.range.clone()], char::from(p.open)))
         .collect();
     assert_eq!(
         got,
         [
-            (r#""model":"m""#, true),
-            (r#"{"role":"user","content":"a"}"#, false),
-            (r#"{"x":[1,{"y":"]"}]}"#, false),
-            (r#""system":"s\"}","tools":[],"n":[1,2]"#, true),
+            (r#""model":"m""#, '{'),
+            // 短的元素攒成一段
+            (r#"{"role":"user","content":"a"} ,{"x":[1,{"y":"]"}]}"#, '['),
+            (r#""system":"s\"}","tools":[],"n":[1,2]"#, '{'),
         ]
     );
 }
@@ -688,7 +707,7 @@ fn anything_unusual_is_scanned_whole() {
     // 拆开的数组的键带转义：没有哪一段替它校验，整项算一段
     let p = split(r#"{"me\u0073sages":[{"a":1}]}"#).unwrap();
     assert_eq!(p.len(), 1);
-    assert!(p[0].wrapped);
+    assert_eq!(p[0].open, b'{');
     // 太深
     let deep = format!(r#"{{"a":{}{}}}"#, "[".repeat(120), "]".repeat(120));
     assert!(split(&deep).is_none());
@@ -701,8 +720,9 @@ fn a_broken_piece_falls_back_to_the_whole_scan() {
     let pad = "padding ".repeat(200);
     let text =
         format!(r#"{{"messages":[{{"content":"{pad} AKIAQRSTUVWXYZ234567"}},{{"content":01}}]}}"#);
-    let cache = ScanCache::new();
-    assert!(cache.kept(&text, &rules, Scope::Whole).is_none());
+    let cache = ScanCache::for_tests();
+    fill(&cache, &text, &rules, Scope::Whole);
+    fill(&cache, &text, &rules, Scope::Whole);
     assert_eq!(cache.len(), 0, "{text}");
     agree(&text, &rules, Dialect::Anthropic, &cache, "broken");
 }
@@ -719,7 +739,7 @@ fn a_body_whose_written_text_cannot_be_read_counts_nothing_either_way() {
         );
         let written = Scope::Written(shape(Dialect::Anthropic));
         assert!(flow::hits_in(&text, &rules, written).is_empty(), "{odd}");
-        let cache = ScanCache::new();
+        let cache = ScanCache::for_tests();
         agree(&text, &rules, Dialect::Anthropic, &cache, odd);
         agree(&text, &rules, Dialect::Anthropic, &cache, odd);
     }
@@ -734,48 +754,92 @@ fn conversation(n: usize, each: usize) -> String {
     json!({"messages": history}).to_string()
 }
 
+/// 数组里的元素攒够 `RUN_BYTES` 才算一段：几万条短消息不是几万段；够长的一条自己一段
+#[test]
+fn short_elements_are_scanned_together() {
+    let text = conversation(20_000, 10);
+    let pieces = split(&text).unwrap();
+    assert!(pieces.len() < 20_000 * 50 / RUN_BYTES, "{}", pieces.len());
+    assert!(
+        pieces[..pieces.len() - 1]
+            .iter()
+            .all(|p| p.range.len() >= RUN_BYTES)
+    );
+    let long = conversation(5, RUN_BYTES);
+    assert_eq!(split(&long).unwrap().len(), 5);
+    // 末尾加长：前面攒好的几段一字不变
+    let more = conversation(20_100, 10);
+    let after = split(&more).unwrap();
+    for (a, b) in pieces[..pieces.len() - 1].iter().zip(&after) {
+        assert_eq!(text[a.range.clone()], more[b.range.clone()]);
+    }
+    let rules = RuleSet::defaults();
+    agree(
+        &text,
+        &rules,
+        Dialect::Anthropic,
+        &ScanCache::for_tests(),
+        "short",
+    );
+}
+
 #[test]
 fn short_and_huge_pieces_are_scanned_but_not_kept() {
     let rules = RuleSet::defaults();
-    let cache = ScanCache::new();
-    // 每条消息不到 64 字节
-    cache.kept(&conversation(50, 10), &rules, Scope::Whole);
-    assert_eq!(cache.len(), 0);
-    // 够长的存下来
-    cache.kept(&conversation(50, 100), &rules, Scope::Whole);
-    assert_eq!(cache.len(), 50);
+    // 整段请求体太短不走缓存；一段不到 64 字节的不存
+    let text = json!({"model": "m", "messages": [{"role": "user", "content": "y".repeat(2000)}]})
+        .to_string();
+    let cache = ScanCache::for_tests();
+    fill(&cache, &text, &rules, Scope::Whole);
+    assert_eq!(cache.len(), 1, "`\"model\":\"m\"` 不存");
     // 一条超过 1 MiB 的不存，旁边的照存
     let text = json!({"messages": [
         {"role": "user", "content": "y".repeat(MAX_BYTES + 1)},
         {"role": "user", "content": "z".repeat(100)},
     ]})
     .to_string();
-    let cache = ScanCache::new();
-    cache.kept(&text, &rules, Scope::Whole);
+    let cache = ScanCache::for_tests();
+    fill(&cache, &text, &rules, Scope::Whole);
     assert_eq!(cache.len(), 1);
 }
 
+/// 存满了挤掉最久没用的
 #[test]
-fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
-    let rules = RuleSet::defaults();
-    let cache = ScanCache::new();
-    cache.kept(&conversation(CAPACITY + 300, 80), &rules, Scope::Whole);
-    assert_eq!(cache.len(), CAPACITY);
-    // 最近用过的留着：最后那 2000 条再来一遍全是取的
-    let tail = {
-        let history: Vec<Value> = (300..CAPACITY + 300)
-            .map(|i| json!({"role": "user", "content": format!("{i:06} {}", "x".repeat(80))}))
-            .collect();
-        json!({"messages": history}).to_string()
+fn the_cache_keeps_the_most_recent_entries() {
+    let found = || Found {
+        hits: Arc::from(Vec::new()),
+        open: false,
+        readable: true,
     };
-    let before = cache.misses();
-    cache.kept(&tail, &rules, Scope::Whole);
-    assert_eq!(cache.misses(), before, "最近的 2000 条都还在");
-    // 最早的 300 条挤掉了
-    let head = conversation(300, 80);
-    cache.kept(&head, &rules, Scope::Whole);
-    assert_eq!(cache.misses(), before + 300);
-    assert_eq!(cache.len(), CAPACITY);
+    let key = |i: usize| -> Key { Sha256::digest(i.to_le_bytes()).into() };
+    let mut lru = Lru::default();
+    for i in 0..CAPACITY + 300 {
+        lru.put(key(i), found());
+    }
+    assert_eq!(lru.map.len(), CAPACITY);
+    assert!(lru.get(&key(299)).is_none());
+    assert!(lru.get(&key(300)).is_some());
+    // 刚用过的这一条不会是下一个被挤掉的
+    lru.put(key(CAPACITY + 300), found());
+    assert!(lru.get(&key(300)).is_some());
+    assert!(lru.get(&key(301)).is_none());
+}
+
+/// 段数比能存的还多：不走缓存（一轮存进去的下一轮用不上）
+#[test]
+fn a_body_with_more_pieces_than_the_cache_holds_is_scanned_whole() {
+    let text = conversation(CAPACITY + 1, RUN_BYTES);
+    assert_eq!(split(&text).unwrap().len(), CAPACITY + 1);
+    let cache = ScanCache::for_tests();
+    for _ in 0..2 {
+        fill(&cache, &text, &RuleSet::defaults(), Scope::Whole);
+    }
+    assert_eq!(cache.len(), 0);
+}
+
+#[test]
+fn the_cache_keeps_a_bounded_number_of_hits() {
+    let rules = RuleSet::defaults();
     // 一段的命中太多的不存；存着的命中加起来有上限
     let key = "AKIAQRSTUVWXYZ234567";
     let many = |n: usize| {
@@ -784,8 +848,11 @@ fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
             .collect();
         json!({"messages": history}).to_string()
     };
-    let cache = ScanCache::new();
-    let found = cache.kept(&many(30), &rules, Scope::Whole).unwrap();
+    let cache = ScanCache::for_tests();
+    let text = many(30);
+    // 头一轮整段做、后台存；第二轮按段取
+    fill(&cache, &text, &rules, Scope::Whole);
+    let found = fill(&cache, &text, &rules, Scope::Whole);
     assert_eq!(found.len(), 90_000);
     assert!(
         cache.hits_stored() <= HITS_BUDGET,
@@ -796,8 +863,8 @@ fn the_cache_keeps_the_most_recent_entries_and_a_bounded_number_of_hits() {
     let huge = json!({"messages": [{"role": "user",
         "content": vec![key; ENTRY_HITS_MAX + 1].join(" ")}]})
     .to_string();
-    let cache = ScanCache::new();
-    cache.kept(&huge, &rules, Scope::Whole);
+    let cache = ScanCache::for_tests();
+    fill(&cache, &huge, &rules, Scope::Whole);
     assert_eq!(cache.len(), 0);
 }
 
@@ -950,7 +1017,7 @@ fn every_rule_alone_agrees_on_adversarial_bodies() {
         for b in BUILTINS {
             let rules = RuleSet::only(&[b.id]).with_saved(saved(&[SAVED]));
             let whole = crate::redact::rules::scan(&text, &rules);
-            let cache = ScanCache::new();
+            let cache = ScanCache::for_tests();
             for scope in [Scope::Whole, Scope::Written(shape(Dialect::Anthropic))] {
                 let got = flow::hits_in_with(&text, &rules, scope, Some(&cache));
                 assert_eq!(flow::hits_in(&text, &rules, scope), got, "{}\n{text}", b.id);
@@ -967,5 +1034,183 @@ fn every_rule_alone_agrees_on_adversarial_bodies() {
             CONTEXTUAL.contains(&id) || id == "command-line-password",
             "{id} 单拿出来扫不一样，却没有防着"
         );
+    }
+}
+
+// ---------------------------------------------------------------- review 0.86
+
+/// Review: every (end of one element, start of the next) pair from the seams most likely to
+/// carry a judgment across `},{` — open commands, header names, grouped numbers, mnemonics,
+/// coordinates, private-key blocks — across several array boundaries and with exceptions in
+/// the rule set. Cached and uncached must agree.
+#[test]
+fn review_seams_between_elements_agree() {
+    let ends = [
+        "curl",
+        "run curl",
+        "mysql",
+        "curl -s",
+        "mysql -h db",
+        "PGPASSWORD",
+        "Authorization",
+        "Authorization:",
+        "x-api-key",
+        "api_key",
+        "?access_token",
+        "https://x.example/?sig",
+        "legal winner thank year wave sausage",
+        "6222 0212",
+        "39.90421",
+        "DE89 3704",
+        "00:1A:2B",
+        "-----BEGIN PRIVATE KEY-----",
+        "sk-ant-api03-",
+        "\\",
+        "x",
+        "curl \\",
+        "curl\t",
+        "mysql\\",
+    ];
+    let starts = [
+        "-u admin:S3cretPass99",
+        "-pS3cretPass99",
+        "--password=S3cretPass99",
+        "=S3cretPass99",
+        ": Bearer abcDEF123456ghiJKL789mno",
+        "Bearer abcDEF123456ghiJKL789mno",
+        "=abcDEF123456ghi",
+        "worth useful legal winner thank yellow",
+        "3456 7890",
+        "116.40741",
+        "0440 5320 1300 0",
+        "3C:4D:5E",
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----",
+        "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+        "n",
+        " -u admin:S3cretPass99",
+        "\t-pS3cretPass99",
+        "\\n-u admin:S3cretPass99",
+        "'-u' 'admin:S3cretPass99'",
+    ];
+    let filler = "lorem ipsum dolor sit amet ".repeat(50);
+    let ex = crate::redact::exceptions::Exceptions::new(
+        ["S3cretPass99", "abcDEF123456ghiJKL789mno"]
+            .iter()
+            .map(|v| {
+                crate::redact::exceptions::parse_hex(&crate::redact::exceptions::sha256_hex(v))
+                    .unwrap()
+            }),
+    )
+    .map(Arc::new);
+    let sets = [
+        ("all-local", all_but(CONTEXTUAL)),
+        (
+            "custom+ex",
+            with_customs(all_but(CONTEXTUAL)).with_exceptions(ex.clone()),
+        ),
+        (
+            "saved+ex",
+            all_but(CONTEXTUAL)
+                .with_saved(saved(&[SAVED]))
+                .with_exceptions(ex),
+        ),
+    ];
+    for (name, rules) in &sets {
+        let cache = ScanCache::for_tests();
+        for a in ends {
+            for b in starts {
+                let bodies = [
+                    // two messages
+                    json!({"model": "m", "messages": [
+                        {"role": "user", "content": filler},
+                        {"role": "user", "content": a},
+                        {"role": "assistant", "content": b}]}),
+                    // system array → messages
+                    json!({"model": "m", "system": [{"type": "text", "text": filler},
+                                                    {"type": "text", "text": a}],
+                           "messages": [{"role": "user", "content": b}]}),
+                    // top-level group → messages
+                    json!({"system": a, "messages": [{"role": "user", "content": b},
+                                                     {"role": "user", "content": filler}]}),
+                    // messages → tools
+                    json!({"messages": [{"role": "user", "content": filler},
+                                        {"role": "user", "content": a}],
+                           "tools": [{"name": "t", "description": b, "input_schema": {}}]}),
+                    // tool_use input → next block in another message
+                    json!({"messages": [
+                        {"role": "assistant", "content": [{"type": "tool_use", "id": "1",
+                            "name": "sh", "input": {"argv": ["x", a]}}]},
+                        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1",
+                            "content": [{"type": "text", "text": b}]}]},
+                        {"role": "user", "content": filler}]}),
+                ];
+                for body in bodies {
+                    let text = body.to_string();
+                    agree(
+                        &text,
+                        rules,
+                        Dialect::Anthropic,
+                        &cache,
+                        &format!("{name} {a:?} | {b:?}"),
+                    );
+                    let esc = ascii_escaped(&text);
+                    agree(
+                        &esc,
+                        rules,
+                        Dialect::Anthropic,
+                        &cache,
+                        &format!("{name} esc {a:?} | {b:?}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Review: Bedrock and Realtime shapes are not in the multi-turn comparison.
+#[test]
+fn review_bedrock_and_other_shapes_agree() {
+    let mut r = Rng(0x0bad_5eed_0086_0001);
+    let rules = with_customs(all_but(CONTEXTUAL)).with_saved(saved(&[SAVED]));
+    let cache = ScanCache::for_tests();
+    for round in 0..40 {
+        let mut msgs = Vec::new();
+        for _ in 0..6 {
+            msgs.push(json!({"role": "user", "content": [{"text": prose(&mut r)},
+                {"toolResult": {"toolUseId": "t", "content": [{"text": prose(&mut r)},
+                                                             {"json": {"k": fragment(&mut r)}}]}}]}));
+            msgs.push(json!({"role": "assistant", "content": [
+                {"reasoningContent": {"reasoningText": {"text": prose(&mut r), "signature": "s"}}},
+                {"toolUse": {"toolUseId": "t", "name": "n", "input": {"cmd": prose(&mut r)}}}]}));
+        }
+        let text = json!({"system": [{"text": prose(&mut r)}, {"text": fragment(&mut r)}],
+            "messages": msgs,
+            "toolConfig": {"tools": [{"toolSpec": {"name": "n", "description": prose(&mut r)}}]}})
+        .to_string();
+        let s = Shape::Generate(Dialect::Bedrock);
+        for scope in [Scope::Written(s), Scope::Whole] {
+            assert_eq!(
+                flow::hits_in(&text, &rules, scope),
+                flow::hits_in_with(&text, &rules, scope, Some(&cache)),
+                "bedrock round {round}\n{text}"
+            );
+        }
+        let emb = json!({"model": "m", "input": [prose(&mut r), prose(&mut r)],
+                         "encoding_format": "float", "user": fragment(&mut r),
+                         "x": [{"y": fragment(&mut r)}, {"y": "lorem ipsum ".repeat(20)}],
+                         "pad": "lorem ipsum ".repeat(100)})
+        .to_string();
+        for s in [
+            Shape::Embeddings,
+            Shape::Completion,
+            Shape::GeminiEmbed,
+            Shape::RealtimeEvent,
+        ] {
+            assert_eq!(
+                flow::hits_in(&emb, &rules, Scope::Written(s)),
+                flow::hits_in_with(&emb, &rules, Scope::Written(s), Some(&cache)),
+                "{s:?} round {round}\n{emb}"
+            );
+        }
     }
 }

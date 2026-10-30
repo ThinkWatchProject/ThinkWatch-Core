@@ -103,16 +103,31 @@ pub fn hits_exact_with(
     scope: Scope,
     cache: Option<&ScanCache>,
 ) -> (Vec<Hit>, Exact) {
-    let hits = match cache.and_then(|c| c.kept(text, rules, scope)) {
-        Some(hits) => hits,
-        None => kept(
+    use crate::redact::cache::Kept;
+    // 整段做：认没认正文、认不认得出记下来，交给缓存在后台存的时候要
+    let whole = |written: &mut Option<bool>| {
+        kept(
             text,
             crate::redact::rules::scan_unresolved(text, rules),
             match scope {
-                Scope::Written(shape) => Some(move || tw_dialect::written::ranges(shape, text)),
+                Scope::Written(shape) => Some(move || {
+                    let w = tw_dialect::written::ranges(shape, text);
+                    *written = Some(w.is_some());
+                    w
+                }),
                 Scope::Whole => None,
             },
-        ),
+        )
+    };
+    let hits = match cache.map(|c| (c, c.kept(text, rules, scope))) {
+        Some((_, Kept::Hits(hits))) => hits,
+        Some((c, Kept::Cold(fp))) => {
+            let mut written = None;
+            let hits = whole(&mut written);
+            c.fill(text, rules, fp, scope, &hits, written);
+            hits
+        }
+        Some((_, Kept::Whole)) | None => whole(&mut None),
     };
     let exact = Exact::of(&hits);
     (crate::redact::rules::resolve(hits, rules), exact)

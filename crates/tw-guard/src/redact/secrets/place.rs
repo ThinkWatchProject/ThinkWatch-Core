@@ -477,48 +477,29 @@ fn option_at(b: &[u8], k: usize) -> bool {
 /// [`command_end`]），在整段请求体里它会接着往后，把后面一段开头的选项也认成它的 —— 这一段
 /// 单拿出来扫就看不到了。
 ///
-/// 宁可多报：最后一个命令分隔之后，以命令名**结尾**的一串 token 字符就算（前面粘着转义的尾巴，
-/// 切 token 时会切掉的，也算上）
+/// 宁可多报：以命令名**结尾**的一串 token 字符就算（前面粘着转义的尾巴，切 token 时会切掉的，
+/// 也算上）。命令名先用一个自动机找（正文里难得出现，几乎整段一跳而过），找到的最后一个往后
+/// 一直没有命令分隔才算 —— 前面的那些后面也隔着同一个分隔
 pub(in crate::redact) fn command_open_at_end(text: &str) -> bool {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    let ac = AC.get_or_init(|| {
+        let words = WORDS
+            .iter()
+            .filter(|(_, m)| matches!(m, Mark::Curl | Mark::Mysql))
+            .map(|(w, _)| *w);
+        aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(words)
+            .expect("命令名编得成自动机")
+    });
     let b = text.as_bytes();
-    // 最后一个命令分隔之后从哪儿起。和 `command_end` 一样两个反斜杠一对跳过：一串 token 的结尾
-    // 不会落在一串反斜杠中间，从头数和从 token 的结尾数，对得上的是同一些分隔
-    let (mut from, mut i) = (0, 0);
-    while i < b.len() {
-        match b[i] {
-            b';' | b'|' | b'&' | b')' | b'`' | b'\n' | b'\r' => {
-                i += 1;
-                from = i;
-            }
-            b'\\' if b.get(i + 1) == Some(&b'\\') => i += 2,
-            b'\\' if matches!(b.get(i + 1), Some(b'n' | b'r')) => {
-                i += 2;
-                from = i;
-            }
-            _ => i += 1,
-        }
-    }
-    let mut k = from;
-    while k < b.len() {
-        if !tok_byte(b[k]) {
-            k += 1;
-            continue;
-        }
-        let s = k;
-        while k < b.len() && tok_byte(b[k]) {
-            k += 1;
-        }
-        let run = &text[s..k];
-        let named = WORDS.iter().any(|&(w, m)| {
-            matches!(m, Mark::Curl | Mark::Mysql)
-                && run.len() >= w.len()
-                && run[run.len() - w.len()..].eq_ignore_ascii_case(w)
-        });
-        if named && command_word(b, k) {
-            return true;
-        }
-    }
-    false
+    // 一串 token 字符以命令名结尾、后面跟着空白或者引号（`command_word`）
+    let last = ac
+        .find_overlapping_iter(text)
+        .map(|m| m.end())
+        .filter(|&e| b.get(e).is_none_or(|&c| !tok_byte(c)) && command_word(b, e))
+        .last();
+    last.is_some_and(|e| command_end(b, e) == b.len())
 }
 
 /// 扫描缓存用：从 `from` 起到这条命令结束（[`command_end`]）之前，有没有一个选项的开头。一条
