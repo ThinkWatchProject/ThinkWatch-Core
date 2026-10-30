@@ -1214,3 +1214,78 @@ fn review_bedrock_and_other_shapes_agree() {
         }
     }
 }
+
+// ---------------------------------------------------------------- review 86b
+
+/// 顶层一项的冒号后面就到头了（客户端截断、插件写坏）：切段要说「切不开」，不能越界
+#[test]
+fn review86b_split_survives_a_body_cut_after_a_colon() {
+    for text in ["{\"a\":", "{\"a\":1,\"b\":", "{\"a\":1,\"b\":   "] {
+        let got = std::panic::catch_unwind(|| split(text));
+        assert!(matches!(got, Ok(None)), "{text:?}");
+    }
+}
+
+/// Chat 请求体：几条各自成段的长消息，后面跟着 `"stream":` 和 `tail`
+fn review86b_chat(tail: &str) -> String {
+    let msgs: Vec<String> = (0..6)
+        .map(|i| {
+            json!({"role": "user", "content": format!("turn {i} {}", "lorem ipsum ".repeat(400))})
+                .to_string()
+        })
+        .collect();
+    format!(
+        "{{\"model\":\"m\",\"messages\":[{}],\"stream\":{tail}",
+        msgs.join(",")
+    )
+}
+
+/// 等后台存完，最多等两秒（后台线程死了的话 `settle` 会一直等下去）
+fn review86b_settle(cache: &ScanCache) -> bool {
+    for _ in 0..2_000 {
+        if cache.shared.pending.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
+/// 一个截断的请求体（没有命中、头一回见）交给后台补存：后台线程切段时越界 panic，之后这份缓存
+/// 再也存不进任何东西
+#[test]
+fn review86b_a_cut_body_does_not_kill_the_background_store() {
+    let cache = ScanCache::for_tests();
+    let rules = RuleSet::defaults();
+    let scope = Scope::Written(Shape::Generate(Dialect::Chat));
+    let cut = review86b_chat("");
+    assert_eq!(
+        flow::hits_in(&cut, &rules, scope),
+        flow::hits_in_with(&cut, &rules, scope, Some(&cache))
+    );
+    let _ = review86b_settle(&cache);
+    let good = review86b_chat("true}");
+    let _ = flow::hits_in_with(&good, &rules, scope, Some(&cache));
+    assert!(
+        review86b_settle(&cache),
+        "后台线程没有收工：pending 一直不归零"
+    );
+    assert!(cache.len() > 0, "截断的请求体之后一段都没存");
+}
+
+/// 存过的对话、同一个开头，这一轮截断在顶层的冒号后面：记号对得上，前台切段越界 panic
+#[test]
+fn review86b_a_cut_turn_of_a_stored_conversation_does_not_panic() {
+    let cache = ScanCache::for_tests();
+    let rules = RuleSet::defaults();
+    let scope = Scope::Written(Shape::Generate(Dialect::Chat));
+    let good = review86b_chat("true}");
+    let _ = flow::hits_in_with(&good, &rules, scope, Some(&cache));
+    assert!(review86b_settle(&cache));
+    assert!(cache.len() > 0);
+    let cut = review86b_chat(" ");
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        flow::hits_in_with(&cut, &rules, scope, Some(&cache))
+    }));
+    assert_eq!(got.ok(), Some(flow::hits_in(&cut, &rules, scope)));
+}

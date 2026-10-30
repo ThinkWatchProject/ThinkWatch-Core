@@ -190,8 +190,15 @@ pub(crate) enum Kept {
     /// 这个请求不按段走：调用方照旧整段做
     Whole,
     /// 这段对话还没存过（第一轮、重启之后、改过前面的历史）：调用方照旧整段做，做完交给
-    /// [`ScanCache::fill`] 在后台按段存下来。带着这套规则的指纹，不用再算一遍
-    Cold([u8; 32]),
+    /// [`ScanCache::fill`] 在后台按段存下来
+    Cold(Stamp),
+}
+
+/// 一次整段扫描是按什么做的：这套规则的指纹（不用再算一遍），和找的时候的日期
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stamp {
+    fp: [u8; 32],
+    day: u32,
 }
 
 /// 交给后台补存的一个请求：原文、整段做出来的命中，和存的时候要的键的那几样
@@ -335,7 +342,11 @@ impl ScanCache {
                 .name("redact-cache".into())
                 .spawn(move || {
                     for job in rx {
-                        store(&shared, job);
+                        // 一个请求体在这里出了错，不能让整个后台停掉：停了之后这份缓存再也
+                        // 存不进东西，每个没存过的请求还白抄一份原文
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            store(&shared, job)
+                        }));
                         shared.pending.fetch_sub(1, Ordering::Release);
                     }
                 })
@@ -427,7 +438,7 @@ impl ScanCache {
                 .is_some_and(|w| <[u8; 32]>::from(Sha256::digest(w)) == m.sum)
         });
         if !seen {
-            return Kept::Cold(fp);
+            return Kept::Cold(Stamp { fp, day });
         }
         let Some(pieces) = split(text) else {
             return Kept::Whole;
@@ -456,7 +467,7 @@ impl ScanCache {
             .map(|(p, _)| p.range.len())
             .sum();
         if missing * 2 > text.len() {
-            return Kept::Cold(fp);
+            return Kept::Cold(Stamp { fp, day });
         }
         let cmdline = rules.is_on("command-line-password");
         let mut fresh: Vec<(Key, Found)> = Vec::new();
@@ -531,12 +542,14 @@ impl ScanCache {
         &self,
         text: &str,
         rules: &RuleSet,
-        fp: [u8; 32],
+        stamp: Stamp,
         scope: Scope,
         hits: &[Hit],
         written: Option<bool>,
     ) {
+        // 身份证号、卡号按「今天」核对：找的时候和现在隔了零点，结果不能记在今天的键下
         if written == Some(false)
+            || stamp.day != super::rules::today_ymd()
             || self.worker.is_none()
             || self.shared.pending.load(Ordering::Acquire) >= PENDING_MAX
         {
@@ -545,8 +558,8 @@ impl ScanCache {
         let job = Job {
             text: text.to_string(),
             hits: hits.to_vec(),
-            fp,
-            day: super::rules::today_ymd(),
+            fp: stamp.fp,
+            day: stamp.day,
             shape: match scope {
                 Scope::Whole => None,
                 Scope::Written(shape) => Some(shape),
@@ -953,7 +966,8 @@ pub(crate) fn split(text: &str) -> Option<Vec<Piece>> {
         }
         i = skip_ws(b, i + 1);
         let value = i;
-        let items = (b[value] == b'[' && plain_key(key))
+        // 请求体可能就断在冒号后面（坏掉的客户端、插件的输出）：值不一定有
+        let items = (b.get(value) == Some(&b'[') && plain_key(key))
             .then(|| elements(b, value))
             .flatten();
         let (end, depth) = match &items {

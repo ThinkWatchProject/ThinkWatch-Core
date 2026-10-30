@@ -121,10 +121,10 @@ pub fn hits_exact_with(
     };
     let hits = match cache.map(|c| (c, c.kept(text, rules, scope))) {
         Some((_, Kept::Hits(hits))) => hits,
-        Some((c, Kept::Cold(fp))) => {
+        Some((c, Kept::Cold(stamp))) => {
             let mut written = None;
             let hits = whole(&mut written);
-            c.fill(text, rules, fp, scope, &hits, written);
+            c.fill(text, rules, stamp, scope, &hits, written);
             hits
         }
         Some((_, Kept::Whole)) | None => whole(&mut None),
