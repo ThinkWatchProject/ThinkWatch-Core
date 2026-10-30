@@ -1135,7 +1135,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **58 起上游可以设最低生成速度**（配置的 `providers[].min_speed`）：[`ProviderView`] 多了
 /// `min_speed`（[`MinSpeedView`]，不管是空），[`ProviderInput`] 多了 `min_speed`
 /// （[`MinSpeedInput`]，不给就是不管）。流式回答从第一个 token 起持续低于它（最近 `window_secs`
-/// 秒的平均速度，中途 5 秒以上的静默不算），回答以一条 503 的错误结束（Anthropic 的
+/// 秒的平均速度；中途 5 秒以上、判定时长不到 20 秒的按它的四分之一以上的静默不算，停着的时候、
+/// 摘要式的推理进行着的时候、回答说完之后不判断；不带 `alt=sse` 的 Gemini 流不管），回答以一条
+/// 503 的错误结束（Anthropic 的
 /// `overloaded_error`、Responses 的 `response.failed` / `server_error`、Gemini 的 `UNAVAILABLE`），
 /// 请求失败，来源 `upstream`，码 `gw.upstream.too_slow`（`upstream`、`rate`、`min`、`secs`），这家
 /// 记一次失败。[`Event::RequestFailed`] 多了 `tokens_per_sec`：只有这种失败带着，是结束那一刻的
@@ -3727,9 +3729,12 @@ pub struct ProviderInput {
 /// 一家上游的最低生成速度（配置的 `providers[].min_speed`）。
 ///
 /// 流式回答从第一个 token 起，每秒看一次最近 `window_secs` 秒的平均生成速度（和
-/// [`RunningView::tokens_per_sec`] 同一个估法；中途连续 5 秒以上没有内容的那一段不算），低于
-/// `tokens_per_sec` 就结束回答：客户端收到一条 503 的错误（可以重试），请求失败，码是
-/// `gw.upstream.too_slow`，这家记一次失败。非流式的回答、WebSocket 上的不管
+/// [`RunningView::tokens_per_sec`] 同一个估法；中途连续 5 秒以上（判定时长不到 20 秒的，它的
+/// 四分之一以上）没有内容的那一段不算），低于 `tokens_per_sec` 就结束回答：客户端收到一条 503 的
+/// 错误（可以重试），请求失败，码是 `gw.upstream.too_slow`，这家记一次失败。停着（上一段内容
+/// 是一秒多以前的）、摘要式的推理（Anthropic、Gemini、Bedrock 的推理，Responses 的推理摘要）
+/// 进行着、回答说完之后都不判断，推理的那段时间之后也不算。非流式的回答、WebSocket 上的、
+/// 不带 `alt=sse` 的 Gemini 流（JSON 数组）不管
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct MinSpeedView {

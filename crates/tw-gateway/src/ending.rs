@@ -221,13 +221,19 @@ struct Stream {
     opened: bool,
     /// 第一个 token 起的正文、推理文字、工具参数
     text: tw_engine::TextTokens,
+    /// 其中的正文和工具参数（没有推理）：推理是摘要时拿它校准（见 [`Stream::learn`]）
+    answer: tw_engine::TextTokens,
+    /// 见过摘要式的推理（见 [`tw_dialect::convert::Reader::summarizes_reasoning`]）
+    summarized: bool,
     /// 一个推理块开了头还没见到字（见 [`Stream::count`]）
     thought_pending: bool,
     /// 有过一个字都没有的推理块：上游报的输出里有看不见的推理，不拿来校准
     thought_hidden_later: bool,
     /// 见过推理的字
     thought_text: bool,
-    /// 上游在流里报的累计输出数（Gemini）
+    /// 上游在流里报的累计输出数（Gemini 的 `candidatesTokenCount`）。**不含推理**：看不见的推理
+    /// 不是生成出来给人看的，有的上游流里只报推理数、不报正文数，算进来的话正文的估数要追上它
+    /// 之前速度一直是 0
     reported: u64,
     /// 已经记到速度表上的
     added: u64,
@@ -244,15 +250,21 @@ struct Stream {
 }
 
 impl Stream {
-    /// 第一个 token 之后的一个事件：输出的字数进账，Gemini 报的累计数记下
-    fn count(&mut self, e: &ir::Event) {
+    /// 第一个 token 之后的一个事件（`now` 到的）：输出的字数进账，Gemini 报的累计数记下。
+    /// `summarizes` 说看得见的推理是不是摘要式的：是的话推理进行着的那段时间不判断速度（见
+    /// [`crate::slow`]）
+    fn count(&mut self, e: &ir::Event, now: Instant, summarizes: bool) {
         match e {
             ir::Event::Delta {
                 delta: ir::Delta::Text(t) | ir::Delta::ToolInput(t),
                 ..
             } => {
                 self.text.add(t);
-                self.fresh |= !t.is_empty();
+                self.answer.add(t);
+                if !t.is_empty() {
+                    self.fresh = true;
+                    self.gauge_do(|g| g.resume(now));
+                }
             }
             ir::Event::Delta {
                 delta: ir::Delta::Thinking(t),
@@ -263,24 +275,50 @@ impl Stream {
                     self.thought_text = true;
                     self.thought_pending = false;
                     self.fresh = true;
+                    if summarizes {
+                        self.summarized = true;
+                        self.gauge_do(|g| g.pause(now));
+                    } else {
+                        self.gauge_do(|g| g.resume(now));
+                    }
                 }
             }
             ir::Event::BlockStart {
                 kind: ir::BlockKind::ToolCall { .. },
                 ..
-            } => self.fresh = true,
+            } => {
+                self.fresh = true;
+                self.gauge_do(|g| g.resume(now));
+            }
             ir::Event::BlockStart {
                 kind: ir::BlockKind::Thinking,
                 ..
-            } => self.thought_pending = true,
-            ir::Event::BlockStop { .. } if self.thought_pending => {
-                self.thought_pending = false;
-                self.thought_hidden_later = true;
+            } => {
+                self.thought_pending = true;
+                if summarizes {
+                    self.gauge_do(|g| g.pause(now));
+                }
+            }
+            ir::Event::BlockStop { .. } => {
+                if self.thought_pending {
+                    self.thought_pending = false;
+                    self.thought_hidden_later = true;
+                }
+                // 推理块收了：回答接着出来
+                self.gauge_do(|g| g.resume(now));
             }
             ir::Event::Usage(u) if self.upstream == ir::Dialect::Gemini => {
-                self.reported = self.reported.max(u.output);
+                self.reported = self.reported.max(u.output.saturating_sub(u.reasoning));
             }
+            // 回答说完了：之后不再判断速度（有的上游说完了过一阵才关连接）
+            ir::Event::Stop(_) => self.gauge_do(crate::slow::Gauge::end),
             _ => {}
+        }
+    }
+
+    fn gauge_do(&mut self, f: impl FnOnce(&mut crate::slow::Gauge)) {
+        if let Some(g) = self.gauge.as_mut() {
+            f(g);
         }
     }
 
@@ -309,15 +347,30 @@ impl Stream {
     }
 
     /// 结束了，上游报了用量：拿它校准这家这个模型的估法。**有看不见的推理就不校**：上游报
-    /// 的输出里有推理 token，流里却没有它们的字，比出来的比例会偏高
+    /// 的输出里有推理 token，流里却没有它们的字，比出来的比例会偏高。
+    ///
+    /// **推理是摘要的也一样**：流里的是几句摘要，上游报的推理数是整段推理，拿它们比，比例被
+    /// 顶到上限。上游分开报了推理数的，只拿正文和工具参数去比；没分开报的（Anthropic）不校
     fn learn(&self, model: &str, usage: &Usage) {
         let hidden = self.hidden_thought
             || self.thought_hidden_later
             || (usage.reasoning > 0 && !self.thought_text);
-        if self.opened && !hidden {
-            self.pace
-                .learn(&self.provider, model, self.text.tokens(), usage.output);
+        if !self.opened || hidden {
+            return;
         }
+        if self.summarized {
+            if usage.reasoning > 0 {
+                self.pace.learn(
+                    &self.provider,
+                    model,
+                    self.answer.tokens(),
+                    usage.output.saturating_sub(usage.reasoning),
+                );
+            }
+            return;
+        }
+        self.pace
+            .learn(&self.provider, model, self.text.tokens(), usage.output);
     }
 }
 
@@ -406,6 +459,8 @@ impl Ending {
             hidden_thought: false,
             opened: false,
             text: Default::default(),
+            answer: Default::default(),
+            summarized: false,
             thought_pending: false,
             thought_hidden_later: false,
             thought_text: false,
@@ -593,7 +648,10 @@ impl Ending {
             return;
         };
         let mut opened = None;
-        for e in f.reader.feed(chunk) {
+        let now = Instant::now();
+        let events = f.reader.feed(chunk);
+        let summarizes = f.reader.summarizes_reasoning();
+        for e in events {
             if !f.opened {
                 match opening(&e) {
                     Some(with_thought) => {
@@ -607,7 +665,7 @@ impl Ending {
                     None => continue,
                 }
             }
-            f.count(&e);
+            f.count(&e, now, summarizes);
         }
         f.tally();
         let Some((with_thought, hidden_thought)) = opened else {
@@ -1877,5 +1935,142 @@ mod tests {
             detail.contains("流里的一个 bug") && detail.contains("ending.rs:"),
             "{detail}"
         );
+    }
+}
+
+/// 判定窗口和实时速度怎么读推理（见 [`crate::slow`]）
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn streaming(dialect: ir::Dialect, pace: &std::sync::Arc<crate::pace::Pace>) -> Ending {
+        let bus = tw_observe::EventBus::new();
+        let mut e = Ending::new(bus, 7, "m".into(), Instant::now(), 1_000, None);
+        e.responded(200);
+        e.streaming(dialect, "up", pace);
+        // 一「秒」10 毫秒：窗口 200 毫秒，长静默 50 毫秒
+        e.gauge(crate::slow::Gauge::new(20, Duration::from_millis(10)));
+        e
+    }
+
+    /// 每隔几毫秒喂一段，喂满 250 毫秒（比窗口长）。计时粗的机器上一隔十几毫秒，也比长静默短
+    fn keep_feeding(e: &mut Ending, chunk: &str) {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(250) {
+            e.feed(chunk.as_bytes());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        e.feed(chunk.as_bytes());
+    }
+
+    fn added(e: &Ending) -> u64 {
+        e.stream.as_ref().unwrap().added
+    }
+
+    /// 40 个 ASCII 字符：估出来 10 个
+    const TEXT: &str = "abcdefghijklmnopqrstuvwxyzabcdefghijklmn";
+
+    /// Gemini 流里只报了推理数（`thoughtsTokenCount`）、没报正文数：看不见的推理不算进生成量。
+    /// 算进去的话一开口就记上几千个，之后正文的估数追上它之前一直是 0
+    #[test]
+    fn hidden_gemini_reasoning_does_not_drive_the_speed() {
+        let pace = std::sync::Arc::new(crate::pace::Pace::new());
+        let mut e = streaming(ir::Dialect::Gemini, &pace);
+        let chunk = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{TEXT}\"}}]}}}}],\"usageMetadata\":{{\"promptTokenCount\":10,\"thoughtsTokenCount\":5000}}}}\r\n\r\n"
+        );
+        for n in 1..=3 {
+            e.feed(chunk.as_bytes());
+            assert_eq!(added(&e), 10 * n);
+        }
+    }
+
+    /// 摘要式的推理（Anthropic 的 thinking）进行着的时候不判断；原样的推理（Chat 的
+    /// `reasoning_content`）照常判断
+    #[test]
+    fn summarised_reasoning_is_not_judged_while_it_lasts_and_raw_reasoning_is() {
+        let pace = std::sync::Arc::new(crate::pace::Pace::new());
+        let mut e = streaming(ir::Dialect::Anthropic, &pace);
+        e.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n");
+        let thought = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"{TEXT}\"}}}}\n\n"
+        );
+        keep_feeding(&mut e, &thought);
+        assert_eq!(e.pace_at(Instant::now()), None, "推理进行着");
+
+        let mut e = streaming(ir::Dialect::Chat, &pace);
+        let raw = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"{TEXT}\"}}}}]}}\n\n"
+        );
+        keep_feeding(&mut e, &raw);
+        assert!(e.pace_at(Instant::now()).is_some(), "原样的推理照常判断");
+    }
+
+    /// 推理是摘要的：不拿几句摘要去比整段推理。上游分开报了推理数的只拿正文去比，没分开报的
+    /// 不校。推理在第一个 token 之后（穿插在回答中间）时才会走到校准
+    #[test]
+    fn a_reasoning_summary_does_not_skew_the_calibration() {
+        fn ev(kind: &str, body: serde_json::Value) -> String {
+            let mut b = body;
+            b["type"] = serde_json::json!(kind);
+            format!("event: {kind}\ndata: {b}\n\n")
+        }
+        let answer = TEXT.repeat(5);
+        // Responses：正文、推理摘要、正文；上游说输出 1000 个
+        let pace = std::sync::Arc::new(crate::pace::Pace::new());
+        let mut e = streaming(ir::Dialect::Responses, &pace);
+        let text = |oi: u64| {
+            [
+                ev("response.output_item.added", serde_json::json!({"output_index": oi, "item": {"type": "message", "id": format!("msg_{oi}")}})),
+                ev("response.content_part.added", serde_json::json!({"output_index": oi, "content_index": 0, "part": {"type": "output_text", "text": ""}})),
+                ev("response.output_text.delta", serde_json::json!({"output_index": oi, "content_index": 0, "delta": answer})),
+                ev("response.output_text.done", serde_json::json!({"output_index": oi, "content_index": 0, "text": answer})),
+                ev("response.output_item.done", serde_json::json!({"output_index": oi, "item": {"type": "message"}})),
+            ]
+            .concat()
+        };
+        let s = [
+            ev("response.created", serde_json::json!({"response": {"id": "resp_1", "model": "m"}})),
+            text(0),
+            ev("response.output_item.added", serde_json::json!({"output_index": 1, "item": {"type": "reasoning", "id": "rs_1", "summary": []}})),
+            ev("response.reasoning_summary_text.delta", serde_json::json!({"output_index": 1, "summary_index": 0, "delta": TEXT})),
+            ev("response.output_item.done", serde_json::json!({"output_index": 1, "item": {"type": "reasoning", "id": "rs_1"}})),
+            text(2),
+            ev("response.completed", serde_json::json!({"response": {"usage": {"input_tokens": 10, "output_tokens": 1000, "output_tokens_details": {"reasoning_tokens": 850}}}})),
+        ]
+        .concat();
+        e.feed(s.as_bytes());
+        e.finished(200);
+        // 嗅到的用量里推理数没分开（`reasoning` 是 0）：说不出正文是多少，不校。拿正文加几句摘要
+        // 的 110 个去比 1000 个的话，比例被顶到 2
+        assert_eq!(pace.ratio("up", "m"), 1.0, "没校");
+
+        // Anthropic：正文、推理、正文，上游的输出数里推理和正文没分开：不校
+        let pace = std::sync::Arc::new(crate::pace::Pace::new());
+        let mut e = streaming(ir::Dialect::Anthropic, &pace);
+        let delta = |i: u64, kind: &str, field: &str, t: &str| {
+            format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"{kind}\",\"{field}\":\"{t}\"}}}}\n\n"
+            )
+        };
+        let s = [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            delta(0, "text_delta", "text", &answer),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n".to_string(),
+            delta(1, "thinking_delta", "thinking", TEXT),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            delta(2, "text_delta", "text", &answer),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n".to_string(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1000}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ]
+        .concat();
+        e.feed(s.as_bytes());
+        e.finished(200);
+        assert_eq!(pace.ratio("up", "m"), 1.0, "没校");
     }
 }

@@ -209,8 +209,13 @@ pub(super) fn respond(
         let _passing = passing;
         // 结局也一样：流被丢掉的时候，它替流报「客户端取消」。
         let mut ending = ending;
-        let mut chunks = std::pin::pin!(chunks);
+        // 上游的流。**装箱是为了结束读的那一刻就能丢掉**：收尾、发错误帧还要一会儿，那段时间
+        // 里上游不该接着生成
+        let mut chunks = Box::pin(chunks);
         let mut broke: Option<GatewayError> = None;
+        // 因为生成太慢结束的：结束那一刻的速度。这一家记失败、结局带上速度，**等结局定了再做**
+        // —— 收尾时回答过滤或工具调用审查也可能把它换成别的错误（见下面的 `denied`）
+        let mut too_slow: Option<u32> = None;
         // 客户端上一次收到字节的时刻。**心跳看的是客户端那一边的静默**，不是上游的：
         // 上游在排队时发的 SSE 注释（DeepSeek 的 `: keep-alive`、OpenRouter 的
         // `: OPENROUTER PROCESSING`）转换时被丢掉，上游不算静默，客户端却什么都没收到
@@ -230,25 +235,25 @@ pub(super) fn respond(
         // 下一次看生成速度的时刻（这一家没设最低生成速度时用不到）
         let mut pace_at = tokio::time::Instant::now() + pace_every(slow);
         loop {
-            // 每秒看一次生成速度：到点了就看（上游一直在发、计时那一支轮不上的时候也看得到）
+            // 每秒看一次生成速度：到点了就看（上游一直在发、计时那一支轮不上的时候也看得到）。
+            // 回答的最后一帧已经交出去的不再看：上游说完了过一阵才关连接，不是慢
             if let Some(w) = slow
+                && !relay.said_all
                 && tokio::time::Instant::now() >= pace_at
             {
                 pace_at = tokio::time::Instant::now() + w.tick;
+                // 同时被手动中止了的：按中止算
+                if abort.thrown() {
+                    aborted = true;
+                    broke = Some(GatewayError::aborted().in_dialect(dialect));
+                    break;
+                }
                 if let Some(rate) = w.judge(ending.pace_at(std::time::Instant::now())) {
                     tracing::warn!(
                         provider = %upstream_name, rate, min = w.min, secs = w.secs,
                         "ended the response: the upstream generated below its minimum speed"
                     );
-                    // 这是用户给这一家定的「不达标」：记一次失败（重发的请求先去别家，连着几次
-                    // 停用），这段对话这一轮不再留在它那儿
-                    crate::server::note_health(
-                        &bus,
-                        &health,
-                        &upstream_name,
-                        health.record_failure(&upstream_name),
-                    );
-                    ending.too_slow(rate);
+                    too_slow = Some(rate);
                     broke = Some(
                         GatewayError::slow(crate::slow::too_slow(
                             &upstream_name,
@@ -364,15 +369,30 @@ pub(super) fn respond(
                 }
             }
         }
+        // 不再读了：上游的连接现在就断（正常走完的，流已经到了末尾），在这家占着的位置也空出来
+        drop(chunks);
+        drop(_slot);
         let (tail, denied) = relay.finish(broke.is_some()).await;
         // 回答里的命中这时报：一次回答一条规则一条
         relay.report_answer();
-        if !tail.is_empty() {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
-        }
         // 扣下整份 body 和流断在半路，对结局来说是同一件事
         if let Some(err) = denied {
             broke = Some(err.in_dialect(dialect));
+        }
+        // 结局还是生成太慢：这是用户给这一家定的「不达标」，记一次失败（重发的请求先去别家，
+        // 连着几次停用），这段对话这一轮不再留在它那儿，结局带着速度
+        if let Some(rate) = too_slow
+            && broke
+                .as_ref()
+                .is_some_and(|e| e.source == crate::error::Source::Slow)
+        {
+            crate::server::note_health(
+                &bus,
+                &health,
+                &upstream_name,
+                health.record_failure(&upstream_name),
+            );
+            ending.too_slow(rate);
         }
         // 上游在流里报的错是限流：回答照样以错误收尾（客户端已经收到了东西，换不了），这一家暂停
         if let Some((code, body)) = ending
@@ -401,13 +421,19 @@ pub(super) fn respond(
             );
         }
         match broke {
-            None => ending.finished(status.as_u16()),
+            None => {
+                if !tail.is_empty() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
+                }
+                ending.finished(status.as_u16());
+            }
             Some(err) => {
                 // 少了这个事件，UI 上那一行会永远停在「进行中」——
                 // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
                 //
                 // **先报再发错误帧**：客户端恰好在最后这一帧上走掉的话，
-                // 结局已经报过了，不会再被记成一次取消。
+                // 结局已经报过了，不会再被记成一次取消。扣着的尾巴也一样在报了之后才发：
+                // 记录、这一家的成败和客户端看到的是同一个结局
                 //
                 // `source` 用这个错误自己的：上游断了是 `upstream`，被
                 // 防火墙切断是 `denied` —— 后者不是上游坏了，是策略拦的。
@@ -419,8 +445,12 @@ pub(super) fn respond(
                     why.text = format!("the response stream broke: {}", why.text);
                 }
                 ending.failed(err.source.into(), why);
-                if let Some(frame) = relay.error_tail(&err) {
-                    yield Ok(Bytes::from(relay.plugins_tail(&frame)));
+                let frame = relay.error_tail(&err).map(|f| relay.plugins_tail(&f));
+                if !tail.is_empty() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
+                }
+                if let Some(frame) = frame {
+                    yield Ok(Bytes::from(frame));
                 }
             }
         }
