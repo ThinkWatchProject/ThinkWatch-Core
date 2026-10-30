@@ -736,8 +736,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("providers[].min_speed"),
                     Def::Unset,
                     t(
-                        "End a streamed answer that generates too slowly: from the first token on, once a second, when the average speed over the last `window_secs` is below `tokens_per_sec`, the answer ends with an error clients retry (503, `overloaded_error` for Anthropic clients), and the upstream counts one failure toward `failover.failures_to_pause`. Pauses of 5 seconds or more partway through are left out of the average; the idle timeout deals with them. Answers that are not streamed are not judged. Unset: never.",
-                        "流式回答生成得太慢时结束它：从第一个 token 起每秒看一次，最近 `window_secs` 秒的平均速度低于 `tokens_per_sec` 时，回答以一条客户端会重试的错误结束（503，Anthropic 格式的客户端收到 `overloaded_error`），这家记一次失败，计入 `failover.failures_to_pause`。中途 5 秒以上的停顿不算进平均速度，由无响应超时处理。不是流式的回答不管。不写：不管。",
+                        "End a streamed answer that generates too slowly: from the first token on, once a second, when the average speed over the last `window_secs` is below `tokens_per_sec`, the answer ends with an error clients retry (503, `overloaded_error` for Anthropic clients), and the upstream counts one failure toward `failover.failures_to_pause`. Long pauses and summarized reasoning partway through are left out of the average; the idle timeout deals with pauses. Answers that are not streamed are not judged. Unset: never.",
+                        "流式回答生成得太慢时结束它：从第一个 token 起每秒看一次，最近 `window_secs` 秒的平均速度低于 `tokens_per_sec` 时，回答以一条客户端会重试的错误结束（503，Anthropic 格式的客户端收到 `overloaded_error`），这家记一次失败，计入 `failover.failures_to_pause`。中途较长的停顿和摘要式的推理不算进平均速度，停顿由无响应超时处理。不是流式的回答不管。不写：不管。",
                     ),
                 ),
                 row(
