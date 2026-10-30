@@ -369,9 +369,15 @@ pub(super) fn respond(
                 }
             }
         }
-        // 不再读了：上游的连接现在就断（正常走完的，流已经到了末尾），在这家占着的位置也空出来
-        drop(chunks);
-        drop(_slot);
+        // 断在半路的（中止、超时、生成太慢、切断）：上游的连接现在就断，在这家占着的位置也空出来
+        // —— 收尾、发错误帧还要一会儿，那段时间里上游不该接着生成。正常走完的照旧跟着响应体走
+        let (_chunks, _slot) = if broke.is_some() {
+            drop(chunks);
+            drop(_slot);
+            (None, None)
+        } else {
+            (Some(chunks), Some(_slot))
+        };
         let (tail, denied) = relay.finish(broke.is_some()).await;
         // 回答里的命中这时报：一次回答一条规则一条
         relay.report_answer();
