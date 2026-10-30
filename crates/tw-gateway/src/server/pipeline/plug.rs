@@ -131,7 +131,8 @@ pub(super) async fn attempt(
         .map_or_else(|| started.ledger.clone(), |b| b.ledger().clone());
     // 插件改过的这一份按它要发往的路径认形状
     let shape = crate::client_api::ClientApi::written(&c.path);
-    let look = crate::guard::look_hits_from(mode, &rt.redact, &body, shape, seed);
+    let look =
+        crate::guard::look_hits_from(mode, &rt.redact, &body, shape, seed, Some(&rt.scan_cache));
     let (found, ledger) = (look.found, look.ledger);
     // 先前几跳报过的不再报（重试、故障转移时插件写进来的还是那几个，见 `crate::guard::Reported`）
     let already = started.found.len() + reported.secrets();

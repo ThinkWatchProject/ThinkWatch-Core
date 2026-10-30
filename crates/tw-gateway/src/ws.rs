@@ -218,6 +218,8 @@ pub struct Upstream {
 pub struct Rules {
     pub redact_mode: tw_config::SecurityMode,
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
+    /// 运行时的扫描缓存，和 `redact` 是同一份运行时的（见 [`crate::state::Runtime::scan_cache`]）
+    pub scan_cache: Arc<tw_guard::redact::cache::ScanCache>,
     pub inspect_mode: tw_config::SecurityMode,
     pub tools: Arc<tw_guard::tools::rules::Rules>,
     /// 内容过滤
@@ -1566,11 +1568,14 @@ fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     // 换的和报出去的是同一批：只在写出来的文字里找，我们自己的占位符、base64 载荷不算（见
     // `crate::guard::find`）
     let scope = tw_guard::redact::flow::Scope::Written(shape);
-    let hits = tw_guard::redact::flow::hits_in(&text, &p.rules.redact, scope);
+    let cache = Some(&*p.rules.scan_cache);
+    let (hits, exact) =
+        tw_guard::redact::flow::hits_exact_with(&text, &p.rules.redact, scope, cache);
     if hits.is_empty() {
         return UpMsg::Text(text.into());
     }
-    let found = tw_guard::redact::flow::reported(&text, &p.rules.redact, &hits, scope);
+    let found =
+        tw_guard::redact::flow::reported_exact(&text, &p.rules.redact, &hits, exact, scope, cache);
     let replaced = mode.acts().then(|| {
         // 只记录的规则命中的不换
         let r = tw_guard::redact::replace::apply(

@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use tw_config::SecurityMode as Mode;
 use tw_guard::content::Screening;
 use tw_guard::redact::flow;
-pub use tw_guard::redact::flow::Shape;
+pub use tw_guard::redact::flow::{ScanCache, Shape};
 use tw_guard::redact::replace::Ledger;
 use tw_guard::redact::rules::{Finding, Hit, Rule, RuleSet};
 
@@ -89,6 +89,7 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], shape: Option<Shape>)
         body,
         shape,
         Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+        None,
     )
 }
 
@@ -100,12 +101,13 @@ pub fn look_from(
     shape: Option<Shape>,
     seed: Ledger,
 ) -> (Vec<Finding>, Ledger) {
-    let l = look_hits_from(mode, rules, body, shape, seed);
+    let l = look_hits_from(mode, rules, body, shape, seed, None);
     (l.found, l.ledger)
 }
 
 /// [`look_from`]，连同找到的命中（见 [`flow::Look::hits`]）：报出去的每一项要说得出在哪儿
-/// （[`detail::secrets`]）。
+/// （[`detail::secrets`]）。`cache` 是运行时的扫描缓存（[`crate::state::Runtime::scan_cache`]）：
+/// 对话历史里没变的消息取上一轮扫的，找出来的一模一样。
 /// 认不出形状的不找：和关着一样，什么都没有
 pub fn look_hits_from(
     mode: Mode,
@@ -113,9 +115,10 @@ pub fn look_hits_from(
     body: &[u8],
     shape: Option<Shape>,
     seed: Ledger,
+    cache: Option<&ScanCache>,
 ) -> flow::Look {
     match shape {
-        Some(shape) => flow::look_hits(mode, rules, body, shape, seed),
+        Some(shape) => flow::look_hits_with(mode, rules, body, shape, seed, cache),
         None => flow::Look {
             found: Vec::new(),
             ledger: Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
@@ -140,7 +143,8 @@ pub fn replace(
 }
 
 /// [`replace`]，`found` 是按这套规则在 `body` 上已经找过的命中（[`look_hits`] 在同一份字节上
-/// 找的，同一个形状）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样。
+/// 找的，同一个形状）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样，没变的段
+/// 取 `cache` 里扫过的（见 [`look_hits_from`]）。
 pub fn replace_found(
     mode: Mode,
     rules: &RuleSet,
@@ -148,9 +152,14 @@ pub fn replace_found(
     ledger: &Ledger,
     shape: Option<Shape>,
     found: Option<&[Hit]>,
+    cache: Option<&ScanCache>,
 ) -> (bytes::Bytes, Ledger) {
+    let replace = |body| match shape {
+        Some(shape) => flow::replace_with(mode, rules, body, ledger, shape, cache),
+        None => (body, ledger.clone()),
+    };
     let Some(found) = found.filter(|_| mode.acts() && !rules.is_empty()) else {
-        return replace(mode, rules, body, ledger, shape);
+        return replace(body);
     };
     // 只记录的规则命中的不换
     let hits = rules.to_replace(found);
@@ -160,7 +169,7 @@ pub fn replace_found(
     }
     // 找得到命中的一定是 UTF-8（见 `flow::look_hits`）
     let Ok(text) = std::str::from_utf8(&body) else {
-        return replace(mode, rules, body, ledger, shape);
+        return replace(body);
     };
     let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
     (bytes::Bytes::from(r.text), r.ledger)
@@ -252,6 +261,8 @@ pub fn items(
             replaced: seen.replaced && !seen.redaction.rules.records(&f.rule),
             detail,
             source: f.source.clone(),
+            // 只给安全日志：事件流不带它（见 `tw_api::SecretItem::value_sha256`）
+            value_sha256: f.sha256.clone(),
         })
         .collect()
 }
@@ -824,6 +835,7 @@ mod tests {
             &seen.ledger,
             crate::guard::TEST_SHAPE,
             Some(&hits),
+            None,
         );
         assert_eq!(known.0, again.0);
         assert_eq!(known.1.table(), again.1.table());
@@ -836,6 +848,7 @@ mod tests {
             &fresh(),
             crate::guard::TEST_SHAPE,
             Some(&hits),
+            None,
         );
         assert_eq!(out, body);
         // 什么都没找到：原样，不拷贝
@@ -847,6 +860,7 @@ mod tests {
             &fresh(),
             crate::guard::TEST_SHAPE,
             Some(&[]),
+            None,
         );
         assert_eq!(out.as_ptr(), plain.as_ptr());
         assert!(l.is_empty());
@@ -902,6 +916,7 @@ mod tests {
             rule: Rule::Builtin("thinkwatch-saved-secret"),
             masked: String::new(),
             count: 1,
+            sha256: None,
             source: Some(SavedSource {
                 kind: SavedSourceKind::UpstreamKey,
                 name: name.into(),

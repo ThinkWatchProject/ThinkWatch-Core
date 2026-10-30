@@ -26,7 +26,7 @@ pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 // `SecurityTestRequest`……）
 pub use tw_guard::content::Outcome as ContentOutcome;
 pub use tw_guard::locate::{Direction as SecurityDirection, Part as HitPart};
-pub use tw_guard::policy::{ContentMatch, ContentScope, Guard, Mode as GuardMode};
+pub use tw_guard::policy::{ContentMatch, ContentScope, Guard, Mode as GuardMode, RedactException};
 /// 保存的凭据是哪一项（出站脱敏的 `thinkwatch-saved-secret`）。定义在 tw-guard：企业版只依赖
 /// 第一层，也要用它
 pub use tw_guard::redact::rules::{SavedSource, SavedSourceKind};
@@ -1116,7 +1116,22 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 的 `upstream-key` / `upstream-header` / `access-key` / `proxy-password` / `control-key` /
 /// `sync-credential`，`name` 是上游名、密钥名、代理名，控制面密钥和同步凭据是空的），这时打码
 /// 后的值是空串。按位置认的（`in-context` 一类）打码只留最后四位
-pub const CONTROL_API_VERSION: u32 = 56;
+///
+/// **57 起出站脱敏有例外值**（配置的 `security.redact.exceptions`，存值的 SHA-256 和打码后的样子）：
+/// 例外的值在任何规则下都不换、不记。新端点 `GET /security/exceptions`（→
+/// [`RedactExceptions`]）、`POST /security/exceptions`（[`ExceptionAdd`]：交原值，core 当场
+/// 算哈希、按认出它的规则打码 → [`ExceptionAdded`]）、`POST /security/events/{id}/exception`
+/// （把安全日志的那一行列为例外，[`BaseVersion`] → [`ExceptionAdded`]；值的哈希只在 core 的内存里
+/// 留最近两万行，更早的、重启之前的是 409 `security.exception_forgotten`）、
+/// `DELETE /security/exceptions/{sha256}`（→ [`ConfigWritten`]）。[`SecurityEventView`] 多了
+/// `excepted`（这个值此刻是例外）和 `exceptable`（这一条能列为例外），「测试…」的命中
+/// （`SecurityTestHit`）多了 `excepted`（例外的值照样标出来，`action` 是空的）。新码：
+/// `config.redact_exceptions_too_many`、`config.redact_exception_hash_bad`、
+/// `config.redact_exception_duplicate`、`security.exception_*`、`security.exceptions_full`、
+/// `security.unknown_event`。新端点 `GET /security/counts`（[`SecurityRuleHitsQuery`] →
+/// [`SecurityRuleHits`] 的列表）：一项防护从某个时刻起每条规则命中了几次，各条记录的 `count`
+/// 加起来，规则表的组头用
+pub const CONTROL_API_VERSION: u32 = 57;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -4396,6 +4411,28 @@ pub struct SecurityEventsQuery {
     pub limit: Option<usize>,
 }
 
+/// `GET /security/counts`：一项防护从某个时刻起每条规则命中了几次（规则表的组头「最近 7 天
+/// 命中 N 次」）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityRuleHitsQuery {
+    pub guard: Guard,
+    /// 从这个时刻起（毫秒，含）。不给是全部
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+}
+
+/// 一条规则命中了几次（[`SecurityRuleHitsQuery`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityRuleHits {
+    /// 内置规则的 id，或者自定义规则的名字
+    pub rule: String,
+    pub custom: bool,
+    /// 这段时间里各条记录的 `count` 加起来（[`SecurityEventView::count`]），不论做了什么
+    pub count: i64,
+}
+
 /// `GET /config/at`：配置原文里的第几个字节落在哪个字段上。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -6234,6 +6271,13 @@ pub struct SecretItem {
     /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`：这时 `masked` 是空的）。别的规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SavedSource>,
+    /// 值的 SHA-256（[`tw_guard::redact::rules::Finding::sha256`]），给记录器留在内存里，日后
+    /// 「列为例外」照它加；不能列为例外的（保存的凭据、几处重叠合成的一段）没有。**只在进程里
+    /// 走**：事件流、在途快照都不带它，请求库也不存 —— 界面要列为例外时交回的是日志那一行的号，
+    /// 用不着哈希；一个不需要它的地方拿到它，对短的值（手机号）就是一张可以穷举的答案
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub value_sha256: Option<String>,
 }
 
 /// 各项防护在一段时间里各留下了几条记录。
@@ -6334,6 +6378,18 @@ pub struct SecurityEventView {
     /// 出站脱敏认出的是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）。别的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SavedSource>,
+    /// 出站脱敏：这个值此刻在例外表里（`security.redact.exceptions`），界面上标「例外」。
+    /// 读的时候按现在的例外表算，不是记下时的
+    #[serde(default)]
+    pub excepted: bool,
+    /// 出站脱敏：这一条能「列为例外」（`POST /security/events/{id}/exception`）。保存的凭据、
+    /// 几处重叠合成的一段、别的防护的记录不能；已经是例外的也是 false。
+    ///
+    /// **这两样只对最近的记录算得出**：值的哈希不进请求库，只在 core 的内存里留最近两万行
+    /// （重启就没了）。更早的记录两样都是 false —— 界面上不给按钮也不标「例外」，那个值可以
+    /// 粘贴进「添加例外」手动加入
+    #[serde(default)]
+    pub exceptable: bool,
 }
 
 /// 一条安全记录最多列几处命中（[`SecurityEventView::locations`]）。再多的只数个数
@@ -6530,6 +6586,47 @@ pub struct RulesToggle {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
+}
+
+/// 出站脱敏的例外表（`GET /security/exceptions`）：按配置里的先后（先加的在前）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RedactExceptions {
+    /// 每一项是配置里的那一项原样：哈希、打码后的样子、最先认出它的规则、加入的时刻。移出例外
+    /// 按 `sha256`
+    pub items: Vec<RedactException>,
+    /// 最多几个（[`tw_guard::policy::EXCEPTIONS_MAX`]）。满了「添加例外」置灰
+    pub max: u32,
+}
+
+/// 手动加入一个例外值（`POST /security/exceptions`）：还没出现在日志里的测试值。
+///
+/// **原值只在这个请求里**：core 收到就算哈希，不写进配置、日志、事件和回答。两头的空白去掉
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExceptionAdd {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 不把值打出来：这个类型带着用户粘贴的原值，一条调试日志就能把它留在盘上
+impl std::fmt::Debug for ExceptionAdd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExceptionAdd")
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("base_version", &self.base_version)
+            .finish()
+    }
+}
+
+/// 加入了例外（或者它本来就在：这时 `version` 是没改动的那一版）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExceptionAdded {
+    pub version: String,
+    /// 例外表里的那一项
+    pub exception: RedactException,
 }
 
 /// 改一条内置规则在第三档下做什么。
@@ -7030,6 +7127,17 @@ pub struct PluginRunView {
 
 #[cfg(test)]
 mod tests {
+    /// 手动加入例外的请求带着原值：调试输出里不能有它
+    #[test]
+    fn an_exception_request_does_not_print_its_value() {
+        let req = ExceptionAdd {
+            value: "sk-ant-api03-SECRETSECRETSECRET".into(),
+            base_version: None,
+        };
+        let d = format!("{req:?}");
+        assert!(!d.contains("SECRET"), "{d}");
+    }
+
     use super::*;
 
     fn attempt(outcome: AttemptOutcome, status: Option<u16>, code: Option<&str>) -> AttemptView {

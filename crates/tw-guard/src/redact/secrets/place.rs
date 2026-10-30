@@ -472,6 +472,43 @@ fn option_at(b: &[u8], k: usize) -> bool {
     b[k] == b'-' && k > 0 && (b[k - 1].is_ascii_whitespace() || matches!(b[k - 1], b'"' | b'\''))
 }
 
+/// 扫描缓存（[`crate::redact::cache`]）用：`text` 里有没有一条命令（`curl`、`mysql`……）到结尾
+/// 都没结束。**命令跨得过字符串**（`["curl","-u","用户:口令"]` 是数组里的几项，见
+/// [`command_end`]），在整段请求体里它会接着往后，把后面一段开头的选项也认成它的 —— 这一段
+/// 单拿出来扫就看不到了。
+///
+/// 宁可多报：以命令名**结尾**的一串 token 字符就算（前面粘着转义的尾巴，切 token 时会切掉的，
+/// 也算上）。命令名先用一个自动机找（正文里难得出现，几乎整段一跳而过），找到的最后一个往后
+/// 一直没有命令分隔才算 —— 前面的那些后面也隔着同一个分隔
+pub(in crate::redact) fn command_open_at_end(text: &str) -> bool {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    let ac = AC.get_or_init(|| {
+        let words = WORDS
+            .iter()
+            .filter(|(_, m)| matches!(m, Mark::Curl | Mark::Mysql))
+            .map(|(w, _)| *w);
+        aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(words)
+            .expect("命令名编得成自动机")
+    });
+    let b = text.as_bytes();
+    // 一串 token 字符以命令名结尾、后面跟着空白或者引号（`command_word`）
+    let last = ac
+        .find_overlapping_iter(text)
+        .map(|m| m.end())
+        .filter(|&e| b.get(e).is_none_or(|&c| !tok_byte(c)) && command_word(b, e))
+        .last();
+    last.is_some_and(|e| command_end(b, e) == b.len())
+}
+
+/// 扫描缓存用：从 `from` 起到这条命令结束（[`command_end`]）之前，有没有一个选项的开头。一条
+/// 没结束的命令（[`command_open_at_end`]）在后面这一截里认得出的口令，都从一个选项开头
+pub(in crate::redact) fn option_before_command_end(b: &[u8], from: usize) -> (bool, usize) {
+    let end = command_end(b, from);
+    ((from.max(1)..end).any(|k| option_at(b, k)), end)
+}
+
 /// `curl -u 用户:口令`、`--user 用户:口令`、`-u用户:口令` 里的口令。`e` 是 `curl` 的终点。
 /// 只有用户名的（`-u user`、`-u sk_…:`，口令为空）不算 —— 后者的密钥在用户名那一段，归
 /// 前缀规则。返回这条命令在哪儿结束

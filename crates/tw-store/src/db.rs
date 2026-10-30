@@ -411,6 +411,8 @@ impl Db {
         // - `requests_routed`：各条路由、规则命中了多少要的那几项，落库时从路由那一列里取出来
         //   存在索引里。数的时候只读索引，不再把一周几 MB 的 JSON 读出来解一遍（见
         //   `route_hits`）
+        // - `security_events_rule_hits`：一项防护每条规则最近几天命中几次，只读索引（见
+        //   `security_rule_hits`）。规则表的组头每次打开都要它
         let sql = format!(
             "CREATE INDEX IF NOT EXISTS requests_client ON requests (client, at_ms)
                 WHERE client > '';
@@ -418,7 +420,9 @@ impl Db {
                 WHERE session IS NOT NULL AND local = 0;
              CREATE INDEX IF NOT EXISTS requests_routed
                 ON requests (at_ms, {ROUTE}, {RULE}, {REWRITTEN_BY}, {DENIED_BY}, error IS NOT NULL)
-                WHERE {ROUTED};"
+                WHERE {ROUTED};
+             CREATE INDEX IF NOT EXISTS security_events_rule_hits
+                ON security_events (guard, at_ms, rule, custom, count);"
         );
         if let Err(e) = self.conn.execute_batch(&sql) {
             tracing::warn!(
@@ -1128,8 +1132,8 @@ impl Db {
             .collect())
     }
 
-    /// 记一条安全日志。
-    pub fn insert_security_event(&self, e: &SecurityEvent) -> Result<(), DbError> {
+    /// 记一条安全日志，返回它的号。
+    pub fn insert_security_event(&self, e: &SecurityEvent) -> Result<i64, DbError> {
         self.conn.execute(
             "INSERT INTO security_events
              (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count,
@@ -1157,7 +1161,53 @@ impl Db {
                     .and_then(|s| serde_json::to_string(s).ok()),
             ],
         )?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 一项防护从 `since_ms` 起每条规则命中了几次：各条记录的 `count` 加起来，不论做了什么
+    /// （只记录的、换掉的、切断的都算）。按规则排，没命中的规则不在里面。
+    ///
+    /// **按记录的 `count` 加，不是数行**：出站脱敏一行是「一个请求里的一个值」，同一个值在一个
+    /// 请求里出现三次是一行、`count` 3；内容过滤一行是一条规则在一个请求里的几处
+    pub fn security_rule_hits(
+        &self,
+        guard: &str,
+        since_ms: i64,
+    ) -> Result<Vec<tw_api::SecurityRuleHits>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT rule, custom, SUM(count) FROM security_events
+             WHERE guard = ?1 AND at_ms >= ?2
+             GROUP BY rule, custom
+             ORDER BY rule, custom",
+        )?;
+        let rows = st.query_map(params![guard, since_ms], |r| {
+            Ok(tw_api::SecurityRuleHits {
+                rule: r.get(0)?,
+                custom: r.get::<_, i64>(1)? != 0,
+                count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 安全日志的第 `id` 条拿去「列为例外」时要的那几样（哈希不在库里，在记录器的内存里，见
+    /// [`crate::Recorder::value_hash`]）。没有这一条（过了保留期、库重建过）是 `None`
+    pub fn exception_source(&self, id: i64) -> Result<Option<ExceptionSource>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT guard, rule, excerpt FROM security_events WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(ExceptionSource {
+                        guard: slug_col(r, 0, tw_api::Guard::from_slug)?,
+                        rule: r.get(1)?,
+                        masked: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// 安全日志的一页，按时间倒序，连同这一段一共几条、各做了什么。
@@ -2063,6 +2113,15 @@ pub struct SecurityEvent {
     pub source: Option<tw_api::SavedSource>,
 }
 
+/// 安全日志里的一条拿去「列为例外」时要的那几样（[`Db::exception_source`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionSource {
+    pub guard: tw_api::Guard,
+    pub rule: String,
+    /// 打码后的值，原样进例外表
+    pub masked: String,
+}
+
 /// 读安全日志时的那段 SELECT。**上游、密钥、模型、会话优先取请求那一行的。**
 ///
 /// 发给上游的模型名也取请求那一行的，**只在它可能发到了上游时**（`tw_reached`，和密钥的
@@ -2149,6 +2208,10 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         rule_snapshot: detail.rule_snapshot,
         outcome_detail: detail.outcome_detail,
         source,
+        // 两样按记录器内存里最近几行的哈希和控制面手里的例外表算
+        // （`tw_control::security::annotate`）：库里不存任何值的哈希
+        excepted: false,
+        exceptable: false,
     })
 }
 

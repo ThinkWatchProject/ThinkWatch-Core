@@ -181,6 +181,12 @@ impl Saved {
         }
     }
 
+    /// 每一项的真值，按收下的先后。规则集的指纹（[`super::super::rules::RuleSet::fingerprint`]）
+    /// 和扫描缓存用：换了一项保存的凭据，以前扫的结果就不作数了
+    pub(crate) fn values(&self) -> impl Iterator<Item = &str> {
+        self.secrets.iter().map(|s| s.value.as_str())
+    }
+
     fn item(&self, value: &str) -> Option<&SavedSecret> {
         self.by_value.get(value).map(|&k| &self.secrets[k])
     }

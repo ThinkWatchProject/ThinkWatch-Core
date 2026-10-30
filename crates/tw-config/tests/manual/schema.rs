@@ -1283,6 +1283,60 @@ pub fn sections() -> Vec<Section> {
                         "自定义规则：匹配到的内容和凭据一样替换，或只记录。",
                     ),
                 ),
+                row(
+                    "exceptions",
+                    Kind::Objs("security.redact.exceptions[]"),
+                    Def::Is("[]"),
+                    t(
+                        "Values that are never replaced or recorded, under any rule. Each is kept as a hash, never as the value itself; at most 500. A saved secret cannot be an exception: an entry whose rule is `thinkwatch-saved-secret` is read but has no effect.",
+                        "例外值：在任何规则下都不替换、不记录。只保存哈希，不保存值本身；最多 500 个。保存的凭据不能列为例外：规则为 `thinkwatch-saved-secret` 的条目可以读入，但不生效。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "security.redact.exceptions[]",
+            ty: checked!(
+                RedactException,
+                "{sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08}"
+            ),
+            rows: vec![
+                row(
+                    "sha256",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "SHA-256 of the value, as 64 lowercase hexadecimal characters. Escapes in the request body are decoded first: the hash is of the value as written.",
+                        "值的 SHA-256，64 个小写十六进制字符。请求体中的转义先解开：哈希按值本身计算。",
+                    ),
+                ),
+                row(
+                    "masked",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t(
+                        "The value as shown when it was added, masked the same way as in the security log.",
+                        "加入时显示的值，打码方式与安全日志相同。",
+                    ),
+                ),
+                row(
+                    "rule",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t(
+                        "The rule that first recognised the value: a built-in rule id or a custom rule name. Empty for a value added by hand that no rule recognises.",
+                        "最先认出该值的规则：内置规则的 id 或自定义规则的名称。手动添加且没有规则认出的值为空。",
+                    ),
+                ),
+                row(
+                    "added_at",
+                    Kind::Int,
+                    Def::Is("0"),
+                    t(
+                        "When the value was added, in milliseconds since the Unix epoch.",
+                        "加入的时间，Unix 纪元以来的毫秒数。",
+                    ),
+                ),
             ],
         },
         Section {
