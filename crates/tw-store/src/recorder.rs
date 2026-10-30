@@ -77,7 +77,11 @@ enum Ending<'a> {
         tokens_per_sec: Option<u32>,
     },
     Cancelled,
-    Failed(&'a tw_api::Msg),
+    /// 失败了，带着原因。生成太慢被结束的另带着结束那一刻的速度（`RequestFailed::tokens_per_sec`）
+    Failed {
+        message: &'a tw_api::Msg,
+        tokens_per_sec: Option<u32>,
+    },
 }
 
 pub struct Recorder {
@@ -664,6 +668,7 @@ impl Recorder {
                 duration_ms,
                 usage,
                 answered_model,
+                tokens_per_sec,
                 ..
             } => self.settle(
                 *id,
@@ -672,7 +677,10 @@ impl Recorder {
                 *duration_ms,
                 *usage,
                 answered_model.clone(),
-                Ending::Failed(message),
+                Ending::Failed {
+                    message,
+                    tokens_per_sec: *tokens_per_sec,
+                },
             ),
             Event::LocallyAnswered {
                 id,
@@ -878,7 +886,9 @@ impl Recorder {
                 client: p.client.clone(),
                 path: p.path.clone(),
                 local,
-                reached: p.routing.reached_upstream(matches!(how, Ending::Failed(_))),
+                reached: p
+                    .routing
+                    .reached_upstream(matches!(how, Ending::Failed { .. })),
                 input: u.map_or(0, |u| u.input),
                 output: u.map_or(0, |u| u.output),
                 cache_read: u.map_or(0, |u| u.cache_read),
@@ -906,8 +916,10 @@ impl Recorder {
             ttft_ms: p.ttft_ms,
             duration_ms: duration_ms.map(|d| d as i64),
             tokens_per_sec: match how {
-                Ending::Finished { tokens_per_sec } => tokens_per_sec,
-                _ => None,
+                Ending::Finished { tokens_per_sec } | Ending::Failed { tokens_per_sec, .. } => {
+                    tokens_per_sec
+                }
+                Ending::Cancelled => None,
             },
             sent_bytes: sent_bytes.map(|b| b.min(i64::MAX as u64) as i64),
             received_bytes: received_bytes.map(|b| b.min(i64::MAX as u64) as i64),
@@ -920,7 +932,7 @@ impl Recorder {
             cost_micros,
             cost_estimated: estimated,
             error: match how {
-                Ending::Failed(message) => Some((*message).clone()),
+                Ending::Failed { message, .. } => Some((*message).clone()),
                 _ => None,
             },
             local,
@@ -1312,6 +1324,7 @@ mod tests {
         });
         r.on_event(&started(3, "gpt-5"));
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 3,
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
@@ -1407,6 +1420,7 @@ mod tests {
             egress: None,
         });
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 1,
             model: String::new(),
             source: tw_api::FailureSource::Denied,
@@ -1657,6 +1671,7 @@ mod tests {
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 1,
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
@@ -2469,6 +2484,7 @@ mod security_detail_tests {
 
     fn denied(id: u64) -> Event {
         Event::RequestFailed {
+            tokens_per_sec: None,
             id,
             model: String::new(),
             source: tw_api::FailureSource::Denied,
@@ -3203,6 +3219,7 @@ mod failure_tests {
 
     fn failed(id: u64, usage: Option<UsageView>) -> Event {
         Event::RequestFailed {
+            tokens_per_sec: None,
             id,
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
@@ -3279,6 +3296,27 @@ mod failure_tests {
         assert_eq!(s.cost_micros_estimated, 300_015);
     }
 
+    /// 生成太慢被结束的（`gw.upstream.too_slow`）带着结束那一刻的速度：照记，事后看得到为什么
+    /// 结束。别的失败没有速度
+    #[test]
+    fn a_failure_for_being_too_slow_keeps_its_speed() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        let mut slow = failed(1, partial());
+        if let Event::RequestFailed { tokens_per_sec, .. } = &mut slow {
+            *tokens_per_sec = Some(3);
+        }
+        r.on_event(&slow);
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.tokens_per_sec, Some(3));
+        assert!(row.error.is_some());
+        assert!(row.cost_estimated);
+
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&failed(2, partial()));
+        assert_eq!(r.db().get(2).unwrap().unwrap().tokens_per_sec, None);
+    }
+
     /// 响应头之前就失败的（每家都拒绝、策略不让）。**没有用量就没有金额，
     /// 不是 0**；耗时照记 —— 「试了二十秒才放弃」是排查的线索。
     #[test]
@@ -3286,6 +3324,7 @@ mod failure_tests {
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 1,
             model: String::new(),
             source: tw_api::FailureSource::RateLimited,
@@ -3356,6 +3395,7 @@ mod failure_tests {
         r.on_event(&start(2));
         r.on_event(&headers(2, 400));
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 2,
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
@@ -3516,6 +3556,7 @@ mod settle_hook_tests {
             answered_model: None,
         });
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 3,
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
@@ -3555,6 +3596,7 @@ mod settle_hook_tests {
         let (_d, mut r, seen) = hooked();
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestFailed {
+            tokens_per_sec: None,
             id: 1,
             model: String::new(),
             source: tw_api::FailureSource::Denied,

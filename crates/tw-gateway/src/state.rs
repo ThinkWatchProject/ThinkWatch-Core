@@ -302,6 +302,9 @@ pub struct AppState {
     /// `failover.idle_timeout_secs` 的一秒有多长（见 `server::pipeline::idle`）。**测试会把它
     /// 调短**，否则一条无响应超时的测试至少要干等三十秒
     pub idle_tick: std::time::Duration,
+    /// 最低生成速度（`providers[].min_speed`，见 [`crate::slow`]）的一秒有多长：判定窗口、长静默
+    /// 和每秒一次的判断都按它算。**测试会把它调短**，否则一条生成过慢的测试至少要干等二十秒
+    pub speed_tick: std::time::Duration,
     /// 流式回答最多压多久不给响应头（[`crate::OPENING_HOLD`]）。**测试会把它调短**
     pub opening_hold: std::time::Duration,
     /// 响应头先交出去之后隔多久发一行保活（[`crate::KEEPALIVE_EVERY`]）。**测试会把它调短**
@@ -395,6 +398,7 @@ impl AppState {
             aborts: Default::default(),
             contents: Default::default(),
             idle_tick: std::time::Duration::from_secs(1),
+            speed_tick: std::time::Duration::from_secs(1),
             opening_hold: crate::OPENING_HOLD,
             keepalive_every: crate::KEEPALIVE_EVERY,
             retry_backoff: Default::default(),
