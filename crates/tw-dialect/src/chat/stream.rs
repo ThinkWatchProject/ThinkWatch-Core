@@ -255,12 +255,15 @@ impl Writer {
             Event::BlockStop { .. } => {}
             Event::Usage(u) => self.usage.get_or_insert_default().merge(u),
             Event::Stop(s) => self.stop = Some(s.clone()),
-            Event::Error { message } => {
-                self.done = true;
-                out.push_str(&error_frame(500, message));
-            }
+            Event::Error { message } => out.push_str(&self.fail(500, message)),
         }
         out
+    }
+
+    /// 中途出错：一条状态码 `status` 的错误帧，之后不再写收尾
+    pub(crate) fn fail(&mut self, status: u16, message: &str) -> String {
+        self.done = true;
+        error_frame(status, message)
     }
 
     /// 流结束。**幂等**

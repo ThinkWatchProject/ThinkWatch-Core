@@ -447,6 +447,7 @@ mod tests {
             answered_model: None,
         });
         b.emit(tw_api::Event::RequestFailed {
+            tokens_per_sec: None,
             id: 2,
             model: "m".into(),
             source: tw_api::FailureSource::Upstream,

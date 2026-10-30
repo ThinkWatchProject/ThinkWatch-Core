@@ -313,6 +313,7 @@ clients:
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
 | `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口、输出上限、会不会推理、收不收图，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
 | `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.wait_secs`。不写：不限。 |
+| `min_speed` | 对象，见 [`providers[].min_speed`](#cfg-providers-min_speed) | — | 流式回答生成得太慢时结束它：从第一个 token 起每秒看一次，最近 `window_secs` 秒的平均速度低于 `tokens_per_sec` 时，回答以一条客户端会重试的错误结束（503，Anthropic 格式的客户端收到 `overloaded_error`），这家记一次失败，计入 `failover.failures_to_pause`。中途 5 秒以上的停顿不算进平均速度，由无响应超时处理。不是流式的回答不管。不写：不管。 |
 | `limits` | 对象列表，见 [`providers[].limits[]`](#cfg-providers-limits) | — | 这家上游的用量上限，照着它自己的限额写：每几分钟、每几小时、每天、每周或每月的请求数、token 数或费用。每一条都有余量才往这家发。滚动窗口满了，请求换下一家或者等它空出来；天、周、月用满了，到下一期之前请求换下一家。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | 从哪里读这家上游的余额，用它自己的密钥、走它自己的代理：`openrouter`、`deepseek`、`moonshot`、`sub2api`、`newapi`（New API 和 One API）或 `thinkwatch`（ThinkWatch 企业网关）。`auto`：OpenRouter、DeepSeek、Moonshot 按 `base_url` 识别；其他地址（Anthropic、OpenAI、Gemini 的官方地址除外）询问一次它是不是 Sub2API、ThinkWatch 企业网关或 New API 中转站，结果只保存在内存中。`off`：不读余额。ChatGPT、Z.ai 账号和 Bedrock 不读余额，与这里写什么无关。 |
@@ -354,6 +355,37 @@ Bedrock 上只为 AWS 列出支持提示缓存的 Claude 模型标注：Claude 3
 ChatGPT 账号上游（`protocol: chatgpt`）只接受桌面应用登录得到的凭据，不能手写。不支持 Claude 和 Google 的订阅登录，请使用 API 密钥。
 
 有的中转站和账号同时只接受几个请求，多出来的直接拒绝。`max_concurrent` 让网关守住这个数：请求发出时占用这家的一个位置，回答完整交给客户端、或者客户端断开时归还。这家满了的时候，为复用提示缓存而留在这家的对话等空位，别的请求直接换下一家。最多等多久由 `failover.wait_secs` 决定。等待不算失败，这家不会因此停用。只计算 token 数的请求不占位置。Responses 的 WebSocket 连接上，每个 `response.create` 从发出起占一个位置，直到它的回答结束，密钥的 `max_concurrent` 也一样；空闲的连接不占位置。
+
+#### `providers[].min_speed`
+
+自部署的模型偶尔会掉到每秒几个 token 并一直这样。内容一直在来，无响应超时不会触发，而重试
+通常就能恢复正常速度。写了 `min_speed`，流式回答从第一个 token 起每秒判断一次：最近
+`window_secs` 秒的平均速度低于 `tokens_per_sec` 时，网关以一条客户端可以重试的错误结束回答
+（503：Anthropic 格式的客户端收到 `overloaded_error`，Responses 格式收到带 `server_error` 的
+`response.failed`，Gemini 格式收到 `UNAVAILABLE`），并断开和上游的连接。
+
+速度和应用里显示的实时速度同一个算法：正文、推理和工具参数，按估算并用上游报的实数校准。
+中途 5 秒以上的停顿不算在内，由无响应超时处理；扣掉之后剩下的不到窗口的一半时，这一秒不判断。
+第一个 token 之前的等待不判断，不是流式的回答也不判断。
+
+请求记为失败并记下当时的速度，已经生成的部分照常计费，这家记一次失败，计入
+`failover.failures_to_pause`；有别的候选时，重试的请求先去别家。
+
+<!-- generated: table providers[].min_speed -->
+<a id="cfg-providers-min_speed"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `tokens_per_sec` | 整数 | **必填** | 最低生成速度，单位 token/秒，和应用里显示的实时速度同一个算法。取值 1 到 1000。 |
+| `window_secs` | 整数 | `20` | 按最近多少秒的平均速度判断。第一次判断在第一个 token 之后这么久。取值 5 到 120。 |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: local-vllm
+    base_url: http://127.0.0.1:8000/v1
+    min_speed: { tokens_per_sec: 15, window_secs: 20 }
+```
 
 #### `providers[].limits`
 

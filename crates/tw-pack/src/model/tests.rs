@@ -49,6 +49,7 @@ providers:
     pricing: 中转
     models: [m1]
     max_concurrent: 4
+    min_speed: {{ tokens_per_sec: 15 }}
     limits:
       - per: hour
         every: 5
@@ -210,10 +211,12 @@ fn an_upstream_splits_into_four_units_by_what_its_fields_are_about() {
     );
     assert_eq!(relay.units["models"], json!({"models": ["m1"]}));
     assert_eq!(relay.units["billing"], json!({"pricing": "中转"}));
-    // 用量上限跟着上游走（分享、导出、同步都带着），和并发上限在同一个单位里
+    // 用量上限、最低生成速度跟着上游走（分享、导出、同步都带着），和并发上限在同一个单位里。
+    // 判定时长没写的也带着默认值：另一边读到的是同一个设定
     assert_eq!(
         relay.units["other"],
-        json!({"max_concurrent": 4, "limits": [{"per": "hour", "every": 5, "requests": 100}]})
+        json!({"max_concurrent": 4, "min_speed": {"tokens_per_sec": 15, "window_secs": 20},
+               "limits": [{"per": "hour", "every": 5, "requests": 100}]})
     );
     // 写明的默认值（proxy: direct）和没写一样；请求头按写的顺序
     let official = &s.items[&id(ItemKind::Provider, "官方")];

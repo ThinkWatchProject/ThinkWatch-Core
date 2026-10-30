@@ -426,6 +426,7 @@ fn refused(
         }
     }
     evs.push(Event::RequestFailed {
+        tokens_per_sec: None,
         id,
         model: String::new(),
         source,

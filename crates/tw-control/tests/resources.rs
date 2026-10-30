@@ -412,6 +412,62 @@ async fn an_upstreams_concurrency_limit_is_saved_shown_and_checked() {
     );
 }
 
+/// 最低生成速度：存进去（判定时长照写）、概览原样给回来；越界的存不进去；去掉就是不管
+#[tokio::test]
+async fn an_upstreams_minimum_speed_is_saved_shown_and_checked() {
+    let b = bed(BASE);
+    let save = |m: serde_json::Value| {
+        let app = b.app.clone();
+        async move {
+            call(
+                &app,
+                "PUT",
+                "/providers/官方",
+                serde_json::json!({ "provider": official(serde_json::json!({ "min_speed": m })) }),
+            )
+            .await
+        }
+    };
+    let (st, body) = save(serde_json::json!({"tokens_per_sec": 15, "window_secs": 20})).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        b.parsed().providers[0].min_speed,
+        Some(tw_config::MinSpeed {
+            tokens_per_sec: 15,
+            window_secs: 20
+        })
+    );
+    assert!(b.file().contains("window_secs: 20"), "{}", b.file());
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(
+        json(&body)["providers"][0]["min_speed"],
+        serde_json::json!({"tokens_per_sec": 15, "window_secs": 20}),
+        "{body}"
+    );
+
+    let before = b.file();
+    for bad in [
+        serde_json::json!({"tokens_per_sec": 0, "window_secs": 20}),
+        serde_json::json!({"tokens_per_sec": 1001, "window_secs": 20}),
+        serde_json::json!({"tokens_per_sec": 15, "window_secs": 4}),
+        serde_json::json!({"tokens_per_sec": 15, "window_secs": 121}),
+    ] {
+        let (st, body) = save(bad.clone()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}：{body}");
+        assert!(body.contains("config.min_speed_range"), "{body}");
+    }
+    assert_eq!(b.file(), before, "拒绝了的保存不该动配置");
+
+    let (st, body) = save(serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(!b.file().contains("min_speed"), "{}", b.file());
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert!(
+        json(&body)["providers"][0].get("min_speed").is_none(),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn billing_is_per_token_or_free_and_nothing_else() {
     // 订阅账号也按价目表算费用：「订阅」「未知」不再是计费方式，存不进去

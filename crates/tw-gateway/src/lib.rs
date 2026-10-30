@@ -57,6 +57,7 @@ pub mod sent;
 pub mod server;
 pub mod session;
 pub mod slots;
+pub mod slow;
 mod splice;
 pub mod state;
 pub mod throttle;
