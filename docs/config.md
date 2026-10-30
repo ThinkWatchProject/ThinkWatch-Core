@@ -544,10 +544,18 @@ clients, `response.failed` with `server_error` for Responses clients,
 
 The speed is counted the way the live speed in the app is: text, reasoning and
 tool arguments, estimated and calibrated against what the upstream reports.
-Pauses of 5 seconds or more partway through are left out, since the idle
-timeout deals with them; when what is left of the window is under half of it,
-nothing is judged that second. The wait before the first token is not judged
-either, nor are answers that are not streamed.
+Pauses of 5 seconds or more partway through (a quarter of the window when it
+is under 20 seconds) are left out, since the idle timeout deals with them; when
+what is left of the window is under half of it, nothing is judged that second.
+Nothing is judged while the stream is paused (no content for more than a
+second): tool arguments often arrive in one burst after a pause. Reasoning that
+arrives as a summary, a few sentences every few seconds while the model thinks
+fast (Anthropic, Gemini and Bedrock reasoning, the Responses reasoning summary),
+is not judged while it lasts and its time is left out afterwards; reasoning
+streamed as it is generated (`reasoning_content` in OpenAI Chat, the Responses
+`reasoning_text`) is judged like text. The wait before the first token is not
+judged, nor is anything after the answer has ended, nor are answers that are
+not streamed, including Gemini streams requested without `alt=sse`.
 
 The request is recorded as failed with the speed it had, the part already
 generated is billed, and the upstream counts one failure toward

@@ -1433,7 +1433,7 @@ impl Db {
         let mut st = self.conn.prepare(&format!(
             "SELECT {by}, tokens_per_sec FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND tokens_per_sec IS NOT NULL
-               AND {by} <> ''
+               AND error IS NULL AND {by} <> ''
              ORDER BY {by}, tokens_per_sec"
         ))?;
         let rows = st.query_map(params![since_ms, until_ms], |r| {

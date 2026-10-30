@@ -32,6 +32,9 @@ const TEXT: &str =
 
 const MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1200,\"output_tokens\":1}}}\n\n";
 const BLOCK_START: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+const THINKING_START: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n";
+const THINKING_STOP: &str = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+     event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
 const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
 const END: &str = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
      event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2000}}\n\n\
@@ -85,6 +88,31 @@ impl Script {
 
     fn slow(self, ms: u64) -> Self {
         self.words(200, ms)
+    }
+
+    /// 每 `every` 毫秒一段推理，持续 `ms` 毫秒（推理块 0，之后的正文块是 1）
+    fn thinking(mut self, every: u64, ms: u64) -> Self {
+        self.steps
+            .push((0, Bytes::from_static(THINKING_START.as_bytes())));
+        for _ in 0..(ms / every).max(1) {
+            self.steps.push((
+                every,
+                Bytes::from(format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"{TEXT}\"}}}}\n\n"
+                )),
+            ));
+        }
+        self.steps
+            .push((0, Bytes::from_static(THINKING_STOP.as_bytes())));
+        self
+    }
+
+    /// 一下子来 `n` 段
+    fn burst(mut self, n: usize) -> Self {
+        for _ in 0..n {
+            self.steps.push((0, word()));
+        }
+        self
     }
 
     fn end(mut self) -> Self {
@@ -149,6 +177,16 @@ async fn upstream(script: Script) -> Upstream {
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     Upstream { addr, dropped }
+}
+
+/// 判定窗口是 `window` 「秒」的上游
+fn provider_over(up: &Upstream, min: u32, window: u32) -> Provider {
+    let mut p = provider(up, Some(min));
+    p.min_speed = Some(MinSpeed {
+        tokens_per_sec: min,
+        window_secs: window,
+    });
+    p
 }
 
 fn provider(up: &Upstream, min_speed: Option<u32>) -> Provider {
@@ -352,7 +390,79 @@ async fn a_whole_answer_is_not_judged() {
     finished(&ending(&mut rx).await);
 }
 
+/// 摘要式的推理（Anthropic 的 thinking）隔一阵来一段，模型其实一直在想：推理进行着的时候不判断，
+/// 之后那段时间也不算
+#[tokio::test]
+async fn summarised_thinking_is_not_judged() {
+    let up = upstream(
+        Script {
+            steps: vec![(0, Bytes::from_static(MESSAGE_START.as_bytes()))],
+            ..Default::default()
+        }
+        .thinking(200, 2_000)
+        .fast(1_200)
+        .end(),
+    )
+    .await;
+    let (gw, mut rx, _) = gateway(provider(&up, Some(MIN))).await;
+    let (status, body) = post(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200);
+    assert!(!body.contains("event: error"), "{body}");
+    finished(&ending(&mut rx).await);
+}
+
+/// 窗口短的，停一下再一下子补上一大段（工具参数那样）：停着的时候不判断，补上之后那段停顿不算
+#[tokio::test]
+async fn a_pause_before_a_burst_is_not_judged() {
+    let up = upstream(
+        Script::opened()
+            .words(25, 600)
+            .quiet(200)
+            .burst(8)
+            .words(25, 600)
+            .end(),
+    )
+    .await;
+    let (gw, mut rx, _) = gateway(provider_over(&up, MIN, 5)).await;
+    let (status, body) = post(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200);
+    assert!(!body.contains("event: error"), "{body}");
+    finished(&ending(&mut rx).await);
+}
+
 // ───────────────────────────────────────────── 中断
+
+/// 原样流出来的推理（Chat 的 `reasoning_content`）照常判断：慢了就结束
+#[tokio::test]
+async fn raw_reasoning_that_is_slow_is_ended() {
+    let chunk = |field: &str| {
+        Bytes::from(format!(
+            "data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"{field}\":\"{TEXT}\"}}}}]}}\n\n"
+        ))
+    };
+    let mut steps: Vec<(u64, Bytes)> = (0..30).map(|_| (10, chunk("reasoning_content"))).collect();
+    steps.extend((0..25).map(|_| (200, chunk("reasoning_content"))));
+    let up = upstream(Script {
+        steps,
+        hang: true,
+        ..Default::default()
+    })
+    .await;
+    let p = Provider {
+        protocol: Some(Protocol::OpenaiChat),
+        ..provider(&up, Some(MIN))
+    };
+    let (gw, mut rx, _) = gateway(p).await;
+    let (status, out) = post(
+        gw,
+        "/v1/chat/completions",
+        &json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{out}");
+    assert!(out.contains("Upstream `local` generated"), "{out}");
+    too_slow(&ending(&mut rx).await);
+}
 
 /// 2. 中途掉速并持续了一个窗口：以 503 的错误帧结束，断开上游，这一家记一次失败；
 /// 失败带着结束那一刻的速度，输出按估数记
