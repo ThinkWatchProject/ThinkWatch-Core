@@ -514,8 +514,22 @@ mod tests {
             "matcher: Matcher",
             "scope?: Array<ContentScope>",
             "replacement?: string",
+            // 名字、说明由 core 给，中英文各一个字段
+            "name_zh?: string",
+            "why_zh?: string",
+            "about?: string",
+            "about_zh?: string",
         ] {
             assert!(rule.contains(field), "{field}: {rule}");
+        }
+        assert!(
+            decl_of(&ts, "GuardDetail").contains("kinds: Array<SecurityKindView>"),
+            "{}",
+            decl_of(&ts, "GuardDetail")
+        );
+        let kind = decl_of(&ts, "SecurityKindView");
+        for field in ["slug: string", "name: string", "name_zh: string"] {
+            assert!(kind.contains(field), "{field}: {kind}");
         }
         assert_eq!(
             decl_of(&ts, "ContentScope"),
@@ -565,8 +579,34 @@ mod tests {
         for field in ["output: string | null", "refused: boolean"] {
             assert!(res.contains(field), "{field}: {res}");
         }
-        let log = decl_of(&ts, "SecurityEventView");
+        // 例外值：哈希不出进程，视图和事件里都没有
+        let item = decl_of(&ts, "SecretItem");
+        assert!(!item.contains("value_sha256"), "{item}");
+        let hit = decl_of(&ts, "SecurityTestHit");
+        assert!(hit.contains("excepted: boolean"), "{hit}");
+        let ex = decl_of(&ts, "RedactException");
         for field in [
+            "sha256: string",
+            "masked: string",
+            "rule?: string",
+            "added_at: number",
+        ] {
+            assert!(ex.contains(field), "{field}: {ex}");
+        }
+        assert!(decl_of(&ts, "RedactExceptions").contains("items: Array<RedactException>"));
+        assert!(decl_of(&ts, "ExceptionAdded").contains("exception: RedactException"));
+        assert!(ts.contains(
+            "  RemoveRedactException: { method: \"DELETE\", path: \"/security/exceptions/{sha256}\", params: [\"sha256\"], format: \"json\" },"
+        ));
+        let counts = decl_of(&ts, "SecurityRuleHits");
+        for field in ["rule: string", "custom: boolean", "count: number"] {
+            assert!(counts.contains(field), "{field}: {counts}");
+        }
+        let log = decl_of(&ts, "SecurityEventView");
+        assert!(!log.contains("value_sha256"), "{log}");
+        for field in [
+            "excepted: boolean",
+            "exceptable: boolean",
             "match?: ContentMatch",
             "revealed?: string",
             "session?: string",

@@ -61,7 +61,7 @@ categories = ["network-programming", "web-programming::http-server"]
 
 # 二进制走 CalVer，crate 走 SemVer —— 两者是两回事，卖给不同的人。
 # 这里是 crate 的版本。
-version = "0.83.2"
+version = "0.86.0"
 
 [workspace.dependencies]
 # ── 内部 crate ───────────────────────────────────────────
@@ -172,7 +172,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 # 发给 Codex 后端的请求体用 zstd 压缩（Codex 直连它时就这么发）。只要流式编码，
 # 不开旧格式和字典训练
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 clap = { version = "4", features = ["derive"] }
 # 配置包的口令加密（scrypt）与同步版本的密钥加密（X25519）。默认特性是空的：不要

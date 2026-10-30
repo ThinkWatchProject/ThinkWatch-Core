@@ -117,6 +117,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::Summary, summary)
         .at(ep::CostBuckets, cost_buckets)
         .at(ep::CostBucketsBy, cost_buckets_by)
+        .at(ep::UsageHistory, usage_history)
         .at(ep::CostBy, cost_by)
         .at(ep::RouteStats, route_stats)
         .at(ep::History, history)
@@ -715,6 +716,22 @@ async fn cost_buckets(
     Ok(Json(x))
 }
 
+/// 很长一段时间里的用量，按格合计（概览上的「最近一年」，见 [`tw_api::UsageHistory`]）。
+///
+/// 参数、缺省值和桶宽的下限都同 `/summary/buckets`：界面拿同一套补空格的办法画它。
+/// **空格同样不补**，而且这里的格子只有有用量的那些小时那么多，跨度再大也不会凭空造出零来。
+/// 用量历史这一次用不了（更新的版本建的、打不开）是 500，请求记录照常
+async fn usage_history(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::BucketQuery>,
+) -> Result<Json<tw_api::UsageHistory>, Fail> {
+    let (from, to) = range(q.from_ms, q.to_ms);
+    let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
+    let store = need_store(&s)?;
+    let x = on_store(store, move |g| g.db().usage_history(from, to, bucket)).await?;
+    Ok(Json(x.map_err(records)?))
+}
+
 /// 按模型或上游分组的花费（钱花在哪儿）。
 async fn cost_buckets_by(
     State(s): State<ControlState>,
@@ -806,6 +823,7 @@ async fn history(
         (Some(from), Some(to)) => g.db().security_of_requests(from, to).map_err(records)?,
         _ => Default::default(),
     };
+    security::annotate(&s.config(), &g, security.values_mut().flatten());
     // 插件改过的那些，同样一次取完
     let changed = match (
         rows.iter().map(|r| r.id).min(),
@@ -856,10 +874,9 @@ async fn history_search(
     let ids: Vec<i64> = found.rows.iter().map(|r| r.id).collect();
     let (mut security, changed) = {
         let g = store.lock().await;
-        (
-            g.db().security_of(&ids).map_err(records)?,
-            g.db().changed_by_plugins(&ids).map_err(records)?,
-        )
+        let mut security = g.db().security_of(&ids).map_err(records)?;
+        security::annotate(&s.config(), &g, security.values_mut().flatten());
+        (security, g.db().changed_by_plugins(&ids).map_err(records)?)
     };
     Ok(Json(tw_api::HistorySearchPage {
         rows: found
@@ -1108,12 +1125,13 @@ async fn request_detail(
             truncated: original_len > stored,
         })
     };
-    let security = g
+    let mut security = g
         .db()
         .security_of_requests(id, id)
         .map_err(records)?
         .remove(&id)
         .unwrap_or_default();
+    security::annotate(&s.config(), &g, &mut security);
     // 插件的每一次运行。**还在跑的请求也有**：请求钩子在发往上游之前就记下了
     let plugins: Vec<tw_api::PluginRunView> = g
         .db()

@@ -19,7 +19,9 @@ when they disagree, so a field listed here is a field the binary reads.
 
 `THINKWATCH_HOME` replaces the directory, and `--config <path>` names the
 file for a single command. The directory holds everything else core keeps
-as well: the request database (`data.db`), the backups of the configuration
+as well: the request database (`data.db`), the hourly usage totals behind the
+overview's year (`usage.db`, kept when the request database is rebuilt and not
+trimmed by the retention period), the backups of the configuration
 (`history/`), the downloaded price table (`model_prices.json`) and the local
 control socket (`twcore.sock`; on Windows a loopback port recorded in
 `control.port`). The directory is private to its owner (`0700`), the file is
@@ -34,6 +36,17 @@ The control key is masked where the configuration is shown so that a write
 through the control plane cannot change it
 ([`listen.control`](#cfg-listen-control)), not to keep it from local
 programs; upstream and gateway keys are shown as written.
+
+Redaction exceptions
+([`security.redact.exceptions`](#cfg-security-redact-exceptions)) are stored
+as a plain, unsalted SHA-256 of each value. That is no secret from anyone
+who can read the file: a short value such as a phone number can be recovered
+from its hash by trying every number. The file already holds upstream keys in
+plain text, so the hash adds nothing to what it gives away; but it travels
+with exports, sync and backups, so list only values that are not sensitive.
+The request database holds no hash of any value found: the hashes behind the
+security log's "list as exception" are kept in memory for the most recent
+20,000 entries and dropped when core restarts.
 
 Tool-call inspection has a built-in rule for this directory,
 `thinkwatch-data`. A tool call whose path or command points into one of the
@@ -849,6 +862,7 @@ written text.
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
 | `actions` | map of built-in rule id → `placeholder` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting (`email: record`). `placeholder` sends a placeholder in place of the value and puts the value back where the answer repeats the placeholder; `record` sends the value as it is and records the match. |
 | `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a rule matches is replaced like a credential, or only recorded. |
+| `exceptions` | list of [`security.redact.exceptions[]`](#cfg-security-redact-exceptions) | `[]` | Values that are never replaced or recorded, under any rule. Each is kept as a hash, never as the value itself; at most 500. A saved secret cannot be an exception: an entry whose rule is `thinkwatch-saved-secret` is read but has no effect. |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -900,6 +914,96 @@ Built-in rules:
 | `cn-mobile-phone` | Chinese mainland mobile number | off |
 | `internal-ip` | Internal IP address | off |
 | `internal-domain` | Internal domain | off |
+| `thinkwatch-saved-secret` | Credentials saved in ThinkWatch | on |
+| `openai-service-key` | OpenAI service account or admin key | on |
+| `openrouter-key` | OpenRouter API key | on |
+| `xai-key` | xAI API key | on |
+| `groq-key` | Groq API key | on |
+| `huggingface-token` | Hugging Face token | on |
+| `replicate-token` | Replicate token | on |
+| `perplexity-key` | Perplexity API key | on |
+| `bedrock-api-key` | Amazon Bedrock API key | on |
+| `fireworks-key` | Fireworks AI API key | on |
+| `cerebras-key` | Cerebras API key | on |
+| `langsmith-key` | LangSmith API key | on |
+| `langfuse-secret-key` | Langfuse secret key | on |
+| `pinecone-key` | Pinecone API key | on |
+| `tavily-key` | Tavily API key | on |
+| `minimax-key` | MiniMax API key | on |
+| `zhipu-api-key` | Zhipu API key | on |
+| `qianfan-api-key` | Baidu Qianfan API key | on |
+| `sk-compat-key` | OpenAI-compatible API key | on |
+| `github-refresh-token` | GitHub refresh token | on |
+| `gitlab-other-token` | Other GitLab token | on |
+| `pypi-token` | PyPI token | on |
+| `rubygems-token` | RubyGems token | on |
+| `clojars-token` | Clojars token | on |
+| `docker-hub-token` | Docker Hub token | on |
+| `artifactory-key` | JFrog Artifactory key | on |
+| `databricks-token` | Databricks token | on |
+| `sentry-token` | Sentry token | on |
+| `grafana-token` | Grafana token | on |
+| `postman-key` | Postman API key | on |
+| `aws-other-key-id` | Other AWS access key ID | on |
+| `alibaba-access-key-id` | Alibaba Cloud AccessKey ID | on |
+| `tencent-secret-id` | Tencent Cloud SecretId | on |
+| `volcengine-access-key-id` | Volcengine AccessKey ID | on |
+| `azure-ad-client-secret` | Azure AD client secret | on |
+| `digitalocean-other-token` | Other DigitalOcean token | on |
+| `cloudflare-origin-ca-key` | Cloudflare Origin CA key | on |
+| `vault-token` | HashiCorp Vault token | on |
+| `terraform-token` | Terraform Cloud token | on |
+| `doppler-token` | Doppler token | on |
+| `pulumi-token` | Pulumi token | on |
+| `heroku-key` | Heroku API key | on |
+| `flyio-token` | Fly.io token | on |
+| `supabase-key` | Supabase key | on |
+| `age-secret-key` | age secret key | on |
+| `onepassword-token` | 1Password service account token | on |
+| `stripe-webhook-secret` | Stripe webhook signing secret | on |
+| `shopify-token` | Shopify token | on |
+| `twilio-api-key` | Twilio API key | on |
+| `brevo-key` | Brevo API key | on |
+| `slack-other-token` | Other Slack token | on |
+| `linear-key` | Linear API key | on |
+| `notion-token` | Notion token | on |
+| `atlassian-token` | Atlassian API token | on |
+| `auth-header-credential` | Credential in a request header | on |
+| `command-line-password` | Password on a command line | on |
+| `url-token` | Token in a URL | on |
+| `bot-webhook` | Bot webhook | on |
+| `telegram-bot-token` | Telegram bot token | on |
+| `config-assignment` | Secret assigned in a config file | on |
+| `crypto-mnemonic` | Recovery phrase | on |
+| `crypto-wif-key` | WIF private key | on |
+| `crypto-extended-key` | Extended private key | on |
+| `cn-resident-id-15` | 15-digit legacy resident ID number | off |
+| `passport-mrz` | Passport machine-readable zone | on |
+| `cn-passport` | Chinese passport number | off |
+| `hk-macau-taiwan-id` | Hong Kong, Macau or Taiwan ID number | off |
+| `mainland-travel-permit` | Mainland travel permit number | off |
+| `us-ssn` | US Social Security number | off |
+| `uk-nino` | UK National Insurance number | off |
+| `sg-nric` | Singapore NRIC / FIN | off |
+| `kr-rrn` | Korean resident registration number | off |
+| `jp-my-number` | Japanese My Number | off |
+| `in-aadhaar` | Indian Aadhaar number | off |
+| `br-cpf` | Brazilian CPF | off |
+| `iban` | IBAN | on |
+| `cn-landline` | Chinese mainland landline number | off |
+| `intl-phone` | International phone number | off |
+| `cn-address` | Chinese mainland street address | off |
+| `geo-coordinates` | Precise coordinates | off |
+| `cn-license-plate` | Chinese mainland license plate | off |
+| `vin` | Vehicle identification number (VIN) | off |
+| `imei` | IMEI | off |
+| `mac-address` | MAC address | off |
+| `public-ip` | Public IP address | off |
+| `labeled-name` | Name by field name | off |
+| `labeled-address` | Address by field name | off |
+| `labeled-birth-date` | Birth date by field name | off |
+| `labeled-account` | Bank account by field name | off |
+| `labeled-health` | Health information by field name | off |
 <!-- /generated -->
 
 `cn-resident-id`, `bank-card`, `email` and `cn-mobile-phone` look for
@@ -937,6 +1041,32 @@ invalid JSON. The placeholders of these rules say what was there
 of a number, and the first character and the domain of an email address. A
 custom rule replaces with `<<TW_SECRET_1>>` unless it names its own
 placeholder (`label`).
+
+Exceptions: a value that a rule keeps matching but that is not sensitive (a
+test fixture, a sample key in documentation) can be listed under
+`exceptions`. The rules keep working; only that value is left alone, under
+every rule, in both `observe` and `enforce`. Each entry holds the SHA-256 of
+the value, never the value itself, so the list can travel with exports,
+sync and backups (see the note on the plain SHA-256 under
+[where the file is](#where-the-file-is)). The app adds entries from the
+security log or from a pasted value; written by hand, `sha256` is the hash of
+the value as it appears in the message, with no surrounding quotes or JSON
+escapes. Only recent log entries can be listed from the log: the hash of each
+value is kept in memory for the last 20,000 entries and not across a restart,
+and a value made of overlapping matches joined into one cannot be listed at
+all. Older entries show neither the button nor the exception tag; paste the
+value instead.
+
+<!-- generated: table security.redact.exceptions[] -->
+<a id="cfg-security-redact-exceptions"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `sha256` | string | **required** | SHA-256 of the value, as 64 lowercase hexadecimal characters. Escapes in the request body are decoded first: the hash is of the value as written. |
+| `masked` | string | `''` | The value as shown when it was added, masked the same way as in the security log. |
+| `rule` | string | `''` | The rule that first recognised the value: a built-in rule id or a custom rule name. Empty for a value added by hand that no rule recognises. |
+| `added_at` | integer | `0` | When the value was added, in milliseconds since the Unix epoch. |
+<!-- /generated -->
 
 #### `security.inspect_tools`
 

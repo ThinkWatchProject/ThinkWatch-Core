@@ -13,8 +13,8 @@
 
 pub use tw_guard::policy::{
     ContentAction, ContentMatch, ContentPolicy, ContentScope, CustomContentRule, CustomRedactRule,
-    CustomToolRule, Mode, PolicyError, RedactAction, RedactPolicy, Security, ToolAction,
-    ToolPolicy,
+    CustomToolRule, Mode, PolicyError, RedactAction, RedactException, RedactPolicy, Security,
+    ToolAction, ToolPolicy,
 };
 use tw_types::{Msg, msg};
 
@@ -67,6 +67,21 @@ pub fn policy_msg(e: &PolicyError) -> Msg {
             "config.rule_scope_codepoints", name = name.clone() =>
             "custom content rule `{name}` checks answers and matches by codepoints; code points are \
              checked in requests only"
+        ),
+        PolicyError::TooManyExceptions { count } => msg!(
+            "config.redact_exceptions_too_many",
+            count = count.to_string(),
+            max = tw_guard::policy::EXCEPTIONS_MAX.to_string() =>
+            "security.redact.exceptions has {count} values; at most {max} are allowed"
+        ),
+        PolicyError::BadExceptionHash { sha256 } => msg!(
+            "config.redact_exception_hash_bad", sha256 = sha256.clone() =>
+            "the exception `{sha256}` in security.redact.exceptions is not a SHA-256 written as 64 \
+             lowercase hexadecimal characters"
+        ),
+        PolicyError::DuplicateException { sha256 } => msg!(
+            "config.redact_exception_duplicate", sha256 = sha256.clone() =>
+            "the exception `{sha256}` appears twice in security.redact.exceptions"
         ),
         PolicyError::UnknownRule { guard, id } => msg!(
             "config.unknown_rule", guard = guard.slug(), rule = id.clone() =>
@@ -136,6 +151,14 @@ mod tests {
             (
                 "content:\n  custom:\n    - { name: a, pattern: 'U+200B', match: codepoints, scope: [response] }",
                 "config.rule_scope_codepoints",
+            ),
+            (
+                "redact:\n  exceptions:\n    - { sha256: abc, masked: x, added_at: 1 }",
+                "config.redact_exception_hash_bad",
+            ),
+            (
+                "redact:\n  exceptions:\n    - { sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 }\n    - { sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 }",
+                "config.redact_exception_duplicate",
             ),
         ];
         for (yaml, code) in errors {

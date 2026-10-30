@@ -13,9 +13,11 @@ ThinkWatch Core 只读一个文件：`config.yaml`。本文逐项说明其中每
 | macOS、Linux | `~/.thinkwatch/config.yaml` |
 | Windows | `%APPDATA%\ThinkWatch\config.yaml` |
 
-`THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、配置的备份（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
+`THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、概览「最近一年」所用的逐小时用量合计（`usage.db`，请求数据库重建时保留，不随请求记录的保留期删除）、配置的备份（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
 
 这两项权限就是这份文件在本机上的全部保护：挡得住其他用户，挡不住以同一用户身份运行的程序。这样的程序能读到文件里的每一把密钥，也能用其中的控制通道密钥经控制通道修改配置。出站脱敏不改变这一点：它保护的是请求带出本机的内容，不是磁盘上的文件。显示配置时给控制通道密钥打码，是为了让经控制通道的写入改不了它（见 [`listen.control`](#cfg-listen-control)），而不是对本机程序隐藏它；上游密钥和网关密钥按原样显示。
+
+脱敏的例外值（[`security.redact.exceptions`](#cfg-security-redact-exceptions)）以每个值不加盐的 SHA-256 保存。能读到这份文件的人不难还原它：手机号这样的短值，逐个试遍所有号码即可从哈希得出原值。文件里本就以明文保存上游密钥，哈希并没有多泄露什么；但它会随导出、同步和备份带走，因此只把不敏感的值列为例外。请求数据库不保存任何命中值的哈希：安全日志「列为例外」所用的哈希只在内存中保留最近 20,000 条，core 重启后即清空。
 
 工具调用审查为这个目录内置了一条规则 `thinkwatch-data`：工具调用的路径或命令指向上述默认位置之一，或服务器上的 `/var/lib/thinkwatch`、`/etc/thinkwatch` 时记录下来，`enforce` 下切断响应。这样模型无法被诱导去读取这些密钥、改写约束它自己的防护。只是提到这个路径（例如在正在编辑的文档里）不算。`THINKWATCH_HOME` 指向别处时，可以在 [`security.inspect_tools`](#cfg-security-inspect_tools) 里为那个路径加一条自定义规则。
 
@@ -622,6 +624,7 @@ pricing:
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
 | `actions` | 映射： 内置规则 id → `placeholder` \| `record` | `{}` | 内置规则在 `enforce` 下的动作，只写与出厂不同的（`email: record`）。`placeholder` 将值替换为占位符后发送，回答中出现该占位符时还原为原值；`record` 原样发送，记录命中。 |
 | `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：匹配到的内容和凭据一样替换，或只记录。 |
+| `exceptions` | 对象列表，见 [`security.redact.exceptions[]`](#cfg-security-redact-exceptions) | `[]` | 例外值：在任何规则下都不替换、不记录。只保存哈希，不保存值本身；最多 500 个。保存的凭据不能列为例外：规则为 `thinkwatch-saved-secret` 的条目可以读入，但不生效。 |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -643,36 +646,126 @@ pricing:
 <!-- generated: rules redact -->
 | id | 名称 | 出厂 |
 |---|---|---|
-| `anthropic-api-key` | Anthropic API key | 开 |
-| `openai-project-key` | OpenAI project key | 开 |
-| `openai-api-key` | OpenAI API key | 开 |
-| `github-personal-token` | GitHub personal access token | 开 |
-| `github-oauth-token` | GitHub OAuth token | 开 |
-| `github-server-token` | GitHub server token | 开 |
-| `github-user-token` | GitHub user token | 开 |
-| `github-fine-grained-token` | GitHub fine-grained token | 开 |
-| `slack-bot-token` | Slack bot token | 开 |
-| `slack-user-token` | Slack user token | 开 |
-| `slack-app-token` | Slack app token | 开 |
-| `aws-access-key-id` | AWS access key ID | 开 |
-| `aws-temporary-key-id` | AWS temporary access key ID | 开 |
-| `google-api-key` | Google API key | 开 |
-| `google-oauth-token` | Google OAuth token | 开 |
-| `gitlab-token` | GitLab token | 开 |
-| `stripe-live-key` | Stripe live key | 开 |
-| `stripe-restricted-key` | Stripe restricted key | 开 |
-| `npm-token` | npm token | 开 |
-| `digitalocean-token` | DigitalOcean token | 开 |
-| `sendgrid-key` | SendGrid key | 开 |
-| `private-key` | Private key | 开 |
+| `anthropic-api-key` | Anthropic API 密钥 | 开 |
+| `openai-project-key` | OpenAI 项目密钥 | 开 |
+| `openai-api-key` | OpenAI API 密钥 | 开 |
+| `github-personal-token` | GitHub 个人令牌 | 开 |
+| `github-oauth-token` | GitHub OAuth 令牌 | 开 |
+| `github-server-token` | GitHub 服务器令牌 | 开 |
+| `github-user-token` | GitHub 用户令牌 | 开 |
+| `github-fine-grained-token` | GitHub 细粒度令牌 | 开 |
+| `slack-bot-token` | Slack 机器人令牌 | 开 |
+| `slack-user-token` | Slack 用户令牌 | 开 |
+| `slack-app-token` | Slack 应用令牌 | 开 |
+| `aws-access-key-id` | AWS 访问密钥 ID | 开 |
+| `aws-temporary-key-id` | AWS 临时访问密钥 ID | 开 |
+| `google-api-key` | Google API 密钥 | 开 |
+| `google-oauth-token` | Google OAuth 令牌 | 开 |
+| `gitlab-token` | GitLab 令牌 | 开 |
+| `stripe-live-key` | Stripe 生产密钥 | 开 |
+| `stripe-restricted-key` | Stripe 受限密钥 | 开 |
+| `npm-token` | npm 令牌 | 开 |
+| `digitalocean-token` | DigitalOcean 令牌 | 开 |
+| `sendgrid-key` | SendGrid 密钥 | 开 |
+| `private-key` | 私钥 | 开 |
 | `jwt` | JWT | 开 |
-| `conn-string-password` | Connection string password | 开 |
-| `cn-resident-id` | Chinese resident ID number | 开 |
-| `bank-card` | Bank card number | 开 |
-| `email` | Email address | 关 |
-| `cn-mobile-phone` | Chinese mainland mobile number | 关 |
-| `internal-ip` | Internal IP address | 关 |
-| `internal-domain` | Internal domain | 关 |
+| `conn-string-password` | 连接串口令 | 开 |
+| `cn-resident-id` | 居民身份证号 | 开 |
+| `bank-card` | 银行卡号 | 开 |
+| `email` | 邮箱地址 | 关 |
+| `cn-mobile-phone` | 中国大陆手机号 | 关 |
+| `internal-ip` | 内网地址 | 关 |
+| `internal-domain` | 内部域名 | 关 |
+| `thinkwatch-saved-secret` | ThinkWatch 中保存的密钥 | 开 |
+| `openai-service-key` | OpenAI 服务账号与管理密钥 | 开 |
+| `openrouter-key` | OpenRouter API 密钥 | 开 |
+| `xai-key` | xAI API 密钥 | 开 |
+| `groq-key` | Groq API 密钥 | 开 |
+| `huggingface-token` | Hugging Face 令牌 | 开 |
+| `replicate-token` | Replicate 令牌 | 开 |
+| `perplexity-key` | Perplexity API 密钥 | 开 |
+| `bedrock-api-key` | Amazon Bedrock API 密钥 | 开 |
+| `fireworks-key` | Fireworks AI API 密钥 | 开 |
+| `cerebras-key` | Cerebras API 密钥 | 开 |
+| `langsmith-key` | LangSmith API 密钥 | 开 |
+| `langfuse-secret-key` | Langfuse 私密密钥 | 开 |
+| `pinecone-key` | Pinecone API 密钥 | 开 |
+| `tavily-key` | Tavily API 密钥 | 开 |
+| `minimax-key` | MiniMax API 密钥 | 开 |
+| `zhipu-api-key` | 智谱 API 密钥 | 开 |
+| `qianfan-api-key` | 百度千帆 API 密钥 | 开 |
+| `sk-compat-key` | OpenAI 兼容格式 API 密钥 | 开 |
+| `github-refresh-token` | GitHub 刷新令牌 | 开 |
+| `gitlab-other-token` | GitLab 其他令牌 | 开 |
+| `pypi-token` | PyPI 令牌 | 开 |
+| `rubygems-token` | RubyGems 令牌 | 开 |
+| `clojars-token` | Clojars 令牌 | 开 |
+| `docker-hub-token` | Docker Hub 令牌 | 开 |
+| `artifactory-key` | JFrog Artifactory 密钥 | 开 |
+| `databricks-token` | Databricks 令牌 | 开 |
+| `sentry-token` | Sentry 令牌 | 开 |
+| `grafana-token` | Grafana 令牌 | 开 |
+| `postman-key` | Postman API 密钥 | 开 |
+| `aws-other-key-id` | AWS 其他访问密钥 ID | 开 |
+| `alibaba-access-key-id` | 阿里云 AccessKey ID | 开 |
+| `tencent-secret-id` | 腾讯云 SecretId | 开 |
+| `volcengine-access-key-id` | 火山引擎 AccessKey ID | 开 |
+| `azure-ad-client-secret` | Azure AD 客户端密码 | 开 |
+| `digitalocean-other-token` | DigitalOcean 其他令牌 | 开 |
+| `cloudflare-origin-ca-key` | Cloudflare Origin CA 密钥 | 开 |
+| `vault-token` | HashiCorp Vault 令牌 | 开 |
+| `terraform-token` | Terraform Cloud 令牌 | 开 |
+| `doppler-token` | Doppler 令牌 | 开 |
+| `pulumi-token` | Pulumi 令牌 | 开 |
+| `heroku-key` | Heroku API 密钥 | 开 |
+| `flyio-token` | Fly.io 令牌 | 开 |
+| `supabase-key` | Supabase 密钥 | 开 |
+| `age-secret-key` | age 私钥 | 开 |
+| `onepassword-token` | 1Password 服务账号令牌 | 开 |
+| `stripe-webhook-secret` | Stripe Webhook 签名密钥 | 开 |
+| `shopify-token` | Shopify 令牌 | 开 |
+| `twilio-api-key` | Twilio API 密钥 | 开 |
+| `brevo-key` | Brevo API 密钥 | 开 |
+| `slack-other-token` | Slack 其他令牌 | 开 |
+| `linear-key` | Linear API 密钥 | 开 |
+| `notion-token` | Notion 令牌 | 开 |
+| `atlassian-token` | Atlassian API 令牌 | 开 |
+| `auth-header-credential` | 请求头中的凭据 | 开 |
+| `command-line-password` | 命令行中的口令 | 开 |
+| `url-token` | URL 中的令牌 | 开 |
+| `bot-webhook` | 机器人 Webhook | 开 |
+| `telegram-bot-token` | Telegram 机器人令牌 | 开 |
+| `config-assignment` | 配置文件中的密钥赋值 | 开 |
+| `crypto-mnemonic` | 助记词 | 开 |
+| `crypto-wif-key` | WIF 私钥 | 开 |
+| `crypto-extended-key` | 扩展私钥 | 开 |
+| `cn-resident-id-15` | 15 位旧身份证号 | 关 |
+| `passport-mrz` | 护照机读区 | 开 |
+| `cn-passport` | 中国护照号 | 关 |
+| `hk-macau-taiwan-id` | 港澳台身份证号 | 关 |
+| `mainland-travel-permit` | 港澳台往来内地通行证号 | 关 |
+| `us-ssn` | 美国社会安全号 | 关 |
+| `uk-nino` | 英国国民保险号 | 关 |
+| `sg-nric` | 新加坡 NRIC / FIN | 关 |
+| `kr-rrn` | 韩国居民登录号 | 关 |
+| `jp-my-number` | 日本个人番号 | 关 |
+| `in-aadhaar` | 印度 Aadhaar 号码 | 关 |
+| `br-cpf` | 巴西 CPF | 关 |
+| `iban` | 国际银行账号（IBAN） | 开 |
+| `cn-landline` | 中国大陆固定电话 | 关 |
+| `intl-phone` | 国际电话号码 | 关 |
+| `cn-address` | 中国大陆详细地址 | 关 |
+| `geo-coordinates` | 精确坐标 | 关 |
+| `cn-license-plate` | 中国大陆车牌号 | 关 |
+| `vin` | 车辆识别代号（VIN） | 关 |
+| `imei` | IMEI | 关 |
+| `mac-address` | MAC 地址 | 关 |
+| `public-ip` | 公网 IP 地址 | 关 |
+| `labeled-name` | 带字段名的姓名 | 关 |
+| `labeled-address` | 带字段名的住址 | 关 |
+| `labeled-birth-date` | 带字段名的出生日期 | 关 |
+| `labeled-account` | 带字段名的银行账号 | 关 |
+| `labeled-health` | 带字段名的健康信息 | 关 |
 <!-- /generated -->
 
 `cn-resident-id`、`bank-card`、`email`、`cn-mobile-phone` 查找的是个人信息而不是凭据。前两条出厂开启，只认结构上核对得上的：
@@ -686,6 +779,19 @@ pricing:
 - `cn-mobile-phone`：中国大陆手机号，11 位数字，以 `1` 开头、第二位为 `3` 至 `9`，前后不紧挨其他数字。
 
 夹在更长的一串字母或数字中间的号码不认；请求体中以 JSON 数值写出的号码（例如工具调用的参数）也不认，替换它会使请求体不再是合法的 JSON。占位符写明原来是什么（`<<TW_ID_NUMBER_1>>`、`<<TW_CARD_NUMBER_1>>`、`<<TW_EMAIL_1>>`、`<<TW_PHONE_1>>`），安全日志中号码只显示最后四位，邮箱只显示第一个字和域名。自定义规则替换为 `<<TW_SECRET_1>>`，写了占位符名称（`label`）时用它。
+
+例外值：某个值反复被规则认出、但并不敏感（测试用的固定值、文档里的示例密钥）时，可以写进 `exceptions`。规则照常工作，只有这个值在任何规则下、`observe` 和 `enforce` 两档都不处理。每一项只保存值的 SHA-256，不保存值本身，因此可以随导出、同步和备份一起带走。（不加盐的 SHA-256，见[文件位置](#文件位置)）。应用从安全日志或粘贴的值加入；手写时 `sha256` 是值在消息中原本的样子的哈希，不含两边的引号和 JSON 转义。只有最近的日志记录可以从日志列为例外：每个值的哈希只在内存中保留最近 20,000 条、不跨重启；由几处重叠的命中合成的一段不能列为例外。更早的记录既没有按钮也不显示「例外」标签，可以粘贴该值手动加入。
+
+<!-- generated: table security.redact.exceptions[] -->
+<a id="cfg-security-redact-exceptions"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `sha256` | 字符串 | **必填** | 值的 SHA-256，64 个小写十六进制字符。请求体中的转义先解开：哈希按值本身计算。 |
+| `masked` | 字符串 | `''` | 加入时显示的值，打码方式与安全日志相同。 |
+| `rule` | 字符串 | `''` | 最先认出该值的规则：内置规则的 id 或自定义规则的名称。手动添加且没有规则认出的值为空。 |
+| `added_at` | 整数 | `0` | 加入的时间，Unix 纪元以来的毫秒数。 |
+<!-- /generated -->
 
 #### `security.inspect_tools`
 
@@ -719,19 +825,19 @@ pricing:
 <!-- generated: rules inspect_tools -->
 | id | 名称 | `enforce` 下出厂处置 |
 |---|---|---|
-| `curl-pipe-sh` | Download and run | `cut` |
-| `base64-decode-exec` | Decode and run | `cut` |
-| `exfil-env` | Send out environment variables | `cut` |
-| `exfil-credentials` | Send out a credential file | `cut` |
-| `exfil-credentials-reversed` | Send out a credential file (verb first) | `cut` |
-| `ssh-key-read` | Read a private key or cloud credential | `cut` |
-| `secret-to-unknown-host` | Send a credential to an unknown host | `cut` |
-| `thinkwatch-data` | Read or change ThinkWatch's own data | `cut` |
-| `write-startup-item` | Write a startup item | `cut` |
-| `crontab-install` | Install a scheduled job | `cut` |
-| `rm-rf-root` | Delete home or root | `record` |
-| `chmod-777` | World-writable permissions | `record` |
-| `upload-file-to-host` | Upload a local file to an external host | `record` |
+| `curl-pipe-sh` | 下载即执行 | `cut` |
+| `base64-decode-exec` | 解码后执行 | `cut` |
+| `exfil-env` | 外发环境变量 | `cut` |
+| `exfil-credentials` | 外发凭据文件 | `cut` |
+| `exfil-credentials-reversed` | 外发凭据文件（动词在前） | `cut` |
+| `ssh-key-read` | 读取私钥或云凭据 | `cut` |
+| `secret-to-unknown-host` | 凭据发往陌生主机 | `cut` |
+| `thinkwatch-data` | 读写 ThinkWatch 自己的数据 | `cut` |
+| `write-startup-item` | 写入启动项 | `cut` |
+| `crontab-install` | 安装定时任务 | `cut` |
+| `rm-rf-root` | 删除主目录或根目录 | `record` |
+| `chmod-777` | 开放全部写权限 | `record` |
+| `upload-file-to-host` | 上传本地文件到外部主机 | `record` |
 <!-- /generated -->
 
 #### `security.content`
@@ -770,32 +876,32 @@ pricing:
 <!-- generated: rules content -->
 | id | 名称 | 分组 | 出厂 | `enforce` 下出厂处置 |
 |---|---|---|---|---|
-| `unicode-tags` | Unicode tag characters | invisible | 开 | `strip` |
-| `bidi-controls` | Bidirectional controls | invisible | 开 | `strip` |
-| `zero-width` | Zero-width characters | invisible | 关 | `strip` |
-| `private-use` | Private-use characters | invisible | 关 | `strip` |
-| `ignore-previous-instructions` | Ignore previous instructions | injection | 开 | `block` |
-| `ignore-all-previous` | Ignore all previous | injection | 开 | `block` |
-| `disregard-your-instructions` | Disregard your instructions | injection | 开 | `block` |
-| `jailbreak` | Jailbreak | injection | 关 | `block` |
+| `unicode-tags` | Unicode 标签字符 | invisible | 开 | `strip` |
+| `bidi-controls` | 双向控制符 | invisible | 开 | `strip` |
+| `zero-width` | 零宽字符 | invisible | 关 | `strip` |
+| `private-use` | 私用区字符 | invisible | 关 | `strip` |
+| `ignore-previous-instructions` | 要求忽略先前的指令 | injection | 开 | `block` |
+| `ignore-all-previous` | 要求忽略之前的全部内容 | injection | 开 | `block` |
+| `disregard-your-instructions` | 要求无视指令 | injection | 开 | `block` |
+| `jailbreak` | 越狱 | injection | 关 | `block` |
 | `dan` | DAN | injection | 关 | `block` |
-| `developer-mode` | Developer mode | injection | 关 | `block` |
-| `you-are-now` | Persona manipulation | persona | 关 | `block` |
-| `new-persona` | New persona | persona | 关 | `record` |
-| `act-as` | Act as | persona | 关 | `record` |
-| `pretend-to-be` | Pretend to be | persona | 关 | `record` |
-| `system-prompt` | System prompt extraction | persona | 关 | `record` |
-| `reveal-your-instructions` | Reveal instructions | persona | 关 | `record` |
-| `what-are-your-rules` | What are your rules | persona | 关 | `record` |
-| `base64-wall` | Base64 smuggling | persona | 关 | `record` |
-| `zh-ignore-previous` | Ignore previous instructions (Chinese) | chinese | 关 | `block` |
-| `zh-forget-your` | Forget your instructions (Chinese) | chinese | 关 | `block` |
-| `zh-do-not-follow` | Do not follow (Chinese) | chinese | 关 | `block` |
-| `zh-you-are-now` | You are now (Chinese) | chinese | 关 | `block` |
-| `zh-role-play` | Role-play (Chinese) | chinese | 关 | `record` |
-| `zh-reveal-your` | Reveal your instructions (Chinese) | chinese | 关 | `record` |
-| `zh-system-prompt` | System prompt (Chinese) | chinese | 关 | `record` |
-| `zh-jailbreak` | Jailbreak (Chinese) | chinese | 关 | `block` |
+| `developer-mode` | 开发者模式 | injection | 关 | `block` |
+| `you-are-now` | 重新设定身份 | persona | 关 | `block` |
+| `new-persona` | 新的人设 | persona | 关 | `record` |
+| `act-as` | 要求扮演角色 | persona | 关 | `record` |
+| `pretend-to-be` | 要求假装身份 | persona | 关 | `record` |
+| `system-prompt` | 索取系统提示词 | persona | 关 | `record` |
+| `reveal-your-instructions` | 要求透露指令 | persona | 关 | `record` |
+| `what-are-your-rules` | 询问规则 | persona | 关 | `record` |
+| `base64-wall` | 长串 Base64 | persona | 关 | `record` |
+| `zh-ignore-previous` | 要求忽略先前的指令（中文） | chinese | 关 | `block` |
+| `zh-forget-your` | 要求忘记指令（中文） | chinese | 关 | `block` |
+| `zh-do-not-follow` | 要求不要遵循（中文） | chinese | 关 | `block` |
+| `zh-you-are-now` | 重新设定身份（中文） | chinese | 关 | `block` |
+| `zh-role-play` | 要求扮演角色（中文） | chinese | 关 | `record` |
+| `zh-reveal-your` | 要求透露指令（中文） | chinese | 关 | `record` |
+| `zh-system-prompt` | 系统提示词（中文） | chinese | 关 | `record` |
+| `zh-jailbreak` | 越狱（中文） | chinese | 关 | `block` |
 <!-- /generated -->
 
 `invisible`（隐藏字符）一组匹配人看不见、模型读得到的字符。Unicode 标签字符（U+E0000–U+E007F）和双向控制符（U+202A–U+202E、U+2066–U+2069）出厂开启；零宽字符（U+200B–U+200D、U+2060、U+FEFF）和私用区字符（U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD）出厂关闭，表情符号、波斯文和图标字体也会用到它们。四条在 `enforce` 下都删除命中的字符。

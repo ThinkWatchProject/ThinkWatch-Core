@@ -37,10 +37,13 @@ Documentation: [configuration reference](docs/config.md) ·
   changing upstreams or models happens in the gateway, with no client change or
   restart. Anthropic Messages, OpenAI Chat Completions, OpenAI Responses and
   Gemini are converted in both directions, streams included.
-- **Outbound redaction.** Outbound redaction can replace API keys,
-  private keys and connection-string passwords with placeholders before a
-  request leaves, and restore them where the answer repeats them, so a relay
-  never sees the real values.
+- **Outbound redaction.** Outbound redaction can replace credentials and
+  personal information with placeholders before a request leaves, and restore
+  them where the answer repeats them, so a relay never sees the real values.
+  It recognises the keys saved in ThinkWatch by value, about 60 kinds of API
+  keys and tokens, credentials in headers, URLs, commands and config files,
+  private keys and wallet seed phrases, and identity, bank and contact numbers
+  that can be checked by their structure.
 - **Malicious tool calls are cut off.** A relay can rewrite an answer and slip
   in a tool call for the client to run. Tool-call inspection can cut off an
   answer whose tool call downloads and runs code, sends out environment

@@ -56,15 +56,20 @@ fn req(id: i64, model: &str) -> tw_store::db::RequestRow {
 
 fn app(rows: &[tw_store::db::RequestRow]) -> (tempfile::TempDir, axum::Router) {
     let d = tempfile::tempdir().unwrap();
-    let p = d.path().join("config.yaml");
+    let app = app_in(d.path(), rows);
+    (d, app)
+}
+
+fn app_in(d: &std::path::Path, rows: &[tw_store::db::RequestRow]) -> axum::Router {
+    let p = d.join("config.yaml");
     std::fs::write(&p, BASE).unwrap();
-    let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
+    let db = tw_store::Db::open(&d.join("data.db")).unwrap();
     for r in rows {
         db.insert(r).unwrap();
     }
     let rec = tw_store::Recorder::new(
         db,
-        tw_store::Blobs::new(d.path().join("blobs")),
+        tw_store::Blobs::new(d.join("blobs")),
         tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
     );
     let cfg: tw_config::Config = serde_yaml_ng::from_str(BASE).unwrap();
@@ -82,7 +87,7 @@ fn app(rows: &[tw_store::db::RequestRow]) -> (tempfile::TempDir, axum::Router) {
         chatgpt: Default::default(),
         zai: Default::default(),
     };
-    (d, tw_control::router(state))
+    tw_control::router(state)
 }
 
 async fn get(app: &axum::Router, path: &str) -> serde_json::Value {
@@ -243,4 +248,52 @@ async fn traffic_and_egress_reach_every_view() {
         lat,
         serde_json::json!([{"model": "我", "p50": 300, "p95": 500, "samples": 2}])
     );
+}
+
+/// 用量历史：参数同 `/summary/buckets`，格子带着「从什么时候起有记录」。
+///
+/// 请求记录先有、用量历史后建（升级的用户）：建的时候把已有的行补进来，起点是最老那一行
+#[tokio::test]
+async fn the_usage_history_answers_the_bucket_query_from_the_hours_it_kept() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
+        db.insert(&req(1, "claude-sonnet-4-5")).unwrap();
+        let mut unknown = req(2, "中转站自己起的名字");
+        unknown.cost_micros = None;
+        db.insert(&unknown).unwrap();
+    }
+    for f in ["usage.db", "usage.db-wal", "usage.db-shm"] {
+        let _ = std::fs::remove_file(d.path().join(f));
+    }
+    let app = app_in(d.path(), &[]);
+    let h = get(
+        &app,
+        "/summary/history?from_ms=0&to_ms=86400000&bucket_ms=86400000",
+    )
+    .await;
+    assert_eq!(h["since_ms"], 1001, "{h}");
+    assert_eq!(h["detail_since_ms"], 1001, "{h}");
+    let b = &h["buckets"];
+    assert_eq!(b.as_array().unwrap().len(), 1, "{h}");
+    assert_eq!(b[0]["at_ms"], 0, "{h}");
+    assert_eq!(b[0]["requests"], 2, "{h}");
+    assert_eq!(b[0]["cost_micros_exact"], 1_000, "{h}");
+    assert_eq!(b[0]["unpriced_requests"], 1, "{h}");
+    assert_eq!(b[0]["input_tokens"], 100, "{h}");
+    assert_eq!(b[0]["ttft_samples"], 0, "{h}");
+    assert!(b[0].get("ttft_p50_ms").is_none(), "{h}");
+    // 桶宽有下限（同 `/summary/buckets`）：一毫秒一格按一秒算
+    let h = get(
+        &app,
+        "/summary/history?from_ms=500&to_ms=86400000&bucket_ms=1",
+    )
+    .await;
+    assert_eq!(
+        h["buckets"].as_array().unwrap().len(),
+        0,
+        "整点 0 在起点之前：{h}"
+    );
+    let h = get(&app, "/summary/history?from_ms=0&bucket_ms=1").await;
+    assert_eq!(h["buckets"][0]["at_ms"], 0, "{h}");
 }

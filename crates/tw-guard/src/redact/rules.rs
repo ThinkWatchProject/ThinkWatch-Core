@@ -10,7 +10,7 @@
 //! - **邮箱和中国大陆手机号**出厂关着：它们没有能核对的结构，只能按「长得像」认，
 //!   在代码和文档里误报得多。要的人（企业版的合规场景）自己打开。
 //!
-//! 个人信息自成一类（[`Kind::Personal`]），占位符写明是哪一种，报出去只留认得出是
+//! 个人信息自成几类（[`Kind::is_personal`]），占位符写明是哪一种，报出去只留认得出是
 //! 哪一个的最少部分（号码留最后四位，邮箱留第一个字和域名）。
 //!
 //! 贯穿全文件的一条：**宁可漏，不可吵。**一个天天误报的安全功能，用户
@@ -30,25 +30,60 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-/// 规则属于哪一类。**只用来分组和说明**，开关按条。
+use super::anchor::{
+    ALNUM, ANY_LEN, Anchor, Anchors, Bytes, C_DASH, C_DIGIT, C_DOT, C_LETTER, C_UNDER, Chars, DIGIT,
+};
+use super::exceptions::Exceptions;
+use super::secrets::ASSIGNMENT_SUFFIXES;
+pub use super::secrets::saved::{
+    SAVED_MIN_CHARS, Saved, SavedSecret, SavedSource, SavedSourceKind,
+};
+
+/// 规则属于哪一类。**只用来分组和说明**，开关按条。界面上按这个顺序分组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
-    /// `sk-ant-`、`ghp_`、`AKIA` 这些前缀明确的
-    ApiKeys,
+    /// 用户在 ThinkWatch 里保存的凭据，按值认（上游密钥、访问密钥、代理口令……）
+    Saved,
+    /// AI 服务的 API 密钥（`sk-ant-`、`xai-`、`gsk_` …）
+    AiServices,
+    /// 代码托管与软件发布（GitHub、GitLab、npm、PyPI …）
+    DevPlatforms,
+    /// 云服务与基础设施（AWS、Google Cloud、阿里云、Vault …）
+    Cloud,
+    /// 支付、通信与协作（Stripe、Slack、Shopify、Notion …）
+    Business,
     /// `-----BEGIN ... PRIVATE KEY-----` 到 END 的整段
     PrivateKeys,
     /// 三段式 base64url，且首段解出来含 `"alg"`
     Jwt,
     /// `postgres://user:pass@` 这类带口令的 URI。**只换口令那一段**
     ConnStrings,
-    /// 身份证号、银行卡号、邮箱、手机号：个人信息，不是凭据。占位符写明是哪一种，
-    /// 报出去只留认得出是哪一个的最少部分
-    Personal,
+    /// 按出现的位置认的凭据：请求头、命令行、URL 参数、机器人 Webhook、配置赋值。
+    /// **只换值那一段**
+    InContext,
+    /// 加密货币的助记词、私钥
+    Crypto,
+    /// 证件号码（身份证、护照、港澳台证件……）
+    IdDocuments,
+    /// 境外证件号码，每国一条
+    ForeignIds,
+    /// 银行卡号、IBAN
+    Financial,
+    /// 手机号、固定电话、邮箱
+    Contact,
+    /// 详细地址、精确坐标
+    Location,
+    /// 车牌号、车辆识别代号
+    Vehicle,
+    /// IMEI、MAC 地址、公网 IP
+    Device,
+    /// 按字段名认的个人信息（姓名、住址、出生日期、账号、健康）
+    LabeledPersonal,
     /// RFC1918 地址、`.local` / `.internal` 域名
     Internal,
     /// 用户自己写的规则
@@ -58,14 +93,75 @@ pub enum Kind {
 impl Kind {
     pub fn slug(&self) -> &'static str {
         match self {
-            Kind::ApiKeys => "api-keys",
+            Kind::Saved => "saved",
+            Kind::AiServices => "ai-services",
+            Kind::DevPlatforms => "dev-platforms",
+            Kind::Cloud => "cloud",
+            Kind::Business => "business",
             Kind::PrivateKeys => "private-keys",
             Kind::Jwt => "jwt",
             Kind::ConnStrings => "conn-strings",
-            Kind::Personal => "personal",
+            Kind::InContext => "in-context",
+            Kind::Crypto => "crypto",
+            Kind::IdDocuments => "id-documents",
+            Kind::ForeignIds => "foreign-ids",
+            Kind::Financial => "financial",
+            Kind::Contact => "contact",
+            Kind::Location => "location",
+            Kind::Vehicle => "vehicle",
+            Kind::Device => "device",
+            Kind::LabeledPersonal => "labeled-personal",
             Kind::Internal => "internal",
             Kind::Custom => "custom",
         }
+    }
+
+    /// 分组的英文名（`data/redact.yaml` 的 `kinds`）
+    pub fn name(&self) -> &'static str {
+        self.names().name
+    }
+
+    /// 分组的中文名
+    pub fn name_zh(&self) -> &'static str {
+        self.names().name_zh
+    }
+
+    fn names(&self) -> &'static KindName {
+        KIND_NAMES
+            .iter()
+            .find(|n| n.kind == *self)
+            // 每一类都在数据文件里，测试钉着（`every_kind_has_names_in_the_order_the_ui_groups_by`）
+            .expect("every kind is named in data/redact.yaml")
+    }
+
+    /// 个人信息，不是凭据：占位符写明是哪一种，报出去只留认得出是哪一个的最少部分
+    pub fn is_personal(&self) -> bool {
+        matches!(
+            self,
+            Kind::IdDocuments
+                | Kind::ForeignIds
+                | Kind::Financial
+                | Kind::Contact
+                | Kind::Location
+                | Kind::Vehicle
+                | Kind::Device
+                | Kind::LabeledPersonal
+        )
+    }
+
+    /// 拿到就能用的凭据：危险命令「凭据发往陌生主机」认的那几类。JWT、连接串、按位置认的
+    /// 不在里面（见 `tools::net::credentials`）
+    pub fn is_credential(&self) -> bool {
+        matches!(
+            self,
+            Kind::Saved
+                | Kind::AiServices
+                | Kind::DevPlatforms
+                | Kind::Cloud
+                | Kind::Business
+                | Kind::PrivateKeys
+                | Kind::Crypto
+        )
     }
 }
 
@@ -86,13 +182,15 @@ pub enum Matcher {
     Jwt,
     /// `协议://用户:口令@主机` 里的口令
     ConnString,
-    /// RFC1918 私有地址，不含回环
+    /// 内网地址：RFC1918 私有地址、运营商级 NAT（`100.64.0.0/10`）、IPv6 唯一本地地址
+    /// （`fc00::/7`），不含回环
     PrivateIp,
     /// 以这几个后缀结尾的域名
     DomainSuffix { suffixes: &'static [&'static str] },
-    /// 18 位的中华人民共和国居民身份证号码：头两位是省级行政区划代码，第 7–14 位
-    /// 是 `born_since` 年 1 月 1 日到今天之间的真实日期，末位是对得上的
-    /// ISO 7064 MOD 11-2 校验码（`0`–`9` 或 `X`）。15 位的老号码不认
+    /// 18 位的中华人民共和国居民身份证号码：头两位是省级行政区划代码（含港澳台居民居住证的
+    /// `81`、`82`、`83`；新版外国人永久居留身份证首位是 `9`、第 2–3 位是省级代码、第 4–6 位是
+    /// 国籍代码），第 7–14 位是 `born_since` 年 1 月 1 日到今天之间的真实日期，末位是对得上的
+    /// ISO 7064 MOD 11-2 校验码（`0`–`9` 或 `X`）。15 位的老号码另有一条规则
     CnResidentId { born_since: u16 },
     /// 卡号：开头和位数属于其中一家卡组织，并且通过 Luhn 校验。连着写的，或者
     /// 四位一组、用一个空格或一个连字符隔开的（最后一组可以不足四位；American
@@ -101,8 +199,39 @@ pub enum Matcher {
     /// 邮箱地址：`本地部分@域名`，域名至少两段、最后一段是两个以上的字母。URL 里的
     /// 用户名（`https://user@host`、`user:pass@host`）和 `icon@2x.png` 这类文件名不算
     Email,
-    /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字
+    /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字；也认
+    /// `+86` / `0086` / `86-` 前缀，和 3-4-4 用空格或连字符分组的写法
     CnMobilePhone,
+    /// 以其中任一个前缀开头，其后至少还有 `min_tail` 个字符，尾巴的字符按 `tail`。同一家
+    /// 服务的几种令牌写成一条
+    Prefixes { list: &'static [Pfx] },
+    /// 用户在 ThinkWatch 里保存的凭据，按值认，与格式无关
+    Saved,
+    /// 配置赋值：变量名以其中一个词结尾的字面量值
+    Assignment { suffixes: &'static [&'static str] },
+    /// 按字段名认的值：字段名是其中一个
+    Labeled { names: &'static [&'static str] },
+    /// 代码里实现的判据（校验位、词表、位置……），没有可展示的模式；说明是规则的 `about`
+    Code,
+}
+
+/// [`Matcher::Prefixes`] 里的一个前缀。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pfx {
+    pub prefix: &'static str,
+    pub min_tail: usize,
+    pub tail: Tail,
+}
+
+/// 前缀后面那段允许哪些字符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tail {
+    /// token 里能有的都行（字母、数字、`-`、`_`、`.`）
+    Any,
+    /// 只有十六进制数字
+    Hex,
+    /// 只有字母和数字
+    Alnum,
 }
 
 /// 一家卡组织认哪些卡号。
@@ -121,8 +250,15 @@ pub struct Builtin {
     /// 规则的 id，也是命中之后报出去的那个词（`anthropic-api-key` …）
     pub id: &'static str,
     pub kind: Kind,
-    /// 英文名。界面按 id 查自己的名称表，查不到才用它
+    /// 英文名
     pub name: &'static str,
+    /// 中文名
+    pub name_zh: &'static str,
+    /// 认什么，给人看的一句话（英文）。按位置认的写明只换哪一段；反引号括起来的一段是代码。
+    /// 前缀类的规则由 build.rs 按前缀和长度生成
+    pub about: &'static str,
+    /// 同上，中文
+    pub about_zh: &'static str,
     /// 出厂时开不开。**关着的是内网地址和邮箱、手机号**：它们在代码和文档里到处
     /// 都是，按「长得像」认误报得多，而危害远小于一把 key，想脱的人自己开
     pub on_by_default: bool,
@@ -132,22 +268,9 @@ pub struct Builtin {
     /// 个人号码写明是哪一种：模型看到 `<<TW_ID_NUMBER_1>>` 才知道那里原来是个
     /// 身份证号，答得像样
     pub label: Option<&'static str>,
-}
-
-const fn prefix(
-    id: &'static str,
-    name: &'static str,
-    prefix: &'static str,
-    min_tail: usize,
-) -> Builtin {
-    Builtin {
-        id,
-        kind: Kind::ApiKeys,
-        name,
-        on_by_default: true,
-        matcher: Matcher::Prefix { prefix, min_tail },
-        label: None,
-    }
+    /// 这把凭据正当地会送往哪些服务商域名（后缀匹配，含子域）。危险命令「凭据发往陌生主机」
+    /// 用它；空的（私钥、个人信息……）送往任何非本机地址都算外传
+    pub hosts: &'static [&'static str],
 }
 
 /// `sk-` 开头的 OpenAI 老式 key 至少要多长。
@@ -155,7 +278,14 @@ const fn prefix(
 /// 前缀太短，**要靠长度把它和 `sk-test`、`sk-xxx` 这种占位符分开**。
 const OPENAI_MIN: usize = 40;
 
-const INTERNAL_SUFFIXES: &[&str] = &[".local", ".internal", ".lan"];
+const INTERNAL_SUFFIXES: &[&str] = &[
+    ".local",
+    ".internal",
+    ".lan",
+    ".corp",
+    ".home.arpa",
+    ".intranet",
+];
 
 /// 18 位身份证号码的出生日期最早到哪一年。
 const BORN_SINCE: u16 = 1900;
@@ -202,147 +332,178 @@ pub const CARD_NETWORKS: &[CardNetwork] = &[
     },
 ];
 
-/// 全部内置规则，**按界面上的顺序**。
+/// 全部内置规则，从 `data/redact.yaml` 编译期生成（见 build.rs）。界面上先按 [`Kind`] 的
+/// 顺序分组，组内按这里的顺序（见 `view::redact`）；前缀表也按这里的顺序比。
 ///
 /// API 密钥那一段**只收前缀明确、长度有下限的**。代码里的 hash、base64 的
 /// 图片、UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
-pub const BUILTINS: &[Builtin] = &[
-    prefix("anthropic-api-key", "Anthropic API key", "sk-ant-", 20),
-    prefix("openai-project-key", "OpenAI project key", "sk-proj-", 20),
-    Builtin {
-        id: "openai-api-key",
-        kind: Kind::ApiKeys,
-        name: "OpenAI API key",
-        on_by_default: true,
-        matcher: Matcher::OpenaiLegacy {
+pub const BUILTINS: &[Builtin] = include!(concat!(env!("OUT_DIR"), "/redact_builtins.rs"));
+
+/// 一个分组叫什么（`data/redact.yaml` 的 `kinds`）。
+#[derive(Debug, Clone, Copy)]
+pub struct KindName {
+    pub kind: Kind,
+    pub name: &'static str,
+    pub name_zh: &'static str,
+}
+
+/// 每个分组的名字，按界面上的顺序（和 [`Kind`] 的定义顺序一致，测试钉着）。
+pub const KIND_NAMES: &[KindName] = include!(concat!(env!("OUT_DIR"), "/redact_kinds.rs"));
+
+/// 判据写在代码里的规则：数据文件里没写前缀的那些按 id 在这里找自己的 [`Matcher`]。
+///
+/// **数据和代码各管一半**：名字、说明、分组、出厂开关在 `data/redact.yaml`，判据（校验位、
+/// 词表、位置、整张号段表）在代码里，这张表把两边按 id 接起来。数据里有、这里没有的是编译错误
+/// （[`detector`]）；这里有、数据里没有的由测试抓（`every_detector_has_a_rule_in_the_data`）。
+/// 判据本身在哪个函数里：最早那一批在本文件，扩充的凭据在 `secrets/`，个人信息在 `personal/`；
+/// 每一条都有样本测试（命中、不命中）钉着。
+const DETECTORS: &[(&str, Matcher)] = &[
+    // OpenAI 老式密钥的长度下限扫描时直接用 `OPENAI_MIN`，所以它算代码判据，不进数据文件
+    (
+        "openai-api-key",
+        Matcher::OpenaiLegacy {
             min_len: OPENAI_MIN,
         },
-        label: None,
-    },
-    prefix(
-        "github-personal-token",
-        "GitHub personal access token",
-        "ghp_",
-        30,
     ),
-    prefix("github-oauth-token", "GitHub OAuth token", "gho_", 30),
-    prefix("github-server-token", "GitHub server token", "ghs_", 30),
-    prefix("github-user-token", "GitHub user token", "ghu_", 30),
-    prefix(
-        "github-fine-grained-token",
-        "GitHub fine-grained token",
-        "github_pat_",
-        30,
-    ),
-    prefix("slack-bot-token", "Slack bot token", "xoxb-", 20),
-    prefix("slack-user-token", "Slack user token", "xoxp-", 20),
-    prefix("slack-app-token", "Slack app token", "xoxa-", 20),
-    prefix("aws-access-key-id", "AWS access key ID", "AKIA", 12),
-    prefix(
-        "aws-temporary-key-id",
-        "AWS temporary access key ID",
-        "ASIA",
-        12,
-    ),
-    prefix("google-api-key", "Google API key", "AIza", 30),
-    prefix("google-oauth-token", "Google OAuth token", "ya29.", 20),
-    prefix("gitlab-token", "GitLab token", "glpat-", 15),
-    prefix("stripe-live-key", "Stripe live key", "sk_live_", 20),
-    prefix(
-        "stripe-restricted-key",
-        "Stripe restricted key",
-        "rk_live_",
-        20,
-    ),
-    prefix("npm-token", "npm token", "npm_", 30),
-    prefix("digitalocean-token", "DigitalOcean token", "dop_v1_", 30),
-    prefix("sendgrid-key", "SendGrid key", "SG.", 30),
-    Builtin {
-        id: "private-key",
-        kind: Kind::PrivateKeys,
-        name: "Private key",
-        on_by_default: true,
-        matcher: Matcher::Pem,
-        label: None,
-    },
-    Builtin {
-        id: "jwt",
-        kind: Kind::Jwt,
-        name: "JWT",
-        on_by_default: true,
-        matcher: Matcher::Jwt,
-        label: None,
-    },
-    Builtin {
-        id: "conn-string-password",
-        kind: Kind::ConnStrings,
-        name: "Connection string password",
-        on_by_default: true,
-        matcher: Matcher::ConnString,
-        label: None,
-    },
-    Builtin {
-        id: "cn-resident-id",
-        kind: Kind::Personal,
-        name: "Chinese resident ID number",
-        on_by_default: true,
-        matcher: Matcher::CnResidentId {
+    ("private-key", Matcher::Pem),
+    ("jwt", Matcher::Jwt),
+    ("conn-string-password", Matcher::ConnString),
+    (
+        "cn-resident-id",
+        Matcher::CnResidentId {
             born_since: BORN_SINCE,
         },
-        label: Some("TW_ID_NUMBER"),
-    },
-    Builtin {
-        id: "bank-card",
-        kind: Kind::Personal,
-        name: "Bank card number",
-        on_by_default: true,
-        matcher: Matcher::BankCard {
+    ),
+    (
+        "bank-card",
+        Matcher::BankCard {
             networks: CARD_NETWORKS,
         },
-        label: Some("TW_CARD_NUMBER"),
-    },
-    Builtin {
-        id: "email",
-        kind: Kind::Personal,
-        name: "Email address",
-        on_by_default: false,
-        matcher: Matcher::Email,
-        label: Some("TW_EMAIL"),
-    },
-    Builtin {
-        id: "cn-mobile-phone",
-        kind: Kind::Personal,
-        name: "Chinese mainland mobile number",
-        on_by_default: false,
-        matcher: Matcher::CnMobilePhone,
-        label: Some("TW_PHONE"),
-    },
-    Builtin {
-        id: "internal-ip",
-        kind: Kind::Internal,
-        name: "Internal IP address",
-        on_by_default: false,
-        matcher: Matcher::PrivateIp,
-        label: None,
-    },
-    Builtin {
-        id: "internal-domain",
-        kind: Kind::Internal,
-        name: "Internal domain",
-        on_by_default: false,
-        matcher: Matcher::DomainSuffix {
+    ),
+    ("email", Matcher::Email),
+    ("cn-mobile-phone", Matcher::CnMobilePhone),
+    ("internal-ip", Matcher::PrivateIp),
+    (
+        "internal-domain",
+        Matcher::DomainSuffix {
             suffixes: INTERNAL_SUFFIXES,
         },
-        label: None,
-    },
+    ),
+    // 扩充的凭据规则（secrets/）
+    ("thinkwatch-saved-secret", Matcher::Saved),
+    ("zhipu-api-key", Matcher::Code),
+    ("qianfan-api-key", Matcher::Code),
+    ("sk-compat-key", Matcher::Code),
+    ("azure-ad-client-secret", Matcher::Code),
+    ("terraform-token", Matcher::Code),
+    ("auth-header-credential", Matcher::Code),
+    ("command-line-password", Matcher::Code),
+    ("url-token", Matcher::Code),
+    ("bot-webhook", Matcher::Code),
+    ("telegram-bot-token", Matcher::Code),
+    (
+        "config-assignment",
+        Matcher::Assignment {
+            suffixes: ASSIGNMENT_SUFFIXES,
+        },
+    ),
+    ("crypto-mnemonic", Matcher::Code),
+    ("crypto-wif-key", Matcher::Code),
+    ("crypto-extended-key", Matcher::Code),
+    // 扩充的个人信息规则（personal/）
+    ("cn-resident-id-15", Matcher::Code),
+    ("passport-mrz", Matcher::Code),
+    ("cn-passport", Matcher::Code),
+    ("hk-macau-taiwan-id", Matcher::Code),
+    ("mainland-travel-permit", Matcher::Code),
+    ("us-ssn", Matcher::Code),
+    ("uk-nino", Matcher::Code),
+    ("sg-nric", Matcher::Code),
+    ("kr-rrn", Matcher::Code),
+    ("jp-my-number", Matcher::Code),
+    ("in-aadhaar", Matcher::Code),
+    ("br-cpf", Matcher::Code),
+    ("iban", Matcher::Code),
+    ("cn-landline", Matcher::Code),
+    ("intl-phone", Matcher::Code),
+    ("cn-address", Matcher::Code),
+    ("geo-coordinates", Matcher::Code),
+    ("cn-license-plate", Matcher::Code),
+    ("vin", Matcher::Code),
+    ("imei", Matcher::Code),
+    ("mac-address", Matcher::Code),
+    ("public-ip", Matcher::Code),
+    (
+        "labeled-name",
+        Matcher::Labeled {
+            names: super::personal::NAME_FIELDS,
+        },
+    ),
+    (
+        "labeled-address",
+        Matcher::Labeled {
+            names: super::personal::ADDRESS_FIELDS,
+        },
+    ),
+    (
+        "labeled-birth-date",
+        Matcher::Labeled {
+            names: super::personal::BIRTH_FIELDS,
+        },
+    ),
+    (
+        "labeled-account",
+        Matcher::Labeled {
+            names: super::personal::ACCOUNT_FIELDS,
+        },
+    ),
+    (
+        "labeled-health",
+        Matcher::Labeled {
+            names: super::personal::HEALTH_FIELDS,
+        },
+    ),
 ];
+
+/// 数据文件里一条代码判据的规则在 [`DETECTORS`] 里的 [`Matcher`]。**在编译期求值**
+/// （生成的 [`BUILTINS`] 里调它）：查不到就停在编译上，不会带着一条认不出任何东西的规则上线
+const fn detector(id: &str) -> Matcher {
+    let mut i = 0;
+    while i < DETECTORS.len() {
+        if same(DETECTORS[i].0, id) {
+            return DETECTORS[i].1;
+        }
+        i += 1;
+    }
+    panic!("a rule in data/redact.yaml has no prefix and no detector in rules::DETECTORS")
+}
+
+/// 两个字符串相等。`==` 在 const fn 里用不了
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(test)]
+#[path = "catalog_tests.rs"]
+mod catalog_tests;
 
 pub fn builtin(id: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|b| b.id == id)
 }
 
 /// 内置规则的一处命中。**标签照规则表上写的**，不在各个找的地方各写一遍。
-fn builtin_hit(id: &'static str, bytes: Range<usize>) -> Hit {
+pub(super) fn builtin_hit(id: &'static str, bytes: Range<usize>) -> Hit {
     Hit {
         bytes,
         rule: Rule::Builtin(id),
@@ -371,7 +532,7 @@ impl Rule {
     }
     pub fn kind(&self) -> Kind {
         match self {
-            Rule::Builtin(id) => builtin(id).map_or(Kind::ApiKeys, |b| b.kind),
+            Rule::Builtin(id) => builtin(id).map_or(Kind::Custom, |b| b.kind),
             Rule::Custom(_) => Kind::Custom,
         }
     }
@@ -461,6 +622,14 @@ pub struct RuleSet {
     custom: Vec<Custom>,
     /// 动作是「仅记录」的规则：照样找、照样报，不换成占位符（见 [`RuleSet::records`]）
     record: HashSet<Rule>,
+    /// 用户在 ThinkWatch 里保存的凭据（见 [`RuleSet::with_saved`]）。规则 `thinkwatch-saved-secret`
+    /// 开着才按它找
+    saved: Option<Arc<Saved>>,
+    /// 例外值（见 [`super::exceptions`]）：命中的值在表里的，哪条规则的都不换、不报。`None` 是
+    /// 一个都没有，一个哈希都不算
+    exceptions: Option<Arc<Exceptions>>,
+    /// 自定义规则编成的预筛（[`CustomIndex`]），头一次扫的时候编。改了自定义规则就作废
+    index: OnceLock<Arc<CustomIndex>>,
 }
 
 impl Default for RuleSet {
@@ -480,6 +649,9 @@ impl RuleSet {
                 .collect(),
             custom: Vec::new(),
             record: HashSet::new(),
+            saved: None,
+            exceptions: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -489,6 +661,9 @@ impl RuleSet {
             on: HashSet::new(),
             custom: Vec::new(),
             record: HashSet::new(),
+            saved: None,
+            exceptions: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -502,6 +677,9 @@ impl RuleSet {
                 .collect(),
             custom: Vec::new(),
             record: HashSet::new(),
+            saved: None,
+            exceptions: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -555,11 +733,73 @@ impl RuleSet {
             pattern,
             label: label.map(Arc::from),
         });
+        self.index = OnceLock::new();
         Ok(self)
     }
 
     pub fn is_on(&self, id: &str) -> bool {
         self.on.contains(id)
+    }
+
+    /// 带上用户在 ThinkWatch 里保存的凭据，按值认（规则 `thinkwatch-saved-secret`）。不足
+    /// [`SAVED_MIN_CHARS`] 个字符的不收；一个都不剩就和没带一样。**跟着配置一起换**：调用方
+    /// 在建运行时的地方建一次
+    pub fn with_saved(mut self, list: Vec<SavedSecret>) -> Self {
+        self.saved = Saved::new(list).map(Arc::new);
+        self
+    }
+
+    /// 带上一份已经编好的保存的凭据（和网关、工具调用审查共用同一份）。`None` 是不带
+    pub fn with_saved_set(mut self, saved: Option<Arc<Saved>>) -> Self {
+        self.saved = saved;
+        self
+    }
+
+    /// 编好的保存的凭据，给工具调用审查的「凭据发往陌生主机」用（见
+    /// [`crate::tools::rules::Rules::with_saved`]）。没有是 `None`
+    pub fn saved(&self) -> Option<&Arc<Saved>> {
+        self.saved.as_ref()
+    }
+
+    /// 命中的这个值是哪一项保存的凭据。不是保存的凭据是 `None`
+    pub fn saved_source(&self, value: &str) -> Option<&SavedSource> {
+        self.saved.as_ref()?.source_of(value)
+    }
+
+    /// 带上例外值（见 [`super::exceptions`]）。`None` 是不带。**跟着配置一起换**
+    pub fn with_exceptions(mut self, exceptions: Option<Arc<Exceptions>>) -> Self {
+        self.exceptions = exceptions;
+        self
+    }
+
+    /// 例外值。没有是 `None`
+    pub fn exceptions(&self) -> Option<&Arc<Exceptions>> {
+        self.exceptions.as_ref()
+    }
+
+    /// 去掉例外值的一份：「测试…」要看见例外的值被哪条规则认出来过
+    pub fn without_exceptions(&self) -> RuleSet {
+        let mut set = self.clone();
+        set.exceptions = None;
+        set
+    }
+
+    /// 例外表的指纹（[`Exceptions::fingerprint`]），没有例外是 `None`。按规则集缓存扫描结果的
+    /// 地方要把它算进规则集的版本：例外表一变，同一段正文找出来的命中就变了
+    pub fn exceptions_fingerprint(&self) -> Option<super::exceptions::Digest32> {
+        self.exceptions.as_ref().map(|e| e.fingerprint())
+    }
+
+    /// `out` 里去掉值是例外的命中（保存的凭据的不去，见 [`super::exceptions`]）。`text` 是
+    /// JSON 原文：值先解开转义再算哈希
+    fn drop_excepted(&self, text: &str, out: &mut Vec<Hit>) {
+        if let Some(ex) = &self.exceptions
+            && !out.is_empty()
+        {
+            out.retain(|h| {
+                !super::exceptions::exceptable(&h.rule) || !ex.excepts_json(&text[h.bytes.clone()])
+            });
+        }
     }
 
     /// 这条规则只记录：动作是「仅记录」
@@ -592,6 +832,9 @@ impl RuleSet {
                 .cloned()
                 .collect(),
             record: self.record.clone(),
+            saved: self.saved.clone(),
+            exceptions: self.exceptions.clone(),
+            index: OnceLock::new(),
         })
     }
 
@@ -618,9 +861,77 @@ impl RuleSet {
             .map(|c| &c.pattern)
     }
 
+    /// 有自定义规则
+    pub(super) fn has_custom(&self) -> bool {
+        !self.custom.is_empty()
+    }
+
     /// 一条都没开。**调用方据此整条短路** —— 没有规则的话，找都不用找。
     pub fn is_empty(&self) -> bool {
         self.on.is_empty() && self.custom.is_empty()
+    }
+
+    /// 这套规则的指纹（SHA-256）：**找出来的命中可能因之而变的每一样**都在里面 —— 开着哪些
+    /// 内置规则、每条自定义规则（顺序、写法、怎么认、标签）、哪些只记录、保存的凭据的值。
+    /// 两套规则指纹一样，在同一段文字上找出来的就一样。扫描缓存（[`super::cache`]）拿它做键的
+    /// 一部分：改了规则、改了保存的密钥，以前存下的结果整个不作数。
+    ///
+    /// **字段一个一个拆开写、不留 `..`**：往 [`RuleSet`] 里加一样会影响命中的东西（例外值……）
+    /// 时，这里编译不过，逼着把它也喂进指纹 —— 漏了的话，缓存会把改之前的结果当成改之后的。
+    /// 只影响报法、不影响命中的（编好的预筛）写成 `_`
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let RuleSet {
+            on,
+            custom,
+            record,
+            saved,
+            exceptions,
+            index: _,
+        } = self;
+        let mut h = Sha256::new();
+        // 每一段先写长度：`ab` + `c` 和 `a` + `bc` 不是同一个指纹
+        let mut put = |tag: &[u8], b: &[u8]| {
+            h.update(tag);
+            h.update((b.len() as u64).to_le_bytes());
+            h.update(b);
+        };
+        // HashSet 的顺序每个实例都不一样，排好再写
+        let mut ids: Vec<&str> = on.iter().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            put(b"on", id.as_bytes());
+        }
+        // 自定义规则的顺序算数：同一处两条都认得时，合成一处后报的是先记下的那条
+        for c in custom {
+            put(b"custom", c.name.as_bytes());
+            put(b"pattern", c.pattern.text.as_bytes());
+            put(
+                b"how",
+                &[
+                    u8::from(c.pattern.regex),
+                    u8::from(c.pattern.case_sensitive),
+                ],
+            );
+            put(b"label", c.label.as_deref().unwrap_or("").as_bytes());
+            put(b"labeled", &[u8::from(c.label.is_some())]);
+        }
+        let mut rec: Vec<(bool, &str)> = record.iter().map(|r| (r.custom(), r.id())).collect();
+        rec.sort_unstable();
+        for (custom, id) in rec {
+            put(b"record", &[u8::from(custom)]);
+            put(b"record-id", id.as_bytes());
+        }
+        if let Some(saved) = saved {
+            for v in saved.values() {
+                put(b"saved", v.as_bytes());
+            }
+        }
+        // 例外值改了，缓存里按旧例外表去掉（或留下）的命中就不对了
+        if let Some(ex) = exceptions {
+            put(b"exceptions", &ex.fingerprint());
+        }
+        h.finalize().into()
     }
 }
 
@@ -648,36 +959,94 @@ const KEY_MIN: usize = {
     let mut min = OPENAI_MIN;
     let mut i = 0;
     while i < BUILTINS.len() {
-        if let Matcher::Prefix { prefix, min_tail } = BUILTINS[i].matcher
-            && prefix.len() + min_tail < min
-        {
-            min = prefix.len() + min_tail;
+        match BUILTINS[i].matcher {
+            Matcher::Prefix { prefix, min_tail } => {
+                if prefix.len() + min_tail < min {
+                    min = prefix.len() + min_tail;
+                }
+            }
+            Matcher::Prefixes { list } => {
+                let mut j = 0;
+                while j < list.len() {
+                    if list[j].prefix.len() + list[j].min_tail < min {
+                        min = list[j].prefix.len() + list[j].min_tail;
+                    }
+                    j += 1;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
     min
 };
 
-/// 一把密钥能以哪些字节开头：每条前缀规则的头一个字节，和 OpenAI 老式密钥的 `s`
+/// 一把密钥能以哪些字节开头：每条前缀规则（单前缀、多前缀）的头一个字节，和 OpenAI 老式
+/// 密钥的 `s`
 const KEY_FIRST: [bool; 256] = {
     let mut t = [false; 256];
     t[b's' as usize] = true;
     let mut i = 0;
     while i < BUILTINS.len() {
-        if let Matcher::Prefix { prefix, .. } = BUILTINS[i].matcher {
-            t[prefix.as_bytes()[0] as usize] = true;
+        match BUILTINS[i].matcher {
+            Matcher::Prefix { prefix, .. } => t[prefix.as_bytes()[0] as usize] = true,
+            Matcher::Prefixes { list } => {
+                let mut j = 0;
+                while j < list.len() {
+                    t[list[j].prefix.as_bytes()[0] as usize] = true;
+                    j += 1;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
     t
 };
 
+/// 前缀表里的一项：前缀、尾巴至少几个、尾巴的字符、哪条规则
+type Entry3 = (&'static str, usize, Tail, &'static str);
+
+/// 前缀表，按头一个字节分好，组内照 [`BUILTINS`] 里的顺序。**一个 token 只和同一个头字节的
+/// 那几项比**：前缀规则有一百来项，过了快速排除的 token 挨个比一遍，在几 MB 的请求体上就是
+/// 好几毫秒
+fn prefix_table() -> &'static [Vec<Entry3>] {
+    static T: std::sync::OnceLock<Vec<Vec<Entry3>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t: Vec<Vec<Entry3>> = vec![Vec::new(); 256];
+        for b in BUILTINS {
+            match b.matcher {
+                Matcher::Prefix { prefix, min_tail } => {
+                    t[usize::from(prefix.as_bytes()[0])].push((prefix, min_tail, Tail::Any, b.id));
+                }
+                Matcher::Prefixes { list } => {
+                    for p in list {
+                        t[usize::from(p.prefix.as_bytes()[0])]
+                            .push((p.prefix, p.min_tail, p.tail, b.id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        t
+    })
+}
+
+/// 前缀后面那段的字符对得上 `tail`。token 里本来只有 token 字符，`Any` 不用再看
+fn tail_fits(tail: Tail, t: &str) -> bool {
+    match tail {
+        Tail::Any => true,
+        Tail::Hex => t.bytes().all(|c| c.is_ascii_hexdigit()),
+        Tail::Alnum => t.bytes().all(|c| c.is_ascii_alphanumeric()),
+    }
+}
+
 /// 一段 token 是哪种 API 密钥。**只看开着的那几条。**`openai`：OpenAI 老式密钥那条开着
 /// （扫之前问一次，不在每个 token 上查一遍表）。
 ///
 /// 太短的、开头哪条前缀都对不上的直接回去：[`classify_prefixed`] 认得出的 token 都过得了
 /// 这两关（[`KEY_MIN`]、[`KEY_FIRST`]）。
-fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
+pub(super) fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
     if tok.len() < KEY_MIN || !KEY_FIRST[usize::from(tok.as_bytes()[0])] {
         return None;
     }
@@ -686,21 +1055,26 @@ fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str
 
 /// [`classify_token`] 的判据本身。
 fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
-    for b in BUILTINS {
-        if let Matcher::Prefix { prefix, min_tail } = b.matcher
-            && let Some(tail) = tok.strip_prefix(prefix)
-            && tail.len() >= min_tail
+    let row = &prefix_table()[usize::from(tok.as_bytes()[0])];
+    for &(prefix, min_tail, tail, id) in row {
+        if let Some(t) = tok.strip_prefix(prefix)
+            && t.len() >= min_tail
+            && tail_fits(tail, t)
         {
             // 前缀认出来了但这条关着 —— **不再往下猜**。`sk-ant-…` 关掉之后
             // 不该被当成一把 OpenAI 老式 key 换掉
-            return set.is_on(b.id).then_some(b.id);
+            return set.is_on(id).then_some(id);
         }
     }
     if openai
         && let Some(tail) = tok.strip_prefix("sk-")
         && tok.len() >= OPENAI_MIN
-        && !tail.starts_with("ant-")
-        && !tail.starts_with("proj-")
+        // 别家的 `sk-` 前缀（`sk-ant-`、`sk-or-v1-`、`sk-lf-` ……）不归 OpenAI：尾巴不够长、
+        // 字符不对的也不归 —— 报错了服务商，「凭据发往陌生主机」就会把发往它自家接口的
+        // 请求当成外传
+        && !row
+            .iter()
+            .any(|(prefix, ..)| prefix.starts_with("sk-") && tok.starts_with(prefix))
         && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         // **全是字母或者全是数字的一长串多半是别的东西**（hash、id、
         // 或者一串占位用的 aaaa）。真的 key 两样都有
@@ -710,6 +1084,36 @@ fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static 
         return Some("openai-api-key");
     }
     None
+}
+
+/// 前缀规则（单前缀、多前缀）和 OpenAI 老式密钥的锚点：前缀本身，整个 token 至少是「前缀 +
+/// 至少要有的尾巴」那么长。**从规则表上的 [`Matcher`] 算出来**，不另写一份
+pub(super) fn key_anchors() -> Vec<Anchor> {
+    let mut v = vec![Anchor::Prefix("sk-", OPENAI_MIN)];
+    for b in BUILTINS {
+        match b.matcher {
+            Matcher::Prefix { prefix, min_tail } => {
+                v.push(Anchor::Prefix(prefix, prefix.len() + min_tail));
+            }
+            Matcher::Prefixes { list } => {
+                v.extend(
+                    list.iter()
+                        .map(|p| Anchor::Prefix(p.prefix, p.prefix.len() + p.min_tail)),
+                );
+            }
+            _ => {}
+        }
+    }
+    v
+}
+
+/// 前缀规则或 OpenAI 老式密钥开着一条以上
+pub(super) fn any_key_on(set: &RuleSet) -> bool {
+    set.is_on("openai-api-key")
+        || BUILTINS.iter().any(|b| {
+            matches!(b.matcher, Matcher::Prefix { .. } | Matcher::Prefixes { .. })
+                && set.is_on(b.id)
+        })
 }
 
 /// 把文本切成 token，回调每个 token 的区间。
@@ -731,7 +1135,7 @@ fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static 
 /// 的字节在这里只是分隔。反斜杠后面跟着的是一个多字节字符时，跳过的只是它的头一个字节，
 /// 剩下的几个照样只是分隔 —— 切出来的和按字符切的一样（测试拿两种切法对过）。token 的两头
 /// 都落在 ASCII 字节上，切片一定在字符边界上。
-fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
+pub(super) fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
     let b = text.as_bytes();
     let mut start: Option<usize> = None;
     let mut quoted = false;
@@ -838,6 +1242,35 @@ fn private_keys(text: &str, json: bool, out: &mut Vec<Hit>) {
 
 // ---------------------------------------------------------------- JWT
 
+/// JWT 的锚点：12 个字符以上、base64url 的字符开头、正好两个点（三段）
+pub(super) const JWT_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: 0,
+    },
+    list: &[Anchor::First(ALNUM.or(Bytes::of(b"-_")), 12, ANY_LEN)],
+    fine: Some(jwt_shaped),
+};
+
+/// 正好两个点、三段都不空、头一段至少 8 个字符：token 里只有 base64url 的字符和点，
+/// [`looks_like_jwt`] 在解码之前看的就是这些。源码里 `self.config.name`、`a.b.c.d` 这类
+/// 带点的标识符成千上万，只数点的话个个都要再进 [`looks_like_jwt`] 切一遍
+fn jwt_shaped(t: &[u8]) -> bool {
+    let mut dots = [0usize; 2];
+    let mut n = 0;
+    for (i, &c) in t.iter().enumerate() {
+        if c == b'.' {
+            if n == 2 {
+                return false;
+            }
+            dots[n] = i;
+            n += 1;
+        }
+    }
+    n == 2 && dots[0] >= 8 && dots[1] > dots[0] + 1 && dots[1] + 1 < t.len()
+}
+
 fn is_b64url(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -848,7 +1281,7 @@ fn is_b64url(s: &str) -> bool {
 ///
 /// 那个解码是必需的：光看「三段用点分开的 base64」会把版本号、文件路径、
 /// 甚至 `a.b.c` 这种普通标识符全算上。
-fn looks_like_jwt(tok: &str) -> bool {
+pub(super) fn looks_like_jwt(tok: &str) -> bool {
     // 首段至少 8 个字符，后两段各至少一个，加两个点：短于 12 的不可能是
     if tok.len() < 12 {
         return false;
@@ -916,6 +1349,28 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
 
 // ---------------------------------------------------------------- 内网标识
 
+/// 内网 IPv4 地址的锚点：数字开头、至少 7 个字符、正好三个点
+pub(super) const IP_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: C_LETTER | C_DASH | C_UNDER,
+    },
+    list: &[Anchor::First(DIGIT, 7, ANY_LEN)],
+    fine: Some(|t| t.iter().filter(|&&c| c == b'.').count() == 3),
+};
+
+/// 内部域名的锚点：以 [`INTERNAL_SUFFIXES`] 之一的最后一个字母结尾（不分大小写），8 个字符以上
+pub(super) const DOMAIN_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DOT,
+        forbid: 0,
+    },
+    list: &[Anchor::Last(Bytes::of(b"lLnNpPaAtT"), 8)],
+    fine: None,
+};
+
 fn is_rfc1918(tok: &str) -> bool {
     // 四段读进一个定长数组，不收集：开着这条时每个 token 都要过一遍
     let mut nums = [0u16; 4];
@@ -933,6 +1388,8 @@ fn is_rfc1918(tok: &str) -> bool {
         (10, _) => true,
         (172, b) if (16..=31).contains(&b) => true,
         (192, 168) => true,
+        // 运营商级 NAT：Tailscale 等组网工具给每台机器发的就是这一段
+        (100, b) if (64..=127).contains(&b) => true,
         _ => false,
     }
 }
@@ -944,7 +1401,7 @@ fn is_rfc1918(tok: &str) -> bool {
 /// 本身藏起来了。何况我们的网关自己就住在那儿。
 ///
 /// `ip`、`domain`：那两条开没开（扫之前问一次，不在每个 token 上查一遍表）。
-fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
+pub(super) fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
     if ip && is_rfc1918(tok) {
         return Some("internal-ip");
     }
@@ -954,8 +1411,9 @@ fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
     if domain
         && t.len() > 7
         && t.contains(&b'.')
+        // 后缀前面得有一段主机名：光秃秃的 `.internal`、`.home.arpa` 是在讲这个后缀
         && INTERNAL_SUFFIXES.iter().any(|s| {
-            t.len() >= s.len() && t[t.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes())
+            t.len() > s.len() && t[t.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes())
         })
     {
         return Some("internal-domain");
@@ -965,16 +1423,20 @@ fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
 
 // ---------------------------------------------------------------- 个人号码
 
-/// 省级行政区划代码（GB/T 2260），身份证号码的头两位。
-const PROVINCES: [u8; 34] = [
+/// 省级行政区划代码（GB/T 2260），身份证号码的头两位。`83` 是台湾居民居住证（港澳的居住证
+/// 用 `81`、`82`）。
+const PROVINCES: [u8; 35] = [
     11, 12, 13, 14, 15, // 华北
     21, 22, 23, // 东北
     31, 32, 33, 34, 35, 36, 37, // 华东
     41, 42, 43, 44, 45, 46, // 中南
     50, 51, 52, 53, 54, // 西南
     61, 62, 63, 64, 65, // 西北
-    71, 81, 82, // 台湾、香港、澳门
+    71, 81, 82, 83, // 台湾、香港、澳门、台湾居民居住证
 ];
+
+/// [`PROVINCES`] 里大陆的那几个（前 31 个）：新版外国人永久居留身份证第 2–3 位的受理地
+const MAINLAND: usize = 31;
 
 /// ISO 7064 MOD 11-2：前 17 位各乘对应的权重，加起来除以 11 的余数在
 /// [`ID_CHECK`] 里查出校验码。
@@ -992,7 +1454,15 @@ fn resident_id(s: &[u8], today: u32) -> bool {
     }
     let d = |i: usize| u32::from(s[i] - b'0');
     let num = |r: Range<usize>| r.fold(0, |v, i| v * 10 + d(i));
-    if !PROVINCES.contains(&(num(0..2) as u8)) {
+    // 新版外国人永久居留身份证（2023 起）：首位 `9`，第 2–3 位是受理地的省级代码，第 4–6 位是
+    // 持证人国籍的 ISO 3166-1 数字代码。其余结构和校验与身份证相同
+    let region = if s[0] == b'9' {
+        PROVINCES[..MAINLAND].contains(&(num(1..3) as u8))
+            && super::personal::nationality(num(3..6))
+    } else {
+        PROVINCES.contains(&(num(0..2) as u8))
+    };
+    if !region {
         return false;
     }
     let (year, month, day) = (num(6..10), num(10..12), num(12..14));
@@ -1011,7 +1481,7 @@ fn resident_id(s: &[u8], today: u32) -> bool {
 
 /// 某年某月有几天。闰年是能被 4 整除而不能被 100 整除的，或者能被 400 整除的
 /// —— 1900 年没有 2 月 29 日，2000 年有。
-fn days_in(year: u32, month: u32) -> u32 {
+pub(super) fn days_in(year: u32, month: u32) -> u32 {
     match month {
         2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
         2 => 28,
@@ -1021,7 +1491,7 @@ fn days_in(year: u32, month: u32) -> u32 {
 }
 
 /// 今天，写成 `YYYYMMDD`。**按北京时间**：身份证上的出生日期是按它记的。
-fn today_ymd() -> u32 {
+pub(super) fn today_ymd() -> u32 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1147,7 +1617,7 @@ fn card_network(d: &[u8]) -> Option<&'static CardNetwork> {
 }
 
 /// Luhn 校验：从右数第二位起每隔一位乘 2（超过 9 的减 9），总和是 10 的倍数。
-fn luhn(d: &[u8]) -> bool {
+pub(super) fn luhn(d: &[u8]) -> bool {
     let sum: u32 = d
         .iter()
         .rev()
@@ -1211,7 +1681,7 @@ fn card_number(s: &str, sep: Option<u8>) -> bool {
 /// 号码。看的是接起来最长的那一整串 —— 从里面截一段去对的话，一张四位数的
 /// 表里每隔几行就「有」一张卡。
 #[derive(Default)]
-struct Spaced {
+pub(super) struct Spaced {
     /// 第一组的起点。`None`：眼下没有在接的
     start: Option<usize>,
     /// 最后一组的起点
@@ -1225,7 +1695,14 @@ struct Spaced {
 
 impl Spaced {
     /// 下一个 token。`body` 是它去掉句末句号的那一段，从 `at` 开始。
-    fn feed(&mut self, text: &str, at: usize, body: &str, dotted: bool, out: &mut Vec<Hit>) {
+    pub(super) fn feed(
+        &mut self,
+        text: &str,
+        at: usize,
+        body: &str,
+        dotted: bool,
+        out: &mut Vec<Hit>,
+    ) {
         // 一组最多六位：4-6-5 中间那组
         let group = (1..=6).contains(&body.len()) && body.bytes().all(|b| b.is_ascii_digit());
         if group
@@ -1257,7 +1734,7 @@ impl Spaced {
     /// 不是的话，末尾那组不足四位时去掉它再看一次：卡号后面紧跟着的月份、安全码
     /// （`6222 0212 3456 7894 12/28`）不是号码的一部分。整串先看 —— 19 位的卡号
     /// 最后一组本来就只有三位。
-    fn finish(&mut self, text: &str, out: &mut Vec<Hit>) {
+    pub(super) fn finish(&mut self, text: &str, out: &mut Vec<Hit>) {
         let Some(start) = self.start.take() else {
             return;
         };
@@ -1275,9 +1752,28 @@ impl Spaced {
     }
 }
 
+/// 身份证号、卡号的锚点：数字开头（连写的号码；分组写的卡号的每一组）
+pub(super) const CARD_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: super::anchor::ANY_CHARS,
+    list: &[Anchor::First(DIGIT, 1, ANY_LEN)],
+    fine: None,
+};
+
+/// 一个 token 里的手机号的锚点：11 个字符以上、其中至少 11 位数字
+pub(super) const PHONE_ANCHORS: Anchors = Anchors {
+    near: None,
+    chars: Chars {
+        need: C_DIGIT,
+        forbid: 0,
+    },
+    list: &[Anchor::First(super::anchor::TOKEN, 11, ANY_LEN)],
+    fine: Some(|t| t.iter().filter(|c| c.is_ascii_digit()).count() >= 11),
+};
+
 /// 一个 token 是不是身份证号，或者连着写、用连字符分组写的卡号。`body` 是
 /// 去掉了句末句号的那一段，从 `at` 开始。
-fn personal_token(
+pub(super) fn personal_token(
     body: &str,
     at: usize,
     want_id: bool,
@@ -1306,7 +1802,7 @@ fn personal_token(
 ///
 /// **前后不紧挨别的数字**：看的是一整串连着的数字，从更长的数字串里截一段去对的话，
 /// 订单号、时间戳里每隔几位就「有」一个手机号。字母挨着没关系（`tel13800138000`）。
-fn mobile_phones(tok: &str, at: usize, out: &mut Vec<Hit>) {
+pub(super) fn mobile_phones(tok: &str, at: usize, out: &mut Vec<Hit>) {
     let b = tok.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -1449,54 +1945,233 @@ pub(crate) fn json_like(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(&spaced).is_ok()
 }
 
-/// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
+/// 一段 JSON 原文里每个字符串引号里面的那一段，按先后。
+///
+/// 按 SIMD 跳着找：字符串外面只找引号，里面找引号和反斜杠（反斜杠连同它转义的那个字符跳过）。
+/// 一段请求体里字符串之间、字符串里面的大段文字一个字节都不用逐个看
 pub(crate) fn json_string_spans(text: &str) -> Vec<Range<usize>> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
+    while let Some(q) = memchr::memchr(b'"', &b[i.min(b.len())..]) {
+        let start = i + q + 1;
         let mut j = start;
-        while j < b.len() && b[j] != b'"' {
-            j += if b[j] == b'\\' { 2 } else { 1 };
+        loop {
+            match memchr::memchr2(b'"', b'\\', &b[j.min(b.len())..]) {
+                Some(k) if b[j + k] == b'\\' => j += k + 2,
+                Some(k) => {
+                    j += k;
+                    break;
+                }
+                None => {
+                    j = b.len();
+                    break;
+                }
+            }
         }
         let end = j.min(b.len());
         out.push(start..end);
         i = end + 1;
+        if i > b.len() {
+            break;
+        }
     }
     out
 }
 
-fn custom_hits(text: &str, set: &RuleSet, json: bool, out: &mut Vec<Hit>) {
+/// 自定义规则的预筛。**每条自定义规则在每个正文字符串上各跑一遍**的话，条数一多就和内置规则
+/// 一样线性变慢。所以：
+///
+/// - 按原样找的（「包含」）编进**一个** Aho-Corasick 自动机，整段文本过一遍，所有规则一起找。
+///   不分大小写的照不分大小写编 —— 只收纯 ASCII、且不含 `k`、`s` 的：正则的不分大小写按
+///   Unicode 折叠，`k` 还认开尔文符号 `K`、`s` 还认长 s `ſ`，自动机的 ASCII 不分大小写认不出
+///   它们（测试钉着只有这两个字母这样）。收不进的和正则一起走下面那条路；
+/// - 正则合成一个 [`regex::RegexSet`]，每个正文字符串先过一遍集合，得知哪几条在这一段里有
+///   命中，只对这几条求位置。正则引擎对固定文字本来就有预筛，没有固定文字的（`\d{6}`）耗时
+///   和逐条跑一样。合不成集合（太大、写法放进分组里不成立）就逐条跑。
+///
+/// 写法、匹配语义（逐个正文字符串、`^` `$`、大小写）不变：命中的还是同一条正则在同一段上
+/// `find_iter` 的结果，按规则的顺序记下来
+#[derive(Debug)]
+struct CustomIndex {
+    /// 自动机，和它的第几个字面量是第几条规则、分不分大小写
+    contains: Option<(aho_corasick::AhoCorasick, Vec<(usize, bool)>)>,
+    /// 正则集合，和它的第几个是第几条规则
+    set: Option<(regex::RegexSet, Vec<usize>)>,
+    /// 逐条跑的
+    each: Vec<usize>,
+}
+
+/// 按原样找、能并进自动机的那几条
+fn lit_rules_of(custom: &[Custom]) -> impl Iterator<Item = usize> + '_ {
+    custom.iter().enumerate().filter_map(|(i, c)| {
+        let p = &c.pattern;
+        (!p.regex && (p.case_sensitive || ascii_fold_safe(&p.text))).then_some(i)
+    })
+}
+
+/// 一条正则放进 [`regex::RegexSet`] 不吃亏：没有 Unicode 的词边界（`\b`）。集合要一次答出
+/// 每一条有没有命中，只能整段跑一遍；带 Unicode 词边界的正则遇到非 ASCII 的正文时快的那种
+/// 引擎跑不了、退到慢的那种，整个集合跟着慢上百倍。单独跑的时候它有固定文字可以预筛（`\bEMP`），
+/// 慢的引擎只在候选附近跑，所以这种留着逐条跑
+fn set_friendly(p: &Pattern) -> bool {
+    let src = if p.regex {
+        p.text.clone()
+    } else {
+        regex::escape(&p.text)
+    };
+    regex_syntax::ParserBuilder::new()
+        .case_insensitive(!p.case_sensitive)
+        .build()
+        .parse(&src)
+        .is_ok_and(|h| !h.properties().look_set().contains_word_unicode())
+}
+
+/// 一段按原样找、不分大小写的文字，按 ASCII 不分大小写找和按正则找结果一样
+fn ascii_fold_safe(text: &str) -> bool {
+    text.is_ascii() && !text.bytes().any(|c| matches!(c, b'k' | b'K' | b's' | b'S'))
+}
+
+impl CustomIndex {
+    fn new(custom: &[Custom]) -> Self {
+        let mut lits: Vec<&str> = Vec::new();
+        let mut lit_rules = Vec::new();
+        let mut rest = Vec::new();
+        let mut each = Vec::new();
+        for (i, c) in custom.iter().enumerate() {
+            let p = &c.pattern;
+            if !p.regex && (p.case_sensitive || ascii_fold_safe(&p.text)) {
+                lits.push(&p.text);
+                lit_rules.push((i, p.case_sensitive));
+            } else if set_friendly(p) {
+                rest.push(i);
+            } else {
+                each.push(i);
+            }
+        }
+        let contains = if lits.is_empty() {
+            None
+        } else {
+            aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(lit_rules.iter().any(|&(_, cs)| !cs))
+                .build(&lits)
+                .ok()
+                .map(|ac| (ac, lit_rules))
+        };
+        // 自动机编不成（不该发生）就把它的那几条也逐条跑
+        if contains.is_none() {
+            each.extend(lit_rules_of(custom));
+        }
+        let set = (rest.len() > 1)
+            .then(|| {
+                let sources = rest.iter().map(|&i| {
+                    let p = &custom[i].pattern;
+                    let src = if p.regex {
+                        p.text.clone()
+                    } else {
+                        regex::escape(&p.text)
+                    };
+                    if p.case_sensitive {
+                        src
+                    } else {
+                        format!("(?i:{src})")
+                    }
+                });
+                // 每一条单独编都在上限以内（[`compile`]）；合起来的上限按条数放宽
+                let limit = (1usize << 20) * rest.len();
+                regex::RegexSetBuilder::new(sources)
+                    .size_limit(limit)
+                    .dfa_size_limit(limit)
+                    .build()
+                    .ok()
+            })
+            .flatten();
+        match set {
+            Some(set) => CustomIndex {
+                contains,
+                set: Some((set, rest)),
+                each,
+            },
+            None => {
+                each.extend(rest);
+                each.sort_unstable();
+                CustomIndex {
+                    contains,
+                    set: None,
+                    each,
+                }
+            }
+        }
+    }
+}
+
+fn custom_hits(
+    text: &str,
+    set: &RuleSet,
+    json: bool,
+    spans: Option<Vec<Range<usize>>>,
+    out: &mut Vec<Hit>,
+) {
     if set.custom.is_empty() {
         return;
     }
+    let index = set
+        .index
+        .get_or_init(|| Arc::new(CustomIndex::new(&set.custom)));
     // 是 JSON 的话（请求体、编成 JSON 字符串的一段正文）**一个字符串一个字符串地找**：
     // 用户的正则（`\S+`）在整段原文上会从 `{`、`:` 这些结构上的字开始，一路吃过引号 ——
     // 换掉结构上的字，请求体就不是 JSON 了；而它吃掉的那一段里真正该换的字也就没换
-    let spans = if json {
-        json_string_spans(text)
-    } else {
-        std::iter::once(0..text.len()).collect()
+    let spans = match spans {
+        Some(s) if json => s,
+        _ if json => json_string_spans(text),
+        _ => std::iter::once(0..text.len()).collect(),
     };
-    for c in &set.custom {
-        for span in &spans {
-            let Some(piece) = text.get(span.clone()) else {
+    let mut found: Vec<Vec<Range<usize>>> = vec![Vec::new(); set.custom.len()];
+    if let Some((ac, rules)) = &index.contains {
+        let b = text.as_bytes();
+        // 每条规则上一处命中的终点：和正则一样，一处命中之后从它的终点往后接着找
+        let mut next = vec![0usize; set.custom.len()];
+        for m in ac.find_overlapping_iter(text) {
+            let (r, cs) = rules[m.pattern().as_usize()];
+            if (cs && &b[m.range()] != set.custom[r].pattern.text.as_bytes()) || m.start() < next[r]
+            {
                 continue;
-            };
-            for m in c.re.find_iter(piece) {
-                let m = span.start + m.start()..span.start + m.end();
-                if let Some(bytes) = json_safe(text, m) {
-                    out.push(Hit {
-                        bytes,
-                        rule: Rule::Custom(c.name.clone()),
-                        label: c.label.clone(),
-                    });
-                }
+            }
+            // 整个落在一个正文字符串里
+            let k = spans.partition_point(|s| s.end < m.end());
+            if spans.get(k).is_none_or(|s| s.start > m.start()) {
+                continue;
+            }
+            next[r] = m.end();
+            found[r].push(m.range());
+        }
+    }
+    let each = |r: usize, span: &Range<usize>, piece: &str, found: &mut Vec<Vec<Range<usize>>>| {
+        for m in set.custom[r].re.find_iter(piece) {
+            found[r].push(span.start + m.start()..span.start + m.end());
+        }
+    };
+    for span in &spans {
+        let Some(piece) = text.get(span.clone()) else {
+            continue;
+        };
+        if let Some((rs, rules)) = &index.set {
+            for k in rs.matches(piece).iter() {
+                each(rules[k], span, piece, &mut found);
+            }
+        }
+        for &r in &index.each {
+            each(r, span, piece, &mut found);
+        }
+    }
+    for (c, ms) in set.custom.iter().zip(found) {
+        for m in ms {
+            if let Some(bytes) = json_safe(text, m) {
+                out.push(Hit {
+                    bytes,
+                    rule: Rule::Custom(c.name.clone()),
+                    label: c.label.clone(),
+                });
             }
         }
     }
@@ -1520,9 +2195,17 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_empty() {
         return out;
     }
-    // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
+    // **个人号码只在 JSON 的字符串里找**（见 `engine`），私钥块不跨出它所在的那个字符串。不是
     // JSON 的文本（直接拿来扫的一段话）不分里外
     let json = json_like(text);
+    // 保存的凭据最先找：同一处另一条规则也认得出时（一把保存的 `sk-ant-…`、连接串里的代理
+    // 口令），报成哪一项保存的凭据说得最清楚（重叠的合成一处时，最先记下的说了算）
+    if let Some(saved) = &set.saved
+        && set.is_on("thinkwatch-saved-secret")
+    {
+        saved.find(text, &mut out);
+    }
+    // 不看 token 边界的几条：锚点（`-----BEGIN `、`://`、`@`）用 SIMD 找，找到再往两边看
     if set.is_on("private-key") {
         private_keys(text, json, &mut out);
     }
@@ -1532,51 +2215,13 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_on("email") {
         emails(text, &mut out);
     }
-    // 每个 token 都要问的几条开没开，扫之前问一次：在每个 token 上查一遍表，光哈希就占了
-    // 整遍扫描的两成
-    let want_openai = set.is_on("openai-api-key");
-    let want_ip = set.is_on("internal-ip");
-    let want_domain = set.is_on("internal-domain");
-    let want_jwt = set.is_on("jwt");
-    let want_id = set.is_on("cn-resident-id");
-    let want_card = set.is_on("bank-card");
-    let want_phone = set.is_on("cn-mobile-phone");
-    // 一次扫描问一次时钟。只开卡号那条时也要问：认出是身份证号的不当卡号换
-    let today = if want_id || want_card { today_ymd() } else { 0 };
-    // **个人号码只在 JSON 的字符串里找。**字符串外面的数字是 JSON 的数值：工具
-    // 调用的参数（`"input":{"order_id":6222…}`）、`seed`。凭据规则在那儿天然认
-    // 不出东西，号码规则却认得出 —— 而把一个数值换成占位符，整个请求体就不是
-    // JSON 了
-    let mut spaced = Spaced::default();
-    for_each_token(text, |tok, span, quoted| {
-        if want_phone && (quoted || !json) {
-            mobile_phones(tok, span.start, &mut out);
-        }
-        if (want_id || want_card) && (quoted || !json) {
-            // 句末的句号不是号码的一部分：`…卡号是 6222 0212 3456 7894.`
-            let body = tok.trim_end_matches('.');
-            if want_card {
-                spaced.feed(text, span.start, body, body.len() < tok.len(), &mut out);
-            }
-            personal_token(body, span.start, want_id, want_card, today, &mut out);
-        } else if want_card {
-            // 字符串外面的东西把在接的那一串截断
-            spaced.finish(text, &mut out);
-        }
-        if let Some(id) = classify_token(tok, set, want_openai) {
-            out.push(builtin_hit(id, span));
-            return;
-        }
-        if want_jwt && looks_like_jwt(tok) {
-            out.push(builtin_hit("jwt", span));
-            return;
-        }
-        if let Some(id) = internal_token(tok, want_ip, want_domain) {
-            out.push(builtin_hit(id, span));
-        }
-    });
-    spaced.finish(text, &mut out);
-    custom_hits(text, set, json, &mut out);
+    // 按 token 认的：先预筛、再校验。切 token 时顺手记下了 JSON 字符串的区间的话，自定义规则
+    // 接着用
+    let spans = super::engine::scan_tokens(text, set, json, &mut out);
+    custom_hits(text, set, json, spans, &mut out);
+    // **例外值在合并重叠之前去掉**：先合并的话，一个例外值和旁边另一处命中合成一处之后，
+    // 那一处就跟着例外一起不换了
+    set.drop_excepted(text, &mut out);
     out
 }
 
@@ -1708,10 +2353,22 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
         on: set.on.clone(),
         custom: Vec::new(),
         record: set.record.clone(),
+        saved: set.saved.clone(),
+        exceptions: set.exceptions.clone(),
+        index: OnceLock::new(),
     };
     let mut out = scan_plain(text, &builtins);
     for c in &set.custom {
-        for m in c.re.find_iter(text).filter(|m| !m.is_empty()) {
+        for m in
+            c.re.find_iter(text)
+                .filter(|m| !m.is_empty())
+                // 解码过的正文：值原样算哈希，不再解一次转义
+                .filter(|m| {
+                    !set.exceptions
+                        .as_ref()
+                        .is_some_and(|ex| ex.excepts(m.as_str()))
+                })
+        {
             out.push(Hit {
                 bytes: m.range(),
                 rule: Rule::Custom(c.name.clone()),
@@ -1731,14 +2388,39 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
 /// 身份证号、卡号、手机号只留最后四位：「留头 5」留下的正好是身份证号的地区码、
 /// 卡号的发卡行，而认出是哪一个号码，看最后四位就够了。邮箱留第一个字和域名。
 pub fn masked(rule: &Rule, value: &str) -> String {
+    // 住址留到区县、姓名留第一个字、坐标留两位小数……（见 `personal::masked`）
+    if let Rule::Builtin(id) = rule
+        && let Some(m) = super::personal::masked(id, value)
+    {
+        return m;
+    }
     if matches!(rule, Rule::Builtin(id) if builtin(id).is_some_and(|b| b.matcher == Matcher::Email))
     {
         return mask_email(value);
     }
     match rule.kind() {
         Kind::Internal => value.to_string(),
-        Kind::Personal => last_four(value),
+        k if k.is_personal() => last_four(value),
+        // 保存的凭据一个字都不留：报的是它是哪一项（[`Finding::source`]）
+        Kind::Saved => String::new(),
+        // 按位置认的多半是口令，没有前缀：留头五个就是留了大半个口令。只留最后四位，短的全打掉
+        Kind::InContext => masked_unknown(value),
+        // 助记词的头几个字母就是头一个词
+        Kind::Crypto if rule.id() == "crypto-mnemonic" => "…".to_string(),
         _ => mask(value),
+    }
+}
+
+/// 不知道是什么的一个值打码后的样子：不足 16 个字符的全打掉，长的只留最后四位（`…7f9c`）。
+/// 按位置认的口令、手动加入例外时哪条规则都认不出的值用它 —— 说不清它是什么，就按最该
+/// 小心的那一种（口令）打
+pub fn masked_unknown(value: &str) -> String {
+    let n = value.chars().count();
+    if n >= 16 {
+        let tail: String = value.chars().skip(n - 4).collect();
+        format!("…{tail}")
+    } else {
+        "…".to_string()
     }
 }
 
@@ -1790,6 +2472,36 @@ pub struct Finding {
     pub masked: String,
     /// 这个值在这段文本里出现了几次
     pub count: u64,
+    /// 是哪一项保存的凭据（规则 `thinkwatch-saved-secret`）；别的规则是 `None`
+    pub source: Option<SavedSource>,
+    /// 值（解开转义之后的样子）的 SHA-256，小写十六进制：「列为例外」照它加（见
+    /// [`super::exceptions`]）。**只在把它列为例外真的管用时才有**：
+    ///
+    /// - 保存的凭据不能列为例外，是 `None`；
+    /// - 这个值的每一处都得是**某条规则原原本本认出来的那一段**。两条规则认到互相重叠的两段时
+    ///   合成了一处（[`resolve`]），只记录的规则让开要换的那几处、截成了几截，这些段没有哪条
+    ///   规则认过：例外表里写上它的哈希，什么都挡不住。这时也是 `None`；
+    /// - 不知道哪些段是原样认出来的（[`findings`]、[`findings_in`] 拿到的只是合并之后的命中）
+    ///   也是 `None`：宁可不给，也不给一个挡不住的。知道的是 [`crate::redact::flow`] 那几个
+    ///   报记录的入口。
+    pub sha256: Option<String>,
+}
+
+/// 合并重叠之前、每条规则原原本本认出来的那些段（见 [`Finding::sha256`]）。
+#[derive(Debug, Clone, Default)]
+pub struct Exact(HashSet<(usize, usize)>);
+
+impl Exact {
+    /// `hits` 是合并之前的命中（[`scan_unresolved`] 之后、[`resolve`] 之前）
+    pub(crate) fn of(hits: &[Hit]) -> Self {
+        Self(hits.iter().map(|h| (h.bytes.start, h.bytes.end)).collect())
+    }
+    pub(crate) fn extend(&mut self, other: Exact) {
+        self.0.extend(other.0);
+    }
+    fn has(&self, r: &Range<usize>) -> bool {
+        self.0.contains(&(r.start, r.end))
+    }
 }
 
 /// 把命中合并成「哪条规则 × 哪个值 × 几次」。**同一个值只报一次**：
@@ -1802,26 +2514,75 @@ pub struct Finding {
 /// **合并按「规则 × 值」查表**，不在已经合过的里面一条条找：一个请求里贴进来几万个不同
 /// 的值时（一份导出的凭据清单），后者是平方级的，几十万个值要几分钟。
 pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
-    let mut out: Vec<(&Rule, &str, u64)> = Vec::new();
+    findings_with(text, hits, None, None)
+}
+
+/// 同 [`findings`]，保存的凭据的命中带上是哪一项（[`Finding::source`]）。**按「规则 × 值」合并**，
+/// 所以两项不同的保存的凭据是两条，即使它们打码之后一样（都是空串）
+pub fn findings_in(text: &str, hits: &[Hit], set: &RuleSet) -> Vec<Finding> {
+    findings_with(text, hits, Some(set), None)
+}
+
+/// 同 [`findings_in`]，`exact` 是合并之前每条规则原样认出来的段：每一处都在里面的值带上哈希
+/// （[`Finding::sha256`]）
+pub(crate) fn findings_exact(
+    text: &str,
+    hits: &[Hit],
+    set: &RuleSet,
+    exact: &Exact,
+) -> Vec<Finding> {
+    findings_with(text, hits, Some(set), Some(exact))
+}
+
+fn findings_with(
+    text: &str,
+    hits: &[Hit],
+    set: Option<&RuleSet>,
+    exact: Option<&Exact>,
+) -> Vec<Finding> {
+    // 规则、值、几处、每一处都是原样认出来的
+    let mut out: Vec<(&Rule, &str, u64, bool)> = Vec::new();
     let mut seen: HashMap<(&Rule, &str), usize> = HashMap::new();
     for h in hits {
         let value = &text[h.bytes.clone()];
+        let whole = exact.is_some_and(|e| e.has(&h.bytes));
         match seen.entry((&h.rule, value)) {
-            Entry::Occupied(at) => out[*at.get()].2 += 1,
+            Entry::Occupied(at) => {
+                let o = &mut out[*at.get()];
+                o.2 += 1;
+                o.3 &= whole;
+            }
             Entry::Vacant(slot) => {
                 slot.insert(out.len());
-                out.push((&h.rule, value, 1));
+                out.push((&h.rule, value, 1, whole));
             }
         }
     }
     out.into_iter()
-        .map(|(rule, value, count)| Finding {
+        .map(|(rule, value, count, whole)| Finding {
             masked: masked(rule, value),
+            source: match (rule, set) {
+                (Rule::Builtin("thinkwatch-saved-secret"), Some(set)) => {
+                    set.saved_source(value).cloned()
+                }
+                _ => None,
+            },
+            // 和比对例外表时一样，先解开转义再算（`text` 是 JSON 原文）
+            sha256: (whole && super::exceptions::exceptable(rule)).then(|| {
+                if value.contains('\\') {
+                    super::exceptions::sha256_hex(&crate::locate::unescape(value))
+                } else {
+                    super::exceptions::sha256_hex(value)
+                }
+            }),
             rule: rule.clone(),
             count,
         })
         .collect()
 }
+
+#[cfg(test)]
+mod oracle;
 
 #[cfg(test)]
 mod tests {
@@ -2065,7 +2826,9 @@ mod tests {
         let got = found("内网 10.1.2.3 和 192.168.0.5，还有 172.20.1.1");
         assert_eq!(got.len(), 3, "{got:?}");
         assert!(got.iter().all(|(k, _)| k == "internal-ip"));
-        assert!(found("127.0.0.1 和 8.8.8.8 和 172.32.0.1").is_empty());
+        // 172.32.0.1 是公网地址：所有规则都开着时归「公网 IP」那条
+        let internal = RuleSet::only(&["internal-ip"]);
+        assert!(scan("127.0.0.1 和 8.8.8.8 和 172.32.0.1", &internal).is_empty());
     }
 
     #[test]
@@ -2235,7 +2998,9 @@ mod tests {
             }
             out.into_iter()
                 .map(|(rule, value, count)| Finding {
+                    source: None,
                     masked: masked(&rule, value),
+                    sha256: None,
                     rule,
                     count,
                 })
@@ -2326,6 +3091,92 @@ mod tests {
                                 }
                             }
                         }
+                    }
+                }
+                Matcher::Prefixes { list } => {
+                    for p in list {
+                        let key = format!("{}{}", p.prefix, &"a1".repeat(p.min_tail)[..p.min_tail]);
+                        let hits = scan(&key, &only);
+                        assert_eq!(hits.len(), 1, "{} 认不出它自己说的形状：{key}", b.id);
+                        let short = &key[..key.len() - 1];
+                        assert!(scan(short, &only).is_empty(), "{} 认了更短的 {short}", b.id);
+                    }
+                }
+                Matcher::Saved => {
+                    let value = "a1b2c3d4e5f6g7h8";
+                    let set = only.clone().with_saved(vec![SavedSecret {
+                        value: value.to_string(),
+                        source: SavedSource {
+                            kind: SavedSourceKind::UpstreamKey,
+                            name: "x".into(),
+                        },
+                        hosts: Vec::new(),
+                    }]);
+                    assert_eq!(scan(value, &set).len(), 1);
+                    assert!(scan(&value[1..], &set).is_empty());
+                }
+                Matcher::Assignment { suffixes } => {
+                    for s in suffixes {
+                        let t = format!("MY_{s}=Abc123def456");
+                        let hits = scan(&t, &only);
+                        assert_eq!(hits.len(), 1, "{t}");
+                        assert_eq!(&t[hits[0].bytes.clone()], "Abc123def456");
+                    }
+                }
+                // 代码实现的凭据规则：说明由界面按 id 给，判据由样本钉着（个人信息那一路有自己的）
+                Matcher::Code if !b.kind.is_personal() => {
+                    let s = super::super::secrets::tests::samples::sample(b.id)
+                        .unwrap_or_else(|| panic!("{} 没有样本", b.id));
+                    let (text, value) = &s.hits[0];
+                    let hits = scan_plain(text, &only);
+                    assert_eq!(hits.len(), 1, "{} 认不出它的样本 {text}", b.id);
+                    assert_eq!(&text[hits[0].bytes.clone()], value);
+                }
+                Matcher::Labeled { names } => {
+                    // 每个字段名都认（裸的 `name`、`address` 要有旁证），值是占位写法的不认
+                    for n in names {
+                        let value = match b.id {
+                            "labeled-name" => "张三",
+                            "labeled-address" => "北京市朝阳区建国路88号",
+                            "labeled-birth-date" => "1990-01-01",
+                            "labeled-account" => "6217000012345678",
+                            _ => "高血压",
+                        };
+                        let text = format!(r#"{{"{n}": "{value}", "email": "z@example.com"}}"#);
+                        let got: Vec<String> = scan_plain(&text, &only)
+                            .into_iter()
+                            .map(|h| text[h.bytes].to_string())
+                            .collect();
+                        assert_eq!(got, [value], "{} 不认字段名 {n}", b.id);
+                        let text = format!(r#"{{"{n}": "${{VALUE}}", "email": "z@example.com"}}"#);
+                        assert!(scan_plain(&text, &only).is_empty(), "{} 认了占位写法", b.id);
+                    }
+                }
+                Matcher::Code if b.kind.is_personal() => {
+                    let text = super::super::personal::tests::sample(b.id)
+                        .unwrap_or_else(|| panic!("{} 没有样本", b.id));
+                    let hits = scan_plain(&text, &only);
+                    assert!(!hits.is_empty(), "{} 认不出自己的样本：{text}", b.id);
+                    assert!(hits.iter().all(|h| h.rule.id() == b.id));
+                }
+                Matcher::DomainSuffix { suffixes } => {
+                    for s in suffixes {
+                        let host = format!("server01{s}");
+                        assert_eq!(scan(&host, &only).len(), 1, "{host}");
+                    }
+                }
+                Matcher::PrivateIp => {
+                    for ip in [
+                        "10.1.2.3",
+                        "172.16.0.1",
+                        "192.168.1.1",
+                        "100.64.0.1",
+                        "fd00::1",
+                    ] {
+                        assert_eq!(scan_plain(ip, &only).len(), 1, "{ip}");
+                    }
+                    for ip in ["127.0.0.1", "100.128.0.1", "fe80::1"] {
+                        assert!(scan_plain(ip, &only).is_empty(), "{ip}");
                     }
                 }
                 _ => {}
@@ -2460,7 +3311,7 @@ mod tests {
         }
         // 地区码不在 GB/T 2260 的省级名单里 —— 其余几样都对
         for code in [
-            10, 16, 20, 30, 38, 40, 47, 55, 60, 66, 70, 72, 80, 83, 90, 91, 99,
+            10, 16, 20, 30, 38, 40, 47, 55, 60, 66, 70, 72, 80, 84, 90, 91, 99,
         ] {
             let id = id_done(&format!("{code}010519900307123"));
             assert!(personal_found(&id).is_empty(), "地区码 {code}：{id}");
@@ -2884,7 +3735,7 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].masked, "…7894");
         assert_eq!(f[0].count, 2);
-        assert_eq!(f[0].rule.kind(), Kind::Personal);
+        assert!(f[0].rule.kind().is_personal());
     }
 
     #[test]
@@ -2950,7 +3801,7 @@ mod tests {
         assert!(scan(t, &RuleSet::defaults()).is_empty());
         for id in ["email", "cn-mobile-phone"] {
             let b = builtin(id).unwrap();
-            assert!(!b.on_by_default && b.kind == Kind::Personal, "{id}");
+            assert!(!b.on_by_default && b.kind.is_personal(), "{id}");
         }
         assert_eq!(builtin("email").unwrap().label, Some("TW_EMAIL"));
         assert_eq!(builtin("cn-mobile-phone").unwrap().label, Some("TW_PHONE"));
@@ -3203,9 +4054,10 @@ mod tests {
         const TAIL: &[u8] = b"abcXYZ0189-_.";
         let mut heads: Vec<&str> = BUILTINS
             .iter()
-            .filter_map(|b| match b.matcher {
-                Matcher::Prefix { prefix, .. } => Some(prefix),
-                _ => None,
+            .flat_map(|b| match b.matcher {
+                Matcher::Prefix { prefix, .. } => vec![prefix],
+                Matcher::Prefixes { list } => list.iter().map(|p| p.prefix).collect(),
+                _ => Vec::new(),
             })
             .collect();
         heads.extend(["sk-", "s", "x", "", "Sk-", "ak"]);
@@ -3232,6 +4084,18 @@ mod tests {
                         "{tok}"
                     );
                 }
+            }
+        }
+        // 按头字节分好的前缀表和逐条比前缀的结论一样
+        for b in BUILTINS {
+            let list: Vec<(&str, usize)> = match b.matcher {
+                Matcher::Prefix { prefix, min_tail } => vec![(prefix, min_tail)],
+                Matcher::Prefixes { list } => list.iter().map(|p| (p.prefix, p.min_tail)).collect(),
+                _ => continue,
+            };
+            for (prefix, min_tail) in list {
+                let tok = format!("{prefix}{}", &"a1".repeat(min_tail)[..min_tail]);
+                assert_eq!(classify_prefixed(&tok, &all(), false), Some(b.id), "{tok}");
             }
         }
         // 最短的那种刚好够长时认得出

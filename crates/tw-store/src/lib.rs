@@ -18,22 +18,25 @@ pub mod recorder;
 pub mod search;
 pub mod task;
 pub mod transcript;
+mod usage;
 
 pub use blobs::{Blobs, Which};
 pub use db::{
-    Db, DbError, KeyUsage, Latency, PluginRunRow, RequestRow, SecurityEvent, Summary, TokenRate,
-    UpstreamUsage,
+    Db, DbError, ExceptionSource, KeyUsage, Latency, PluginRunRow, RequestRow, SecurityEvent,
+    Summary, TokenRate, UpstreamUsage,
 };
 pub use recorder::{Recorder, SettleHook, Settled, price_source};
 pub use task::StoredBody;
 
 use std::path::Path;
 
-/// 打开数据目录里的请求库（`data.db`）和正文目录（`blobs/`）。
+/// 打开数据目录里的请求库（`data.db`）和正文目录（`blobs/`）。用量历史（`usage.db`，见
+/// [`usage`]）由请求库接上。
 ///
 /// **库是旧版本建的，就连同正文整个重建，不迁移。**项目还没有存量用户，
 /// 为旧库写迁移只是负担。正文必须一起清：新库的请求号从 1 重新数，留着的
-/// 旧正文会被当成新请求的正文显示出来。
+/// 旧正文会被当成新请求的正文显示出来。**用量历史不清**：它另有自己的版本号，
+/// 留下它就是为了跨过这种重建。
 ///
 /// **比自己新的库原样留着，返回错误**：这一次不记录历史，转发照常。那是更新的
 /// twcore 写的 —— 装回了旧版、或者同一台机器上另一份更新过的桌面端用过这个目录。
@@ -174,6 +177,7 @@ mod tests {
                 session: None,
                 sent_model: None,
                 detail: Default::default(),
+                source: None,
             })
             .unwrap();
             db.insert_plugin_run(&PluginRunRow {

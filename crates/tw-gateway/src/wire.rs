@@ -96,11 +96,24 @@ pub fn from_dialect(d: tw_api::Dialect) -> tw_dialect::ir::Dialect {
 pub fn secret_kind(k: tw_guard::redact::rules::Kind) -> tw_api::SecretKind {
     use tw_guard::redact::rules::Kind;
     match k {
-        Kind::ApiKeys => tw_api::SecretKind::ApiKeys,
+        Kind::Saved => tw_api::SecretKind::Saved,
+        Kind::AiServices => tw_api::SecretKind::AiServices,
+        Kind::DevPlatforms => tw_api::SecretKind::DevPlatforms,
+        Kind::Cloud => tw_api::SecretKind::Cloud,
+        Kind::Business => tw_api::SecretKind::Business,
         Kind::PrivateKeys => tw_api::SecretKind::PrivateKeys,
         Kind::Jwt => tw_api::SecretKind::Jwt,
         Kind::ConnStrings => tw_api::SecretKind::ConnStrings,
-        Kind::Personal => tw_api::SecretKind::Personal,
+        Kind::InContext => tw_api::SecretKind::InContext,
+        Kind::Crypto => tw_api::SecretKind::Crypto,
+        Kind::IdDocuments => tw_api::SecretKind::IdDocuments,
+        Kind::ForeignIds => tw_api::SecretKind::ForeignIds,
+        Kind::Financial => tw_api::SecretKind::Financial,
+        Kind::Contact => tw_api::SecretKind::Contact,
+        Kind::Location => tw_api::SecretKind::Location,
+        Kind::Vehicle => tw_api::SecretKind::Vehicle,
+        Kind::Device => tw_api::SecretKind::Device,
+        Kind::LabeledPersonal => tw_api::SecretKind::LabeledPersonal,
         Kind::Internal => tw_api::SecretKind::Internal,
         Kind::Custom => tw_api::SecretKind::Custom,
     }

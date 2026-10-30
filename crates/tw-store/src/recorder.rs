@@ -103,6 +103,41 @@ pub struct Recorder {
     /// **直接调，不走总线。**总线上丢了事件的话，这一行也就不在库里，重启之后从库里
     /// 加回来的数和此刻内存里的数对得上；走总线再绕一圈，两边丢的不是同一批。
     settled: Option<SettleHook>,
+    /// 最近几行出站脱敏的安全日志，各自命中的值的哈希（见 [`Hashes`]）
+    hashes: Hashes,
+}
+
+/// 最近 [`Hashes::CAP`] 行出站脱敏的安全日志：日志的号 → 那个值的 SHA-256（不能列为例外的是
+/// `None`）。「列为例外」和日志上的「例外」标签靠它。
+///
+/// **只在内存里，不落盘，重启就没了。**库里不存任何值的哈希：一个不加盐的 SHA-256 对手机号、
+/// 身份证号这种短的值，配上打码后留下的那几位，是能穷举回去的 —— 存进请求库等于把号码本身
+/// 存了一份，而请求库会被导出、拷走、附在问题报告里。只留最近的一批，是因为要列为例外的
+/// 多半就是刚看到的那几条；更早的没有按钮，用户照样可以粘贴那个值手动加入。
+#[derive(Debug, Default)]
+struct Hashes {
+    by_id: HashMap<i64, Option<String>>,
+    order: std::collections::VecDeque<i64>,
+}
+
+impl Hashes {
+    /// 留多少行。一行几十个字节，两万行一两 MB
+    const CAP: usize = 20_000;
+
+    fn put(&mut self, id: i64, hash: Option<String>) {
+        if self.by_id.insert(id, hash).is_none() {
+            self.order.push_back(id);
+        }
+        while self.order.len() > Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.by_id.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, id: i64) -> Option<Option<&str>> {
+        self.by_id.get(&id).map(Option::as_deref)
+    }
 }
 
 /// 记下的一行里，密钥和上游的用量上限要的那几样（见 `tw_gateway::key_limits`、
@@ -165,6 +200,7 @@ impl Recorder {
             bus: None,
             transcripts: Default::default(),
             settled: None,
+            hashes: Hashes::default(),
         }
     }
 
@@ -180,11 +216,24 @@ impl Recorder {
         self
     }
 
-    /// 记一条安全日志。**写不进去只记一行日志** —— 观测挂了，代理照跑。
-    fn record_security(&self, e: crate::db::SecurityEvent) {
-        if let Err(err) = self.db.insert_security_event(&e) {
-            tracing::debug!("the security record could not be written: {err}");
+    /// 记一条安全日志，返回它的号。**写不进去只记一行日志** —— 观测挂了，代理照跑。
+    fn record_security(&self, e: crate::db::SecurityEvent) -> Option<i64> {
+        match self.db.insert_security_event(&e) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::debug!("the security record could not be written: {err}");
+                None
+            }
         }
+    }
+
+    /// 安全日志第 `id` 条（出站脱敏的）命中的值的 SHA-256，「列为例外」照它加（见 [`Hashes`]）。
+    ///
+    /// - `None`：这一条不在内存里 —— 不是出站脱敏的、core 重启之前记的、或者早已被后来的挤掉了；
+    /// - `Some(None)`：在内存里，但不能列为例外（保存的凭据、几处重叠合成的一段）；
+    /// - `Some(Some(哈希))`：能列为例外。
+    pub fn value_hash(&self, id: i64) -> Option<Option<&str>> {
+        self.hashes.get(id)
     }
 
     pub fn db(&self) -> &Db {
@@ -413,7 +462,7 @@ impl Recorder {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
                 let session = self.inflight.get(id).and_then(|p| p.session.clone());
                 for it in items {
-                    self.record_security(crate::db::SecurityEvent {
+                    let row = self.record_security(crate::db::SecurityEvent {
                         at_ms: *at_ms as i64,
                         request_id: *id as i64,
                         guard: tw_api::Guard::Redact,
@@ -432,7 +481,11 @@ impl Recorder {
                         // 请求还没发出去
                         sent_model: None,
                         detail: it.detail.clone(),
+                        source: it.source.clone(),
                     });
+                    if let Some(row) = row {
+                        self.hashes.put(row, it.value_sha256.clone());
+                    }
                 }
             }
             // 内容过滤：一条规则一条，`count` 是几处（码位规则是几个字符）。回答里的在回答结束时报
@@ -484,6 +537,7 @@ impl Recorder {
                             .filter(|m| !m.is_empty()),
                     },
                     detail: detail.clone(),
+                    source: None,
                 });
             }
             /*
@@ -528,6 +582,7 @@ impl Recorder {
                     session,
                     sent_model,
                     detail: detail.clone(),
+                    source: None,
                 });
             }
             Event::RequestHeaders {
@@ -833,7 +888,7 @@ impl Recorder {
                 served: p.routing.served_by().map(str::to_string),
             });
         }
-        self.write(RequestRow {
+        let written = self.write(RequestRow {
             id: id as i64,
             at_ms: p.at_ms,
             client: p.client,
@@ -877,12 +932,26 @@ impl Recorder {
             translated: p.translated,
             session_log_bytes: p.session_log_bytes,
         });
+        // 结局这一行就是最终的：加进用量历史的那个整点。**每个请求只在这里加一次**（`inflight`
+        // 里取走了，同一个请求不会再走到这里）；本地应答、`local` 的在 SQL 里排除。这一行没写
+        // 进去的不加 —— 加的数是从这一行读的
+        if written && let Err(e) = self.db.add_to_usage(id as i64) {
+            tracing::debug!(
+                id,
+                "the request could not be added to the usage history: {e}"
+            );
+        }
     }
 
-    fn write(&self, r: RequestRow) {
-        if let Err(e) = self.db.insert(&r) {
-            // **不往回抛。**观测挂了，代理照跑。
-            tracing::debug!(id = r.id, "the request row could not be written: {e}");
+    /// 写一行，写进去了是 true。
+    fn write(&self, r: RequestRow) -> bool {
+        match self.db.insert(&r) {
+            Ok(()) => true,
+            Err(e) => {
+                // **不往回抛。**观测挂了，代理照跑。
+                tracing::debug!(id = r.id, "the request row could not be written: {e}");
+                false
+            }
         }
     }
 
@@ -940,6 +1009,14 @@ mod tests {
             at_ms: 1_000_000,
             input_estimate: None,
         }
+    }
+
+    /// 用量历史里一小时一格
+    pub(super) fn usage_hours(r: &Recorder) -> Vec<tw_api::CostBucket> {
+        r.db()
+            .usage_history(0, i64::MAX, 3_600_000)
+            .unwrap()
+            .buckets
     }
 
     pub(super) fn finished(id: u64, usage: Option<tw_api::UsageView>) -> Event {
@@ -1626,6 +1703,7 @@ mod tests {
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.requests, 0, "本地应答混进了请求总数");
         assert_eq!(s.locally_answered, 1);
+        assert!(usage_hours(&r).is_empty(), "本地应答加进了用量历史");
     }
 
     /// 数 token 由网关估了数：这一行是网关自己答的，费用 0，不进汇总
@@ -1720,6 +1798,7 @@ mod tests {
         let row = r.db().get(4).unwrap().unwrap();
         assert!(row.local);
         assert_eq!((row.sent_bytes, row.received_bytes), (None, None));
+        assert!(usage_hours(&r).is_empty(), "估的数加进了用量历史");
     }
 
     #[test]
@@ -2065,6 +2144,23 @@ mod pricing_report_tests {
 mod security_tests {
     use super::tests::{finished, rec, started};
 
+    /// 一个值的哈希（随便哪个，这里测的是它记下、读回、不出进程）
+    const HASH: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    /// 内存里只留最近的那些：多出来的从最早的挤掉
+    #[test]
+    fn only_the_latest_value_hashes_are_kept() {
+        let mut h = super::Hashes::default();
+        let cap = super::Hashes::CAP as i64;
+        for id in 1..=cap + 5 {
+            h.put(id, Some(format!("{id}")));
+        }
+        assert_eq!(h.get(5), None);
+        assert_eq!(h.get(6), Some(Some("6")));
+        assert_eq!(h.get(cap + 5), Some(Some(&*format!("{}", cap + 5))));
+        assert_eq!(h.by_id.len(), super::Hashes::CAP);
+    }
+
     fn secrets(replaced: bool) -> tw_api::Event {
         tw_api::Event::SecretsFound {
             id: 1,
@@ -2074,11 +2170,13 @@ mod security_tests {
                 tw_api::SecretItem {
                     rule: "anthropic-api-key".into(),
                     custom: false,
-                    kind: tw_api::SecretKind::ApiKeys,
+                    kind: tw_api::SecretKind::AiServices,
                     masked: "sk-an…AAAA".into(),
                     count: 2,
                     replaced,
                     detail: Default::default(),
+                    source: None,
+                    value_sha256: Some(HASH.into()),
                 },
                 tw_api::SecretItem {
                     rule: "公司令牌".into(),
@@ -2088,6 +2186,8 @@ mod security_tests {
                     count: 1,
                     replaced,
                     detail: Default::default(),
+                    source: None,
+                    value_sha256: None,
                 },
             ],
             at_ms: 10,
@@ -2121,6 +2221,33 @@ mod security_tests {
             // 密钥和模型取自请求那一行
             assert_eq!(got[0].client, "claude-code");
             assert_eq!(got[0].model, "claude-sonnet-4-5");
+            // 值的哈希只在记录器的内存里：库里没有，事件写成 JSON 也不带它
+            assert_eq!(r.value_hash(got[1].id), Some(Some(HASH)));
+            assert_eq!(r.value_hash(got[0].id), Some(None), "不能列为例外的也记着");
+            assert_eq!(r.value_hash(999), None);
+            assert!(!serde_json::to_string(&got).unwrap().contains(HASH));
+            assert!(
+                !serde_json::to_string(&secrets(replaced))
+                    .unwrap()
+                    .contains(HASH)
+            );
+            let mut st = r
+                .db()
+                .conn
+                .prepare("SELECT * FROM security_events")
+                .unwrap();
+            let n = st.column_count();
+            let dump: Vec<String> = st
+                .query_map([], |row| {
+                    Ok((0..n)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(!dump.join("\n").contains(HASH), "库里有哈希");
         }
     }
 
@@ -2303,6 +2430,8 @@ mod security_detail_tests {
                 count: 8,
                 replaced: true,
                 detail,
+                source: None,
+                value_sha256: None,
             }],
             at_ms: 10,
         }
@@ -3030,6 +3159,39 @@ mod cancellation_tests {
 
         assert_eq!(r.db().count().unwrap(), 1);
         assert!(r.db().get(1).unwrap().unwrap().cancelled);
+        assert_eq!(
+            super::tests::usage_hours(&r)[0].requests,
+            1,
+            "第二个结局又加了一次"
+        );
+    }
+
+    /// 结局那一行加进它开始的那个整点，和汇总同一个数；开始的那一刻还没有
+    #[test]
+    fn the_ending_adds_the_request_to_the_usage_history_once() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        assert!(super::tests::usage_hours(&r).is_empty(), "开始时就加了");
+        r.on_event(&finished(
+            1,
+            Some(tw_api::UsageView {
+                input: 100,
+                output: 50,
+                ..Default::default()
+            }),
+        ));
+        let h = super::tests::usage_hours(&r);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].at_ms, 0, "started 的时刻（1_000_000）落在第 0 个整点");
+        assert_eq!(
+            (h[0].requests, h[0].input_tokens, h[0].output_tokens),
+            (1, 100, 50)
+        );
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(
+            (h[0].cost_micros_exact, h[0].sent_bytes, h[0].received_bytes),
+            (s.cost_micros_exact, s.sent_bytes, s.received_bytes)
+        );
     }
 }
 

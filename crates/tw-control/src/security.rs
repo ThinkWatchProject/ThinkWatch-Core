@@ -22,6 +22,25 @@
 //!   写，几十条就是几十次热重载、几十个版本；
 //! - **自定义规则写成配置里那个类型序列化出来的样子**，默认值不写 —— 写进去的就是
 //!   读回来的那一份。
+//!
+//! # 例外值
+//!
+//! 出站脱敏的例外值（[`tw_guard::redact::exceptions`]）写在 `security.redact.exceptions`，和规则
+//! 一样走配置的写入路径，随配置导出、同步、备份。**原值不落在任何地方**：
+//!
+//! - 手动加入时界面交原值，这里当场算哈希、按认出它的规则打码，写进配置的只有这两样；
+//!   原值不进日志（[`tw_api::ExceptionAdd`] 的 `Debug` 不打它）、不进回答。
+//! - 从安全日志加入时界面交的是**那一行的号**，不是哈希。值的哈希**不进请求库**，只在记录器
+//!   的内存里留最近两万行（[`tw_store::Recorder::value_hash`]），重启就没了：对手机号这种短的
+//!   值，一个不加盐的 SHA-256 配上打码后留下的几位是能穷举回去的，存进库等于把号码存了一份，
+//!   也没理由交给不需要它的界面（事件流、日志视图都不带它）。更早的记录没法从日志加入（409），
+//!   粘贴那个值手动加入。界面要的「这一条已经是例外」「这一条能列为例外」读的时候在这里
+//!   照内存里的哈希和现在的例外表算好（[`annotate`]），不在内存里的两样都是 false。
+//! - 几处重叠的命中合成的一段、只记录的规则让开之后剩下的几截没有哈希
+//!   （[`tw_guard::redact::rules::Finding::sha256`]）：没有哪条规则认过那一段，列为例外挡不住
+//!   什么。
+//! - 移出按哈希：例外表本身（`GET /security/exceptions`）就是配置里的那一份，界面
+//!   拿得到配置原文，哈希在这里不多泄露什么。
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -45,6 +64,7 @@ pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
         .at(ep::Security, detail)
         .at(ep::SecurityEvents, events)
+        .at(ep::SecurityRuleCounts, counts)
         .at(ep::SetSecurityMode, set_mode)
         .at(ep::ToggleBuiltinRule, toggle_builtin)
         .at(ep::SetBuiltinRuleAction, set_builtin_action)
@@ -53,6 +73,10 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::UpdateCustomRule, update_custom)
         .at(ep::DeleteCustomRule, delete_custom)
         .at(ep::TestSecurity, test)
+        .at(ep::RedactExceptions, exceptions)
+        .at(ep::AddRedactException, add_exception)
+        .at(ep::ExceptSecurityEvent, add_exception_from_event)
+        .at(ep::RemoveRedactException, remove_exception)
 }
 
 /// 这一边对每项防护要知道的事。路径里写的就是配置里的那个键。
@@ -207,7 +231,23 @@ async fn events(
             q.limit.unwrap_or(100).clamp(1, PAGE_MAX),
         )
         .map_err(crate::records)?;
+    let mut page = page;
+    annotate(&s.config(), &g, &mut page.events);
     Ok(Json(page))
+}
+
+/// 每条规则命中了几次。只读索引（`security_events_rule_hits`），不翻日志
+async fn counts(
+    State(s): State<ControlState>,
+    Query(q): Query<tw_api::SecurityRuleHitsQuery>,
+) -> Result<Json<Vec<tw_api::SecurityRuleHits>>, Fail> {
+    let store = crate::need_store(&s)?;
+    let g = store.lock().await;
+    let hits = g
+        .db()
+        .security_rule_hits(q.guard.slug(), q.since_ms.unwrap_or(0))
+        .map_err(crate::records)?;
+    Ok(Json(hits))
 }
 
 // ---------------------------------------------------------------- 写
@@ -560,10 +600,12 @@ fn rule_fail(e: PolicyError) -> Fail {
         PolicyError::EmptyScope { .. } => scope_empty(),
         PolicyError::BlockInAnswer { .. } => block_in_answer(),
         PolicyError::CodepointsInAnswer { .. } => codepoints_in_answer(),
-        // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id 不在这里写
-        e @ (PolicyError::DuplicateName { .. } | PolicyError::UnknownRule { .. }) => {
-            tw_config::policy_msg(&e)
-        }
+        // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id、例外表不在这里写
+        e @ (PolicyError::DuplicateName { .. }
+        | PolicyError::UnknownRule { .. }
+        | PolicyError::TooManyExceptions { .. }
+        | PolicyError::BadExceptionHash { .. }
+        | PolicyError::DuplicateException { .. }) => tw_config::policy_msg(&e),
     };
     fail(StatusCode::BAD_REQUEST, m)
 }
@@ -687,6 +729,218 @@ async fn delete_custom(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
+// ---------------------------------------------------------------- 例外值
+
+/// 例外表那一节：按 `sha256` 认
+const EXCEPTIONS: edit::Section = edit::Section {
+    path: &["security", "redact", "exceptions"],
+    what: "redaction exception",
+    key: "sha256",
+};
+
+/// 安全日志的记录按现在的例外表标上 `excepted`、`exceptable`（见文件头）。**每个返回日志
+/// 记录的端点都要过一遍**：哈希不在库里，在记录器的内存里，只有最近的那些行有
+/// （[`tw_store::Recorder::value_hash`]）；不在内存里的两样都是 false
+pub(crate) fn annotate<'a>(
+    cfg: &tw_config::Config,
+    rec: &tw_store::Recorder,
+    views: impl IntoIterator<Item = &'a mut tw_api::SecurityEventView>,
+) {
+    let set = cfg.security.redact.exception_set();
+    for v in views {
+        if v.guard != Guard::Redact {
+            continue;
+        }
+        let Some(Some(hash)) = rec.value_hash(v.id) else {
+            continue;
+        };
+        v.excepted = set.as_ref().is_some_and(|ex| ex.contains_hex(hash));
+        v.exceptable = !v.excepted;
+    }
+}
+
+async fn exceptions(State(s): State<ControlState>) -> Json<tw_api::RedactExceptions> {
+    Json(tw_api::RedactExceptions {
+        items: s.config().security.redact.exceptions.clone(),
+        max: tw_guard::policy::EXCEPTIONS_MAX as u32,
+    })
+}
+
+/// 手动加入：交来的是原值。**算完哈希它就没用了**，不进任何一条日志、不进回答
+async fn add_exception(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ExceptionAdd>,
+) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
+    // 网关手里那一份保存的凭据：贴进来一把上游的密钥，认得出它、不收
+    let saved = s.gateway.runtime().redact.saved().cloned();
+    let e = s
+        .config()
+        .security
+        .redact
+        .exception_of(&req.value, saved, crate::config::now_ms() as i64)
+        .map_err(exception_fail)?;
+    drop(req.value);
+    put_exception(&s, e, req.base_version.as_deref()).await
+}
+
+/// 从安全日志的一条加入：哈希、打码后的样子、规则都取自那一行
+async fn add_exception_from_event(
+    State(s): State<ControlState>,
+    Path(id): Path<i64>,
+    Json(req): Json<tw_api::BaseVersion>,
+) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
+    let store = crate::need_store(&s)?;
+    let (src, hash) = {
+        let g = store.lock().await;
+        let src = g
+            .db()
+            .exception_source(id)
+            .map_err(crate::records)?
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::NOT_FOUND,
+                    msg!(
+                        "security.unknown_event", id = id.to_string() =>
+                        "There is no security log entry {id}; it may have passed the retention \
+                         period."
+                    ),
+                )
+            })?;
+        let hash = g.value_hash(id).map(|h| h.map(str::to_string));
+        (src, hash)
+    };
+    let not_exceptable = || {
+        fail(
+            StatusCode::BAD_REQUEST,
+            msg!(
+                "security.exception_not_exceptable" =>
+                "Only a value found by outbound redaction can be an exception, and a saved \
+                 secret or a span joined from overlapping matches cannot."
+            ),
+        )
+    };
+    let sha256 = match (src.guard, hash) {
+        (Guard::Redact, Some(Some(h))) => h,
+        // 工具调用审查、内容过滤的记录没有可以例外的「值」；保存的凭据、几处重叠合成的一段
+        // 列为例外也挡不住什么
+        (Guard::Redact, Some(None)) | (Guard::InspectTools | Guard::Content, _) => {
+            return Err(not_exceptable());
+        }
+        // 记下时的哈希只在内存里留最近的一批，重启就没了（见 `tw_store::Recorder::value_hash`）
+        (Guard::Redact, None) => {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                msg!(
+                    "security.exception_forgotten" =>
+                    "This entry is too old to be listed as an exception from the log; paste the \
+                     value into Add exception instead."
+                ),
+            ));
+        }
+    };
+    let e = tw_config::RedactException {
+        sha256,
+        masked: src.masked,
+        rule: src.rule,
+        added_at: crate::config::now_ms() as i64,
+    };
+    put_exception(&s, e, req.base_version.as_deref()).await
+}
+
+/// 写进例外表。**已经在表里的不再写一次**（不论是哪条规则加的）：回那一项和现在的版本。
+/// 满了是 409。
+///
+/// 两样都在写入那一步里、对着那一刻的配置查：两个「列为例外」同时到，后写的那个读到的是先写
+/// 完的那一份。写的时候磁盘上的配置被别人改了（[`tw_config::StoreError::Conflict`]）、而调用方
+/// 没带版本时重来一次，重来时就看见了先写进去的那一项
+async fn put_exception(
+    s: &ControlState,
+    e: tw_config::RedactException,
+    base_version: Option<&str>,
+) -> Result<Json<tw_api::ExceptionAdded>, Fail> {
+    let m = item(&e)?;
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        // 已经在表里：那一项和没改动的那一版
+        let mut have: Option<(tw_config::RedactException, String)> = None;
+        let r = s
+            .cfg
+            .transform(base_version, Origin::Ui, |text, cfg| {
+                let list = &cfg.security.redact.exceptions;
+                if let Some(x) = list.iter().find(|x| x.sha256 == e.sha256) {
+                    have = Some((x.clone(), tw_config::version_of(text)));
+                    return Err(ApplyError::InUse(already_listed()));
+                }
+                if list.len() >= tw_guard::policy::EXCEPTIONS_MAX {
+                    return Err(ApplyError::InUse(msg!(
+                        "security.exceptions_full", max = tw_guard::policy::EXCEPTIONS_MAX.to_string() =>
+                        "There are already {max} exceptions; remove one before adding another."
+                    )));
+                }
+                Ok(edit::upsert(text, EXCEPTIONS, None, &m)?)
+            })
+            .await;
+        if let Some((exception, version)) = have {
+            return Ok(Json(tw_api::ExceptionAdded { version, exception }));
+        }
+        match r {
+            Ok(version) => {
+                return Ok(Json(tw_api::ExceptionAdded {
+                    version,
+                    exception: e,
+                }));
+            }
+            Err(ApplyError::Store(tw_config::StoreError::Conflict { .. }))
+                if base_version.is_none() && tries < 3 => {}
+            Err(err) => return Err(apply_fail(err)),
+        }
+    }
+}
+
+/// 只在 [`put_exception`] 里头用来停下那次写入，不会到界面上（已经在表里的回 200），所以
+/// 没有码
+fn already_listed() -> tw_types::Msg {
+    tw_types::Msg {
+        code: String::new(),
+        args: Default::default(),
+        text: String::new(),
+    }
+}
+
+async fn remove_exception(
+    State(s): State<ControlState>,
+    Path(sha256): Path<String>,
+    Query(q): Query<tw_api::BaseVersion>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let version = s
+        .cfg
+        .transform(q.base_version.as_deref(), Origin::Ui, |text, _| {
+            Ok(edit::remove(text, EXCEPTIONS, &sha256)?)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 一个值加不进例外表
+fn exception_fail(e: tw_guard::policy::ExceptionError) -> Fail {
+    use tw_guard::policy::ExceptionError;
+    let m = match e {
+        ExceptionError::Empty => {
+            msg!("security.exception_value_empty" => "The value is empty.")
+        }
+        ExceptionError::Saved => msg!(
+            "security.exception_saved_secret" =>
+            "This value is a secret saved in ThinkWatch; saved secrets are always replaced and \
+             cannot be exceptions."
+        ),
+        // 配置读进来时校验过，到这里还编不起来是绕过校验写进去的：那是这边的问题
+        ExceptionError::Policy(e) => return internal(e),
+    };
+    fail(StatusCode::BAD_REQUEST, m)
+}
+
 // ---------------------------------------------------------------- 测试
 
 fn unknown_rule(id: &str) -> Fail {
@@ -700,14 +954,16 @@ fn unknown_rule(id: &str) -> Fail {
 }
 
 /// 「测试…」。怎么算全在共享层（[`tw_guard::trial`]）：按配置里现在这一份策略试，
-/// 和网关手里那一份是同一份。
+/// 和网关手里那一份是同一份，保存的凭据也是网关手里那一份。
 async fn test(
     State(s): State<ControlState>,
     Path(guard): Path<String>,
     Json(req): Json<tw_api::SecurityTestRequest>,
 ) -> Result<Json<tw_api::SecurityTestResult>, Fail> {
     let guard = Guard::parse(&guard)?;
-    tw_guard::trial::run(guard, &s.config().security, &req)
+    // 网关手里那一份保存的凭据：贴进来一把上游的密钥，试出来的和真的请求一样
+    let saved = s.gateway.runtime().redact.saved().cloned();
+    tw_guard::trial::run_with(guard, &s.config().security, &req, saved)
         .map(Json)
         .map_err(|e| trial_fail(guard, e))
 }

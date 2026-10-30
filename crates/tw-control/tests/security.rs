@@ -108,20 +108,26 @@ fn event(
         session: None,
         sent_model: None,
         detail: Default::default(),
+        source: None,
     }
 }
 
 fn bed_with(yaml: &str, seed: impl FnOnce(&tw_store::Db)) -> Bed {
+    bed_rec(yaml, |rec| seed(rec.db()))
+}
+
+/// [`bed_with`]，种子交给记录器：经事件记下的安全日志，值的哈希留在记录器的内存里
+fn bed_rec(yaml: &str, seed: impl FnOnce(&mut tw_store::Recorder)) -> Bed {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
     std::fs::write(&p, yaml).unwrap();
     let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
-    seed(&db);
-    let rec = tw_store::Recorder::new(
+    let mut rec = tw_store::Recorder::new(
         db,
         tw_store::Blobs::new(d.path().join("blobs")),
         tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
     );
+    seed(&mut rec);
     let cfg = tw_config::try_parse(yaml).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
     let bus = gw.bus.clone();
@@ -1570,4 +1576,428 @@ async fn an_unknown_guard_names_all_three() {
     assert_eq!(v["code"], "security.unknown_guard");
     let text = v["text"].as_str().unwrap();
     assert!(text.contains("redact, inspect_tools or content"), "{text}");
+}
+
+// ─────────────────────────────────────────────────────────── 例外值
+
+fn sha256(v: &str) -> String {
+    tw_guard::redact::exceptions::sha256_hex(v)
+}
+
+/// R5：手动加入。原值只在请求里：配置里只有哈希和打码后的样子；加入之后「测试…」把它标成
+/// 例外；再加一次不写第二份；移出之后又是命中
+#[tokio::test]
+async fn a_value_added_by_hand_is_kept_as_a_hash_and_can_be_removed() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "GET",
+        "/security/exceptions",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v, json!({ "items": [], "max": 500 }));
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/exceptions",
+        json!({ "value": format!("{KEY}\n") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let h = sha256(KEY);
+    assert_eq!(v["exception"]["sha256"], h);
+    assert_eq!(v["exception"]["rule"], "anthropic-api-key");
+    assert_eq!(v["exception"]["masked"], "sk-an…AAAA");
+    let version = v["version"].clone();
+    // 原值哪儿都没有：配置文件、回答
+    let file = b.file();
+    assert!(file.contains(&h) && !file.contains(KEY), "{file}");
+    assert!(!v.to_string().contains(KEY), "{v}");
+
+    // 再加一次：不写第二份，版本不变
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/exceptions",
+        json!({ "value": KEY }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["version"], version);
+    assert_eq!(b.parsed().security.redact.exceptions.len(), 1);
+
+    // 「测试…」：认得出，标成例外，不换
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/redact/test",
+        json!({ "sample": format!("key {KEY}") }),
+    )
+    .await;
+    assert_eq!(v["hits"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["hits"][0]["excepted"], true);
+    assert_eq!(v["hits"][0]["action"], serde_json::Value::Null);
+    assert_eq!(v["output"], serde_json::Value::Null);
+
+    // 列出来就是配置里那一份
+    let (_, v) = call(
+        &b.app,
+        "GET",
+        "/security/exceptions",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(v["items"][0]["sha256"], h);
+
+    // 认不出的值：规则是空的，按最小心的打码
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/exceptions",
+        json!({ "value": "fixture-value-for-tests-9876" }),
+    )
+    .await;
+    assert_eq!(v["exception"]["masked"], "…9876", "{v}");
+    assert!(v["exception"].get("rule").is_none(), "{v}");
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/exceptions",
+        json!({ "value": "  " }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(v["code"], "security.exception_value_empty");
+
+    // 移出：又是命中
+    let (st, v) = call(
+        &b.app,
+        "DELETE",
+        &format!("/security/exceptions/{h}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!b.file().contains(&h), "{}", b.file());
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/redact/test",
+        json!({ "sample": format!("key {KEY}") }),
+    )
+    .await;
+    assert_eq!(v["hits"][0]["excepted"], false, "{v}");
+    let (st, _) = call(
+        &b.app,
+        "DELETE",
+        &format!("/security/exceptions/{h}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // 别的规则接口照常走得到（路径和 `/security/{guard}/…` 不打架）
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/redact/mode",
+        json!({ "mode": "enforce" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+/// 保存的凭据不能列为例外：上游的密钥贴进来是 400，一个字都不写
+#[tokio::test]
+async fn a_saved_secret_cannot_be_added() {
+    let saved = "sk-relay-0123456789abcdefghij";
+    let b = bed(&BASE.replace("key: sk-relay", &format!("key: {saved}")));
+    let before = b.file();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/exceptions",
+        json!({ "value": saved }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.exception_saved_secret");
+    assert_eq!(b.file(), before);
+}
+
+/// 满了 500 个再加是 409；读配置时超出是配置错误
+#[tokio::test]
+async fn the_list_holds_at_most_500() {
+    let mut yaml = format!("{BASE}security:\n  redact:\n    exceptions:\n");
+    for i in 0..500 {
+        yaml.push_str(&format!(
+            "      - {{ sha256: {}, masked: x }}\n",
+            sha256(&i.to_string())
+        ));
+    }
+    let b = bed(&yaml);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/exceptions",
+        json!({ "value": KEY }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "security.exceptions_full");
+    yaml.push_str(&format!("      - {{ sha256: {} }}\n", sha256("one more")));
+    let e = tw_config::try_parse(&yaml).unwrap_err();
+    assert_eq!(e.message.code, "config.redact_exceptions_too_many", "{e}");
+}
+
+/// 从安全日志加入：界面交那一行的号，哈希从记录器的内存里取，日志的视图里没有哈希。加入之后
+/// 同一个值的每一条都标「例外」，不能再加。不在内存里的（重启之前记的）两样都不标，加入是 409
+#[tokio::test]
+async fn a_logged_value_is_added_by_its_row_and_the_log_marks_it() {
+    let h = sha256(KEY);
+    let found =
+        |at_ms: u64, rule: &str, value_sha256: Option<String>| tw_api::Event::SecretsFound {
+            id: 1,
+            provider: "中转".into(),
+            replaced: false,
+            items: vec![tw_api::SecretItem {
+                rule: rule.into(),
+                custom: false,
+                kind: tw_api::SecretKind::AiServices,
+                masked: "sk-an…AAAA".into(),
+                count: 1,
+                replaced: false,
+                detail: Default::default(),
+                source: None,
+                value_sha256,
+            }],
+            at_ms,
+        };
+    let b = bed_rec(BASE, |rec| {
+        rec.db().insert(&request(1, 1_000, "中转")).unwrap();
+        // 1：重启之前记的，内存里没有
+        rec.db()
+            .insert_security_event(&event(1, 1_000, "redact", "anthropic-api-key", "recorded"))
+            .unwrap();
+        // 2、3：同一个值
+        rec.on_event(&found(1_001, "anthropic-api-key", Some(h.clone())));
+        rec.on_event(&found(1_002, "anthropic-api-key", Some(h.clone())));
+        // 4：保存的凭据（或者几处重叠合成的一段）：没有哈希
+        rec.on_event(&found(1_003, "thinkwatch-saved-secret", None));
+        // 5
+        rec.db()
+            .insert_security_event(&event(1, 1_004, "inspect_tools", "curl-pipe-sh", "cut"))
+            .unwrap();
+    });
+    async fn log(b: &Bed, h: &str) -> Vec<serde_json::Value> {
+        let (st, v) = call(&b.app, "GET", "/security/events", serde_json::Value::Null).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(!v.to_string().contains(h), "日志的视图带了哈希：{v}");
+        v["events"].as_array().unwrap().clone()
+    }
+    let rows = log(&b, &h).await;
+    // 倒序：5 4 3 2 1
+    let flags: Vec<(bool, bool)> = rows
+        .iter()
+        .map(|e| {
+            (
+                e["excepted"].as_bool().unwrap(),
+                e["exceptable"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            (false, false),
+            (false, false),
+            (false, true),
+            (false, true),
+            (false, false)
+        ]
+    );
+    let id = rows[3]["id"].as_i64().unwrap();
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/security/events/{id}/exception"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["exception"]["sha256"], h);
+    assert_eq!(v["exception"]["masked"], "sk-an…AAAA");
+    assert_eq!(v["exception"]["rule"], "anthropic-api-key");
+    assert_eq!(b.parsed().security.redact.exceptions.len(), 1);
+
+    let rows = log(&b, &h).await;
+    let flags: Vec<(bool, bool)> = rows
+        .iter()
+        .map(|e| {
+            (
+                e["excepted"].as_bool().unwrap(),
+                e["exceptable"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            (false, false),
+            (false, false),
+            (true, false),
+            (true, false),
+            (false, false)
+        ]
+    );
+    // 请求详情里的记录也标着（按号正序：1 不在内存里，2 是例外）
+    let (_, d) = call(&b.app, "GET", "/request/1", serde_json::Value::Null).await;
+    assert_eq!(d["row"]["security"][0]["excepted"], false, "{d}");
+    assert_eq!(d["row"]["security"][1]["excepted"], true, "{d}");
+    // 再加一次：已经在表里，200，不写第二份
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/security/events/{}/exception", rows[2]["id"]),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.parsed().security.redact.exceptions.len(), 1);
+
+    for (id, status, code) in [
+        (
+            rows[0]["id"].as_i64().unwrap(),
+            StatusCode::BAD_REQUEST,
+            "security.exception_not_exceptable",
+        ),
+        (
+            rows[1]["id"].as_i64().unwrap(),
+            StatusCode::BAD_REQUEST,
+            "security.exception_not_exceptable",
+        ),
+        (
+            rows[4]["id"].as_i64().unwrap(),
+            StatusCode::CONFLICT,
+            "security.exception_forgotten",
+        ),
+        (999, StatusCode::NOT_FOUND, "security.unknown_event"),
+    ] {
+        let (st, v) = call(
+            &b.app,
+            "POST",
+            &format!("/security/events/{id}/exception"),
+            json!({}),
+        )
+        .await;
+        assert_eq!((st, v["code"].as_str()), (status, Some(code)), "{v}");
+    }
+}
+
+/// 规则表的组头：一项防护从某个时刻起每条规则命中了几次，按记录的 `count` 加
+#[tokio::test]
+async fn hits_per_rule_add_up_the_counts_since_a_time() {
+    let b = bed_with(BASE, |db| {
+        db.insert(&request(1, 1_000, "中转")).unwrap();
+        for (at, rule, action, count) in [
+            (500, "anthropic-api-key", "recorded", 9),
+            (1_001, "anthropic-api-key", "recorded", 2),
+            (1_002, "anthropic-api-key", "replaced", 3),
+            (1_003, "jwt", "recorded", 1),
+        ] {
+            db.insert_security_event(&tw_store::SecurityEvent {
+                count,
+                ..event(1, at, "redact", rule, action)
+            })
+            .unwrap();
+        }
+        db.insert_security_event(&tw_store::SecurityEvent {
+            custom: true,
+            count: 4,
+            ..event(1, 1_004, "redact", "项目号", "recorded")
+        })
+        .unwrap();
+        db.insert_security_event(&event(1, 1_005, "inspect_tools", "curl-pipe-sh", "cut"))
+            .unwrap();
+    });
+    let (st, v) = call(
+        &b.app,
+        "GET",
+        "/security/counts?guard=redact&since_ms=1000",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v,
+        json!([
+            { "rule": "anthropic-api-key", "custom": false, "count": 5 },
+            { "rule": "jwt", "custom": false, "count": 1 },
+            { "rule": "项目号", "custom": true, "count": 4 },
+        ])
+    );
+    let (_, v) = call(
+        &b.app,
+        "GET",
+        "/security/counts?guard=redact",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(v[0]["count"], 14, "{v}");
+    let (_, v) = call(
+        &b.app,
+        "GET",
+        "/security/counts?guard=inspect_tools",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        v,
+        json!([{ "rule": "curl-pipe-sh", "custom": false, "count": 1 }])
+    );
+}
+
+/// 同时加：同一个值两次都是 200、只写一份；只剩一个空位时两个不同的值一个进去、一个 409
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adding_at_the_same_time_is_idempotent_and_honours_the_cap() {
+    let b = bed(BASE);
+    let add = |v: &str| {
+        let app = b.app.clone();
+        let v = v.to_string();
+        async move { call(&app, "POST", "/security/exceptions", json!({ "value": v })).await }
+    };
+    let (x, y) = tokio::join!(add(KEY), add(KEY));
+    assert_eq!((x.0, y.0), (StatusCode::OK, StatusCode::OK), "{x:?} {y:?}");
+    assert_eq!(b.parsed().security.redact.exceptions.len(), 1);
+
+    let mut yaml = format!("{BASE}security:\n  redact:\n    exceptions:\n");
+    for i in 0..499 {
+        yaml.push_str(&format!(
+            "      - {{ sha256: {}, masked: x }}\n",
+            sha256(&i.to_string())
+        ));
+    }
+    let b = bed(&yaml);
+    let add = |v: &str| {
+        let app = b.app.clone();
+        let v = v.to_string();
+        async move { call(&app, "POST", "/security/exceptions", json!({ "value": v })).await }
+    };
+    let (x, y) = tokio::join!(
+        add("first-fixture-value-0001"),
+        add("second-fixture-value-0002")
+    );
+    let mut codes = [x.0, y.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::CONFLICT], "{x:?} {y:?}");
+    let full = if x.0 == StatusCode::CONFLICT {
+        &x.1
+    } else {
+        &y.1
+    };
+    assert_eq!(full["code"], "security.exceptions_full");
+    assert_eq!(b.parsed().security.redact.exceptions.len(), 500);
 }

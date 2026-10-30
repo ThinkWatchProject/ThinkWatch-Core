@@ -34,7 +34,9 @@ use tw_api::Msg;
 /// 27：`bytes`（解码之后的回答有多少字节）换成网关和上游之间的流量 —— `sent_bytes`、
 /// `received_bytes` —— 和出口 `egress`；尝试链的每一跳（`routing`）多了 `proxy`。安全日志
 /// 多了细节（`security_events` 的 `session`、`sent_model`、`detail`）。
-pub(crate) const SCHEMA: i64 = 27;
+///
+/// 28：安全日志记下出站脱敏认出的是哪一项保存的凭据（`security_events` 的 `source`）。
+pub(crate) const SCHEMA: i64 = 28;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -71,6 +73,51 @@ const DENIED_BY: &str = "json_extract(routing, '$.denied_by')";
 /// 也不该让它自己写不进去
 const ROUTED: &str = "local = 0 AND json_valid(routing)";
 
+/// 一格用量的那十二项，按请求行合计：请求、失败、费用三态、流量、四类 token，顺序同
+/// [`cost_bucket`] 读的。**`/summary/buckets` 和用量历史（[`crate::usage`]）用的是这一串**：
+/// 历史从结局那一行加进整点时就按它取数，两边的口径不会各写各的走开。口径同
+/// [`Db::summary`]：失败是 `error` 不空，没有价格、没有用量见 [`NO_PRICE`]、[`NO_USAGE`]。
+/// 哪些行算（本地应答不算）由用的一方写在条件里
+pub(crate) static TALLY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "COUNT(*),
+         COALESCE(SUM(error IS NOT NULL), 0),
+         COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
+         COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+         COALESCE(SUM({NO_PRICE}), 0),
+         COALESCE(SUM({NO_USAGE}), 0),
+         COALESCE(SUM(sent_bytes), 0),
+         COALESCE(SUM(received_bytes), 0),
+         COALESCE(SUM(input_tokens), 0),
+         COALESCE(SUM(output_tokens), 0),
+         COALESCE(SUM(cache_read_tokens), 0),
+         COALESCE(SUM(cache_write_tokens), 0)"
+    )
+});
+
+/// 读一格：第 1 到 12 列是 [`TALLY`] 那十二项（第 0 列留给格子的序号）。首 token 的三项
+/// 由调用方填
+pub(crate) fn cost_bucket(at_ms: i64, r: &rusqlite::Row) -> rusqlite::Result<tw_api::CostBucket> {
+    Ok(tw_api::CostBucket {
+        at_ms,
+        requests: r.get(1)?,
+        failed: r.get(2)?,
+        cost_micros_exact: r.get(3)?,
+        cost_micros_estimated: r.get(4)?,
+        unpriced_requests: r.get(5)?,
+        no_usage_requests: r.get(6)?,
+        sent_bytes: r.get(7)?,
+        received_bytes: r.get(8)?,
+        input_tokens: r.get(9)?,
+        output_tokens: r.get(10)?,
+        cache_read_tokens: r.get(11)?,
+        cache_write_tokens: r.get(12)?,
+        ttft_p50_ms: None,
+        ttft_p95_ms: None,
+        ttft_samples: 0,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("{path} could not be opened: {source}")]
@@ -82,6 +129,10 @@ pub enum DbError {
     /// 连同正文目录整个重建，更新的版本建的原样留着。
     #[error("the database is schema version {found}; this twcore reads only {supported}")]
     OtherVersion { found: i64, supported: i64 },
+    /// 用量历史（`usage.db`，见 [`crate::usage`]）这一次用不了：更新的版本建的，或者打不开。
+    /// **请求记录照常**，只有问历史的那一个查询报这个错
+    #[error("the usage history is unavailable: {0}")]
+    UsageUnavailable(String),
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
 }
@@ -233,10 +284,53 @@ fn register_reached(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// **先把空文件以 0600 建出来，再交给 SQLite。**让 SQLite 自己建的话，它按 umask 给 0644，
+/// [`restrict`] 之前别的用户已经能打开它。`-wal`、`-shm` 由 SQLite 照主库的权限位建，主库对了
+/// 它们就对了。请求库和用量历史都这么建
+pub(crate) fn create_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path);
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// **0600。**这两个库里有每一条请求的模型、上游、token 数和花费（用量历史里是每个小时的合计）
+/// —— 同一台机器上的别的用户不该能读走一份你的使用记录（那条「权限就是认证」的同一个道理）。
+/// 新库由 [`create_private`] 建对了，这里收的是已经存在的库；WAL 模式还会带出两个兄弟文件，
+/// 一起收。
+pub(crate) fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+            };
+            if p.exists() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[derive(Debug)]
 pub struct Db {
     /// 上游体检的查询在 `crate::health`，和这里共用一个连接
     pub(crate) conn: Connection,
+    /// 用量历史 ATTACH 在这条连接上（库名 `usage`），这一次用不用得了（见 [`crate::usage`]）
+    pub(crate) usage: crate::usage::Usage,
 }
 
 impl Db {
@@ -247,47 +341,19 @@ impl Db {
         {
             let _ = std::fs::create_dir_all(d);
         }
-        // **先把空文件以 0600 建出来，再交给 SQLite。**让 SQLite 自己建的话，
-        // 它按 umask 给 0644，下面的 `chmod` 之前别的用户已经能打开它。
-        // `-wal`、`-shm` 由 SQLite 照主库的权限位建，主库对了它们就对了
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path);
-        }
+        create_private(path);
         let conn = Connection::open(path).map_err(|source| DbError::Open {
             path: path.display().to_string(),
             source,
         })?;
-        // **0600。**这个库里有每一条请求的模型、上游、token 数和花费 ——
-        // 同一台机器上的别的用户不该能读走一份你的使用记录（那条
-        // 「权限就是认证」的同一个道理）。新库上面已经建对了，这里收的是
-        // 已经存在的库；WAL 模式还会带出两个兄弟文件，一起收。
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm"] {
-                let p = if suffix.is_empty() {
-                    path.to_path_buf()
-                } else {
-                    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
-                };
-                if p.exists() {
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-        }
-        Self::from_conn(conn)
+        restrict(path);
+        // 用量历史在同一个目录里另一个文件（为什么另一个文件见 [`crate::usage`]）
+        Self::from_conn(conn, Some(&path.with_file_name(crate::usage::FILE)))
     }
 
-    /// 内存库。测试用，也是「磁盘写不了」时的退路。
+    /// 内存库。测试用，也是「磁盘写不了」时的退路。用量历史也在内存里
     pub fn in_memory() -> Result<Self, DbError> {
-        Self::from_conn(Connection::open_in_memory()?)
+        Self::from_conn(Connection::open_in_memory()?, None)
     }
 
     /// 给同一个 crate 里另写在别处的查询用（搜索在 `crate::search`）
@@ -295,7 +361,8 @@ impl Db {
         &self.conn
     }
 
-    fn from_conn(conn: Connection) -> Result<Self, DbError> {
+    /// `usage`：用量历史那个库文件，None 是内存库
+    fn from_conn(conn: Connection, usage: Option<&Path>) -> Result<Self, DbError> {
         // WAL：读不挡写。**界面在查历史的同时数据面在写** —— 默认的
         // rollback journal 下那是互相阻塞的。
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -314,11 +381,17 @@ impl Db {
                 supported: SCHEMA,
             });
         }
-        let db = Self { conn };
+        let mut db = Self {
+            conn,
+            usage: crate::usage::Usage::Unavailable(String::new()),
+        };
         if found == 0 {
             db.create()?;
         }
         db.indexes();
+        // **请求库建好了才接上用量历史**：版本对不上的请求库在上面就返回了，这时候接上的话，
+        // 新建的用量历史会去补一张样子不对的表。用量历史出什么错都不让请求库打不开
+        db.usage = crate::usage::attach(&db.conn, usage);
         Ok(db)
     }
 
@@ -338,6 +411,8 @@ impl Db {
         // - `requests_routed`：各条路由、规则命中了多少要的那几项，落库时从路由那一列里取出来
         //   存在索引里。数的时候只读索引，不再把一周几 MB 的 JSON 读出来解一遍（见
         //   `route_hits`）
+        // - `security_events_rule_hits`：一项防护每条规则最近几天命中几次，只读索引（见
+        //   `security_rule_hits`）。规则表的组头每次打开都要它
         let sql = format!(
             "CREATE INDEX IF NOT EXISTS requests_client ON requests (client, at_ms)
                 WHERE client > '';
@@ -345,7 +420,9 @@ impl Db {
                 WHERE session IS NOT NULL AND local = 0;
              CREATE INDEX IF NOT EXISTS requests_routed
                 ON requests (at_ms, {ROUTE}, {RULE}, {REWRITTEN_BY}, {DENIED_BY}, error IS NOT NULL)
-                WHERE {ROUTED};"
+                WHERE {ROUTED};
+             CREATE INDEX IF NOT EXISTS security_events_rule_hits
+                ON security_events (guard, at_ms, rule, custom, count);"
         );
         if let Err(e) = self.conn.execute_batch(&sql) {
             tracing::warn!(
@@ -469,7 +546,9 @@ impl Db {
                 -- 细节，JSON（`tw_api::SecurityHitDetail`）：每一处在哪儿、打过码的前后文、
                 -- 当时的规则、具体做了什么。**命中那一刻定下**：规则之后改了，这一条不变。
                 -- 存在这一行上，和请求记录一起过期
-                detail     TEXT    NOT NULL
+                detail     TEXT    NOT NULL,
+                -- 出站脱敏认出的是哪一项保存的凭据，JSON（`tw_api::SavedSource`）。别的是 NULL
+                source     TEXT
              );
              CREATE INDEX security_events_at ON security_events (at_ms DESC);
              CREATE INDEX security_events_request ON security_events (request_id);
@@ -1053,13 +1132,13 @@ impl Db {
             .collect())
     }
 
-    /// 记一条安全日志。
-    pub fn insert_security_event(&self, e: &SecurityEvent) -> Result<(), DbError> {
+    /// 记一条安全日志，返回它的号。
+    pub fn insert_security_event(&self, e: &SecurityEvent) -> Result<i64, DbError> {
         self.conn.execute(
             "INSERT INTO security_events
              (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count,
-              matching, revealed, session, sent_model, detail)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              matching, revealed, session, sent_model, detail, source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 e.at_ms,
                 e.request_id,
@@ -1077,9 +1156,58 @@ impl Db {
                 e.session,
                 e.sent_model,
                 serde_json::to_string(&e.detail).unwrap_or_default(),
+                e.source
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok()),
             ],
         )?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 一项防护从 `since_ms` 起每条规则命中了几次：各条记录的 `count` 加起来，不论做了什么
+    /// （只记录的、换掉的、切断的都算）。按规则排，没命中的规则不在里面。
+    ///
+    /// **按记录的 `count` 加，不是数行**：出站脱敏一行是「一个请求里的一个值」，同一个值在一个
+    /// 请求里出现三次是一行、`count` 3；内容过滤一行是一条规则在一个请求里的几处
+    pub fn security_rule_hits(
+        &self,
+        guard: &str,
+        since_ms: i64,
+    ) -> Result<Vec<tw_api::SecurityRuleHits>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT rule, custom, SUM(count) FROM security_events
+             WHERE guard = ?1 AND at_ms >= ?2
+             GROUP BY rule, custom
+             ORDER BY rule, custom",
+        )?;
+        let rows = st.query_map(params![guard, since_ms], |r| {
+            Ok(tw_api::SecurityRuleHits {
+                rule: r.get(0)?,
+                custom: r.get::<_, i64>(1)? != 0,
+                count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 安全日志的第 `id` 条拿去「列为例外」时要的那几样（哈希不在库里，在记录器的内存里，见
+    /// [`crate::Recorder::value_hash`]）。没有这一条（过了保留期、库重建过）是 `None`
+    pub fn exception_source(&self, id: i64) -> Result<Option<ExceptionSource>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT guard, rule, excerpt FROM security_events WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(ExceptionSource {
+                        guard: slug_col(r, 0, tw_api::Guard::from_slug)?,
+                        rule: r.get(1)?,
+                        masked: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// 安全日志的一页，按时间倒序，连同这一段一共几条、各做了什么。
@@ -1345,42 +1473,14 @@ impl Db {
             return Ok(Vec::new());
         }
         let mut st = self.conn.prepare(&format!(
-            "SELECT ((at_ms - ?1) / ?3) AS b,
-                    COUNT(*),
-                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
-                    COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
-                    COALESCE(SUM({NO_PRICE}), 0),
-                    COALESCE(SUM({NO_USAGE}), 0),
-                    COALESCE(SUM(sent_bytes), 0),
-                    COALESCE(SUM(received_bytes), 0),
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_write_tokens), 0)
+            "SELECT ((at_ms - ?1) / ?3) AS b, {tally}
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
-             GROUP BY b ORDER BY b"
+             GROUP BY b ORDER BY b",
+            tally = *TALLY
         ))?;
         let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
-            Ok(tw_api::CostBucket {
-                at_ms: since_ms + r.get::<_, i64>(0)? * bucket_ms,
-                requests: r.get(1)?,
-                failed: r.get(2)?,
-                cost_micros_exact: r.get(3)?,
-                cost_micros_estimated: r.get(4)?,
-                unpriced_requests: r.get(5)?,
-                no_usage_requests: r.get(6)?,
-                sent_bytes: r.get(7)?,
-                received_bytes: r.get(8)?,
-                input_tokens: r.get(9)?,
-                output_tokens: r.get(10)?,
-                cache_read_tokens: r.get(11)?,
-                cache_write_tokens: r.get(12)?,
-                ttft_p50_ms: None,
-                ttft_p95_ms: None,
-                ttft_samples: 0,
-            })
+            cost_bucket(since_ms + r.get::<_, i64>(0)? * bucket_ms, r)
         })?;
         let mut buckets = rows.collect::<Result<Vec<_>, _>>()?;
         // 每一格的首 token 分位数：**样本和 `latency_by_model` 同一个口径**（有第一个 token 的、
@@ -2009,6 +2109,17 @@ pub struct SecurityEvent {
     pub sent_model: Option<String>,
     /// 细节：每一处在哪儿、当时的规则、具体做了什么。**已打码**
     pub detail: tw_api::SecurityHitDetail,
+    /// 出站脱敏认出的是哪一项保存的凭据
+    pub source: Option<tw_api::SavedSource>,
+}
+
+/// 安全日志里的一条拿去「列为例外」时要的那几样（[`Db::exception_source`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionSource {
+    pub guard: tw_api::Guard,
+    pub rule: String,
+    /// 打码后的值，原样进例外表
+    pub masked: String,
 }
 
 /// 读安全日志时的那段 SELECT。**上游、密钥、模型、会话优先取请求那一行的。**
@@ -2029,7 +2140,7 @@ const SECURITY_SELECT: &str =
             WHEN r.id IS NULL THEN e.sent_model
             WHEN tw_reached(r.routing, r.error IS NOT NULL) THEN NULLIF(r.sent_model, '')
         END,
-        e.detail
+        e.detail, e.source
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 /// 安全日志按什么筛：`?1`–`?2` 这一段时间，`?3` 这一项（NULL 是全部）。
@@ -2061,6 +2172,12 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
     let detail: tw_api::SecurityHitDetail = serde_json::from_str(&detail).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(20, rusqlite::types::Type::Text, e.into())
     })?;
+    let source: Option<tw_api::SavedSource> = match r.get::<_, Option<String>>(21)? {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(21, rusqlite::types::Type::Text, e.into())
+        })?),
+        None => None,
+    };
     Ok(tw_api::SecurityEventView {
         id: r.get(0)?,
         at_ms: r.get(1)?,
@@ -2090,6 +2207,11 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         more_locations: detail.more_locations,
         rule_snapshot: detail.rule_snapshot,
         outcome_detail: detail.outcome_detail,
+        source,
+        // 两样按记录器内存里最近几行的哈希和控制面手里的例外表算
+        // （`tw_control::security::annotate`）：库里不存任何值的哈希
+        excepted: false,
+        exceptable: false,
     })
 }
 
@@ -3319,17 +3441,26 @@ mod permission_tests {
         {
             let db = Db::open(&p).unwrap();
             db.insert(&super::tests::row(1, 100)).unwrap();
+            db.add_to_usage(1).unwrap();
         }
         // 重新打开一次，让权限那一步也覆盖到 WAL（它是第一次写才出现的）
-        let _db = Db::open(&p).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            let f = std::path::PathBuf::from(format!("{}{suffix}", p.display()));
-            if !f.exists() {
-                continue;
+        let db = Db::open(&p).unwrap();
+        db.insert(&super::tests::row(2, 100)).unwrap();
+        db.add_to_usage(2).unwrap();
+        // 用量历史（`usage.db`）里是每个小时的合计，同样只给自己看
+        let mut seen = 0;
+        for base in [p.clone(), d.path().join(crate::usage::FILE)] {
+            for suffix in ["", "-wal", "-shm"] {
+                let f = std::path::PathBuf::from(format!("{}{suffix}", base.display()));
+                if !f.exists() {
+                    continue;
+                }
+                seen += 1;
+                let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} 的权限是 {mode:o}", f.display());
             }
-            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{} 的权限是 {mode:o}", f.display());
         }
+        assert!(seen >= 4, "两个库和它们的 WAL 都该在：{seen}");
     }
 }
 
@@ -3729,6 +3860,7 @@ mod security_log_tests {
             session: None,
             sent_model: None,
             detail: Default::default(),
+            source: None,
         }
     }
 
@@ -3750,6 +3882,29 @@ mod security_log_tests {
             db.insert_security_event(&event(at, guard, action)).unwrap();
         }
         db
+    }
+
+    /// 认出的是哪一项保存的凭据，存下来、读回来是同一项；别的记录没有
+    #[test]
+    fn the_source_of_a_saved_secret_is_kept() {
+        let db = Db::in_memory().unwrap();
+        let source = tw_api::SavedSource {
+            kind: tw_api::SavedSourceKind::UpstreamKey,
+            name: "DeepSeek".into(),
+        };
+        db.insert_security_event(&SecurityEvent {
+            rule: "thinkwatch-saved-secret".into(),
+            excerpt: String::new(),
+            source: Some(source.clone()),
+            ..event(1, Guard::Redact, SecurityOutcome::Replaced)
+        })
+        .unwrap();
+        db.insert_security_event(&event(2, Guard::Redact, SecurityOutcome::Recorded))
+            .unwrap();
+        let p = db.security_events(None, 0, i64::MAX, None, 10).unwrap();
+        let by_at = |at| p.events.iter().find(|e| e.at_ms == at).unwrap();
+        assert_eq!(by_at(1).source, Some(source));
+        assert_eq!(by_at(2).source, None);
     }
 
     fn ids(p: &tw_api::SecurityEventsPage) -> Vec<i64> {

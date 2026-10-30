@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use tw_config::SecurityMode as Mode;
 use tw_guard::content::Screening;
 use tw_guard::redact::flow;
-pub use tw_guard::redact::flow::Shape;
+pub use tw_guard::redact::flow::{ScanCache, Shape};
 use tw_guard::redact::replace::Ledger;
 use tw_guard::redact::rules::{Finding, Hit, Rule, RuleSet};
 
@@ -89,6 +89,7 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], shape: Option<Shape>)
         body,
         shape,
         Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+        None,
     )
 }
 
@@ -100,12 +101,13 @@ pub fn look_from(
     shape: Option<Shape>,
     seed: Ledger,
 ) -> (Vec<Finding>, Ledger) {
-    let l = look_hits_from(mode, rules, body, shape, seed);
+    let l = look_hits_from(mode, rules, body, shape, seed, None);
     (l.found, l.ledger)
 }
 
 /// [`look_from`]，连同找到的命中（见 [`flow::Look::hits`]）：报出去的每一项要说得出在哪儿
-/// （[`detail::secrets`]）。
+/// （[`detail::secrets`]）。`cache` 是运行时的扫描缓存（[`crate::state::Runtime::scan_cache`]）：
+/// 对话历史里没变的消息取上一轮扫的，找出来的一模一样。
 /// 认不出形状的不找：和关着一样，什么都没有
 pub fn look_hits_from(
     mode: Mode,
@@ -113,9 +115,10 @@ pub fn look_hits_from(
     body: &[u8],
     shape: Option<Shape>,
     seed: Ledger,
+    cache: Option<&ScanCache>,
 ) -> flow::Look {
     match shape {
-        Some(shape) => flow::look_hits(mode, rules, body, shape, seed),
+        Some(shape) => flow::look_hits_with(mode, rules, body, shape, seed, cache),
         None => flow::Look {
             found: Vec::new(),
             ledger: Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
@@ -140,7 +143,8 @@ pub fn replace(
 }
 
 /// [`replace`]，`found` 是按这套规则在 `body` 上已经找过的命中（[`look_hits`] 在同一份字节上
-/// 找的，同一个形状）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样。
+/// 找的，同一个形状）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样，没变的段
+/// 取 `cache` 里扫过的（见 [`look_hits_from`]）。
 pub fn replace_found(
     mode: Mode,
     rules: &RuleSet,
@@ -148,9 +152,14 @@ pub fn replace_found(
     ledger: &Ledger,
     shape: Option<Shape>,
     found: Option<&[Hit]>,
+    cache: Option<&ScanCache>,
 ) -> (bytes::Bytes, Ledger) {
+    let replace = |body| match shape {
+        Some(shape) => flow::replace_with(mode, rules, body, ledger, shape, cache),
+        None => (body, ledger.clone()),
+    };
     let Some(found) = found.filter(|_| mode.acts() && !rules.is_empty()) else {
-        return replace(mode, rules, body, ledger, shape);
+        return replace(body);
     };
     // 只记录的规则命中的不换
     let hits = rules.to_replace(found);
@@ -160,7 +169,7 @@ pub fn replace_found(
     }
     // 找得到命中的一定是 UTF-8（见 `flow::look_hits`）
     let Ok(text) = std::str::from_utf8(&body) else {
-        return replace(mode, rules, body, ledger, shape);
+        return replace(body);
     };
     let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
     (bytes::Bytes::from(r.text), r.ledger)
@@ -168,17 +177,23 @@ pub fn replace_found(
 
 /// `after` 里 `before` 没有的那些值：插件写进请求里的（见 [`crate::plugin::request`]）。
 ///
-/// 按规则和打过码的样子比：同一个值在两份里打出来的码一样。客户端原话里就有的值，开头
-/// 那一遍已经报过了，插件改过的那一份里再出现不再报一次。**查表比**，不两两比：两份里
-/// 各有几万个值时，后者是平方级的。
+/// 按规则、打过码的样子和是哪一项保存的凭据比：同一个值在两份里打出来的码一样。客户端原话
+/// 里就有的值，开头那一遍已经报过了，插件改过的那一份里再出现不再报一次。**保存的凭据打码
+/// 是空串**，不带上是哪一项的话，插件写进来的另一项会被当成「已经报过」（和 [`Reported`]
+/// 一样）。**查表比**，不两两比：两份里各有几万个值时，后者是平方级的。
 pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
-    let known: HashSet<(&Rule, &str)> = before
+    type Key<'a> = (
+        &'a Rule,
+        &'a str,
+        Option<&'a tw_guard::redact::rules::SavedSource>,
+    );
+    let known: HashSet<Key> = before
         .iter()
-        .map(|b| (&b.rule, b.masked.as_str()))
+        .map(|b| (&b.rule, b.masked.as_str(), b.source.as_ref()))
         .collect();
     after
         .into_iter()
-        .filter(|f| !known.contains(&(&f.rule, f.masked.as_str())))
+        .filter(|f| !known.contains(&(&f.rule, f.masked.as_str(), f.source.as_ref())))
         .collect()
 }
 
@@ -187,8 +202,9 @@ pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
 /// 安全日志里一处一行，不因为多试了几跳多出几行
 #[derive(Default)]
 pub struct Reported {
-    /// 出站脱敏报过的值：规则和打了码的那个值
-    secrets: HashSet<(String, String)>,
+    /// 出站脱敏报过的值：规则、打了码的那个值，和它是哪一项保存的凭据（保存的凭据打码是空的，
+    /// 两项不同的靠这个分开）
+    secrets: HashSet<(String, String, Option<tw_guard::redact::rules::SavedSource>)>,
     /// 内容过滤报过的命中：规则和摘录
     content: HashSet<(String, String)>,
 }
@@ -200,7 +216,7 @@ impl Reported {
             .into_iter()
             .filter(|f| {
                 self.secrets
-                    .insert((f.rule.id().to_string(), f.masked.clone()))
+                    .insert((f.rule.id().to_string(), f.masked.clone(), f.source.clone()))
             })
             .collect()
     }
@@ -244,6 +260,9 @@ pub fn items(
             // 拦截档下，动作是「仅记录」的规则原样发出
             replaced: seen.replaced && !seen.redaction.rules.records(&f.rule),
             detail,
+            source: f.source.clone(),
+            // 只给安全日志：事件流不带它（见 `tw_api::SecretItem::value_sha256`）
+            value_sha256: f.sha256.clone(),
         })
         .collect()
 }
@@ -731,7 +750,7 @@ mod tests {
             &body(),
         );
         assert_eq!(it[0].rule, "anthropic-api-key");
-        assert_eq!(it[0].kind, tw_api::SecretKind::ApiKeys);
+        assert_eq!(it[0].kind, tw_api::SecretKind::AiServices);
         assert!(!it[0].custom);
         assert!(!it[0].masked.contains("AAAAAAAAAAAA"), "{}", it[0].masked);
     }
@@ -816,6 +835,7 @@ mod tests {
             &seen.ledger,
             crate::guard::TEST_SHAPE,
             Some(&hits),
+            None,
         );
         assert_eq!(known.0, again.0);
         assert_eq!(known.1.table(), again.1.table());
@@ -828,6 +848,7 @@ mod tests {
             &fresh(),
             crate::guard::TEST_SHAPE,
             Some(&hits),
+            None,
         );
         assert_eq!(out, body);
         // 什么都没找到：原样，不拷贝
@@ -839,6 +860,7 @@ mod tests {
             &fresh(),
             crate::guard::TEST_SHAPE,
             Some(&[]),
+            None,
         );
         assert_eq!(out.as_ptr(), plain.as_ptr());
         assert!(l.is_empty());
@@ -877,13 +899,30 @@ mod tests {
             .filter(|f| {
                 !before
                     .iter()
-                    .any(|b| b.rule == f.rule && b.masked == f.masked)
+                    .any(|b| b.rule == f.rule && b.masked == f.masked && b.source == f.source)
             })
             .cloned()
             .collect();
         let got = more_found(&before, after);
         assert_eq!(got, pairwise);
         assert_eq!(got.len(), 35, "60..90 是新的，0..5 换了规则");
+    }
+
+    /// 保存的凭据打码都是空串：客户端原话里有上游 A 的密钥、插件又写进上游 B 的，B 照样报
+    #[test]
+    fn a_saved_secret_added_by_a_plugin_is_reported_even_if_another_was_already() {
+        use tw_guard::redact::rules::{SavedSource, SavedSourceKind};
+        let f = |name: &str| Finding {
+            rule: Rule::Builtin("thinkwatch-saved-secret"),
+            masked: String::new(),
+            count: 1,
+            sha256: None,
+            source: Some(SavedSource {
+                kind: SavedSourceKind::UpstreamKey,
+                name: name.into(),
+            }),
+        };
+        assert_eq!(more_found(&[f("A")], vec![f("A"), f("B")]), [f("B")]);
     }
 
     /// 每一跳接着原文那本账换：同一把密钥在每一跳都是同一个号，哪怕那一跳发出去的那份

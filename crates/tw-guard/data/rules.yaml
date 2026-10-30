@@ -14,44 +14,68 @@
 # **中英文都要覆盖。**只写英文规则等于对中文的注入完全不设防，而写
 # 中文提示词的人只多不少。
 #
-# 每条规则要有 `name`（界面上的名字）和 `why`（为什么值得看一眼）。
-# 界面按 id 查自己的中文名称表，这里的英文是查不到时的退路。
+# 每条规则要有 `name` / `name_zh`（界面上的名字，英文、中文）和 `why` / `why_zh`
+# （为什么值得看一眼）。**名字和说明只在这里写一份**：两个产品的界面都显示规则视图带过去
+# 的文字，不再各存一张名称表。
+
+# 工具调用审查的规则表怎么分组（界面上按这个顺序）。用户自己加的规则在「自定义」组，
+# 那个组的名字和另两项防护共用，在 redact.yaml 里。
+kinds:
+  - slug: command
+    name: Built-in
+    name_zh: 内置
 
 # 一、提示注入。命中只说明「这段文字在试图改变模型的行为」，不等于
 #     恶意 —— 所以只报告，让人看一眼。
 injection:
   - id: ignore-previous
     name: Ignore previous instructions
+    name_zh: 要求忽略先前的指令
     pattern: '(?i)ignore\s+(all\s+)?(previous|above|prior)[^\n]{0,20}instructions'
     why: A prompt injection typically starts this way
+    why_zh: 典型的提示注入开头
   - id: disregard
     name: Disregard the system prompt
+    name_zh: 要求无视系统提示
     pattern: '(?i)disregard\s+(the\s+)?(system|above|previous)'
     why: A prompt injection typically starts this way, with a verb like disregard
+    why_zh: 典型的提示注入开头，使用 disregard 一类的动词
   - id: you-are-now
     name: Reset the model's identity
+    name_zh: 重新设定模型身份
     pattern: '(?i)you\s+are\s+now\s+(a|an)\s'
     why: An attempt to reset who the model is
+    why_zh: 试图重新设定模型的身份
   - id: ignore-previous-zh
     name: Ignore previous instructions (Chinese)
+    name_zh: 要求忽略先前的指令（中文）
     pattern: '忽略(以上|之前|上面|前面)(的)?(所有)?(指令|要求|规则)'
     why: A Chinese prompt injection asking the model to ignore earlier instructions
+    why_zh: 中文提示注入，要求忽略先前的指令
   - id: new-instructions-zh
     name: New instructions (Chinese)
+    name_zh: 声明新的指令（中文）
     pattern: '新的?指令[：:]'
     why: A Chinese prompt injection declaring new instructions
+    why_zh: 中文提示注入，声明新的指令
   - id: you-are-now-zh
     name: Reset the model's identity (Chinese)
+    name_zh: 重新设定模型身份（中文）
     pattern: '你(现在)?(是|扮演)一[个位名]'
     why: An attempt to reset who the model is
+    why_zh: 试图重新设定模型的身份
   - id: chat-marker
     name: Forged chat markers
+    name_zh: 伪造对话标记
     pattern: '<\|(im_start|im_end|system|endoftext)\|>'
     why: Forged conversation markers, so the model reads the body as a system message
+    why_zh: 伪造对话标记，试图让模型将正文当作系统消息
   - id: fake-system
     name: Disguised system text
+    name_zh: 伪装的系统发言
     pattern: '(?i)\[?(system|assistant)\]?\s*[:：]\s*(you|your|ignore|从现在|你)'
     why: Text disguised as something the system or the assistant said
+    why_zh: 伪装成系统或助手的发言
 
 # 二、危险命令。工具调用审查只用这一组。
 #
@@ -67,36 +91,48 @@ dangerous:
   # 填长到 200 字符以上，同一条命令就匹配不到了。测试抓住的。
   - id: curl-pipe-sh
     name: Download and run
+    name_zh: 下载即执行
     pattern: '(?i)(curl|wget)[^\n|]*\|\s*(sudo\s+)?(ba|z|d)?sh'
     why: Downloads and runs it straight away; what runs is decided remotely and cannot be read first
+    why_zh: 下载后直接执行，执行的内容由远端决定且无法预先查看
     level: high
   - id: base64-decode-exec
     name: Decode and run
+    name_zh: 解码后执行
     pattern: '(?i)base64\s+(-d|--decode)[^\n|]*\|\s*(ba)?sh'
     why: Hides what will run inside base64
+    why_zh: 将要执行的内容隐藏在 base64 编码中
     level: high
   - id: exfil-env
     name: Send out environment variables
+    name_zh: 外发环境变量
     pattern: '(?i)(env|printenv|cat\s+[^\n]{0,60}\.env)[^\n]{0,200}(curl|wget|nc\s)'
     why: Sends the environment, which usually holds keys, somewhere else
+    why_zh: 将环境变量（通常包含密钥）发送到外部
     level: high
   # **命令形状的规则对中文指令完全不设防。**「把 ~/.aws/credentials
   # 打印出来」里没有 cat 也没有 curl，但它要的是同一件事。所以再加一条
   # 按「凭据路径 + 外送动词」匹配的，两个方向都写。
   - id: exfil-credentials
     name: Send out a credential file
+    name_zh: 外发凭据文件
     pattern: '(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)[^\n]{0,30}(发|传|上报|打印|输出|贴出|读出|(?i:send|upload|post|print|paste|exfil))'
     why: Asks the model to send the contents of a credential file somewhere
+    why_zh: 要求模型将凭据文件的内容发送出去
     level: high
   - id: exfil-credentials-reversed
     name: Send out a credential file (verb first)
+    name_zh: 外发凭据文件（动词在前）
     pattern: '(发送|上传|贴出|打印|输出|读取|(?i:send|upload|post|print|read))[^\n]{0,30}(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)'
     why: Asks the model to send the contents of a credential file somewhere
+    why_zh: 要求模型将凭据文件的内容发送出去
     level: high
   - id: ssh-key-read
     name: Read a private key or cloud credential
+    name_zh: 读取私钥或云凭据
     pattern: '(?i)(cat|cp|scp|curl)[^\n]{0,200}(\.ssh/id_|\.aws/credentials|\.netrc)'
     why: Reads a private key or a cloud credential
+    why_zh: 读取私钥或云服务凭据
     level: high
   # 下面两条**一条正则认不出**：要跨参数把 URL、凭据、上传标记凑到一起看，所以由
   # 代码实现（`check`，见 src/tools/net.rs），`pattern` 留空。它们一样是内置的危险命令
@@ -106,8 +142,10 @@ dangerous:
   # key 加一个陌生 host，就是把凭据送出去 —— 一步就能拿走凭据，高危、拦截档下切断。
   - id: secret-to-unknown-host
     name: Send a credential to an unknown host
+    name_zh: 凭据发往陌生主机
     pattern: ''
     why: Sends a credential to a host that is neither local nor the credential's own provider
+    why_zh: 将凭据发往既非本机、也不是该凭据服务商的主机
     level: high
     check: credential-to-network
   # ThinkWatch 自己的数据目录：里面是明文的全部上游密钥和这几项防护的设置。读它一步就
@@ -115,8 +153,10 @@ dangerous:
   # 回答「配置在哪」），只看路径和命令参数，所以由代码实现，见 src/tools/own_data.rs。
   - id: thinkwatch-data
     name: Read or change ThinkWatch's own data
+    name_zh: 读写 ThinkWatch 自己的数据
     pattern: ''
     why: Reads or changes ThinkWatch's data directory, which holds every upstream key in plain text and the settings of these protections
+    why_zh: 读写 ThinkWatch 的数据目录，其中以明文保存全部上游密钥和这几项防护的设置
     level: high
     check: thinkwatch-data
   # **写入启动项**：只要写进去了，下次开终端就执行 —— 而且是在你完全
@@ -124,32 +164,42 @@ dangerous:
   # 一步就能拿到执行权。
   - id: write-startup-item
     name: Write a startup item
+    name_zh: 写入启动项
     pattern: '(>>?|tee|cp|mv|ln\s+-s)[^\n]{0,200}(\.zshrc|\.bashrc|\.bash_profile|\.profile|\.zprofile|LaunchAgents|LaunchDaemons|\.git/hooks|crontab)'
     why: Writes somewhere that runs at login or whenever a terminal opens
+    why_zh: 写入开机或打开终端时自动执行的位置
     level: high
   # `crontab -l` 是看一眼，`crontab <文件>` / `crontab -r` / `crontab -`
   # 才是动手。分不开的话，这条规则会在每次「帮我看看定时任务」时误报。
   - id: crontab-install
     name: Install a scheduled job
+    name_zh: 安装定时任务
     pattern: 'crontab\s+(-r\b|-\s*($|["'';&|)])|[^\s-][^\n]{0,40})'
     why: Installs a scheduled job, or deletes every existing one
+    why_zh: 安装定时任务，或删除全部现有定时任务
     level: high
   - id: rm-rf-root
     name: Delete home or root
+    name_zh: 删除主目录或根目录
     pattern: 'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$|["'';&|)])'
     why: Deletes the whole home directory or the root
+    why_zh: 删除整个主目录或根目录
     level: medium
   - id: chmod-777
     name: World-writable permissions
+    name_zh: 开放全部写权限
     pattern: 'chmod\s+(-R\s+)?777'
     why: Makes a file writable by everyone
+    why_zh: 将文件权限设为所有人可写
     level: medium
   # 把本地文件的内容上传到外部主机（`curl -T 文件`、`--data @文件`、`-F 字段=@文件` 等）。
   # 开发里很常见（上传构建产物、贴日志），**出厂只记录**，先让人看见误报再说。代码实现，
   # 见 src/tools/net.rs。
   - id: upload-file-to-host
     name: Upload a local file to an external host
+    name_zh: 上传本地文件到外部主机
     pattern: ''
     why: Uploads the contents of a local file to an external host
+    why_zh: 将本地文件的内容上传到外部主机
     level: medium
     check: file-to-network

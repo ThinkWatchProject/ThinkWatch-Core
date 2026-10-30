@@ -348,6 +348,7 @@ pub(super) async fn ws_upgrade(
     let rules = crate::ws::Rules {
         redact_mode: rt.config.security.redact.mode,
         redact: rt.redact.clone(),
+        scan_cache: rt.scan_cache.clone(),
         inspect_mode: rt.config.security.inspect_tools.mode,
         tools: rt.tools.clone(),
         screen: crate::guard::Screen::of(&rt),

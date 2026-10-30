@@ -38,6 +38,9 @@ pub struct Runtime {
     /// **和配置一起建、一起换**，而不是每个请求现编一次 —— 自定义规则是
     /// 正则，摆在数据面上现编就是每个请求白付一次编译。
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
+    /// 出站脱敏的扫描缓存：对话历史里没变的消息不再扫（见 [`tw_guard::redact::cache`]）。
+    /// **跟着规则一起换**：重载配置换上一份空的，旧规则下扫出来的结果不会留到新规则下
+    pub scan_cache: Arc<tw_guard::redact::cache::ScanCache>,
     /// 工具调用审查的规则。同上。
     pub tools: Arc<tw_guard::tools::rules::Rules>,
     /// 内容过滤的规则（隐藏字符那一组也在里面）。同上
@@ -96,8 +99,18 @@ impl Runtime {
         let bad = |e: tw_config::PolicyError| {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         };
-        let redact = sec.redact.rules().map_err(bad)?;
-        let tools = sec.inspect_tools.rules().map_err(bad)?;
+        // 保存的凭据（上游密钥、访问密钥、代理口令……）按值认，跟着配置一起换。工具调用审查的
+        // 「凭据发往陌生主机」用同一份，和脱敏那条规则开没开无关
+        let redact = sec
+            .redact
+            .rules()
+            .map_err(bad)?
+            .with_saved(config.saved_secrets());
+        let tools = sec
+            .inspect_tools
+            .rules()
+            .map_err(bad)?
+            .with_saved(redact.saved().cloned());
         let content = sec.content.rules().map_err(bad)?;
         let answer = tw_guard::content::answer::Answer::build(&content);
         let plugins = Arc::new(plugins.build(&config));
@@ -107,6 +120,7 @@ impl Runtime {
             clients,
             allow,
             redact: Arc::new(redact),
+            scan_cache: Arc::new(tw_guard::redact::cache::ScanCache::new()),
             tools: Arc::new(tools),
             content: Arc::new(content),
             answer,
@@ -122,6 +136,8 @@ impl Runtime {
             clients: self.clients.clone(),
             allow: self.allow.clone(),
             redact: self.redact.clone(),
+            // 规则没变，扫过的照样作数
+            scan_cache: self.scan_cache.clone(),
             tools: self.tools.clone(),
             content: self.content.clone(),
             answer: self.answer.clone(),
@@ -775,6 +791,19 @@ mod tests {
         let rt = s.runtime();
         assert_eq!(rt.clients.len(), 2);
         assert!(rt.clients.contains_key("a") && rt.clients.contains_key("b"));
+    }
+
+    /// 扫描缓存跟着规则走：重载配置换上一份新的，旧规则下扫出来的不会留到新规则下；只换插件时
+    /// 规则没变，接着用同一份
+    #[test]
+    fn a_reload_brings_a_fresh_scan_cache() {
+        let s = AppState::new(cfg()).unwrap();
+        let before = s.runtime().scan_cache.clone();
+        s.reload(cfg()).unwrap();
+        assert!(!Arc::ptr_eq(&before, &s.runtime().scan_cache));
+        let rt = s.runtime();
+        let same = rt.with_plugins(crate::plugin::PluginSet::default());
+        assert!(Arc::ptr_eq(&rt.scan_cache, &same.scan_cache));
     }
 
     #[test]
