@@ -838,6 +838,120 @@ async fn a_missing_balance_moves_on_and_sets_the_upstream_aside() {
 }
 
 #[tokio::test]
+async fn an_ordered_chat_route_moves_on_from_insufficient_credits_and_skips_it_next_time() {
+    for streaming in [false, true] {
+        let (broke, broke_hits) = start_answering_upstream(
+            400,
+            "application/json",
+            r#"{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error","code":"BAD_REQUEST"}"#,
+        )
+        .await;
+        let (content_type, body) = if streaming {
+            (
+                "text/event-stream",
+                "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"answer\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                 data: [DONE]\n\n",
+            )
+        } else {
+            (
+                "application/json",
+                r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}]}"#,
+            )
+        };
+        let (good, good_hits) = start_answering_upstream(200, content_type, body).await;
+        let mut cfg = two(broke, good);
+        for provider in &mut cfg.providers {
+            provider.protocol = Some(tw_config::Protocol::OpenaiChat);
+        }
+        cfg.groups = vec![
+            serde_yaml_ng::from_str("name: ordered\ntype: fallback\nproviders: [first, second]\n")
+                .unwrap(),
+        ];
+        cfg.routes = vec![tw_engine::RouteSet::default_with(vec![
+            serde_yaml_ng::from_str("name: catch-all\nto: ordered\n").unwrap(),
+        ])];
+        let state = tw_gateway::AppState::new(cfg).unwrap();
+        let health = state.health.clone();
+        let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let response = reqwest::Client::new()
+                .post(format!("http://{gw}/v1/chat/completions"))
+                .bearer_auth("tw-k")
+                .json(&serde_json::json!({
+                    "model": "deepseek-v4.1-flash",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": streaming
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let text = response.text().await.unwrap();
+            assert!(text.contains("answer"), "{text}");
+        }
+        assert!(!health.is_available("first"));
+        assert_eq!(broke_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(good_hits.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn other_credit_mentions_do_not_pause_or_fail_over_a_client_error() {
+    for body in [
+        r#"{"error":{"type":"invalid_request_error","message":"You have enough credits, but max_tokens must be positive."}}"#,
+        r#"{"error":{"type":"invalid_request_error","message":"max_tokens must be positive"},"request":{"messages":[{"content":"I don't have enough credits"}]}}"#,
+    ] {
+        let (first, _) = start_answering_upstream(400, "application/json", body).await;
+        let (second, second_hits) = start_answering_upstream(200, "application/json", "{}").await;
+        let state = tw_gateway::AppState::new(two(first, second)).unwrap();
+        let health = state.health.clone();
+        let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let response = send_to(gw).await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await.unwrap(), body);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        assert!(health.is_available("first"));
+    }
+}
+
+#[tokio::test]
+async fn insufficient_credits_at_the_start_of_a_stream_moves_on_and_pauses() {
+    let (broke, broke_hits) = start_answering_upstream(
+        200,
+        "text/event-stream",
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"You don\\u0027t have enough credits\"}}\n\n",
+    )
+    .await;
+    let (good, _) = start_upstream(true).await;
+    let state = tw_gateway::AppState::new(two(broke, good)).unwrap();
+    let health = state.health.clone();
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let text = reqwest::Client::new()
+            .post(format!("http://{gw}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .body(r#"{"model":"claude-sonnet-4-5","stream":true}"#)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(!text.contains("have enough credits"), "{text}");
+    }
+    assert!(!health.is_available("first"));
+    assert_eq!(broke_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn the_last_upstreams_own_refusal_reaches_the_client() {
     // 没有下一家可换了：上游自己的原话比「回了 401」有用
     let (bad_key, _) = start_answering_upstream(
