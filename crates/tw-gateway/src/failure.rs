@@ -50,7 +50,7 @@ pub const BODY_PEEK: usize = 64 * 1024;
 
 /// 看一个非 2xx 的回答。`body` 是正文的开头（最多 [`BODY_PEEK`]）。
 pub fn classify(status: u16, headers: &HeaderMap, body: &[u8], now_ms: u64) -> Verdict {
-    let text = String::from_utf8_lossy(body).to_lowercase();
+    let text = error_text(body);
     // **正文说的原因优先于状态码**：没钱了有人回 402，有人回 429、400、403，
     // 甚至 500；额度用完有人回 429，有人回 403
     if says(&text, NO_BALANCE) {
@@ -85,6 +85,10 @@ const NO_BALANCE: &[&str] = &[
     "insufficient account balance",
     "credit balance is too low",
     "balance is too low",
+    "insufficient credit",
+    "not enough credit",
+    "don't have enough credit",
+    "do not have enough credit",
     "payment required",
     "billing_hard_limit",
     "arrearage",
@@ -122,6 +126,42 @@ const MODEL_UNAVAILABLE: &[&str] = &[
 
 fn says(text: &str, words: &[&str]) -> bool {
     words.iter().any(|w| text.contains(w))
+}
+
+/// 只看错误字段，不把响应里回显的请求、元数据当成失败原因。先解码 JSON，
+/// `don\u0027t` 和中文的 Unicode 转义才和原文同义。扁平的中转错误、嵌套的
+/// API 错误、Responses 的失败事件都看；纯文本、截断的 JSON 或没有这些字段的
+/// 格式保留原来的全文回退。
+fn error_text(body: &[u8]) -> String {
+    let raw = || String::from_utf8_lossy(body).to_lowercase();
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return raw();
+    };
+    let mut texts = Vec::new();
+    for scope in [
+        value.pointer("/response/error"),
+        value.get("error"),
+        Some(&value),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(s) = scope.as_str() {
+            texts.push(s);
+        } else {
+            texts.extend(
+                ["code", "type", "status", "message", "detail"]
+                    .into_iter()
+                    .filter_map(|k| scope.get(k).and_then(|v| v.as_str())),
+            );
+        }
+    }
+    if texts.is_empty() {
+        raw()
+    } else {
+        // 不同字段的尾和头不能拼成一条短语。
+        texts.join("\0").to_lowercase()
+    }
 }
 
 /// 额度头说用完了没有：`None` 是没说用完，`Some(None)` 是说用完了、没说什么时候
@@ -236,6 +276,14 @@ mod tests {
                 r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
             ),
             (402, r#"{"error":{"message":"Insufficient Balance"}}"#),
+            (
+                400,
+                r#"{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error","code":"BAD_REQUEST"}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"message":"You don't have enough credits for this model."}}"#,
+            ),
             (403, r#"{"error":{"code":"Arrearage"}}"#),
             (
                 429,
@@ -248,6 +296,84 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn sufficient_credit_is_not_a_missing_balance() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"You have enough credits, but max_tokens must be positive."}}"#;
+        assert_eq!(verdict(400, body), Verdict::ClientError);
+        assert_eq!(
+            verdict(429, body),
+            Verdict::Failed(Cause::RateLimited { retry_after: None })
+        );
+    }
+
+    #[test]
+    fn request_echoes_do_not_override_the_error_reason() {
+        for (status, message, expected) in [
+            (400, "max_tokens must be positive", Verdict::ClientError),
+            (
+                429,
+                "too many requests",
+                Verdict::Failed(Cause::RateLimited { retry_after: None }),
+            ),
+            (
+                400,
+                "unknown model: foo",
+                Verdict::Failed(Cause::ModelUnavailable),
+            ),
+        ] {
+            let body = serde_json::json!({
+                "error": {"message": message},
+                "request": {"messages": [{"content": "I don't have enough credits"}]},
+                "metadata": {"note": "insufficient balance"}
+            })
+            .to_string();
+            assert_eq!(verdict(status, &body), expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn json_error_fields_are_decoded_across_upstream_envelopes() {
+        for body in [
+            r#"{"message":"You have insufficient credit","code":"BAD_REQUEST"}"#,
+            r#"{"error":{"message":"You do not have enough credits"}}"#,
+            r#"{"error":{"message":"Not enough credit"}}"#,
+            r#"{"error":{"message":"You don\u0027t have enough credits"}}"#,
+            r#"{"error":{"message":"\u4f59\u989d\u4e0d\u8db3"}}"#,
+            r#"{"error":"You don\u0027t have enough credits"}"#,
+            r#"{"type":"response.failed","response":{"error":{"code":"BAD_REQUEST","message":"You don\u0027t have enough credits"}}}"#,
+            r#"{"error":"BAD_REQUEST","message":"You have insufficient credits"}"#,
+        ] {
+            assert_eq!(
+                verdict(400, body),
+                Verdict::Failed(Cause::NoBalance),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn unfamiliar_or_incomplete_errors_keep_the_text_fallback() {
+        for body in [
+            "You don't have enough credits",
+            r#"{"errors":[{"reason":"insufficient credits"}]}"#,
+            r#"{"error":{"message":"insufficient credits""#,
+        ] {
+            assert_eq!(
+                verdict(400, body),
+                Verdict::Failed(Cause::NoBalance),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn separate_error_fields_cannot_form_a_balance_signal() {
+        assert_eq!(
+            verdict(400, r#"{"code":"insufficient","message":"credit"}"#),
+            Verdict::ClientError
+        );
     }
 
     #[test]
