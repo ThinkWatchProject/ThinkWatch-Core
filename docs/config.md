@@ -441,6 +441,7 @@ Upstreams: the APIs requests are forwarded to.
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
 | `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window, output limit, reasoning and image input of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
 | `max_concurrent` | integer | — | Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.wait_secs`. Unset: no limit. |
+| `min_speed` | object, [`providers[].min_speed`](#cfg-providers-min_speed) | — | End a streamed answer that generates too slowly: from the first token on, once a second, when the average speed over the last `window_secs` is below `tokens_per_sec`, the answer ends with an error clients retry (503, `overloaded_error` for Anthropic clients), and the upstream counts one failure toward `failover.failures_to_pause`. Long pauses and summarized reasoning partway through are left out of the average; the idle timeout deals with pauses. Answers that are not streamed are not judged. Unset: never. |
 | `limits` | list of [`providers[].limits[]`](#cfg-providers-limits) | — | Usage limits of this upstream, written like its own quota: requests, tokens or cost every few minutes or hours, per day, week or month. Every one has to have room before a request is sent to it. When a rolling window is full, requests go to the next upstream or wait for room; when a day, week or month is used up, requests go to the next upstream until the next one starts. Unset: no limit. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | Where the upstream's balance is read from, with its own key and proxy: `openrouter`, `deepseek`, `moonshot`, `sub2api`, `newapi` (New API and One API) or `thinkwatch` (a ThinkWatch Enterprise gateway). `auto`: recognized from `base_url` for OpenRouter, DeepSeek and Moonshot; any other address, except Anthropic's, OpenAI's and Gemini's own, is asked once whether it is a Sub2API, ThinkWatch Enterprise or New API relay, and the answer is kept in memory only. `off`: no balance. ChatGPT and Z.ai accounts and Bedrock have no balance whatever is written here. |
@@ -529,6 +530,53 @@ not set aside. Requests that only count tokens do not take a slot. On a
 Responses WebSocket connection, each `response.create` takes a slot from when
 it is sent until its answer ends, and so does a key's `max_concurrent`; an
 idle connection takes none.
+
+#### `providers[].min_speed`
+
+A self-hosted model sometimes drops to a few tokens per second and stays
+there. Content keeps arriving, so the idle timeout never fires, and retrying
+usually brings the speed back. With `min_speed`, a streamed answer is judged
+once a second from its first token on: when the average speed over the last
+`window_secs` seconds is below `tokens_per_sec`, the gateway ends the answer
+with an error the client can retry (503: `overloaded_error` for Anthropic
+clients, `response.failed` with `server_error` for Responses clients,
+`UNAVAILABLE` for Gemini clients) and closes the connection to the upstream.
+
+The speed is counted the way the live speed in the app is: text, reasoning and
+tool arguments, estimated and calibrated against what the upstream reports.
+Pauses of 5 seconds or more partway through (a quarter of the window when it
+is under 20 seconds) are left out, since the idle timeout deals with them; when
+what is left of the window is under half of it, nothing is judged that second.
+Nothing is judged while the stream is paused (no content for more than a
+second): tool arguments often arrive in one burst after a pause. Reasoning that
+arrives as a summary, a few sentences every few seconds while the model thinks
+fast (Anthropic, Gemini and Bedrock reasoning, the Responses reasoning summary),
+is not judged while it lasts and its time is left out afterwards; reasoning
+streamed as it is generated (`reasoning_content` in OpenAI Chat, the Responses
+`reasoning_text`) is judged like text. The wait before the first token is not
+judged, nor is anything after the answer has ended, nor are answers that are
+not streamed, including Gemini streams requested without `alt=sse`.
+
+The request is recorded as failed with the speed it had, the part already
+generated is billed, and the upstream counts one failure toward
+`failover.failures_to_pause`, so a retry goes to another upstream first when
+there is one.
+
+<!-- generated: table providers[].min_speed -->
+<a id="cfg-providers-min_speed"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `tokens_per_sec` | integer | **required** | The lowest acceptable speed, in tokens per second, counted the way the live speed in the app is. From 1 to 1000. |
+| `window_secs` | integer | `20` | How many seconds the average is taken over. The first one is taken this long after the first token. From 5 to 120. |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: local-vllm
+    base_url: http://127.0.0.1:8000/v1
+    min_speed: { tokens_per_sec: 15, window_secs: 20 }
+```
 
 #### `providers[].limits`
 

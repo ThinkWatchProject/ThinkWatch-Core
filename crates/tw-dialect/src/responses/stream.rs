@@ -44,9 +44,17 @@ pub struct Parser {
     texts: HashMap<(u64, u64), (usize, bool)>,
     next: usize,
     tool_call: bool,
+    /// 推理是原样流出来的（`response.reasoning_text.delta`，开源模型），不是摘要
+    raw_reasoning: bool,
 }
 
 impl Parser {
+    /// 看得见的推理是摘要（`reasoning_summary_text`）：隔几秒一段，不代表模型想得多快。见过
+    /// 原样的推理（`reasoning_text`）就不是
+    pub(crate) fn summarizes_reasoning(&self) -> bool {
+        !self.raw_reasoning
+    }
+
     fn open(&mut self, kind: BlockKind, out: &mut Vec<Event>) -> usize {
         let index = self.next;
         self.next += 1;
@@ -162,6 +170,7 @@ impl Parser {
                 self.close_text(oi, ci, out);
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                self.raw_reasoning |= kind == "response.reasoning_text.delta";
                 let summary_index = u64_of(&v, "summary_index");
                 let Some(it) = self.items.get_mut(&oi) else {
                     return;
@@ -487,14 +496,19 @@ impl Writer {
             Event::BlockStop { index } => self.stop_item(*index, &mut out),
             Event::Usage(u) => self.usage.get_or_insert_default().merge(u),
             Event::Stop(s) => self.stop = Some(s.clone()),
-            Event::Error { message } => {
-                self.start(&mut out);
-                self.finished = true;
-                let mut r = envelope(&self.id, self.created, &self.model, "failed");
-                r["error"] = failure(500, message);
-                self.emit("response.failed", json!({ "response": r }), &mut out);
-            }
+            Event::Error { message } => out.push_str(&self.fail(500, message)),
         }
+        out
+    }
+
+    /// 中途出错：`response.failed`，错误码按状态码 `status` 定（见 [`failure`]）
+    pub(crate) fn fail(&mut self, status: u16, message: &str) -> String {
+        let mut out = String::new();
+        self.start(&mut out);
+        self.finished = true;
+        let mut r = envelope(&self.id, self.created, &self.model, "failed");
+        r["error"] = failure(status, message);
+        self.emit("response.failed", json!({ "response": r }), &mut out);
         out
     }
 

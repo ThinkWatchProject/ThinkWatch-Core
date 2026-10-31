@@ -732,6 +732,15 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "min_speed",
+                    Kind::Obj("providers[].min_speed"),
+                    Def::Unset,
+                    t(
+                        "End a streamed answer that generates too slowly: from the first token on, once a second, when the average speed over the last `window_secs` is below `tokens_per_sec`, the answer ends with an error clients retry (503, `overloaded_error` for Anthropic clients), and the upstream counts one failure toward `failover.failures_to_pause`. Long pauses and summarized reasoning partway through are left out of the average; the idle timeout deals with pauses. Answers that are not streamed are not judged. Unset: never.",
+                        "流式回答生成得太慢时结束它：从第一个 token 起每秒看一次，最近 `window_secs` 秒的平均速度低于 `tokens_per_sec` 时，回答以一条客户端会重试的错误结束（503，Anthropic 格式的客户端收到 `overloaded_error`），这家记一次失败，计入 `failover.failures_to_pause`。中途较长的停顿和摘要式的推理不算进平均速度，停顿由无响应超时处理。不是流式的回答不管。不写：不管。",
+                    ),
+                ),
+                row(
                     "limits",
                     Kind::Objs("providers[].limits[]"),
                     Def::Unset,
@@ -808,6 +817,30 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Whether the model takes images as input. The model list carries it, as `input_modalities`. Unset: the price table's; the list leaves it out when the price table does not say.",
                         "这个模型收不收图。模型列表里以 `input_modalities` 给出。不写：取价目表的；价目表也没写时，列表里不给这一项。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "providers[].min_speed",
+            ty: checked!(MinSpeed, "{tokens_per_sec: 15}"),
+            rows: vec![
+                row(
+                    "tokens_per_sec",
+                    Kind::Int,
+                    Def::Required,
+                    t(
+                        "The lowest acceptable speed, in tokens per second, counted the way the live speed in the app is. From 1 to 1000.",
+                        "最低生成速度，单位 token/秒，和应用里显示的实时速度同一个算法。取值 1 到 1000。",
+                    ),
+                ),
+                row(
+                    "window_secs",
+                    Kind::Int,
+                    Def::Is("20"),
+                    t(
+                        "How many seconds the average is taken over. The first one is taken this long after the first token. From 5 to 120.",
+                        "按最近多少秒的平均速度判断。第一次判断在第一个 token 之后这么久。取值 5 到 120。",
                     ),
                 ),
             ],
