@@ -2496,3 +2496,240 @@ async fn a_quota_reset_is_kept_as_the_moment_it_happens() {
         Some(resets_at)
     );
 }
+
+/// 第一家暂时不可用，第二家是最后的候选；四笔成功让下一笔成败能从成功率上看出来。
+async fn last_stream_gateway(
+    body: &'static str,
+    wait_secs: u64,
+) -> (SocketAddr, tw_gateway::AppState, Arc<AtomicUsize>) {
+    let (first, _) = start_upstream(false).await;
+    let (last, hits) = start_answering_upstream(200, "text/event-stream", body).await;
+    let mut cfg = two(first, last);
+    cfg.groups = vec![
+        serde_yaml_ng::from_str("name: ordered\ntype: fallback\nproviders: [second, first]\n")
+            .unwrap(),
+    ];
+    cfg.routes = vec![tw_engine::RouteSet::default_with(vec![
+        serde_yaml_ng::from_str("name: catch-all\nto: ordered\n").unwrap(),
+    ])];
+    cfg.failover.wait_secs = wait_secs;
+    cfg.failover.failures_to_pause = 1;
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    state
+        .health
+        .record_cause("first", tw_gateway::failure::Cause::NoBalance);
+    for _ in 0..4 {
+        state.health.record_success("second");
+    }
+    let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    (gw, state, hits)
+}
+
+async fn last_stream(gw: SocketAddr) -> String {
+    let response = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_last_stream_balance_error_pauses_the_provider_and_counts_once() {
+    let error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Insufficient Balance\"}}\n\n";
+    for (wait_secs, body) in [
+        (0, error),
+        (0, error.trim_end()),
+        (2, error),
+        (2, error.trim_end()),
+    ] {
+        let (gw, state, hits) = last_stream_gateway(body, wait_secs).await;
+        let mut events = state.bus.subscribe();
+        assert_eq!(last_stream(gw).await, body);
+        assert!(
+            !state.health.is_available("second"),
+            "wait={wait_secs}, {body}"
+        );
+        assert_eq!(
+            state.health.success_rates(&["second".into()])["second"],
+            0.8,
+            "一次失败不能既记成功又记失败"
+        );
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                tw_api::Event::RequestFailed { message, .. } => {
+                    assert_eq!(message.code, "gw.upstream.stream_error");
+                    assert!(message.text.contains("Insufficient Balance"));
+                    break;
+                }
+                tw_api::Event::RequestFinished { .. } => panic!("错误流被记成了成功"),
+                _ => {}
+            }
+        }
+        // 第一家恢复后，下一次请求跳过刚刚报余额不足的第二家。
+        state.health.record_success("first");
+        assert_eq!(send_to(gw).await.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn last_stream_errors_use_the_same_health_causes_as_opening_errors() {
+    for (body, available, rate) in [
+        (
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            false,
+            Some(0.8),
+        ),
+        (
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"Bad key\"}}\n\n",
+            false,
+            Some(0.8),
+        ),
+        (
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model not found\"}}\n\n",
+            true,
+            None,
+        ),
+        (
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens must be positive\"}}\n\n",
+            true,
+            Some(1.0),
+        ),
+    ] {
+        let (gw, state, hits) = last_stream_gateway(body, 0).await;
+        assert_eq!(last_stream(gw).await, body);
+        assert_eq!(state.health.is_available("second"), available, "{body}");
+        assert_eq!(
+            state
+                .health
+                .success_rates(&["second".into()])
+                .get("second")
+                .copied(),
+            rate,
+            "{body}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_last_stream_quota_error_uses_the_reported_reset() {
+    for known in [false, true] {
+        let body = if known {
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"usage_limit_reached\"}}"
+        } else {
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"usage_limit_reached\",\"resets_in_seconds\":120}}\n\n"
+        };
+        let (gw, state, _) = last_stream_gateway(body, 0).await;
+        if known {
+            let headers = HeaderMap::from_iter([
+                (
+                    "anthropic-ratelimit-unified-5h-utilization"
+                        .parse()
+                        .unwrap(),
+                    "1.0".parse().unwrap(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-5h-reset".parse().unwrap(),
+                    "120".parse().unwrap(),
+                ),
+            ]);
+            let now = chrono::Utc::now().timestamp_millis() as u64;
+            state.record_quota(0, "second", tw_gateway::quota::from_headers(&headers, now));
+        }
+        assert_eq!(last_stream(gw).await, body);
+        assert!(!state.health.is_available("second"));
+        let left = state.health.cooldown_left("second").unwrap();
+        assert!((115..=120).contains(&left.as_secs()), "{left:?}");
+        assert_eq!(
+            state.health.success_rates(&["second".into()])["second"],
+            0.8
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_last_stream_rate_limit_pauses_without_counting_as_success_or_failure() {
+    for body in [
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many requests\"}}\n\n",
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many requests\"}}",
+    ] {
+        let (gw, state, hits) = last_stream_gateway(body, 0).await;
+        assert_eq!(last_stream(gw).await, body);
+        assert!(state.health.is_available("second"));
+        assert!(state.health.success_rates(&["second".into()]).is_empty());
+        assert!(state.throttles.view("second").is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_last_stream_with_content_keeps_its_success_and_is_not_replayed() {
+    for body in [
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Insufficient Balance\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many requests\"}}",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ] {
+        let (gw, state, hits) = last_stream_gateway(body, 0).await;
+        assert_eq!(last_stream(gw).await, body);
+        assert!(state.health.is_available("second"));
+        assert_eq!(
+            state.health.success_rates(&["second".into()])["second"],
+            1.0
+        );
+        assert_eq!(
+            state.throttles.view("second").is_some(),
+            body.contains("rate_limit_error")
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn last_stream_errors_are_classified_in_the_upstream_dialect() {
+    for (path, request, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[],"stream":true}"#,
+            "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Insufficient Balance\"}}\n\n",
+        ),
+        (
+            "/v1/responses",
+            r#"{"model":"m","input":"hi","stream":true}"#,
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"Insufficient Balance\"}}}\n\n",
+        ),
+        (
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+            "data: {\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"message\":\"Insufficient Balance\"}}\n\n",
+        ),
+    ] {
+        let (gw, state, hits) = last_stream_gateway(body, 0).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{gw}{path}"))
+            .header("x-api-key", "tw-k")
+            .body(request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        assert_eq!(response.text().await.unwrap(), body, "{path}");
+        assert!(!state.health.is_available("second"), "{path}");
+        assert_eq!(
+            state.health.success_rates(&["second".into()])["second"],
+            0.8,
+            "{path}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
