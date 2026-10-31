@@ -21,6 +21,7 @@ use futures::StreamExt;
 use super::Inbound;
 use super::hop::Served;
 use crate::error::GatewayError;
+use crate::failure::Cause;
 use crate::forward;
 use crate::server::{because, flagged};
 use crate::state::{AppState, Runtime};
@@ -197,6 +198,7 @@ pub(super) fn respond(
     let throttles = state.throttles.clone();
     // 这个请求结束时记一笔，到了时候重读这一家的余额（见 `crate::balances`）
     let passing = state.balance_passing(&upstream_name);
+    let state = state.clone();
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
@@ -327,11 +329,19 @@ pub(super) fn respond(
             match item {
                 Ok(chunk) => {
                     upstream_since = tokio::time::Instant::now();
+                    // **旁路嗅探和留档，不缓冲**：看的是上游原话（带占位符的那一版），
+                    // usage 和请求记录不受后面的还原、转换影响。先认错误，再记这一家的成败。
+                    ending.feed(&chunk);
                     // 真内容才重新计时：心跳、开头的例行事件不算
                     if pulse.feed(&chunk) {
                         said = true;
                         quiet_by = quiet.after(std::time::Instant::now());
-                        if std::mem::take(&mut unconfirmed) {
+                        // 错误帧也算上游有动静（不能报静默超时），却不是答上了。
+                        // 同一块里已经有内容再报错的，保留开头成功的那一笔。
+                        if unconfirmed
+                            && (ending.has_content() || ending.upstream_fault().is_none())
+                        {
+                            unconfirmed = false;
                             crate::server::note_health(
                                 &bus,
                                 &health,
@@ -340,13 +350,6 @@ pub(super) fn respond(
                             );
                         }
                     }
-                    // **旁路嗅探和留档，不缓冲**：字节照常流向客户端，同时
-                    // 喂它一份。上游返回的 usage 是真相，而拿不到它就只能估。
-                    //
-                    // 看的是上游原话（带占位符的那一版）：usage 数字不受
-                    // 影响，而请求详情里存的正是「我们发出去的和收回来的」，
-                    // 把还原后的存进去会让那一页说谎。
-                    ending.feed(&chunk);
                     let (out, cut) = relay.chunk(&chunk).await;
                     relay.sent(&out);
                     if !out.is_empty() {
@@ -400,31 +403,31 @@ pub(super) fn respond(
             );
             ending.too_slow(rate);
         }
-        // 上游在流里报的错是限流：回答照样以错误收尾（客户端已经收到了东西，换不了），这一家暂停
-        if let Some((code, body)) = ending
+        // 尾帧没带空行的也先认出来：健康记录和请求结局看的是同一个错误。
+        ending.flush_stream_error();
+        let fault = ending
             .upstream_fault()
-            .and_then(|data| super::opening::stream_error(upstream_dialect, data))
-            && let crate::failure::Verdict::Failed(crate::failure::Cause::RateLimited {
-                retry_after,
-            }) = crate::failure::classify(
-                code,
-                &http::HeaderMap::new(),
-                &body,
-                crate::server::now_ms(),
-            )
-        {
+            .and_then(|data| super::hop::stream_fault(&state, &upstream_name, upstream_dialect, data));
+        // 答到一半才报的限流也暂停；客户端已经收到了东西，这一轮不重放。
+        if let Some(Cause::RateLimited { retry_after }) = fault {
             throttles.limited(&upstream_name, sent_at, retry_after);
         }
         // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
         // 东西，分开写就会有一种漏掉
-        // 一段真内容都没有就好好收了尾：也是答上了
+        // 还没有记过成败：正常 EOF 不代表成功，流里报的错和压着开头时按同一个原因记。
         if unconfirmed && broke.is_none() {
-            crate::server::note_health(
-                &bus,
-                &health,
-                &upstream_name,
-                health.record_success(&upstream_name),
-            );
+            let changed = match fault {
+                // 限流由上面暂停，不进健康的成功率和熔断。
+                Some(Cause::RateLimited { .. }) => None,
+                Some(cause) => {
+                    if matches!(cause, Cause::NoBalance | Cause::QuotaUsedUp { .. }) {
+                        throttles.released(&upstream_name, sent_at);
+                    }
+                    health.record_cause(&upstream_name, cause)
+                }
+                None => health.record_success(&upstream_name),
+            };
+            crate::server::note_health(&bus, &health, &upstream_name, changed);
         }
         match broke {
             None => {
