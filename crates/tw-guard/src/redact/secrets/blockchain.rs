@@ -741,6 +741,7 @@ fn bare_literal(v: &str) -> bool {
     // An unquoted identifier is a variable reference. Actual opaque keys normally
     // mix character classes; quoted passphrases have no alphabet restriction.
     v.starts_with(['[', '{'])
+        || v.bytes().all(|c| c.is_ascii_digit())
         || v.contains(' ')
         || !v.is_ascii()
         || (v.bytes().any(|c| c.is_ascii_digit()) && v.bytes().any(|c| c.is_ascii_alphabetic()))

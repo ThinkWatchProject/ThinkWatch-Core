@@ -494,3 +494,20 @@ fn seed_aliases_and_yaml_blocks_keep_following_fields() {
     assert_eq!(sent, "mnemonic: |\n  <<TW_SECRET_1>>\nnext: safe");
     assert_eq!(restore(&r.text, &r.ledger), body);
 }
+
+#[test]
+fn numeric_credentials_in_text_are_hidden_without_replacing_json_numbers() {
+    for text in [
+        "OTP: 927416",
+        "privateKey = 123456789012345678901234567890123456789012345678901234567890123456789012345",
+        "seed: 42",
+    ] {
+        let body = serde_json::json!({"messages":[{"role":"user","content":text}]}).to_string();
+        let r = redact(&body, &RuleSet::defaults(), Ledger::new(Scheme::SECRET));
+        assert_eq!(r.ledger.len(), 1, "{text}");
+        assert_eq!(restore(&r.text, &r.ledger), body);
+        serde_json::from_str::<serde_json::Value>(&r.text).unwrap();
+    }
+    let body = r#"{"seed":42,"OTP":927416}"#;
+    assert!(scan(body, &RuleSet::defaults()).is_empty());
+}
