@@ -8,7 +8,7 @@
 //! - **WIF 私钥**、**扩展私钥**（`xprv` 一类）：Base58Check，末四个字节是前面的两次 SHA-256，
 //!   碰巧对上的机会是四十亿分之一。
 //!
-//! 64 位十六进制的以太坊私钥和交易哈希、SHA-256 摘要分不开，不收。
+//! 裸十六进制私钥和其他链的编码见 `blockchain`，其中哈希形状作为隐私数据处理。
 //!
 //! 词表取自 BIP39 的官方仓库（bitcoin/bips 的 `bip-0039/`），原样放在 `bip39/` 下，每张
 //! 2048 行；测试钉着行数、排序和几组官方测试向量。
@@ -30,6 +30,12 @@ pub(in crate::redact) const KEY_ANCHORS: &[Anchor] = &[
     Anchor::Prefix("tprv", 111),
     Anchor::Prefix("yprv", 111),
     Anchor::Prefix("zprv", 111),
+    Anchor::Prefix("Yprv", 111),
+    Anchor::Prefix("Zprv", 111),
+    Anchor::Prefix("uprv", 111),
+    Anchor::Prefix("Uprv", 111),
+    Anchor::Prefix("vprv", 111),
+    Anchor::Prefix("Vprv", 111),
 ];
 
 /// 英文助记词的锚点：一个像 BIP39 词的 token（[`qualifies`]），或者一个编号。第一段数的是
@@ -187,15 +193,18 @@ pub(super) fn mnemonic(idx: &[u16]) -> bool {
 const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// Base58 解码（比特币的字母表）。前导的 `1` 是前导的零字节
-fn base58(s: &[u8]) -> Option<Vec<u8>> {
-    static MAP: OnceLock<[u8; 128]> = OnceLock::new();
-    let map = MAP.get_or_init(|| {
+pub(super) fn base58(s: &[u8]) -> Option<Vec<u8>> {
+    base58_alphabet(s, BASE58)
+}
+
+pub(super) fn base58_alphabet(s: &[u8], alphabet: &[u8]) -> Option<Vec<u8>> {
+    let map = {
         let mut m = [0xFF; 128];
-        for (i, &c) in BASE58.iter().enumerate() {
+        for (i, &c) in alphabet.iter().enumerate() {
             m[usize::from(c)] = i as u8;
         }
         m
-    });
+    };
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     for &c in s {
         let d = *map.get(usize::from(c)).filter(|&&d| d != 0xFF)?;
@@ -210,7 +219,7 @@ fn base58(s: &[u8]) -> Option<Vec<u8>> {
             carry >>= 8;
         }
     }
-    let zeros = s.iter().take_while(|&&c| c == b'1').count();
+    let zeros = s.iter().take_while(|&&c| c == alphabet[0]).count();
     let mut full = vec![0u8; zeros];
     full.extend(out);
     Some(full)
@@ -243,17 +252,25 @@ pub(super) fn wif(tok: &str) -> bool {
     let Some(v) = base58check(b) else {
         return false;
     };
-    matches!(v.first(), Some(0x80 | 0xEF)) && (v.len() == 33 || (v.len() == 34 && v[33] == 0x01))
+    matches!(v.first(), Some(0x80 | 0xEF))
+        && (v.len() == 33 || (v.len() == 34 && v[33] == 0x01))
+        && scalar(&v[1..33])
 }
 
 /// BIP32 扩展私钥：`xprv`（主网）、`tprv`（测试网）、`yprv`、`zprv`（BIP49、BIP84）开头的
 /// 111 位，Base58Check 解出来 78 字节、头四个字节是对应的版本号
 pub(super) fn extended_key(tok: &str) -> bool {
-    const VERSIONS: [(&[u8], [u8; 4]); 4] = [
+    const VERSIONS: [(&[u8], [u8; 4]); 10] = [
         (b"xprv", [0x04, 0x88, 0xAD, 0xE4]),
         (b"tprv", [0x04, 0x35, 0x83, 0x94]),
         (b"yprv", [0x04, 0x9D, 0x78, 0x78]),
         (b"zprv", [0x04, 0xB2, 0x43, 0x0C]),
+        (b"Yprv", [0x02, 0x95, 0xB0, 0x05]),
+        (b"Zprv", [0x02, 0xAA, 0x7A, 0x99]),
+        (b"uprv", [0x04, 0x4A, 0x4E, 0x28]),
+        (b"Uprv", [0x02, 0x42, 0x85, 0xB5]),
+        (b"vprv", [0x04, 0x5F, 0x18, 0xBC]),
+        (b"Vprv", [0x02, 0x57, 0x50, 0x48]),
     ];
     let b = tok.as_bytes();
     if b.len() != 111 {
@@ -262,7 +279,18 @@ pub(super) fn extended_key(tok: &str) -> bool {
     let Some((_, version)) = VERSIONS.iter().find(|(p, _)| b.starts_with(p)) else {
         return false;
     };
-    base58check(b).is_some_and(|v| v.len() == 78 && v[..4] == version[..])
+    base58check(b)
+        .is_some_and(|v| v.len() == 78 && v[..4] == version[..] && v[45] == 0 && scalar(&v[46..]))
+}
+
+/// secp256k1 scalar: 1 <= k < n.
+pub(super) fn scalar(v: &[u8]) -> bool {
+    const N: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+        0x41, 0x41,
+    ];
+    v.len() == 32 && v.iter().any(|&b| b != 0) && v < N.as_slice()
 }
 
 // ---------------------------------------------------------------- 助记词

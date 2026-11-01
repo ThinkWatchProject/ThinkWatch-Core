@@ -3860,7 +3860,9 @@ version = "0.87.1"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
+ "bech32",
  "bytes",
+ "curve25519-dalek",
  "memchr",
  "regex",
  "regex-syntax",

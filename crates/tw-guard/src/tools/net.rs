@@ -88,9 +88,11 @@ impl Check {
 fn credentials() -> &'static RuleSet {
     static S: OnceLock<RuleSet> = OnceLock::new();
     S.get_or_init(|| {
+        // A raw hex value can be a public transaction hash, so its shape alone
+        // is insufficient evidence of credential exfiltration.
         let ids: Vec<&str> = BUILTINS
             .iter()
-            .filter(|b| b.kind.is_credential())
+            .filter(|b| b.kind.is_credential() && b.id != "crypto-hex-key")
             .map(|b| b.id)
             .collect();
         RuleSet::only(&ids)
@@ -506,6 +508,34 @@ mod tests {
         assert!(!fires_a(&format!(
             r#"{{"command":"export ANTHROPIC_API_KEY={KEY}"}}"#
         )));
+    }
+
+    #[test]
+    fn blockchain_identifiers_are_redacted_without_becoming_theft_evidence() {
+        for value in [
+            "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            "ab".repeat(32),
+            format!("0x{}", "ab".repeat(20)),
+        ] {
+            assert!(
+                !fires_a(&format!(
+                    r#"{{"command":"curl https://rpc.example/query?id={value}"}}"#
+                )),
+                "{value}"
+            );
+            assert!(!crate::redact::rules::scan_plain(&value, &RuleSet::defaults()).is_empty());
+        }
+        for id in [
+            "crypto-wif-key",
+            "crypto-extended-key",
+            "crypto-mnemonic",
+            "crypto-solana-key",
+            "crypto-sui-key",
+            "crypto-stellar-key",
+            "crypto-xrp-seed",
+        ] {
+            assert!(credentials().is_on(id), "{id}");
+        }
     }
 
     #[test]

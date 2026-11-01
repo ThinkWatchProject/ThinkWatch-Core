@@ -80,6 +80,7 @@ pub(crate) fn wif_of(seed: u64, version: u8, compressed: bool) -> String {
 pub(crate) fn xprv_of(seed: u64, version: [u8; 4]) -> String {
     let mut p = version.to_vec();
     p.extend(bytes(seed, 74));
+    p[45] = 0;
     check_encode(&p)
 }
 
@@ -547,7 +548,7 @@ pub(crate) fn sample(id: &str) -> Option<Sample> {
                 format!("xprv{}", "1".repeat(107)),
             ],
         },
-        _ => return None,
+        _ => return super::super::blockchain::tests::sample(id),
     };
     Some(s)
 }

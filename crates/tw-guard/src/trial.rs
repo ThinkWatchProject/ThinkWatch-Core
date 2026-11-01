@@ -942,14 +942,17 @@ mod tests {
             Some("Mistral")
         );
         assert_eq!(r.output.as_deref(), Some("key <<TW_SECRET_1>> ok"));
-        // 不带就认不出
+        // 未保存的同形值仍按 UUID 隐私规则替换，不附带保存项来源
         let r = run(
             Guard::Redact,
             &s,
             &req("key 0123456789abcdef0123456789abcdef ok"),
         )
         .unwrap();
-        assert!(r.hits.is_empty());
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].rule, "uuid");
+        assert!(r.hits[0].source.is_none());
+        assert_eq!(r.output.as_deref(), Some("key <<TW_SECRET_1>> ok"));
     }
 
     /// 例外的值标成「例外」，不算命中：不给动作，发出去的样子里原样留着

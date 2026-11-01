@@ -748,6 +748,7 @@ pub(super) fn scan_tokens(
     let mut personal = super::personal::Want::new(set);
     let on = enabled(set, &secrets, &personal);
     if on == 0 {
+        super::secrets::blockchain::scan(text, set, json, None, out);
         personal.text(text, json, None, out);
         return None;
     }
@@ -755,7 +756,7 @@ pub(super) fn scan_tokens(
         text,
         json,
         on,
-        json && (personal.labeled_on() || set.has_custom()),
+        json && (personal.labeled_on() || set.has_custom() || super::secrets::blockchain::on(set)),
     );
     let spans = (json && !pre.quotes.is_empty()).then(|| pre.string_spans(text.len()));
     // 整段文本过一遍的（中文助记词；护照机读区、住址……）在按 token 认的前面，和老写法一样
@@ -837,6 +838,7 @@ pub(super) fn scan_tokens(
         secrets.word_run(text, r.clone(), out);
     }
     spaced.finish(text, out);
+    super::secrets::blockchain::scan(text, set, json, spans.as_deref(), out);
     secrets.finish(text, set, out);
     personal.finish(text, out);
     spans
