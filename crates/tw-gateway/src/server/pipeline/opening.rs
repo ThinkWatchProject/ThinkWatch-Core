@@ -91,8 +91,14 @@ pub(super) async fn watch(
             }
         };
         let chunk = match next {
-            // 只有开头的例行事件就收了尾：一段内容都没有，和断了一样
-            None => return Opening::Broken(ended()),
+            None => {
+                // 和回程一样容忍尾帧没有空行。只补给解析器，转发的仍是上游原字节；
+                // 只有开头的例行事件就收了尾的，照旧算没有内容。
+                let Some(judged) = sse.judge(dialect, b"\n\n") else {
+                    return Opening::Broken(ended());
+                };
+                break judged;
+            }
             Some(Ok(c)) => c,
             Some(Err(e)) => {
                 return Opening::Broken(crate::forward::map_reqwest_error(e));
@@ -112,12 +118,7 @@ pub(super) async fn watch(
             },
         };
         usage.feed(&text);
-        let judged = sse
-            .feed(&text)
-            .into_iter()
-            .map(|(event, data)| judge(dialect, event.as_deref(), &data))
-            .find(|j| !matches!(j, Judge::Preamble));
-        if let Some(j) = judged {
+        if let Some(j) = sse.judge(dialect, &text) {
             break j;
         }
         if size >= HOLD_LIMIT {
@@ -422,6 +423,13 @@ struct Sse {
 }
 
 impl Sse {
+    fn judge(&mut self, dialect: Dialect, bytes: &[u8]) -> Option<Judge> {
+        self.feed(bytes)
+            .into_iter()
+            .map(|(event, data)| judge(dialect, event.as_deref(), &data))
+            .find(|j| !matches!(j, Judge::Preamble))
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Vec<(Option<String>, String)> {
         self.buf.push_str(&String::from_utf8_lossy(bytes));
         let mut out = Vec::new();

@@ -2881,8 +2881,8 @@ fn known_reset(state: &AppState, provider: &str, cause: Cause) -> Cause {
 /// 一个流式回答在第一段内容之前就收了尾，收尾的那个事件是 `data`：这算不算 `provider` 的错、
 /// 按什么原因停用。**和这里开头报错的一跳同一个判据**（[`super::opening`] 读出状态码，
 /// [`crate::failure::classify`] 判断）：5xx、限流、额度用完、凭据被拒是 `Some`；请求本身的
-/// 问题、不是错误的是 `None` —— 那是这一家答上了。WebSocket 上 Responses 的一轮用它（见
-/// `crate::ws::turn`）
+/// 问题、不是错误的是 `None` —— 那是这一家答上了。HTTP 回程和 WebSocket 上 Responses 的一轮
+/// 都用它（见 [`super::relay`]、`crate::ws::turn`）
 pub(crate) fn stream_fault(
     state: &AppState,
     provider: &str,

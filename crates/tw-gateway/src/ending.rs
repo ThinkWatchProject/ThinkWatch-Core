@@ -76,7 +76,7 @@ pub struct Ending {
     /// 上游在流里报的错：哪一家、原话。**有它就不是成功** —— 响应头是 200，回答却断在了
     /// 半路
     upstream_error: Option<(String, String)>,
-    /// 上游报错的那一帧的 `data`：回程照它认是不是限流（见 [`Ending::upstream_fault`]）
+    /// 上游报错的那一帧的 `data`：回程照它认失败原因（见 [`Ending::upstream_fault`]）
     upstream_fault: Option<String>,
     /// 上游报的错是解不开对话里别家封存的内容（见 [`tw_dialect::sealed`]）：失败的说明讲清楚
     /// 怎么回事，不只转述原话
@@ -495,10 +495,24 @@ impl Ending {
     }
 
     /// 上游在流里报了错：那一帧的 `data`（上游的格式，[`Ending::streaming`] 时给的）。回程照它
-    /// 认是不是限流 —— 答到一半才报的限流，回答照样以错误收尾，这一家照样暂停（见
-    /// [`crate::throttle`]）
+    /// 认失败原因；流结束后先调 [`Self::flush_stream_error`]，没有空行的尾帧也算。
     pub fn upstream_fault(&self) -> Option<&str> {
         self.upstream_fault.as_deref()
+    }
+
+    /// 上游不再来字节了：看最后一帧有没有报错。只收错误嗅探器，不报结局、不结算用量，
+    /// 回程先按同一个错误记这一家的成败，之后再交给 [`Self::finished`] 或 [`Self::failed`]。
+    pub fn flush_stream_error(&mut self) {
+        if let Some(mut w) = self.watch.take() {
+            let frames = w.frames.flush();
+            if self.upstream_error.is_none()
+                && let Some((found, data)) = w.error_in(frames)
+            {
+                self.sealed_refused = sealed_refusal(w.dialect, &data);
+                self.upstream_error = Some(found);
+                self.upstream_fault = Some(data);
+            }
+        }
     }
 
     /// 上游 `provider` 回的不是 2xx，原样交给了客户端（4xx 是请求本身的问题，或者没有
@@ -749,17 +763,7 @@ impl Ending {
             self.fail(tw_api::FailureSource::Upstream, why);
             return;
         }
-        // 最后一帧后面不带空行的上游：收尾时再看一眼
-        if let Some(mut w) = self.watch.take() {
-            let frames = w.frames.flush();
-            if self.upstream_error.is_none()
-                && let Some((found, data)) = w.error_in(frames)
-            {
-                self.sealed_refused = sealed_refusal(w.dialect, &data);
-                self.upstream_error = Some(found);
-                self.upstream_fault = Some(data);
-            }
-        }
+        self.flush_stream_error();
         if let Some((upstream, message)) = self.upstream_error.take() {
             let message: String = message.chars().take(500).collect();
             let why = if self.sealed_refused {
