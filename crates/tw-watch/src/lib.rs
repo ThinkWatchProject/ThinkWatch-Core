@@ -171,15 +171,8 @@ pub(crate) mod tests {
         p.extension().is_some_and(|e| e == "md")
     }
 
-    /// 测试用的目录。**Linux 上放在内存盘（`/dev/shm`）上。**
-    ///
-    /// 「连写十次是一阵」的前提是任意两次写之间不超过去抖窗口。放在磁盘上时
-    /// 这个前提不归测试管：CI 的机器上别的测试同时在写盘，一次 `fs::write` 被
-    /// 截断之后的刷盘和脏页限流卡住两三百毫秒是常事（在 Docker 里加上 `dd`
-    /// 压盘就能复现，失败的那几次正好都有一次写超过了 200ms）。那时监听报两次
-    /// 是对的，错的是测试。内存盘上的写不碰磁盘，前提才真的成立。
-    ///
-    /// macOS 没有 `/dev/shm`，用系统的临时目录 —— 那边从来没有因此失败过。
+    /// 测试用的目录。Linux 上优先用内存盘，减少并行测试的磁盘负载；其他平台用系统
+    /// 临时目录。写入和事件投递的间隔不由测试控制，精确的合并次数由原始事件测试验证。
     pub(crate) fn scratch() -> tempfile::TempDir {
         let shm = Path::new("/dev/shm");
         if cfg!(target_os = "linux") && shm.is_dir() {
@@ -189,7 +182,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// 去抖本身，不经过文件系统：事件之间有没有空隙完全由测试决定。
+    /// 去抖本身，不经过文件系统：十个事件先全部排好，再开始去抖。即使线程被调度出去，
+    /// 下一次接收时队列里仍然有事件，不能把调度延迟误当作事件之间的静默窗口。
     #[tokio::test]
     async fn events_already_waiting_are_one_signal_and_a_later_one_is_another() {
         let (raw_tx, raw_rx) = std::sync::mpsc::channel();
@@ -216,19 +210,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_burst_of_writes_is_one_signal() {
+    async fn a_series_of_writes_is_observed() {
         let d = scratch();
         let (_w, mut rx) = watch(&[d.path().to_path_buf()], WINDOW, only_md).unwrap();
         for i in 0..10 {
             std::fs::write(d.path().join("a.md"), format!("{i}\n")).unwrap();
-            std::thread::sleep(Duration::from_millis(10));
         }
+        // 文件系统接缝只验证改动能送达。写入或事件投递卡住超过 WINDOW 时，这十次写
+        // 合法地成为多阵；精确的一阵一个信号由上面的原始事件测试验证。
         assert_eq!(recv(&mut rx, Duration::from_secs(3)).await, Signal::Got);
-        assert_eq!(
-            recv(&mut rx, Duration::from_millis(600)).await,
-            Signal::Quiet,
-            "连写十次产生了不止一个信号"
-        );
     }
 
     #[tokio::test]
