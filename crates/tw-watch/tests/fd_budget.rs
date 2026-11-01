@@ -65,6 +65,20 @@ async fn settle(rx: &mut tokio::sync::mpsc::Receiver<()>) {
     while let Ok(Some(())) = tokio::time::timeout(WINDOW * 3, rx.recv()).await {}
 }
 
+/// 去抖通道安静不代表后端切换完成：FSEvents 可能还在启动，旧的 fd 要等它起来才释放。
+/// 等实际数量收敛，超时后仍按精确数量报错，泄漏不会因调度延迟的容忍而被放过。
+async fn expect_open_fds(expected: usize, why: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = open_fds();
+        if actual == expected || tokio::time::Instant::now() >= deadline {
+            assert_eq!(actual, expected, "{why}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[test]
 fn with_too_few_fds_it_falls_back_to_fsevents_and_misses_nothing() {
     // 名额 32
@@ -95,7 +109,7 @@ fn with_too_few_fds_it_falls_back_to_fsevents_and_misses_nothing() {
         }
         assert!(got(&mut rx).await, "超名额的那一批新文件");
         settle(&mut rx).await;
-        assert_eq!(open_fds(), before + 1, "换回 FSEvents 之后还拿着 fd");
+        expect_open_fds(before + 1, "换回 FSEvents 之后还拿着 fd").await;
         // 换过去之后照样一个不漏：新文件的原地写、rename 保存
         append(&some[0].join("7.md"), "1\n");
         assert!(got(&mut rx).await, "换回 FSEvents 之后的原地写");
