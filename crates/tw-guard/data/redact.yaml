@@ -44,8 +44,8 @@
 #   **前缀类的规则不写 `about`**：说明由 build.rs 按前缀和长度生成，和判据不会说两样。
 #   加一条前缀类的规则只改这个文件。
 #
-# 每一条内置规则都要求「前缀明确」或者「结构上无法误认」。代码里的 hash、base64 的图片、
-# UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
+# 凭据规则按前缀、结构或字段位置识别。UUID、裸十六进制和链上地址另作隐私规则，
+# 不把这些无从区分用途的格式单独当成密钥外传证据。
 
 kinds:
   - slug: saved
@@ -869,8 +869,87 @@ rules:
     on_by_default: true
     name: Extended private key
     name_zh: 扩展私钥
-    about: 'Starts with `xprv`, `tprv`, `yprv` or `zprv` and passes Base58Check'
-    about_zh: '`xprv`、`tprv`、`yprv`、`zprv` 开头，Base58Check 校验通过'
+    about: 'BIP32 / SLIP-0132 extended private keys: `xprv`, `tprv`, `yprv`, `Yprv`, `zprv`, `Zprv`, `uprv`, `Uprv`, `vprv` or `Vprv`; valid Base58Check, private marker and secp256k1 scalar'
+    about_zh: 'BIP32 / SLIP-0132 扩展私钥：`xprv`、`tprv`、`yprv`、`Yprv`、`zprv`、`Zprv`、`uprv`、`Uprv`、`vprv`、`Vprv`；Base58Check、私钥标记及 secp256k1 标量均有效'
+
+
+  - id: uuid
+    kind: device
+    on_by_default: true
+    name: UUID / compact identifier
+    name_zh: UUID／紧凑标识符
+    about: 'Hyphenated UUIDs and 32 hexadecimal characters, ignoring case and without version restrictions, including order and trace IDs; compact hashes of the same shape are also replaced'
+    about_zh: '带连字符的 UUID 和 32 位十六进制串，不区分大小写、不限制版本，包括订单号和追踪 ID；同形状的紧凑哈希也替换'
+  - id: crypto-hex-key
+    kind: crypto
+    on_by_default: true
+    name: Raw wallet key / 32-byte hash
+    name_zh: 裸钱包私钥／32 字节哈希
+    about: '64 hexadecimal characters with an optional `0x` prefix; covers EVM and TRON private keys as well as indistinguishable transaction hashes and digests'
+    about_zh: '64 位十六进制串，可带 `0x` 前缀；覆盖 EVM、TRON 裸私钥以及格式无法区分的交易哈希和摘要'
+  - id: crypto-solana-key
+    kind: crypto
+    on_by_default: true
+    name: Solana keypair
+    name_zh: Solana 密钥对
+    about: '64-byte Ed25519 seed and public key encoded as Base58 or a pasted JSON byte array; the public half must match the seed, excluding signatures of the same length'
+    about_zh: 'Base58 编码或作为文本粘贴的 JSON 字节数组，含 64 字节 Ed25519 种子与公钥；由种子派生的公钥须一致，排除同长度签名'
+  - id: crypto-sui-key
+    kind: crypto
+    on_by_default: true
+    name: Sui private key
+    name_zh: Sui 私钥
+    about: '`suiprivkey1` Bech32 encoding with a valid checksum, a supported signature scheme and 32 key bytes'
+    about_zh: '`suiprivkey1` Bech32 编码，校验和有效，含支持的签名方案和 32 字节密钥'
+  - id: crypto-stellar-key
+    kind: crypto
+    on_by_default: true
+    name: Stellar secret seed
+    name_zh: Stellar 私密种子
+    about: 'Stellar `S` StrKey seed with the correct version, 32-byte payload and CRC16-XModem checksum'
+    about_zh: 'Stellar `S` StrKey 种子，版本、32 字节载荷和 CRC16-XModem 校验均有效'
+  - id: crypto-xrp-seed
+    kind: crypto
+    on_by_default: true
+    name: XRP family seed
+    name_zh: XRP 账户种子
+    about: 'XRP-alphabet Base58Check family seeds, including secp256k1 and Ed25519 version encodings'
+    about_zh: 'XRP 字母表的 Base58Check 账户种子，包括 secp256k1 和 Ed25519 版本'
+  - id: crypto-address
+    kind: financial
+    on_by_default: true
+    name: Blockchain account / extended public key
+    name_zh: 区块链账户／扩展公钥
+    about: 'EVM hex addresses, checksummed Bitcoin/TRON/XRP/Stellar addresses, Bitcoin witness addresses and BIP32 / SLIP-0132 extended public keys; also 32-byte Base58 account shapes such as Solana, which lack a checksum'
+    about_zh: 'EVM 十六进制地址，经校验的 Bitcoin／TRON／XRP／Stellar 地址、Bitcoin 隔离见证地址和 BIP32／SLIP-0132 扩展公钥；也覆盖 Solana 等无校验和的 32 字节 Base58 账户格式'
+  - id: crypto-secret-field
+    kind: in-context
+    on_by_default: true
+    name: Wallet secret in a field
+    name_zh: 字段中的钱包机密
+    about: 'Literal private keys, seeds, mnemonic/recovery phrases, passphrases, recovery codes and MPC/backup shares in named fields, including `pk`, `privateKey`, `PRIVY_WALLET_PRIVATE_KEY` and Chinese labels; only the value is replaced, with no guessed key length'
+    about_zh: '按字段识别私钥、种子、助记词、恢复短语、口令、恢复码和 MPC／备份份额，包括 `pk`、`privateKey`、`PRIVY_WALLET_PRIVATE_KEY` 和中文标签；只换值，不猜测密钥长度'
+  - id: exchange-credential
+    kind: in-context
+    on_by_default: true
+    name: Trading API / signed authentication credential
+    name_zh: 交易 API／签名鉴权凭证
+    about: 'Literal API keys, secrets, passphrases, signing memos, OTPs and authentication signatures in SDK/config fields or trading headers; Binance, OKX, Bybit, Coinbase, Kraken, KuCoin, Bitget, Gate, MEXC, Gemini, Bitfinex, HTX, BitMart, Phemex, Bitstamp, Polymarket and predict.fun; only the value is replaced'
+    about_zh: 'SDK／配置字段或交易请求头中的 API key、secret、passphrase、签名 Memo、OTP 和鉴权签名；覆盖 Binance、OKX、Bybit、Coinbase、Kraken、KuCoin、Bitget、Gate、MEXC、Gemini、Bitfinex、HTX、BitMart、Phemex、Bitstamp、Polymarket 和 predict.fun；只换值'
+  - id: crypto-keystore
+    kind: in-context
+    on_by_default: true
+    name: Wallet keystore / ciphertext
+    name_zh: 钱包密钥库／密文
+    about: 'Literal `keystore` or `ciphertext` fields, including Ethereum V3 encrypted key material; pasted JSON objects are protected as text and only the value is replaced'
+    about_zh: '字面量 `keystore` 或 `ciphertext` 字段，包括 Ethereum V3 加密密钥材料；作为文本粘贴的 JSON 对象也保护，只换值'
+  - id: crypto-rpc-key
+    kind: in-context
+    on_by_default: true
+    name: Blockchain RPC URL credential
+    name_zh: 区块链 RPC 地址凭证
+    about: 'API credentials in Infura `/v3/`, Alchemy `/v2/`, QuickNode token paths and Helius `api-key` URLs; only the credential part is replaced'
+    about_zh: 'Infura `/v3/`、Alchemy `/v2/`、QuickNode 令牌路径及 Helius `api-key` URL 中的 API 凭据；只换凭据部分'
 
   # ---- 扩充的个人信息规则（判据在 src/redact/personal/）
   - id: cn-resident-id-15

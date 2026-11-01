@@ -86,6 +86,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
         }
     });
     spaced.finish(text, &mut out);
+    super::super::secrets::blockchain::scan(text, set, json, None, &mut out);
     secrets.finish(text, set, &mut out);
     personal.finish(text, &mut out);
     custom_hits(text, set, json, &mut out);

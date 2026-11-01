@@ -23,6 +23,7 @@ use super::anchor::Anchor;
 use super::rules::{Hit, RuleSet};
 
 pub(super) mod assign;
+pub(in crate::redact) mod blockchain;
 pub(super) mod crypto;
 pub(super) mod place;
 pub(crate) mod saved;

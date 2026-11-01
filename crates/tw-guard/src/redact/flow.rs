@@ -622,6 +622,39 @@ mod tests {
     }
 
     #[test]
+    fn uuid_redaction_observes_or_replaces_written_ids_and_restores_them() {
+        let value = "7b1e2d60-6f9a-4dd7-8f3e-21b8f94c77a2";
+        let input = serde_json::json!({
+            "id": value,
+            "model": value,
+            "messages": [{"role": "user", "content": format!("order {value}; key {value}")}]
+        })
+        .to_string();
+        let rules = RuleSet::defaults();
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let (found, ledger) = look(mode, &rules, input.as_bytes(), S);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].rule.id(), "uuid");
+            let (out, ledger) = replace(mode, &rules, input.clone().into(), &ledger, S);
+            let out = String::from_utf8(out.to_vec()).unwrap();
+            if mode == Mode::Observe {
+                assert_eq!(out, input);
+                assert!(ledger.is_empty());
+            } else {
+                let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(parsed["id"], value);
+                assert_eq!(parsed["model"], value);
+                assert_eq!(
+                    parsed["messages"][0]["content"],
+                    "order <<TW_SECRET_1>>; key <<TW_SECRET_1>>"
+                );
+                assert_eq!(ledger.len(), 1);
+                assert_eq!(crate::redact::replace::restore(&out, &ledger), input);
+            }
+        }
+    }
+
+    #[test]
     fn off_does_not_even_look() {
         assert!(find(Mode::Off, &RuleSet::defaults(), &body(), S).is_empty());
         let (out, _) = replace(Mode::Off, &RuleSet::defaults(), body(), &fresh(), S);

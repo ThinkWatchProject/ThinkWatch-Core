@@ -335,8 +335,7 @@ pub const CARD_NETWORKS: &[CardNetwork] = &[
 /// 全部内置规则，从 `data/redact.yaml` 编译期生成（见 build.rs）。界面上先按 [`Kind`] 的
 /// 顺序分组，组内按这里的顺序（见 `view::redact`）；前缀表也按这里的顺序比。
 ///
-/// API 密钥那一段**只收前缀明确、长度有下限的**。代码里的 hash、base64 的
-/// 图片、UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
+/// API 密钥按前缀、结构或上下文识别；UUID、链上地址和裸十六进制另作隐私规则。
 pub const BUILTINS: &[Builtin] = include!(concat!(env!("OUT_DIR"), "/redact_builtins.rs"));
 
 /// 一个分组叫什么（`data/redact.yaml` 的 `kinds`）。
@@ -410,6 +409,17 @@ const DETECTORS: &[(&str, Matcher)] = &[
     ("crypto-mnemonic", Matcher::Code),
     ("crypto-wif-key", Matcher::Code),
     ("crypto-extended-key", Matcher::Code),
+    ("uuid", Matcher::Code),
+    ("crypto-hex-key", Matcher::Code),
+    ("crypto-solana-key", Matcher::Code),
+    ("crypto-sui-key", Matcher::Code),
+    ("crypto-stellar-key", Matcher::Code),
+    ("crypto-xrp-seed", Matcher::Code),
+    ("crypto-address", Matcher::Code),
+    ("crypto-secret-field", Matcher::Code),
+    ("exchange-credential", Matcher::Code),
+    ("crypto-keystore", Matcher::Code),
+    ("crypto-rpc-key", Matcher::Code),
     // 扩充的个人信息规则（personal/）
     ("cn-resident-id-15", Matcher::Code),
     ("passport-mrz", Matcher::Code),
@@ -2398,6 +2408,16 @@ pub fn masked(rule: &Rule, value: &str) -> String {
     {
         return mask_email(value);
     }
+    if matches!(
+        rule.id(),
+        "uuid"
+            | "crypto-secret-field"
+            | "exchange-credential"
+            | "crypto-keystore"
+            | "crypto-rpc-key"
+    ) {
+        return "…".to_string();
+    }
     match rule.kind() {
         Kind::Internal => value.to_string(),
         k if k.is_personal() => last_four(value),
@@ -2406,7 +2426,7 @@ pub fn masked(rule: &Rule, value: &str) -> String {
         // 按位置认的多半是口令，没有前缀：留头五个就是留了大半个口令。只留最后四位，短的全打掉
         Kind::InContext => masked_unknown(value),
         // 助记词的头几个字母就是头一个词
-        Kind::Crypto if rule.id() == "crypto-mnemonic" => "…".to_string(),
+        Kind::Crypto => "…".to_string(),
         _ => mask(value),
     }
 }
@@ -2658,8 +2678,6 @@ mod tests {
         // **宁可漏，不可吵。**一个天天误报的安全功能，用户第二天就关了。
         for t in [
             "把 sk-test 换成你自己的 key",
-            "const hash = 'a3f5c9e1b7d2f4a6c8e0b2d4f6a8c0e2';",
-            "UUID 是 550e8400-e29b-41d4-a716-446655440000",
             "版本 1.2.3，路径 a.b.c",
             "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
             // 全字母或全数字的一长串是 hash / id，不是 key
@@ -3154,6 +3172,10 @@ mod tests {
                 }
                 Matcher::Code if b.kind.is_personal() => {
                     let text = super::super::personal::tests::sample(b.id)
+                        .or_else(|| {
+                            super::super::secrets::tests::samples::sample(b.id)
+                                .map(|s| s.hits[0].0.clone())
+                        })
                         .unwrap_or_else(|| panic!("{} 没有样本", b.id));
                     let hits = scan_plain(&text, &only);
                     assert!(!hits.is_empty(), "{} 认不出自己的样本：{text}", b.id);

@@ -1025,6 +1025,17 @@ Built-in rules:
 | `crypto-mnemonic` | Recovery phrase | on |
 | `crypto-wif-key` | WIF private key | on |
 | `crypto-extended-key` | Extended private key | on |
+| `uuid` | UUID / compact identifier | on |
+| `crypto-hex-key` | Raw wallet key / 32-byte hash | on |
+| `crypto-solana-key` | Solana keypair | on |
+| `crypto-sui-key` | Sui private key | on |
+| `crypto-stellar-key` | Stellar secret seed | on |
+| `crypto-xrp-seed` | XRP family seed | on |
+| `crypto-address` | Blockchain account / extended public key | on |
+| `crypto-secret-field` | Wallet secret in a field | on |
+| `exchange-credential` | Trading API / signed authentication credential | on |
+| `crypto-keystore` | Wallet keystore / ciphertext | on |
+| `crypto-rpc-key` | Blockchain RPC URL credential | on |
 | `cn-resident-id-15` | 15-digit legacy resident ID number | off |
 | `passport-mrz` | Passport machine-readable zone | on |
 | `cn-passport` | Chinese passport number | off |

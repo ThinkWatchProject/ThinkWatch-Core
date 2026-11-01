@@ -775,6 +775,17 @@ pricing:
 | `crypto-mnemonic` | 助记词 | 开 |
 | `crypto-wif-key` | WIF 私钥 | 开 |
 | `crypto-extended-key` | 扩展私钥 | 开 |
+| `uuid` | UUID／紧凑标识符 | 开 |
+| `crypto-hex-key` | 裸钱包私钥／32 字节哈希 | 开 |
+| `crypto-solana-key` | Solana 密钥对 | 开 |
+| `crypto-sui-key` | Sui 私钥 | 开 |
+| `crypto-stellar-key` | Stellar 私密种子 | 开 |
+| `crypto-xrp-seed` | XRP 账户种子 | 开 |
+| `crypto-address` | 区块链账户／扩展公钥 | 开 |
+| `crypto-secret-field` | 字段中的钱包机密 | 开 |
+| `exchange-credential` | 交易 API／签名鉴权凭证 | 开 |
+| `crypto-keystore` | 钱包密钥库／密文 | 开 |
+| `crypto-rpc-key` | 区块链 RPC 地址凭证 | 开 |
 | `cn-resident-id-15` | 15 位旧身份证号 | 关 |
 | `passport-mrz` | 护照机读区 | 开 |
 | `cn-passport` | 中国护照号 | 关 |
