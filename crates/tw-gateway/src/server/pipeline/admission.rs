@@ -55,7 +55,7 @@ pub(super) async fn admit(
         _ => &[],
     };
     if let Err(r) = state.key_limits.calendar(&req.client_name, limits) {
-        return Err(refused(state, rt, req, reading, choice, fp, ending, &r));
+        return Err(refused(state, rt, req, reading, choice, fp, ending, &r).await);
     }
     let pass = state.gate.acquire(&req.client_name, max_concurrent).await;
     // 等待期限从这里起算：之后的两段等待共用它
@@ -75,7 +75,7 @@ pub(super) async fn admit(
             hold,
             wait_until,
         }),
-        Err(r) => Err(refused(state, rt, req, reading, choice, fp, ending, &r)),
+        Err(r) => Err(refused(state, rt, req, reading, choice, fp, ending, &r).await),
     }
 }
 
@@ -130,7 +130,7 @@ fn input_cost(
 
 /// 被上限拒了：照样开始、留一行（尝试链是空的），交回给客户端的那个 429。
 #[allow(clippy::too_many_arguments)]
-fn refused(
+async fn refused(
     state: &AppState,
     rt: &Runtime,
     req: &Inbound,
@@ -143,7 +143,7 @@ fn refused(
     tracing::info!(key = %req.client_name, per = r.limit.per.word(), "a usage limit of the key refused the request");
     let why = r.error();
     // 一个字节都没发出去；存下来的请求照样按这一档换、打码
-    let seen = super::heavy(&req.body, || look(rt, req));
+    let seen = super::heavy(&req.body, || look(rt, req)).await;
     let (id, _) = open(
         state,
         req,

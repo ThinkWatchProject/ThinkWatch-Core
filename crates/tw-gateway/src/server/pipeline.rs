@@ -97,7 +97,8 @@ pub(super) async fn pipeline(
         let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
         let probed = probe(&state, &rt, &req, parsed.as_ref());
         (parsed, probed)
-    });
+    })
+    .await;
     let intent = match probed {
         Probe::Answered(resp) => return Ok(resp),
         Probe::Intent(intent) => intent,
@@ -107,7 +108,8 @@ pub(super) async fn pipeline(
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
     let (reading, fp) = heavy(&req.body, || {
         read(&req, intent, parsed.as_ref(), (state.local_time)())
-    });
+    })
+    .await;
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref()) {
         Routed::Go(choice, decision) => (choice, decision),
@@ -117,7 +119,7 @@ pub(super) async fn pipeline(
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
             // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
-            let seen = heavy(&req.body, || look(&rt, &req));
+            let seen = heavy(&req.body, || look(&rt, &req)).await;
             let redaction = redaction(&rt, seen.ledger);
             let (id, _) = open(
                 &state,
@@ -267,27 +269,29 @@ async fn enter(
             ending,
         );
         (screening, started)
-    });
+    })
+    .await;
     // 用量上限的预留跟着请求号走，等存储层记下这一行时换成实数
     hold.bind(started.id);
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
     // 流量里照样留一行；一个字节都不发
     let provider = started.alive.first().map(String::as_str).unwrap_or("");
-    let refused = (!screening.hits.is_empty())
-        .then(|| {
-            // 前后文和存下来的正文一样换、打码：同一套规则、同一本账
-            let redaction = redaction(rt, started.ledger.clone());
-            let src = crate::guard::detail::Screened {
-                body: &screened,
-                dialect: req.api.map(|a| a.dialect()),
-                rules: &rt.content,
-                redaction: &redaction,
-            };
-            heavy(&screened, || {
-                crate::guard::report(&state.bus, started.id, provider, &screening, &src)
-            })
+    let refused = if !screening.hits.is_empty() {
+        // 前后文和存下来的正文一样换、打码：同一套规则、同一本账
+        let redaction = redaction(rt, started.ledger.clone());
+        let src = crate::guard::detail::Screened {
+            body: &screened,
+            dialect: req.api.map(|a| a.dialect()),
+            rules: &rt.content,
+            redaction: &redaction,
+        };
+        heavy(&screened, || {
+            crate::guard::report(&state.bus, started.id, provider, &screening, &src)
         })
-        .flatten();
+        .await
+    } else {
+        None
+    };
     drop(screened);
     if let Some(why) = refused {
         return Err(GatewayError::denied(why));
@@ -1087,7 +1091,8 @@ fn start(
             redaction: &redacting,
             replaced: redact_mode.acts(),
         };
-        let items = heavy(&req.body, || crate::guard::items(&found, 0, &seen));
+        // start 已经在 heavy_for 的名额内，不能递归等同一个调度器。
+        let items = crate::guard::items(&found, 0, &seen);
         state.bus.emit(tw_api::Event::SecretsFound {
             id,
             provider: alive.first().cloned().unwrap_or_default(),
@@ -1292,30 +1297,14 @@ fn screen(
     sc
 }
 
-/// 请求体到这么大，管线上整份解它、扫它的那几步挪出异步线程（见 [`heavy`]）。
-const HEAVY_BODY: usize = 1024 * 1024;
-
-/// 在整个请求体上做的 CPU 活：解析、本地应答的判定、内容过滤、出站脱敏、每一跳改写请求体。
-///
-/// **大的请求体挪出异步线程做**（`block_in_place`）：一个 8 MB 的请求要算几十毫秒，就地算的话，
-/// 同一个线程上别的连接 —— 正在流的回答 —— 跟着停住这么久。挪出去时这个线程上排着的活交给
-/// 别的线程接着干。小的就地做：挪一次的开销比它本身还大。
-///
-/// 只在多线程的运行时上挪：单线程的运行时（测试用的就是它）里 `block_in_place` 会 panic。
-pub(super) fn heavy<T>(body: &[u8], f: impl FnOnce() -> T) -> T {
-    heavy_for(body.len(), f)
+/// 整份请求体的 CPU 工作统一准入；大正文或小正文的并发扫描都会按需交还 I/O 调度权。
+pub(super) async fn heavy<T>(body: &[u8], f: impl FnOnce() -> T) -> T {
+    heavy_for(body.len(), f).await
 }
 
-/// [`heavy`]，按请求体的长度：要在 `f` 里改请求体的调用方先量好长度
-pub(super) fn heavy_for<T>(size: usize, f: impl FnOnce() -> T) -> T {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    let threads =
-        Handle::try_current().is_ok_and(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread);
-    if size >= HEAVY_BODY && threads {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
-    }
+/// [`heavy`]，按请求体的长度：要在 `f` 里改请求体的调用方先量好长度。
+pub(super) async fn heavy_for<T>(size: usize, f: impl FnOnce() -> T) -> T {
+    crate::resources::heavy(size, f).await
 }
 
 /// 这个请求是 Claude Code 发的吗。
@@ -1364,4 +1353,58 @@ fn local_answer(kind: crate::clientprobe::ProbeKind, body: &Bytes) -> Response {
         axum::Json(crate::clientprobe::json_response(kind, body)),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heavy_work_is_bounded_while_the_async_runtime_remains_responsive() {
+        let cap = crate::resources::policy().heavy_jobs;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (began, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut jobs = Vec::new();
+        for _ in 0..cap + 3 {
+            let (active, peak, began, release) =
+                (active.clone(), peak.clone(), began.clone(), release.clone());
+            jobs.push(tokio::spawn(async move {
+                heavy_for(1024 * 1024, || {
+                    let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    let _ = began.send(());
+                    let (lock, wake) = &*release;
+                    let guard = lock.lock().unwrap();
+                    // 有界等待：断言失败时测试也能收场，不会留下永久阻塞线程。
+                    let _guard = wake
+                        .wait_timeout_while(guard, std::time::Duration::from_secs(5), |done| !*done)
+                        .unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            }));
+        }
+        for _ in 0..cap {
+            tokio::time::timeout(std::time::Duration::from_secs(3), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // 全部 CPU 名额被占用时，异步计时器仍能被调度，额外任务仍在异步等候。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), starts.recv())
+                .await
+                .is_err()
+        );
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        for job in jobs {
+            job.await.unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), cap);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 }

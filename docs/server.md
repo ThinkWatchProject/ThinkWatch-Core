@@ -23,6 +23,35 @@ upgrading. Every field mentioned is described in the
   and the version the app needs. [Upgrading](#upgrading) describes how to
   switch versions.
 
+## Automatic resource scheduling
+
+Core sizes its runtime automatically; no `runtime` configuration or allocator
+environment variables are needed. Up to eight permanent Tokio workers handle
+I/O. CPU work shares slots sized from the process's available parallelism and
+memory: up to one job per available CPU, limited to one per 128 MiB of memory.
+An 80-core server with enough memory can run 80 CPU jobs concurrently. This is
+a capacity limit, not a set of prestarted threads. Parsing, scanning, rewriting,
+decompression and plugins obtain slots asynchronously before doing CPU work.
+Large bodies move off the I/O scheduler immediately; concurrent small-body
+scans also hand back scheduling capacity when the inline lanes are occupied.
+Execution threads grow with demand, and surplus threads retire after ten idle
+seconds. Plugins use the same policy with separate sandbox stacks. Streaming
+responses and ordinary file or DNS operations can continue while CPU work waits.
+
+Incoming request bodies share a process-wide buffering budget: one eighth of
+the machine's memory (the cgroup limit on Linux containers), between 64 and
+512 MiB, with threefold headroom for parsing and copies. The reservation follows
+the last reference to the buffered body, including while a request is queued.
+When the budget is occupied, new bodies receive a retryable `429` with
+`Retry-After`. A single large body can use the budget exclusively; the existing
+256 MiB per-request limit still applies. This budget covers request buffering,
+not the entire process RSS.
+
+Release binaries use mimalloc to reduce allocator fragmentation and retained
+free pages. The chosen worker count, heavy-work slots, buffering budget and
+allocator are printed once at startup. CPU and memory sizing is calculated at
+startup; execution threads grow and retire throughout the process lifetime.
+
 ## 1. Install
 
 ```sh

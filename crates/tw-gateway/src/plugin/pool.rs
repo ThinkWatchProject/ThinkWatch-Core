@@ -2,10 +2,10 @@
 //!
 //! 插件调用是阻塞的、吃 CPU 的（一次请求钩子最多跑两百毫秒）。放在 tokio 的工作线程
 //! 上调，几个慢插件就能把整个数据面的线程占满 —— 那时连不走插件的请求也一起卡住。
-//! 所以一律交给这里：几根自己的线程，**排队的数量有上限**，满了的话调用方异步地等，
+//! 所以一律交给这里：按需创建、空闲回收的专用线程，**排队的数量有上限**，满了调用方异步地等，
 //! 不占着 tokio 的线程。
 //!
-//! 线程**第一次用到时才起**：绝大多数用户一个插件都没装，不该为它多几根闲着的线程。
+//! 线程按实际并发创建，空闲十秒退出。上限取自动 CPU 预算，和网关重任务共用 CPU 名额。
 //!
 //! # 回答实例的名额
 //!
@@ -17,14 +17,13 @@
 //! 满了就按那个插件的 `on_error` 处置 —— 拒绝是这个请求失败，跳过是这次回答绕过它。
 //! 名额跟着实例走（[`Slot`]），实例扔掉的那一刻还回来。
 
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use tokio::runtime::{Builder, Runtime};
 
 /// 同时活着的回答实例最多这么多个（见模块说明）。按一个实例 64 MiB 的上限算，最坏
 /// 2 GiB；实际的插件一个实例多半不到 1 MiB
 pub const MAX_LIVE_REPLIES: usize = 32;
-
-type Job = Box<dyn FnOnce() + Send>;
 
 /// 池子坏了：任务 panic 了，或者线程起不来。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +49,7 @@ pub struct Pool {
     replies: Arc<tokio::sync::Semaphore>,
     /// 名额一共几个
     reply_cap: usize,
-    tx: OnceLock<Result<Mutex<mpsc::Sender<Job>>, String>>,
+    runtime: OnceLock<Result<Runtime, String>>,
 }
 
 /// 一个回答实例占着的名额（见 [`Pool::reply_slot`]）。**和实例放在一起**：实例在哪儿被
@@ -80,7 +79,7 @@ impl Pool {
             permits: Arc::new(tokio::sync::Semaphore::new(queue.max(threads))),
             replies: Arc::new(tokio::sync::Semaphore::new(replies)),
             reply_cap: replies,
-            tx: OnceLock::new(),
+            runtime: OnceLock::new(),
         }
     }
 
@@ -104,41 +103,27 @@ impl Pool {
             .saturating_sub(self.replies.available_permits())
     }
 
-    /// 按机器的核数定：至少两根，最多八根；排队的是线程数的四倍。
+    /// 线程按需创建，上限取机器的自动 CPU 预算；排队的是上限的四倍。
     pub fn default_size() -> Self {
-        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-        let threads = cores.clamp(2, 8);
-        Self::new(threads, threads * 4)
+        let threads = crate::resources::policy().heavy_jobs;
+        Self::new(threads, threads.saturating_mul(4))
     }
 
-    fn sender(&self) -> Result<&Mutex<mpsc::Sender<Job>>, PoolError> {
-        self.tx
-            .get_or_init(|| {
-                let (tx, rx) = mpsc::channel::<Job>();
-                let rx = Arc::new(Mutex::new(rx));
-                for i in 0..self.threads {
-                    let rx = rx.clone();
-                    std::thread::Builder::new()
-                        .name(format!("tw-plugin-{i}"))
-                        .stack_size(STACK)
-                        .spawn(move || {
-                            loop {
-                                // 锁只在取任务时拿着，跑任务时放开
-                                let job = match rx.lock() {
-                                    Ok(r) => r.recv(),
-                                    Err(_) => return,
-                                };
-                                match job {
-                                    Ok(job) => job(),
-                                    // 池子被丢掉了
-                                    Err(_) => return,
-                                }
-                            }
-                        })
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(Mutex::new(tx))
-            })
+    fn builder(&self) -> Builder {
+        // 只用 Tokio 的弹性 blocking pool：current-thread runtime 不创建调度线程，
+        // 也不需要驱动 block_on。沙箱保留独立的 8 MiB 栈，不占普通文件/DNS 线程。
+        let mut builder = Builder::new_current_thread();
+        builder
+            .max_blocking_threads(self.threads)
+            .thread_name("tw-plugin-worker")
+            .thread_stack_size(STACK)
+            .thread_keep_alive(crate::resources::CPU_KEEP_ALIVE);
+        builder
+    }
+
+    fn runtime(&self) -> Result<&Runtime, PoolError> {
+        self.runtime
+            .get_or_init(|| self.builder().build().map_err(|e| e.to_string()))
             .as_ref()
             .map_err(|e| PoolError::Unavailable(e.clone()))
     }
@@ -156,20 +141,26 @@ impl Pool {
             .acquire_owned()
             .await
             .map_err(|e| PoolError::Unavailable(e.to_string()))?;
-        let (done, wait) = tokio::sync::oneshot::channel();
-        let job: Job = Box::new(move || {
-            let _permit = permit;
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-                .map_err(|_| PoolError::Panicked);
-            let _ = done.send(out);
-        });
-        self.sender()?
-            .lock()
+        let cpu = crate::resources::heavy_slot().await;
+        self.runtime()?
+            .spawn_blocking(move || {
+                // 调用方取消也不能提前归还 CPU 和队列名额：阻塞调用仍会继续跑。
+                let (_permit, _cpu) = (permit, cpu);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                    .map_err(|_| PoolError::Panicked)
+            })
+            .await
             .map_err(|e| PoolError::Unavailable(e.to_string()))?
-            .send(job)
-            .map_err(|e| PoolError::Unavailable(e.to_string()))?;
-        wait.await
-            .map_err(|_| PoolError::Unavailable("the plugin thread went away".into()))?
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if let Some(Ok(runtime)) = self.runtime.take() {
+            // Pool 常在异步任务里随配置一起被丢掉；不能在这里阻塞关闭 runtime。
+            // 已经开始的调用照样完成，随后线程全部退出。
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -193,6 +184,75 @@ mod tests {
         let pool = Pool::new(1, 1);
         let r: Result<(), _> = pool.run(|| panic!("boom")).await;
         assert_eq!(r, Err(PoolError::Panicked));
+        assert_eq!(pool.run(|| 7).await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn threads_follow_demand_retire_and_can_be_created_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let pool = Arc::new(Pool::new(80, 80));
+        let live = Arc::new(AtomicUsize::new(0));
+        let (started, stopped) = (live.clone(), live.clone());
+        let runtime = pool
+            .builder()
+            .thread_keep_alive(Duration::from_millis(100))
+            .on_thread_start(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+            })
+            .on_thread_stop(move || {
+                stopped.fetch_sub(1, Ordering::SeqCst);
+            })
+            .build()
+            .unwrap();
+        pool.runtime.set(Ok(runtime)).unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.run(|| 42).await, Ok(42));
+        assert_eq!(live.load(Ordering::SeqCst), 1, "do not prestart 80 threads");
+
+        let count = crate::resources::policy().heavy_jobs.min(12);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (began, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut jobs = Vec::new();
+        for _ in 0..count {
+            let (pool, release, began) = (pool.clone(), release.clone(), began.clone());
+            jobs.push(tokio::spawn(async move {
+                pool.run(move || {
+                    began.send(()).unwrap();
+                    let guard = release.0.lock().unwrap();
+                    let _guard = release
+                        .1
+                        .wait_timeout_while(guard, Duration::from_secs(10), |done| !*done)
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for _ in 0..count {
+            tokio::time::timeout(Duration::from_secs(5), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(live.load(Ordering::SeqCst), count);
+        // 丢掉调用方不能让仍在执行的插件提前归还队列名额。
+        jobs[0].abort();
+        assert_eq!(pool.permits.available_permits(), 80 - count);
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        for job in jobs {
+            let _ = job.await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.permits.available_permits(), 80);
         assert_eq!(pool.run(|| 7).await, Ok(7));
     }
 

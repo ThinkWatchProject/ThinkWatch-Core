@@ -947,7 +947,13 @@ async fn redact(raw: Bytes, r: Redaction) -> String {
     let heavy = raw.len() >= HEAVY;
     let go = move || r.apply(&String::from_utf8_lossy(&raw));
     if heavy {
-        tokio::task::spawn_blocking(go).await.unwrap_or_default()
+        let slot = crate::resources::heavy_slot().await;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            go()
+        })
+        .await
+        .unwrap_or_default()
     } else {
         go()
     }

@@ -115,7 +115,10 @@ pub(super) async fn attempt(
         None => None,
     };
     // 内容过滤：只报插件加进来的。处置档下删过的话，后面一律用删过的那一份
-    let (body, value) = rescreen(state, rt, req, started, &provider.name, &c, reported)?;
+    let (body, value) = super::heavy(&c.body, || {
+        rescreen(state, rt, req, started, &provider.name, &c, reported)
+    })
+    .await?;
     // 生成回答的请求重新解码：格式转换用改过的这一份。数 token、压缩这些不转换（只发给
     // 同格式的上游），不用解
     let decoded = req.api.filter(|_| reading.generates).map(|api| {
