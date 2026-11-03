@@ -1065,6 +1065,13 @@ Built-in rules:
 | `labeled-health` | Health information by field name | off |
 <!-- /generated -->
 
+`uuid` is on by default. It matches hexadecimal UUIDs written as 8-4-4-4-12
+or 32 consecutive hexadecimal characters, ignoring case and without restricting
+the UUID version. Order and trace IDs, and compact hashes with the same shape,
+are replaced too; longer tokens are not split and JSON numbers stay numbers.
+Observe mode only records matches. A UUID alone does not trigger the
+credential-to-network tool check; saved credentials are still checked by value.
+
 `cn-resident-id`, `bank-card`, `email` and `cn-mobile-phone` look for
 personal information rather than credentials. The first two are on out of the
 box and match only what checks out by structure:
