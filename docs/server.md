@@ -48,7 +48,9 @@ When the budget is occupied, new bodies receive a retryable `429` with
 not the entire process RSS.
 
 Release binaries use mimalloc to reduce allocator fragmentation and retained
-free pages. The chosen worker count, heavy-work slots, buffering budget and
+free pages. Linux builds disable transparent huge pages for the Core process
+where the kernel permits it, reducing residency for small allocations without
+changing system settings. The chosen worker count, heavy-work slots, buffering budget and
 allocator are printed once at startup. CPU and memory sizing is calculated at
 startup; execution threads grow and retire throughout the process lifetime.
 

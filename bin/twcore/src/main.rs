@@ -261,6 +261,7 @@ fn main() -> Result<()> {
                 }),
         )
         .init();
+    runtime::init_allocator();
     // 网关的代码 panic 时，那个请求的结局写得出哪一行、为什么（stderr 在桌面版里没人看）
     tw_gateway::panic_note::install();
 

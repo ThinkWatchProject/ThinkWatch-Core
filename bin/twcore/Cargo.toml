@@ -19,7 +19,8 @@ default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-mimalloc = { version = "0.1.52", optional = true }
+# Linux 不主动申请 THP，避免小对象/线程堆按大页驻留；不要求用户设置内核或环境变量。
+mimalloc = { version = "0.1.52", optional = true, features = ["no_thp"] }
 tw-config = { workspace = true }
 tw-control = { workspace = true }
 # 升级不断线：新旧 core 之间的交接连接

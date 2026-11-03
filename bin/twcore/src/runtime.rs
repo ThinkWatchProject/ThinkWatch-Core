@@ -2,6 +2,28 @@
 
 use anyhow::{Context, Result};
 
+/// Linux 的 THP 会把小对象所在的稀疏堆按 2 MiB 驻留，抵消线程回收的收益。
+/// 只约束本进程，不改系统设置，也不要求用户提供分配器环境变量。
+pub fn init_allocator() {
+    #[cfg(all(target_os = "linux", feature = "mimalloc"))]
+    {
+        // SAFETY: PR_SET_THP_DISABLE 只接受整数参数，不读写 Rust 的内存。
+        // 必须在创建工作线程之前调用，使其继承该进程的策略。
+        let result = unsafe {
+            libc::prctl(
+                libc::PR_SET_THP_DISABLE,
+                1 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if result != 0 {
+            tracing::debug!(error = %std::io::Error::last_os_error(), "could not disable transparent huge pages");
+        }
+    }
+}
+
 pub fn build() -> Result<tokio::runtime::Runtime> {
     let policy = tw_gateway::resources::policy();
     // 保留 Tokio 原有的显式覆盖，但自动值本身就适用于大核服务器。
@@ -44,6 +66,23 @@ fn workers(automatic: usize, explicit: Option<&str>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", feature = "mimalloc"))]
+    #[test]
+    fn allocator_disables_transparent_huge_pages_for_this_process() {
+        init_allocator();
+        // SAFETY: PR_GET_THP_DISABLE returns the process flag and takes integer arguments.
+        let disabled = unsafe {
+            libc::prctl(
+                libc::PR_GET_THP_DISABLE,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        assert_eq!(disabled, 1);
+    }
 
     #[test]
     fn explicit_tokio_override_is_optional_and_validated() {
