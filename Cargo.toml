@@ -61,7 +61,7 @@ categories = ["network-programming", "web-programming::http-server"]
 
 # 二进制走 CalVer，crate 走 SemVer —— 两者是两回事，卖给不同的人。
 # 这里是 crate 的版本。
-version = "0.88.0"
+version = "0.89.0"
 
 [workspace.dependencies]
 # ── 内部 crate ───────────────────────────────────────────
@@ -89,6 +89,8 @@ tw-handover = { path = "crates/tw-handover" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+# 只读内存容量和 Linux cgroup 限额，不扫描进程，也不开采集线程。
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 hyper = { version = "1", features = ["full"] }

@@ -425,6 +425,7 @@ gw.request.body_declared_too_large
 gw.request.body_over_limit
 gw.request.body_unreadable
 gw.request.decoded_body_over_limit
+gw.request.memory_busy
 gw.request.unsupported_encoding
 gw.route.all_selected_disabled
 gw.route.denied

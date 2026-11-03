@@ -637,7 +637,9 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 (out, effort)
             })
-        }) {
+        })
+        .await
+        {
             Ok(out) => out,
             Err(err) => {
                 chain.push(hop_failed(
@@ -689,7 +691,8 @@ pub(super) async fn try_upstreams<'a>(
                 Some(&rt.scan_cache),
             );
             (body, ledger, differs)
-        });
+        })
+        .await;
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。

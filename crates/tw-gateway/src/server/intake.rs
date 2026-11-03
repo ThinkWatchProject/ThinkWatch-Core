@@ -12,8 +12,8 @@
 
 use axum::body::Body;
 use axum::http::{HeaderMap, header};
-use bytes::Bytes;
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use bytes::{Bytes, BytesMut};
+use http_body_util::BodyExt;
 
 use crate::error::GatewayError;
 use crate::inflate::{Coding, Decode};
@@ -35,6 +35,15 @@ pub(super) async fn read(
     body: Body,
     max: usize,
 ) -> Result<Bytes, GatewayError> {
+    read_with_budget(headers, body, max, crate::resources::body_budget()).await
+}
+
+async fn read_with_budget(
+    headers: &mut HeaderMap,
+    mut body: Body,
+    max: usize,
+    budget: &std::sync::Arc<crate::resources::Budget>,
+) -> Result<Bytes, GatewayError> {
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -47,32 +56,55 @@ pub(super) async fn read(
     }
     // 认不得的编码在读体之前就拒：不用先收完几百兆再说不认识
     let coding = coding_of(headers)?;
-    let raw = match Limited::new(body, max).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+    let mut reservation = budget.reserve();
+    let mut raw = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| {
+            GatewayError::request(msg!(
+                "gw.request.body_unreadable", detail = e =>
+                "The request body could not be read: {detail}"
+            ))
+        })?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let next = raw.len().saturating_add(data.len());
+        if next > max {
             return Err(GatewayError::too_large(msg!(
                 "gw.request.body_over_limit", max = max =>
                 "The request body is over the {max}-byte limit."
             )));
         }
-        // 客户端传到一半断了。它多半已经听不到这句了，但这一行得有个结局
-        Err(e) => {
-            return Err(GatewayError::request(msg!(
-                "gw.request.body_unreadable", detail = e =>
-                "The request body could not be read: {detail}"
-            )));
+        // 先记账再拷贝。用满就让客户端退避，不拿着半份正文等别的请求释放。
+        if !reservation.grow(next) {
+            return Err(crate::resources::memory_busy());
         }
-    };
+        raw.extend_from_slice(&data);
+    }
+    let raw = raw.freeze();
     let Some(coding) = coding else {
-        return Ok(raw);
+        return Ok(reservation.wrap(raw));
     };
     headers.remove(header::CONTENT_ENCODING);
     // 解压是纯 CPU 的活，几百兆要几百毫秒：不占 async 线程
-    let decoded = tokio::task::spawn_blocking(move || coding.decode(&raw, max))
-        .await
-        .unwrap_or_else(|e| Err(Decode::Failed(e.to_string())));
+    let slot = crate::resources::heavy_slot().await;
+    let decoded = tokio::task::spawn_blocking(move || {
+        // 客户端取消时阻塞任务仍可能在跑：CPU 名额和预算都跟任务走。
+        let _slot = slot;
+        let decoded = coding.decode_with(&raw, max, |output| {
+            if reservation.grow(raw.len().saturating_add(output)) {
+                Ok(())
+            } else {
+                Err(Decode::Busy)
+            }
+        })?;
+        Ok(reservation.wrap(decoded))
+    })
+    .await
+    .unwrap_or_else(|e| Err(Decode::Failed(e.to_string())));
     match decoded {
         Ok(b) => Ok(b),
+        Err(Decode::Busy) => Err(crate::resources::memory_busy()),
         Err(Decode::OverLimit) => Err(GatewayError::too_large(msg!(
             "gw.request.decoded_body_over_limit", max = max =>
             "The request body is over the {max}-byte limit once decoded."
@@ -123,6 +155,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_bodies_share_a_budget_until_the_last_clone_is_dropped() {
+        let budget = crate::resources::Budget::new(30);
+        let body = read_with_budget(&mut HeaderMap::new(), chunked(&[b"123456"]), 100, &budget)
+            .await
+            .unwrap();
+        let clone = body.clone();
+        drop(body);
+        let e = read_with_budget(&mut HeaderMap::new(), chunked(&[b"12345"]), 100, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(e.detail.code, "gw.request.memory_busy");
+        assert_eq!(e.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(e.retry.is_some());
+        drop(clone);
+        assert!(
+            read_with_budget(&mut HeaderMap::new(), chunked(&[b"12345"]), 100, &budget)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_partial_read_returns_its_budget() {
+        use futures::StreamExt;
+        let budget = crate::resources::Budget::new(30);
+        let stream =
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"123456"))])
+                .chain(futures::stream::pending());
+        let mut headers = HeaderMap::new();
+        let mut reading = Box::pin(read_with_budget(
+            &mut headers,
+            Body::from_stream(stream),
+            100,
+            &budget,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut reading)
+                .await
+                .is_err()
+        );
+        assert!(
+            read_with_budget(&mut HeaderMap::new(), chunked(&[b"12345"]), 100, &budget)
+                .await
+                .is_err()
+        );
+        drop(reading);
+        assert!(
+            read_with_budget(&mut HeaderMap::new(), chunked(&[b"12345"]), 100, &budget)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_releases_its_partial_reservation() {
+        let budget = crate::resources::Budget::new(30);
+        let e = read_with_budget(
+            &mut HeaderMap::new(),
+            chunked(&[b"123456", b"789"]),
+            8,
+            &budget,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.detail.code, "gw.request.body_over_limit");
+        assert!(
+            read_with_budget(
+                &mut HeaderMap::new(),
+                chunked(&[b"123456789"]),
+                100,
+                &budget
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn a_body_without_a_length_stops_at_the_limit() {
         let e = read(&mut HeaderMap::new(), chunked(&[b"123", b"456"]), 5)
             .await
@@ -168,6 +278,39 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_ENCODING, HeaderValue::from_static(v));
         h
+    }
+
+    #[tokio::test]
+    async fn decompression_reserves_output_and_releases_everything_on_failure() {
+        let budget = crate::resources::Budget::new(3_000);
+        let held = read_with_budget(
+            &mut HeaderMap::new(),
+            Body::from(vec![b'h'; 500]),
+            10_000,
+            &budget,
+        )
+        .await
+        .unwrap();
+        // 压缩数据放得下，解压后的那份放不下：必须在解压增长时检查预算。
+        let e = read_with_budget(
+            &mut with_encoding("gzip"),
+            Body::from(gz(&[b'x'; 1_000])),
+            10_000,
+            &budget,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.detail.code, "gw.request.memory_busy");
+        drop(held);
+        let decoded = read_with_budget(
+            &mut with_encoding("gzip"),
+            Body::from(gz(&[b'x'; 1_000])),
+            10_000,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(&decoded[..], &[b'x'; 1_000]);
     }
 
     #[tokio::test]

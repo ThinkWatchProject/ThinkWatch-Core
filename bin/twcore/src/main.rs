@@ -18,11 +18,16 @@ mod lockfile;
 mod pack_cli;
 mod proc;
 mod record;
+mod runtime;
 mod sync_cmd;
 mod upgrade;
 
 use background::Background;
 use lockfile::{LockFile, LockOutcome};
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 // `about` 不写值就是 Cargo.toml 里的 description：一句话只写一处，两边不会各说各的
@@ -256,6 +261,7 @@ fn main() -> Result<()> {
                 }),
         )
         .init();
+    runtime::init_allocator();
     // 网关的代码 panic 时，那个请求的结局写得出哪一行、为什么（stderr 在桌面版里没人看）
     tw_gateway::panic_note::install();
 
@@ -394,7 +400,9 @@ fn fmt_time(ms: u64) -> String {
 /// 数字准不准。
 fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Result<()> {
     let cfg = tw_config::load(path).with_context(|| format!("reading {}", path.display()))?;
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         if let Some(name) = proxy {
             let px = cfg
@@ -792,9 +800,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // 端口文件）都会顺手 `create_dir_all`，谁先到谁建 —— 而 Windows 上「谁
     // 建的」决定了它的 ACL，也就决定了那份明文密钥同机的其他用户读不读得到。
     tw_config::private_dir::create(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = runtime::build()?;
     // **锁被一个活着的 core 占着时，先问它是不是在等接替者**（升级不断线，见 `handover`）。
     // 是的话接管它；不是的话照旧报「已有实例在运行」
     let (mut lock, mut incoming) = match LockFile::acquire(&dir)? {

@@ -13,7 +13,14 @@ description = "Self-contained AI gateway: the local engine behind ThinkWatch Lit
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["mimalloc"]
+# 系统分配器的构建只用于对照诊断；发布包默认启用，无需用户设置。
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+# Linux 不主动申请 THP，避免小对象/线程堆按大页驻留；不要求用户设置内核或环境变量。
+mimalloc = { version = "0.1.52", optional = true, features = ["no_thp"] }
 tw-config = { workspace = true }
 tw-control = { workspace = true }
 # 升级不断线：新旧 core 之间的交接连接

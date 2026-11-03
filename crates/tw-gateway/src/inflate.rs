@@ -30,6 +30,8 @@ pub enum Coding {
 pub enum Decode {
     /// 解出来的超过了上限
     OverLimit,
+    /// 进程的正文缓冲预算暂时用满了，客户端可以稍后重试
+    Busy,
     /// 数据和编码对不上、解到一半断了
     Failed(String),
 }
@@ -57,6 +59,16 @@ impl Coding {
     /// 解开 `raw`，解出来的最多 `max` 字节。**读到第 `max + 1` 个字节就停**：解出来的有多大，
     /// 压缩数据自己说了不算（zstd 的帧头可以写一个假的长度），只信实际解出来的
     pub fn decode(self, raw: &[u8], max: usize) -> Result<Bytes, Decode> {
+        self.decode_with(raw, max, |_| Ok(()))
+    }
+
+    /// 解压输出每次增长前预留预算，不信压缩帧自报的长度。
+    pub(crate) fn decode_with(
+        self,
+        raw: &[u8],
+        max: usize,
+        mut reserve: impl FnMut(usize) -> Result<(), Decode>,
+    ) -> Result<Bytes, Decode> {
         let reader: Box<dyn Read> = match self {
             Self::Gzip => Box::new(flate2::read::MultiGzDecoder::new(raw)),
             // HTTP 的 deflate 是 zlib 封装的（RFC 9110 §8.4.1.2）
@@ -66,12 +78,21 @@ impl Coding {
             ),
         };
         let mut out = Vec::new();
-        reader
-            .take(max as u64 + 1)
-            .read_to_end(&mut out)
-            .map_err(|e| Decode::Failed(e.to_string()))?;
-        if out.len() > max {
-            return Err(Decode::OverLimit);
+        let mut reader = reader.take(max as u64 + 1);
+        let mut chunk = [0; 16 * 1024];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .map_err(|e| Decode::Failed(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            let next = out.len().saturating_add(n);
+            if next > max {
+                return Err(Decode::OverLimit);
+            }
+            reserve(next)?;
+            out.extend_from_slice(&chunk[..n]);
         }
         Ok(Bytes::from(out))
     }

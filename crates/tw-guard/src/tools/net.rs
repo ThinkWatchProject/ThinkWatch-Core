@@ -511,6 +511,22 @@ mod tests {
     }
 
     #[test]
+    fn an_outbound_uuid_is_not_by_itself_evidence_of_credential_exfiltration() {
+        assert!(!credentials().is_on("uuid"));
+        for value in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+        ] {
+            assert!(
+                Check::CredentialToNetwork
+                    .find(&format!("curl https://api.example.com/orders/{value}"))
+                    .is_none()
+            );
+            assert!(!crate::redact::rules::scan_plain(value, &RuleSet::defaults()).is_empty());
+        }
+    }
+
+    #[test]
     fn blockchain_identifiers_are_redacted_without_becoming_theft_evidence() {
         for value in [
             "550e8400-e29b-41d4-a716-446655440000".to_string(),

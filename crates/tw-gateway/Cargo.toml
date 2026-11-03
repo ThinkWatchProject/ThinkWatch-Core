@@ -51,6 +51,7 @@ tw-dialect = { workspace = true }
 tw-plugin = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+sysinfo = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
 # 压缩过的请求体和上游回答：gzip、deflate 用它解，zstd 用上面那个
