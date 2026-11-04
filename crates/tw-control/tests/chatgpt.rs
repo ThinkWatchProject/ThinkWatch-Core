@@ -45,6 +45,9 @@ struct OpenAi {
     device_asks: Mutex<Vec<Value>>,
     /// 登录换 token 时发的 id_token。不设就是 [`id_token`]
     id_token: Mutex<Option<String>>,
+    usage_percent: Mutex<Option<f64>>,
+    usage_failed: Mutex<bool>,
+    usage_delay: Mutex<Duration>,
 }
 
 fn jwt(claims: Value) -> String {
@@ -220,9 +223,15 @@ async fn start_openai(o: Arc<OpenAi>) -> Endpoints {
                     h.get("authorization").and_then(|v| v.to_str().ok()) == Some(&format!("Bearer {t}"))
                 });
                 seen(&o, &uri, h);
+                let delay = *o.usage_delay.lock().unwrap();
+                tokio::time::sleep(delay).await;
                 if rejected {
                     return (StatusCode::UNAUTHORIZED, axum::Json(json!({"detail": "Unauthorized"})));
                 }
+                if *o.usage_failed.lock().unwrap() {
+                    return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"detail": "Try later"})));
+                }
+                let used = o.usage_percent.lock().unwrap().unwrap_or(21.0);
                 (StatusCode::OK, axum::Json(json!({
                     "user_id": "user-1",
                     "account_id": "acct-1",
@@ -231,7 +240,7 @@ async fn start_openai(o: Arc<OpenAi>) -> Endpoints {
                     "rate_limit": {
                         "allowed": true,
                         "limit_reached": false,
-                        "primary_window": {"used_percent": 21, "limit_window_seconds": 604800, "reset_after_seconds": 410907, "reset_at": 1790000000},
+                        "primary_window": {"used_percent": used, "limit_window_seconds": 604800, "reset_after_seconds": 410907, "reset_at": 1790000000},
                         "secondary_window": {"used_percent": 0, "limit_window_seconds": 0, "reset_after_seconds": 0, "reset_at": 0}
                     },
                     "credits": {"has_credits": false, "unlimited": false, "balance": "0"},
@@ -960,11 +969,219 @@ async fn a_login_mode_that_is_not_understood_is_refused() {
 // ---------------------------------------------------------------- 用量与重置卡
 
 #[tokio::test]
+async fn overview_and_menu_quota_reads_work_before_visiting_upstreams() {
+    let b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    let (st, quotas) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(quotas[0]["provider"], "chatgpt");
+    assert_eq!(quotas[0]["windows"][0]["used_percent"], 21.0);
+    // Multiple quota views share the refresh; the account panel can still request a fresh read.
+    b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 1);
+    b.call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null)
+        .await;
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn quota_polling_warms_and_refreshes_without_any_desktop_page() {
+    let mut b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    let task = tw_control::chatgpt::quotas::spawn(b.state.clone());
+    async fn seen(b: &mut Bed) -> f64 {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(tw_api::Event::QuotaSeen { windows, .. }) = b.events.recv().await {
+                    return windows[0].used_percent;
+                }
+            }
+        })
+        .await
+        .expect("no quota update event")
+    }
+    assert_eq!(seen(&mut b).await, 21.0);
+    *b.openai.usage_percent.lock().unwrap() = Some(78.0);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(66)).await;
+    tokio::time::resume();
+    b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(
+        b.openai.backend.lock().unwrap().len(),
+        1,
+        "no minute polling"
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15 * 60)).await;
+    tokio::time::resume();
+    assert_eq!(seen(&mut b).await, 78.0);
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        b.state.gateway.quotas()["chatgpt"].windows[0].used_percent,
+        78.0
+    );
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 2);
+}
+
+fn quota_from_traffic(b: &Bed, used_percent: f64, resets_at_ms: Option<u64>) {
+    // The data plane calls record_quota when a real response includes quota headers.
+    b.state.gateway.record_quota(
+        b.state.bus().next_id(),
+        "chatgpt",
+        tw_gateway::quota::Quota {
+            windows: vec![tw_gateway::quota::Window {
+                window: "weekly".into(),
+                used_percent,
+                resets_at_ms,
+                status: None,
+                credits: None,
+            }],
+        },
+    );
+}
+
+#[tokio::test]
+async fn fresh_traffic_keeps_the_menu_current_without_extra_quota_queries() {
+    let b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    b.call("GET", "/quota", Value::Null).await;
+    let task = tw_control::chatgpt::quotas::spawn(b.state.clone());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(14 * 60)).await;
+    tokio::time::resume();
+    quota_from_traffic(&b, 48.0, None);
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2 * 60)).await;
+    tokio::time::resume();
+    let (_, q) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(q[0]["windows"][0]["used_percent"], 48.0);
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 1);
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn a_quota_window_reset_refreshes_before_the_idle_deadline() {
+    let mut b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    b.call("GET", "/quota", Value::Null).await;
+    // Discard the startup event before waiting for the refresh following the reset.
+    while b.events.try_recv().is_ok() {}
+    let task = tw_control::chatgpt::quotas::spawn(b.state.clone());
+    quota_from_traffic(&b, 100.0, Some(now_ms() + 60_000));
+    tokio::task::yield_now().await;
+    *b.openai.usage_percent.lock().unwrap() = Some(0.0);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(66)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(tw_api::Event::QuotaSeen { windows, .. }) = b.events.recv().await
+                && windows[0].used_percent == 0.0
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no quota refresh after reset");
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 2);
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn simultaneous_reads_and_a_timed_out_reader_share_a_detached_quota_read() {
+    let mut b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    *b.openai.usage_delay.lock().unwrap() = Duration::from_millis(100);
+    tw_control::chatgpt::quotas::refresh(&b.state, Duration::ZERO).await;
+    let (a, c, _) = tokio::join!(
+        b.call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null),
+        b.call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null),
+        b.call("GET", "/quota", Value::Null),
+    );
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(c.0, StatusCode::OK);
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 1);
+    assert!(matches!(
+        b.events.try_recv(),
+        Ok(tw_api::Event::QuotaSeen { .. })
+    ));
+}
+
+#[tokio::test]
+async fn quota_polling_skips_disabled_accounts_and_preserves_the_last_value_on_failure() {
+    let b = bed(|e| {
+        format!(
+            "{}{}",
+            logged_in("chatgpt", e, "rt-cfg"),
+            logged_in("off", e, "rt-off").replace(
+                "    protocol: chatgpt",
+                "    disabled: true\n    protocol: chatgpt"
+            )
+        )
+    })
+    .await;
+    let (_, q) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(q.as_array().unwrap().len(), 1);
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 1);
+    *b.openai.usage_failed.lock().unwrap() = true;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15 * 60 + 1)).await;
+    tokio::time::resume();
+    let (_, q) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(q[0]["windows"][0]["used_percent"], 21.0);
+    b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(
+        b.openai.backend.lock().unwrap().len(),
+        2,
+        "a failed read must back off"
+    );
+}
+
+#[tokio::test]
+async fn an_account_disabled_during_a_read_does_not_publish_a_late_quota() {
+    let b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    *b.openai.usage_delay.lock().unwrap() = Duration::from_millis(150);
+    let change = async {
+        eventually("quota request started", || {
+            !b.openai.backend.lock().unwrap().is_empty()
+        })
+        .await;
+        let mut config = (*b.state.config()).clone();
+        config
+            .providers
+            .iter_mut()
+            .find(|p| p.name == "chatgpt")
+            .unwrap()
+            .disabled = true;
+        b.state.gateway.reload(config).unwrap();
+    };
+    let ((_, q), ()) = tokio::join!(b.call("GET", "/quota", Value::Null), change);
+    assert_eq!(q, json!([]));
+    assert!(b.state.gateway.quotas().is_empty());
+}
+
+#[tokio::test]
+async fn stopping_the_quota_poller_cancels_its_pending_reads() {
+    let b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    *b.openai.usage_delay.lock().unwrap() = Duration::from_millis(150);
+    let task = tw_control::chatgpt::quotas::spawn(b.state.clone());
+    eventually("quota request started", || {
+        !b.openai.backend.lock().unwrap().is_empty()
+    })
+    .await;
+    task.abort();
+    let _ = task.await;
+    // A new read can acquire the slot after handover/cancellation; no claim stays stuck.
+    let (_, q) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(q[0]["windows"][0]["used_percent"], 21.0);
+    assert_eq!(b.openai.backend.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn usage_shows_the_limits_without_personal_details() {
     let b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
     // 还没有请求经过，额度就还不知道
-    let (_, v) = b.call("GET", "/quota", Value::Null).await;
-    assert_eq!(v, json!([]));
+    assert!(b.state.gateway.quotas().is_empty());
     let (st, v) = b
         .call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null)
         .await;
