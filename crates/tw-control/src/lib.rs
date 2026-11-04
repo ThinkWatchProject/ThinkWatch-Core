@@ -1236,10 +1236,14 @@ fn not_running(id: u64) -> Fail {
 /// 按量付费的账号没有这些头，那时这个列表是空的 —— 界面据此决定显示
 /// 金额还是百分比，两种人格共用同一块地方。
 ///
-/// GLM Coding Plan 的额度不在响应头里：**界面来要时去问**（60 秒内合成一次），问得慢的
-/// 不等，问完由 `QuotaSeen` 补上；判定没有套餐的，由一条窗口为空的 `QuotaSeen` 撤下
+/// ChatGPT 和 GLM Coding Plan 都可主动查询：**所有读取者共用同一份额度**，不依赖上游页。
+/// ChatGPT 优先跟随真实流量的响应头，过期或窗口重置时才补问；GLM 60 秒内合成一次。
+/// 问得慢的由 `QuotaSeen` 补上；GLM 没有套餐时用空窗口撤下。
 async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>> {
-    s.gateway.refresh_glm_quotas(GLM_QUOTA_WAIT).await;
+    tokio::join!(
+        s.gateway.refresh_glm_quotas(QUOTA_WAIT),
+        chatgpt::quotas::refresh(&s, QUOTA_WAIT),
+    );
     let mut out: Vec<tw_api::ProviderQuota> = s
         .gateway
         .quotas()
@@ -1253,8 +1257,8 @@ async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>
     Json(out)
 }
 
-/// 界面来要额度时，最多等 GLM 的额度接口多久
-const GLM_QUOTA_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 界面来要额度时，最多等账号的额度接口多久
+const QUOTA_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 按上游分的延迟。**「哪家 TTFT 最差」问的是这个。**
 ///

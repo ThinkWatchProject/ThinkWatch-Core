@@ -1,4 +1,4 @@
-//! 后台事务：OAuth 写回、同步、价目表刷新、默认插件、模型目录、余额、日志回收。
+//! 后台事务：OAuth 写回、同步、价目表刷新、默认插件、模型目录、额度、余额、日志回收。
 //!
 //! # 为什么放在一个单独的运行时上
 //!
@@ -8,8 +8,8 @@
 //! [`Background::stop`] 一次关掉整个运行时，任务连同它们派生的任务一起停下，转发那一边
 //! （主运行时）不受影响。
 //!
-//! **模型目录、余额例外**，见 [`Background::start`] 里的说明：它们和转发共用连接池，
-//! 不能跟着这个运行时一起关。
+//! **模型目录、额度、余额例外**，见 [`Background::start`] 里的说明：它们和转发共用连接池，
+//! 不能跟着这个运行时一起关。额度任务单独持有把手，交接时取消。
 //!
 //! **OAuth 写回例外地先收尾**：它手上那份新 refresh token 要是丢了，新 core 读到的就是一张
 //! 已经作废的（见 [`tw_control::rotation::Rotation::settle`]）。
@@ -28,12 +28,13 @@ const ROTATION_SETTLE: Duration = Duration::from_secs(5);
 pub struct Background {
     rt: Option<tokio::runtime::Runtime>,
     rotation: Option<Arc<tw_control::rotation::Rotation>>,
+    quotas: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// 起后台事务要的东西。
 pub struct Start<'a> {
     pub control: &'a tw_control::ControlState,
-    /// 安全模式：只起写回、同步（暂停着）、价目表；不起默认插件、模型目录、余额
+    /// 安全模式：只起写回、同步（暂停着）、价目表；不起默认插件、模型目录、额度、余额
     pub safe: bool,
     pub seeder: Option<tw_control::plugins::defaults::Seeder>,
     pub store: Option<Store>,
@@ -82,6 +83,9 @@ impl Background {
             tw_gateway::models::spawn(s.control.gateway.clone());
             // 余额：启动时读一遍，之后按节奏读（见 `tw_gateway::balances`）。**不挡启动，不挡转发**
             tw_gateway::balances::spawn(s.control.gateway.clone());
+            // Account quota reads also share gateway connections. Keep their drivers on the
+            // main runtime, but cancel the poller at handover so the old Core cannot rotate tokens.
+            self.quotas = Some(tw_control::chatgpt::quotas::spawn(s.control.clone()));
         }
         self.rt = Some(rt);
         Ok(sync)
@@ -94,6 +98,9 @@ impl Background {
 
     /// 全部停下（交接提交之后）。**先在锁外收尾 OAuth 写回**（见模块文档），再调这个。
     pub fn stop(&mut self) {
+        if let Some(task) = self.quotas.take() {
+            task.abort();
+        }
         self.rotation = None;
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();

@@ -39,6 +39,8 @@ use crate::{ControlState, Fail, fail};
 use tw_api::{LoginStatus, ep};
 use tw_types::{Msg, msg};
 
+pub mod quotas;
+
 /// 登录要在多久之内完成。和 Codex 一样是 15 分钟
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
 /// 设备码最快多久问一次「批准了没有」。服务端给的间隔比它还短就按它来 —— 问得再勤，
@@ -91,6 +93,7 @@ impl Default for Endpoints {
 pub struct Accounts {
     pub endpoints: Endpoints,
     current: Mutex<Option<Current>>,
+    quotas: quotas::Cache,
 }
 
 impl Accounts {
@@ -98,6 +101,7 @@ impl Accounts {
         Self {
             endpoints,
             current: Mutex::new(None),
+            quotas: Default::default(),
         }
     }
 
@@ -997,13 +1001,21 @@ async fn usage(
     State(s): State<ControlState>,
     Path(name): Path<String>,
 ) -> Result<Json<tw_api::ChatgptUsage>, Fail> {
-    let v = account_call(&s, &name, reqwest::Method::GET, "usage", None).await?;
+    quotas::usage(&s, &name).await.map(Json)
+}
+
+async fn read_usage(s: &ControlState, name: &str) -> Result<tw_api::ChatgptUsage, Fail> {
+    let v = account_call(s, name, reqwest::Method::GET, "usage", None).await?;
     let usage = parse_usage(&v, now_ms());
+    Ok(usage)
+}
+
+fn record_usage(s: &ControlState, name: &str, usage: &tw_api::ChatgptUsage) {
     // 问来的额度和响应头里读到的一样记下来：**额度只在内存里**，冷启动之后要等这个账号
     // 第一次有请求才会有，而界面一打开就该看得见
     s.gateway.record_quota(
         s.bus().next_id(),
-        &name,
+        name,
         tw_gateway::quota::Quota {
             windows: usage
                 .windows
@@ -1018,7 +1030,6 @@ async fn usage(
                 .collect(),
         },
     );
-    Ok(Json(usage))
 }
 
 /// `wham/usage` 的回答。**只取额度和重置卡**：同一份回答里的邮箱、套餐由上游视图从
