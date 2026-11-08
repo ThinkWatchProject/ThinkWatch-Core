@@ -93,6 +93,13 @@ async fn start_openai_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
 async fn start_gateway(
     up: SocketAddr,
 ) -> (SocketAddr, tokio::sync::broadcast::Receiver<tw_api::Event>) {
+    start_gateway_with_security(up, tw_config::Security::default()).await
+}
+
+async fn start_gateway_with_security(
+    up: SocketAddr,
+    security: tw_config::Security,
+) -> (SocketAddr, tokio::sync::broadcast::Receiver<tw_api::Event>) {
     let cfg = Config {
         version: 1,
         listen: Listen::default(),
@@ -109,6 +116,7 @@ async fn start_gateway(
             protocol: Some(tw_config::Protocol::OpenaiChat),
             ..Default::default()
         }],
+        security,
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
@@ -160,16 +168,24 @@ async fn mistral_array_text_reaches_the_client_before_the_upstream_finishes() {
 
     let proceed = Arc::new(tokio::sync::Notify::new());
     let next = proceed.clone();
-    let app = Router::new().route("/v1/chat/completions", post(move || {
+    let app = Router::new().route("/v1/chat/completions", post(move |body: bytes::Bytes| {
         let next = next.clone();
         async move {
+            let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let text = sent["messages"].as_array().unwrap().iter()
+                .find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap();
+            assert!(text.contains("<<TW_SECRET_1>>"), "{text}");
+            assert!(!text.contains("array-secret-fixture"), "{text}");
             let body = axum::body::Body::from_stream(async_stream::stream! {
                 yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
                     b"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"FIRST\"}]}}]}\r\n\r\n"
                 ));
                 next.notified().await;
                 yield Ok(bytes::Bytes::from_static(
-                    b"data: {\"choices\":[{\"delta\":{\"content\":\", SECOND\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n"
+                    b"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\", <<TW_SEC\"}]}}]}\r\n\r\n"
+                ));
+                yield Ok(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"RET_1>>, SECOND\"}]},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n"
                 ));
             });
             axum::response::Response::builder()
@@ -180,7 +196,13 @@ async fn mistral_array_text_reaches_the_client_before_the_upstream_finishes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (gateway, _) = start_gateway(upstream).await;
+    let security = serde_json::from_value(serde_json::json!({
+        "redact": {"mode":"enforce", "custom":[{
+            "name":"array fixture", "pattern":"array-secret-fixture"
+        }]}
+    }))
+    .unwrap();
+    let (gateway, _) = start_gateway_with_security(upstream, security).await;
     let response = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -188,7 +210,7 @@ async fn mistral_array_text_reaches_the_client_before_the_upstream_finishes() {
         .post(format!("http://{gateway}/v1/messages"))
         .header("x-api-key", "tw-testkey")
         .header("content-type", "application/json")
-        .body(claude_body(true))
+        .body(claude_body(true).replace("帮我看看 a/b.rs", "帮我看看 a/b.rs array-secret-fixture"))
         .send()
         .await
         .unwrap();
@@ -225,7 +247,7 @@ async fn mistral_array_text_reaches_the_client_before_the_upstream_finishes() {
             v.pointer("/delta/text")?.as_str().map(str::to_owned)
         })
         .collect();
-    assert_eq!(text, "FIRST, SECOND");
+    assert_eq!(text, "FIRST, array-secret-fixture, SECOND");
     assert!(body.contains("message_stop"));
     server.abort();
 }
