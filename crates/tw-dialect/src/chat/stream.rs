@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use super::response::{completion_id, finish_reason, stop_reason, usage, usage_json};
+use super::response::{
+    completion_id, content_parts, finish_reason, stop_reason, usage, usage_json,
+};
 use crate::convert::Session;
 use crate::frame::{self, Frame};
 use crate::ir::*;
@@ -81,13 +83,21 @@ impl Parser {
             });
         }
         for key in ["content", "refusal"] {
-            if let Some(t) = str_of(delta, key).filter(|t| !t.is_empty()) {
-                let index = self.ensure(Open::Text, None, out);
+            content_parts(&delta[key], |thinking, text| {
+                let index = self.ensure(
+                    if thinking { Open::Thinking } else { Open::Text },
+                    None,
+                    out,
+                );
                 out.push(Event::Delta {
                     index,
-                    delta: Delta::Text(t.to_string()),
+                    delta: if thinking {
+                        Delta::Thinking(text.to_string())
+                    } else {
+                        Delta::Text(text.to_string())
+                    },
                 });
-            }
+            });
         }
         for c in arr_of(delta, "tool_calls") {
             let k = u64_of(c, "index").unwrap_or(0);
@@ -316,6 +326,63 @@ mod tests {
         }
         p.finish(&mut out);
         out
+    }
+
+    #[test]
+    fn mistral_array_content_is_emitted_before_the_stream_finishes() {
+        let mut parser = Parser::default();
+        let mut out = Vec::new();
+        let mut decoder = Decoder::default();
+        for content in [
+            json!([{"type":"text", "text":"FIRST"}]),
+            json!(", SECOND"),
+            json!([{"type":"text", "text":", THIRD"}]),
+        ] {
+            let chunk = frame::data(&json!({"choices":[{"delta":{"content":content}}]}));
+            for bytes in chunk.as_bytes().chunks(7) {
+                for f in decoder.feed(bytes) {
+                    parser.frame(&f, &mut out);
+                }
+            }
+        }
+        let text: String = out
+            .iter()
+            .filter_map(|event| match event {
+                Event::Delta {
+                    delta: Delta::Text(t),
+                    ..
+                } => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "FIRST, SECOND, THIRD");
+        assert!(!out.iter().any(|e| matches!(e, Event::Stop(_))));
+    }
+
+    #[test]
+    fn mistral_thinking_stays_separate_from_visible_text() {
+        let chunk = frame::data(&json!({"choices":[{"delta":{"content":[
+            {"type":"thinking", "thinking":[{"type":"text", "text":"reason"}, {"type":"reference", "text":"not prose"}]},
+            {"type":"text", "text":"answer"},
+            {"type":"unknown", "text":"not prose"}
+        ]},"finish_reason":"stop"}]}));
+        let events = parse(&[&chunk]);
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Delta {
+                    delta: Delta::Text(t),
+                    ..
+                } => Some((false, t.as_str())),
+                Event::Delta {
+                    delta: Delta::Thinking(t),
+                    ..
+                } => Some((true, t.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, [(true, "reason"), (false, "answer")]);
+        assert!(events.contains(&Event::Stop(StopReason::EndTurn)));
     }
 
     /// 有的中转每一块都带着 `"error": null`：照常读内容。真的错误没写说明时，不拿那一块凑

@@ -4,6 +4,7 @@
 //! 起真网关、真上游：要验的是「流到一半」那一刻总线上的读数，单元测试里只能假装。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -29,22 +30,32 @@ async fn listen(app: Router) -> SocketAddr {
 }
 
 /// 开场帧马上发，读完输入之后每 `every` 吐一段，一共 `deltas` 段，最后报累计输出
-fn streaming(deltas: usize, every: Duration) -> Router {
-    Router::new().fallback(any(move || async move {
-        let body = async_stream::stream! {
-            yield Ok::<_, std::io::Error>(Bytes::from_static(MESSAGE_START));
-            tokio::time::sleep(PREFILL).await;
-            yield Ok(Bytes::from_static(TEXT_BLOCK));
-            for _ in 0..deltas {
-                yield Ok(Bytes::from_static(TEXT_DELTA));
-                tokio::time::sleep(every).await;
-            }
-            yield Ok(Bytes::from_static(MESSAGE_END));
-        };
-        axum::response::Response::builder()
-            .header("content-type", "text/event-stream")
-            .body(axum::body::Body::from_stream(body))
-            .unwrap()
+fn streaming(
+    deltas: usize,
+    every: Duration,
+    prefill_gate: Option<Arc<tokio::sync::Notify>>,
+) -> Router {
+    Router::new().fallback(any(move || {
+        let prefill_gate = prefill_gate.clone();
+        async move {
+            let body = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(MESSAGE_START));
+                if let Some(gate) = prefill_gate {
+                    gate.notified().await;
+                }
+                tokio::time::sleep(PREFILL).await;
+                yield Ok(Bytes::from_static(TEXT_BLOCK));
+                for _ in 0..deltas {
+                    yield Ok(Bytes::from_static(TEXT_DELTA));
+                    tokio::time::sleep(every).await;
+                }
+                yield Ok(Bytes::from_static(MESSAGE_END));
+            };
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap()
+        }
     }))
 }
 
@@ -83,7 +94,11 @@ async fn serve(cfg: Config) -> Gateway {
 }
 
 async fn ask(gw: SocketAddr) -> String {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
         .post(format!("http://{gw}/v1/messages"))
         .header("x-api-key", "tw-k")
         .body(r#"{"model":"claude-sonnet-5","stream":true,"messages":[]}"#)
@@ -99,17 +114,31 @@ async fn ask(gw: SocketAddr) -> String {
 /// 速度；开口之后每秒约 20 个（每 100 毫秒一段、一段估两个）
 #[tokio::test]
 async fn the_speed_is_there_while_the_stream_is_still_running() {
-    let up = listen(streaming(30, Duration::from_millis(100))).await;
+    let prefill_gate = Arc::new(tokio::sync::Notify::new());
+    let up = listen(streaming(
+        30,
+        Duration::from_millis(100),
+        Some(prefill_gate.clone()),
+    ))
+    .await;
     let gw = serve(cfg(up)).await;
     let request = tokio::spawn(ask(gw.addr));
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 客户端建连可能受调度影响；等请求真的开始，并把上游留在输出前。
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gw.bus.live().running.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request never reached the gateway");
     let live = gw.bus.live();
     assert_eq!(live.running.len(), 1, "{live:?}");
     assert_eq!(live.tokens_per_sec, Some(0));
     assert_eq!(live.running[0].tokens_per_sec, None);
     assert_eq!(live.running[0].output_tokens, None);
 
+    prefill_gate.notify_one();
     tokio::time::sleep(Duration::from_millis(1_600)).await;
     let live = gw.bus.live();
     let r = &live.running[0];
@@ -131,7 +160,7 @@ async fn the_speed_is_there_while_the_stream_is_still_running() {
 /// 模型的估数乘 2（比例最多到 2）
 #[tokio::test]
 async fn a_finished_stream_teaches_the_estimate() {
-    let up = listen(streaming(30, Duration::from_millis(5))).await;
+    let up = listen(streaming(30, Duration::from_millis(5), None)).await;
     let gw = serve(cfg(up)).await;
     assert_eq!(gw.pace.ratio("up", "claude-sonnet-5"), 1.0);
     let text = ask(gw.addr).await;

@@ -511,3 +511,60 @@ fn numeric_credentials_in_text_are_hidden_without_replacing_json_numbers() {
     let body = r#"{"seed":42,"OTP":927416}"#;
     assert!(scan(body, &RuleSet::defaults()).is_empty());
 }
+
+#[test]
+fn code_arguments_and_type_annotations_are_not_credential_assignments() {
+    for text in [
+        "print(key, 'field_names', list(value))",
+        "print(key, 'type', type(value).__name__)",
+        "const labels = [key, 'time', 'event'];",
+        "pub passphrase: String,",
+        "pub passphrase: Option<String>,",
+        "pub seed: Vec<u8>,",
+        "pub secret: Option<String>,",
+        "passphrase: String,\\n    next_field: value",
+        "passphrase: Option<String>,\\n    next_field: value",
+        "fn restore(passphrase: &str) -> String { value.to_string() }",
+    ] {
+        let set = RuleSet::defaults();
+        assert!(scan_plain(text, &set).is_empty(), "{text}");
+        let body = serde_json::json!({"input":[{"role":"user","content":text}]}).to_string();
+        let (sent, ledger) = crate::redact::flow::replace(
+            crate::policy::Mode::Enforce,
+            &set,
+            body.clone().into(),
+            &Ledger::new(Scheme::SECRET),
+            crate::redact::flow::Shape::Generate(tw_dialect::ir::Dialect::Responses),
+        );
+        assert_eq!(sent.as_ref(), body.as_bytes(), "{text}");
+        assert!(ledger.is_empty(), "{text}");
+    }
+}
+
+#[test]
+fn quoted_header_pairs_still_protect_the_value() {
+    for text in [
+        "headers.insert(\"X-API-KEY\", \"opaqueAlpha37\")",
+        "headers = [(\"POLY_API_KEY\", \"opaqueAlpha37\")]",
+        "headers[\"api_key\"] = \"opaqueAlpha37\"",
+    ] {
+        let hits = scan_plain(text, &RuleSet::defaults());
+        let values: Vec<_> = hits.iter().map(|h| &text[h.bytes.clone()]).collect();
+        assert_eq!(values, ["opaqueAlpha37"], "{text}");
+    }
+}
+
+#[test]
+fn short_numeric_lookup_keys_are_not_secrets_but_explicit_credentials_are() {
+    for text in [
+        "[WsPool] new connection: key=0, 2 assets",
+        "key=42",
+        "pub seed: u64,",
+        "let seed: u64 = get_seed();",
+    ] {
+        assert!(scan_plain(text, &RuleSet::defaults()).is_empty(), "{text}");
+    }
+    for text in ["KEY: '42'", "API_KEY=42", "OTP: 927416", "seed: 42"] {
+        assert_eq!(scan_plain(text, &RuleSet::defaults()).len(), 1, "{text}");
+    }
+}

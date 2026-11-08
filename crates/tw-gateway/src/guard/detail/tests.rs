@@ -75,6 +75,34 @@ fn place_of(l: &HitLocation) -> (HitPart, Option<u32>, Option<&str>, Option<&str
     )
 }
 
+#[test]
+fn paths_preserve_indices_while_masking_secrets_in_keys() {
+    let rules = RuleSet::defaults().with_custom("index-zero", "0").unwrap();
+    let body = json!({"messages": [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call", "name": "audit",
+             "input": {"debug[0]": "0"}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call", "content": "0"}
+        ]}
+    ]});
+    let details = redacted(Mode::Enforce, Some(Dialect::Anthropic), &body, rules);
+    assert_eq!(details.len(), 1);
+    let paths: Vec<_> = details[0]
+        .locations
+        .iter()
+        .map(|l| l.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "messages[0].content[0].input[\"debug[<<TW_SECRET_1>>]\"]",
+            "messages[1].content[0].content",
+        ]
+    );
+}
+
 // ---------------------------------------------------------------- 出站脱敏：四种格式
 
 #[test]

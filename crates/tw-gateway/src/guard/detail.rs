@@ -244,14 +244,49 @@ fn cap(s: &str, n: usize) -> String {
     out
 }
 
-/// 一处命中写成线上的样子。角色、工具名、路径是请求里来的字，也过一遍打码
+/// 路径里的字段名可能来自请求，仍要打码；数组下标是结构，不能按正文账本替换。
+fn masked_path(red: &Redaction, path: &str) -> String {
+    let b = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut start = 0;
+    let mut i = 0;
+    while i < b.len() {
+        // 非标识符键写成 JSON 字符串，里面的 [数字] 仍属于键，不能跳过打码。
+        if b[i] == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if b[i] == b'[' {
+            let mut end = i + 1;
+            while b.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            if end > i + 1 && b.get(end) == Some(&b']') {
+                out.push_str(&red.apply(&path[start..i]));
+                out.push_str(&path[i..=end]);
+                i = end + 1;
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&red.apply(&path[start..]));
+    out
+}
+
+/// 一处命中写成线上的样子。角色、工具名、路径里的字段名也过一遍打码。
 fn location(red: &Redaction, place: Place, path: &str, e: Excerpt) -> HitLocation {
     HitLocation {
         part: place.part,
         message_index: place.message_index,
         role: place.role.map(|r| red.apply(&r)),
         tool: place.tool.map(|t| red.apply(&t)),
-        path: red.apply(path),
+        path: masked_path(red, path),
         before: e.before,
         matched: e.matched,
         after: e.after,

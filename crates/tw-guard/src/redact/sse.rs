@@ -399,6 +399,26 @@ fn fields(d: Dialect, v: &Value) -> Vec<Field> {
                         lane: Lane::Text(choice_lane(n, 0)),
                         path: vec![Key("choices"), Idx(pos), Key("delta"), Key("content")],
                     });
+                } else if let Some(parts) = delta.get("content").and_then(Value::as_array) {
+                    // Mistral 的数组与字符串是同一路正文，分片可以在两种写法间切换。
+                    // 按顺序还原每个 text，不能把 thinking 或引用并到正文里。
+                    for (i, part) in parts.iter().enumerate() {
+                        if kind(part) == Some("text")
+                            && part.get("text").is_some_and(Value::is_string)
+                        {
+                            out.push(Field {
+                                lane: Lane::Text(choice_lane(n, 0)),
+                                path: vec![
+                                    Key("choices"),
+                                    Idx(pos),
+                                    Key("delta"),
+                                    Key("content"),
+                                    Idx(i),
+                                    Key("text"),
+                                ],
+                            });
+                        }
+                    }
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for (k, c) in calls.iter().enumerate() {
@@ -1039,6 +1059,46 @@ mod tests {
             .collect();
         assert_eq!(text, format!("key 是 {KEY}"));
         assert_eq!(args, format!(r#"{{"v":"{KEY}"}}"#));
+    }
+
+    #[test]
+    fn mistral_text_arrays_share_the_chat_text_lane() {
+        let array = |text: &str| json!([{"type":"text", "text":text}]);
+        for contents in [
+            vec![array("key: <<TW_SEC"), array("RET_1>> end")],
+            vec![json!("key: <<TW_SEC"), array("RET_1>> end")],
+            vec![array("key: <<TW_SEC"), json!("RET_1>> end")],
+            vec![json!([
+                {"type":"text", "text":"key: <<TW_SEC"},
+                {"type":"thinking", "thinking":[{"type":"text", "text":"unchanged <<TW_SECRET_1>>"}]},
+                {"type":"text", "text":"RET_1>> end"}
+            ])],
+        ] {
+            let mut frames: Vec<_> = contents
+                .into_iter()
+                .map(|content| chat(json!({"content":content}), Value::Null))
+                .collect();
+            frames.push(chat(json!({}), json!("stop")));
+            let out = run(Dialect::Chat, &frames);
+            let text: String = values(&out)
+                .iter()
+                .flat_map(|v| {
+                    let content = &v["choices"][0]["delta"]["content"];
+                    content.as_str().into_iter().chain(
+                        content
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|p| p["type"] == "text")
+                            .filter_map(|p| p["text"].as_str()),
+                    )
+                })
+                .collect();
+            assert_eq!(text, format!("key: {KEY} end"), "{out}");
+            if out.contains("unchanged") {
+                assert!(out.contains("unchanged <<TW_SECRET_1>>"), "{out}");
+            }
+        }
     }
 
     #[test]
