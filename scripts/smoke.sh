@@ -209,6 +209,7 @@ python3 - "$CFG" "$UPPORT" "$PORT" <<'PY'
 import sys, io
 cfg, upport, port = sys.argv[1], sys.argv[2], sys.argv[3]
 io.open(cfg, 'w', encoding='utf-8').write(f"""version: 1
+default_route: 默认
 listen:
   gateway:
     port: {port}
@@ -477,7 +478,8 @@ for _ in $(seq 1 20); do
           | python3 -c 'import sys, json
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
-good = r.get("provider") == "bedrock" and r.get("input_tokens") == 31 and r.get("output_tokens") == 3
+good = (r.get("provider") == "bedrock" and r.get("input_tokens") == 31 and r.get("output_tokens") == 3
+        and r.get("routing", {}).get("rule") == "Bedrock 的模型走 Bedrock")
 print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/dev/null)
   [ "$GOT" = "ok" ] && break
   sleep 0.25

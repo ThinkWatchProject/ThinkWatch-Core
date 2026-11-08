@@ -616,23 +616,41 @@ async fn a_port_already_taken_keeps_the_old_listener_and_says_why() {
     assert!(state.listening().error.is_none());
 }
 
+/// 等测试放行才回答：先确认请求真的到了上游，再切换监听器。
+/// 固定睡眠无法保证此前提，读取系统代理或 CI 调度都可能推迟客户端建连。
+async fn held_upstream() -> (
+    SocketAddr,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = Router::new().fallback(any({
+        let entered = entered.clone();
+        let release = release.clone();
+        move || {
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                axum::response::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"by":"slow"}"#))
+                    .unwrap()
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, entered, release)
+}
+
 #[tokio::test]
 async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
-    // **新的先起来，老的停止接受新连接并等现有请求自然结束**。
-    // 一个跑了六分钟的流不该因为你改了个端口而断掉。
-    let slow = {
-        let app = Router::new().fallback(any(|| async {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            axum::response::Response::builder()
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(r#"{"by":"slow"}"#))
-                .unwrap()
-        }));
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        a
-    };
+    // 新端口开始服务时，旧请求仍在上游等待；放行后必须自然完成。
+    let (slow, entered, release) = held_upstream().await;
     let mut c = cfg(vec![provider("slow", slow)], vec![]);
     let (p1, p2) = (spare_port(), spare_port());
     c.listen.gateway.port = p1;
@@ -640,7 +658,10 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
     following(&state, &c).await;
 
     let inflight = tokio::spawn(async move {
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://127.0.0.1:{p1}/v1/messages"))
             .header("x-api-key", "tw-k")
             .timeout(Duration::from_secs(10))
@@ -648,24 +669,31 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
             .send()
             .await
     });
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the old request never reached its upstream");
     let mut next = c.clone();
     next.listen.gateway.port = p2;
-    state.reload(next).unwrap();
+    switch(&state, next).await;
+    assert_eq!(state.listening().error, None);
+    assert!(
+        !inflight.is_finished(),
+        "the old request must still be in flight"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", p2))
+            .await
+            .is_ok(),
+        "the new port must accept connections while the old request is running"
+    );
 
-    // **新端口不等旧请求跑完就要能连。**以前是等旧的那一个排空了才去绑
-    // 新的 —— 一个长的流在跑时，这几分钟里两边都不接新连接
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(!inflight.is_finished(), "测试的前提：旧请求还在跑");
-    let probe = tokio::net::TcpStream::connect(("127.0.0.1", p2)).await;
-    assert!(probe.is_ok(), "旧请求还没跑完，新端口就该能连了");
-
-    let r = inflight
+    release.notify_one();
+    let response = inflight
         .await
         .unwrap()
-        .expect("换监听器把跑到一半的请求掐了");
-    assert_eq!(r.status(), 200);
-    assert!(r.text().await.unwrap().contains("slow"));
+        .expect("rebuilding the listener cut off the old request");
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("slow"));
 }
 
 fn bind(raw: &str) -> tw_config::Bind {
@@ -745,20 +773,8 @@ async fn the_pre_save_check_does_not_call_our_own_port_taken() {
 
 #[tokio::test]
 async fn a_request_in_flight_survives_the_old_listener_giving_way() {
-    // 旧的先让出端口时，**让的只是监听**：已经连上、跑到一半的请求照常跑完
-    let slow = {
-        let app = Router::new().fallback(any(|| async {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            axum::response::Response::builder()
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(r#"{"by":"slow"}"#))
-                .unwrap()
-        }));
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        a
-    };
+    // 旧的先让出端口时，只让出监听；已经到达上游的请求仍须完整返回。
+    let (slow, entered, release) = held_upstream().await;
     let mut c = cfg(vec![provider("slow", slow)], vec![]);
     let port = spare_port();
     c.listen.gateway.port = port;
@@ -767,7 +783,10 @@ async fn a_request_in_flight_survives_the_old_listener_giving_way() {
     following(&state, &c).await;
 
     let inflight = tokio::spawn(async move {
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
             .header("x-api-key", "tw-k")
             .timeout(Duration::from_secs(10))
@@ -775,23 +794,31 @@ async fn a_request_in_flight_survives_the_old_listener_giving_way() {
             .send()
             .await
     });
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the old request never reached its upstream");
     let mut next = c.clone();
     next.listen.gateway.bind = bind("127.0.0.1");
     switch(&state, next).await;
     assert_eq!(state.listening().error, None);
-    assert!(!inflight.is_finished(), "测试的前提：旧请求还在跑");
+    assert!(
+        !inflight.is_finished(),
+        "the old request must still be in flight"
+    );
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok(),
-        "旧请求还没跑完，新的监听就该能连了"
+        "the rebuilt listener must accept connections while the old request is running"
     );
-    let r = inflight
+
+    release.notify_one();
+    let response = inflight
         .await
         .unwrap()
-        .expect("让出端口把跑到一半的请求掐了");
-    assert_eq!(r.status(), 200);
+        .expect("giving way cut off the old request");
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("slow"));
 }
 
 #[tokio::test]
