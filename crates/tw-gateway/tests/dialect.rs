@@ -153,6 +153,83 @@ async fn ask(gw: SocketAddr, body: String) -> (u16, String) {
     (status, r.text().await.unwrap())
 }
 
+/// 上游在客户端读到第一段之前不再发送：转换器若丢首段或攒整包，这里就超时。
+#[tokio::test]
+async fn mistral_array_text_reaches_the_client_before_the_upstream_finishes() {
+    use futures::StreamExt;
+
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let next = proceed.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move || {
+        let next = next.clone();
+        async move {
+            let body = axum::body::Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"FIRST\"}]}}]}\r\n\r\n"
+                ));
+                next.notified().await;
+                yield Ok(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\", SECOND\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n"
+                ));
+            });
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream; charset=utf-8")
+                .body(body).unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (gateway, _) = start_gateway(upstream).await;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{gateway}/v1/messages"))
+        .header("x-api-key", "tw-testkey")
+        .header("content-type", "application/json")
+        .body(claude_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut stream = response.bytes_stream();
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !String::from_utf8_lossy(&received).contains("FIRST") {
+            received.extend_from_slice(
+                &stream
+                    .next()
+                    .await
+                    .expect("stream ended before first text")
+                    .unwrap(),
+            );
+        }
+    })
+    .await
+    .expect("array text was buffered or lost");
+    assert!(!String::from_utf8_lossy(&received).contains("SECOND"));
+    proceed.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    let body = String::from_utf8(received).unwrap();
+    let text: String = body
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line.strip_prefix("data: ")?).ok()?;
+            v.pointer("/delta/text")?.as_str().map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(text, "FIRST, SECOND");
+    assert!(body.contains("message_stop"));
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_claude_code_request_reaches_an_openai_only_upstream_in_the_right_shape() {
     let (up, seen) = start_openai_upstream(false).await;

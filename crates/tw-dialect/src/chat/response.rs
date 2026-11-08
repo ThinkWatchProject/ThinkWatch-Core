@@ -55,6 +55,36 @@ pub fn usage_json(u: &Usage) -> Value {
     })
 }
 
+/// Chat 兼容端点的正文：标准字符串，或 Mistral 的有序内容块。
+/// 只读文本和显式的推理文字，引用、图片与未知块不能当作回答正文。
+pub(super) fn content_parts(v: &Value, mut emit: impl FnMut(bool, &str)) {
+    if let Some(text) = v.as_str() {
+        if !text.is_empty() {
+            emit(false, text);
+        }
+    } else if let Some(parts) = v.as_array() {
+        for part in parts {
+            match str_of(part, "type") {
+                Some("text") => {
+                    if let Some(text) = str_of(part, "text").filter(|t| !t.is_empty()) {
+                        emit(false, text);
+                    }
+                }
+                Some("thinking") => {
+                    for thought in arr_of(part, "thinking") {
+                        if str_of(thought, "type") == Some("text")
+                            && let Some(text) = str_of(thought, "text").filter(|t| !t.is_empty())
+                        {
+                            emit(true, text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// 上游 Chat 的整包响应 → 中间表示。
 pub fn decode_response(v: &Value) -> Response {
     let choice = v
@@ -74,9 +104,16 @@ pub fn decode_response(v: &Value) -> Response {
         }));
     }
     for key in ["content", "refusal"] {
-        if let Some(t) = str_of(msg, key).filter(|t| !t.is_empty()) {
-            blocks.push(Block::Text(t.to_string()));
-        }
+        content_parts(&msg[key], |thinking, text| {
+            blocks.push(if thinking {
+                Block::Thinking(Thinking {
+                    text: text.to_string(),
+                    signature: Some(Signature::new(Vendor::Chat, "")),
+                })
+            } else {
+                Block::Text(text.to_string())
+            });
+        });
     }
     for c in arr_of(msg, "tool_calls") {
         let id = str_of(c, "id").unwrap_or_default().to_string();
@@ -192,6 +229,22 @@ pub fn error_message(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mistral_content_blocks_keep_their_order_and_kinds() {
+        let response = decode_response(&json!({"choices":[{"message":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"reason"}]},
+            {"type":"text","text":"first"},
+            {"type":"reference","text":"not prose"},
+            {"type":"text","text":"second"}
+        ]}, "finish_reason":"stop"}]}));
+        assert!(matches!(&response.blocks[0], Block::Thinking(t) if t.text == "reason"));
+        assert_eq!(
+            &response.blocks[1..],
+            &[Block::Text("first".into()), Block::Text("second".into())]
+        );
+        assert_eq!(response.stop, Some(StopReason::EndTurn));
+    }
 
     #[test]
     fn cached_tokens_are_taken_out_of_the_prompt_count() {
