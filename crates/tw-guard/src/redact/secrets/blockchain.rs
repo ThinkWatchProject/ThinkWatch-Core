@@ -106,7 +106,7 @@ pub(in crate::redact) fn scan(
                         .and_then(|c| c.name("name"))
                         .is_some_and(|m| m.start() == 0 && m.end() == decoded.len())
                     && let Some(id) = field_id(&decoded).filter(|id| set.is_on(id))
-                    && let Some((r, _, true)) = value(text, s.end)
+                    && let Some((r, _, true)) = value(text, s.clone())
                     && inside(ss, r.clone())
                     && literal_value(&crate::locate::unescape(&text[r.clone()]))
                 {
@@ -526,7 +526,7 @@ fn context(text: &str, set: &RuleSet, strings: Option<&[Range<usize>]>, out: &mu
                 continue;
             }
         }
-        let Some((mut r, end, quoted)) = value(text, m.end()) else {
+        let Some((mut r, end, quoted)) = value(text, m.range()) else {
             continue;
         };
         // Bitstamp's X-Auth value has a scheme followed by the API key.
@@ -546,7 +546,9 @@ fn context(text: &str, set: &RuleSet, strings: Option<&[Range<usize>]>, out: &mu
                 r = from..to;
             }
         }
-        // Plain recovery phrases commonly appear without quotes.
+        // Plain recovery phrases commonly appear without quotes. Stop at code
+        // delimiters and escaped newlines too: a type declaration inside a
+        // nested tool result must not consume the rest of that result.
         let n = normalized(m.as_str());
         if !quoted
             && !text[r.clone()].starts_with(['[', '{'])
@@ -555,10 +557,23 @@ fn context(text: &str, set: &RuleSet, strings: Option<&[Range<usize>]>, out: &mu
                 || matches!(n.as_str(), "助记词" | "恢复短语" | "种子短语"))
         {
             r.end = text[r.start..]
-                .find(['\n', '\r'])
+                .find([
+                    '\n', '\r', '\\', ',', ';', '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<',
+                    '>',
+                ])
                 .map_or(text.len(), |e| r.start + e);
+            r.end = r.start + text[r.clone()].trim_end().len();
         }
         if strings.is_some_and(|ss| !inside(ss, r.clone())) {
+            continue;
+        }
+        // Short numeric lookup keys in logs commonly identify a pool entry.
+        // Quoted values and explicit credential labels still protect short secrets.
+        if n == "key"
+            && !quoted
+            && r.len() < 8
+            && text[r.clone()].bytes().all(|c| c.is_ascii_digit())
+        {
             continue;
         }
         seen = end.max(r.end);
@@ -577,8 +592,12 @@ fn context(text: &str, set: &RuleSet, strings: Option<&[Range<usize>]>, out: &mu
 /// A literal following a field/header name. Quoted values may contain spaces,
 /// Unicode and escaped characters. Arrays/objects are allowed only when the
 /// caller proves the entire span is inside a JSON string (text pasted into chat).
-fn value(text: &str, mut i: usize) -> Option<(Range<usize>, usize, bool)> {
+fn value(text: &str, name: Range<usize>) -> Option<(Range<usize>, usize, bool)> {
     let b = text.as_bytes();
+    let mut i = name.end;
+    let quoted_name = name.start.checked_sub(1).is_some_and(|before| {
+        matches!(b[before], b'"' | b'\'' | b'`') && b.get(i) == Some(&b[before])
+    });
     if matches!(b.get(i), Some(b'"' | b'\'' | b'`')) {
         i += 1;
     }
@@ -593,7 +612,10 @@ fn value(text: &str, mut i: usize) -> Option<(Range<usize>, usize, bool)> {
     }
     match b.get(i) {
         _ if text[i..].starts_with('：') => i += "：".len(),
-        Some(b':' | b'=' | b',') => i += 1,
+        Some(b':' | b'=') => i += 1,
+        // Header setters and tuples use a quoted name, followed by a comma.
+        // A variable in print(key, "label") is not a credential assignment.
+        Some(b',') if quoted_name => i += 1,
         _ => return None,
     }
     if matches!(b.get(i), Some(b'=' | b'~' | b'>')) {
@@ -642,7 +664,7 @@ fn value(text: &str, mut i: usize) -> Option<(Range<usize>, usize, bool)> {
             i += 1;
         }
         end = i;
-        if text[start..end].contains(['(', ')', '[', '{']) {
+        if text[start..end].contains(['(', ')', '[', '{', '<', '>']) {
             return None;
         }
     }
@@ -738,6 +760,24 @@ fn literal_value(v: &str) -> bool {
 }
 
 fn bare_literal(v: &str) -> bool {
+    if matches!(
+        v,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    ) {
+        return false;
+    }
     // An unquoted identifier is a variable reference. Actual opaque keys normally
     // mix character classes; quoted passphrases have no alphabet restriction.
     v.starts_with(['[', '{'])
