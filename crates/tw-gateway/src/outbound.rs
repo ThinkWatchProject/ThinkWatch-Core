@@ -66,7 +66,8 @@ pub fn client_for_provider(
             b = b.no_proxy();
         }
         tw_config::SYSTEM => {
-            // reqwest 默认就读系统代理，什么都不做即可。
+            // reqwest 的 system-proxy 特性读取 Windows/macOS 原生设置，同时
+            // 支持环境变量。禁用默认特性时必须显式开启，否则只剩环境变量。
         }
         name => {
             let proxy = cfg.proxies.iter().find(|x| x.name == name).ok_or_else(|| {

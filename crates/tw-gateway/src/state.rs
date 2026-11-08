@@ -58,8 +58,8 @@ impl Runtime {
     ///
     /// `previous` 在时**尽量复用上一份的 Client**。每次重载都重建所有
     /// Client，等于把每个上游的连接池连同已经握好的 TLS 一起扔掉 ——
-    /// 改一条路由规则不该让下一个请求多付一次完整的建连。只有代理相关
-    /// 的字段变了才必须重建，因为代理是绑在 Client 上的。
+    /// 改一条路由规则不该让下一个请求多付一次完整的建连。显式代理只在代理相关
+    /// 字段变了时重建；跟随系统的每次重载都重新读取系统设置。
     ///
     /// 插件最后建：**它不会失败**（哪个插件有问题只停它自己，见 [`crate::plugin::load`]），
     /// 放在所有可能失败的步骤之后，建出来就一定换得进去。
@@ -72,7 +72,11 @@ impl Runtime {
         for p in &config.providers {
             let reusable = previous.and_then(|prev| {
                 let old = prev.config.providers.iter().find(|x| x.name == p.name)?;
-                if proxy_shape(&prev.config, old) == proxy_shape(&config, p) {
+                // 系统代理在 Client 建立时读取。重新应用配置时必须重读，不能因
+                // 配置里仍写着 system 就沿用开启/切换代理之前的连接池。
+                if p.proxy != tw_config::SYSTEM
+                    && proxy_shape(&prev.config, old) == proxy_shape(&config, p)
+                {
                     prev.clients.get(&p.name)
                 } else {
                     None
