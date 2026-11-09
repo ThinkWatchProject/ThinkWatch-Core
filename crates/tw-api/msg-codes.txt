@@ -320,6 +320,8 @@ gw.chatgpt.token_missing
 gw.chatgpt.token_not_json
 gw.chatgpt.token_status
 gw.chatgpt.token_unreachable
+gw.codex_catalog.client_version
+gw.codex_catalog.too_large
 gw.config.allow_from
 gw.config.http_client
 gw.config.no_upstreams

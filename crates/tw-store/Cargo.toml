@@ -2,7 +2,8 @@
 name = "tw-store"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# rusqlite 0.41 (patched bundled SQLite) requires Rust 1.89.
+rust-version = "1.89"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

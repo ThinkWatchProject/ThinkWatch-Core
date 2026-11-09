@@ -1997,9 +1997,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2771,9 +2771,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -3763,7 +3763,7 @@ dependencies = [
 
 [[package]]
 name = "tw-api"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3774,7 +3774,7 @@ dependencies = [
 
 [[package]]
 name = "tw-bedrock"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "tw-breaker"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3803,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "tw-config"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "blake3",
  "libc",
@@ -3829,7 +3829,7 @@ dependencies = [
 
 [[package]]
 name = "tw-control"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "tw-dialect"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "memchr",
  "serde",
@@ -3884,7 +3884,7 @@ dependencies = [
 
 [[package]]
 name = "tw-engine"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "tw-gateway"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -3950,7 +3950,7 @@ dependencies = [
 
 [[package]]
 name = "tw-guard"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "tw-handover"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "libc",
  "serde",
@@ -3984,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "tw-link"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3998,7 +3998,7 @@ dependencies = [
 
 [[package]]
 name = "tw-observe"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pack"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "age",
  "blake3",
@@ -4031,7 +4031,7 @@ dependencies = [
 
 [[package]]
 name = "tw-plugin"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "libc",
  "rand 0.10.2",
@@ -4047,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pricing"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "arc-swap",
  "flate2",
@@ -4060,14 +4060,14 @@ dependencies = [
 
 [[package]]
 name = "tw-secret"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "tw-store"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "tw-sync"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "age",
  "axum",
@@ -4115,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "tw-types"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4124,7 +4124,7 @@ dependencies = [
 
 [[package]]
 name = "tw-watch"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "libc",
  "notify",
@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "tw-yaml"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "saphyr-parser",
  "serde_yaml_ng",
@@ -4145,7 +4145,7 @@ dependencies = [
 
 [[package]]
 name = "twcore"
-version = "0.89.2"
+version = "0.90.0"
 dependencies = [
  "anyhow",
  "axum",

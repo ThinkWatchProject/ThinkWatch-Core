@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hello", get(|| async {}))
         // **和准入共用同一个函数** —— 列表和准入不可能不一致。
         .route("/v1/models", get(list_models))
+        .route("/codex/models", get(crate::codex_catalog::list))
         // **单点查询要走同一道准入**。不接这条的话它掉进
         // fallback 直接透传上游 —— 一个被 `allow` 限制成只能用便宜
         // 模型的 client，`GET /v1/models/claude-opus-4` 照样拿 200。
