@@ -762,6 +762,12 @@ async fn exchange(cfg: &OAuth, refresh: &str, http: &reqwest::Client) -> Result<
 mod tests {
     use super::*;
 
+    fn direct_client() -> reqwest::Client {
+        // These tests require a direct loopback connection refusal, regardless
+        // of the developer machine's native system proxy settings.
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
     fn cfg(endpoint: &str) -> OAuth {
         OAuth {
             access: None,
@@ -780,7 +786,7 @@ mod tests {
         let c = Cache::new();
         let mut o = cfg("http://127.0.0.1:1/nope");
         o.access = Some("a-existing".into());
-        let http = reqwest::Client::new();
+        let http = direct_client();
         let got = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(c.token("p", &o, &http))
@@ -792,7 +798,7 @@ mod tests {
     #[test]
     fn a_configured_access_token_is_used_until_its_lead_time_then_renewed() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let http = reqwest::Client::new();
+        let http = direct_client();
         let at = |secs: i64| {
             (chrono::Utc::now() + chrono::Duration::seconds(secs))
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -863,7 +869,7 @@ mod tests {
         // **没有退避，一个坏掉的 token 端点会被每个请求敲一次。**
         let c = Cache::new();
         let o = cfg("http://127.0.0.1:1/nope");
-        let http = reqwest::Client::new();
+        let http = direct_client();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let first = rt.block_on(c.token("p", &o, &http)).unwrap_err();
         assert!(matches!(first, OauthError::Http { .. }), "{first}");

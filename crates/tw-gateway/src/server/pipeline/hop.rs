@@ -2069,9 +2069,32 @@ fn prepare(
     id: u64,
 ) -> Result<Outbound, Skip> {
     let generates = reading.generates;
-    // 方言互转。**同格式时是 None，这一整段零成本**
     let client_dialect = req.api.map(|a| a.dialect());
     let target = crate::translate::plan(req.api, generates, provider.effective_protocol());
+    let model = effective_set
+        .model
+        .as_deref()
+        .unwrap_or(&reading.facts.model);
+    let history_target = crate::translate::history_target(provider, model);
+    if generates
+        && asked.decoded.is_some_and(|decoded| {
+            decoded.as_ref().is_ok_and(|d| {
+                tw_dialect::history::incompatible(
+                    &d.request,
+                    &history_target,
+                    target.or(client_dialect) == Some(tw_dialect::ir::Dialect::Chat),
+                )
+            })
+        })
+    {
+        return Err(GatewayError::new(
+            crate::error::Source::Request,
+            msg!(
+                "gw.convert.reasoning_history_incompatible", upstream = provider.name.clone() =>
+                "Signed reasoning history cannot be replayed to upstream `{upstream}`: its source or request format is incompatible."
+            ),
+        ));
+    }
     let chatgpt = generates && provider.effective_protocol() == Some(tw_config::Protocol::Chatgpt);
     // DeepSeek Harness 的扩展只有 DeepSeek 官方认。**发给它时一个字节都不改**。
     // 不止生成请求：数 token 这样的请求一样带着它的头，也可能带着会话日志
@@ -2088,11 +2111,13 @@ fn prepare(
             // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
             // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
             // 一个用户显式要求的例外，不是默认行为。
-            let model = effective_set
-                .model
-                .as_deref()
-                .unwrap_or(&reading.facts.model);
             let out = forward::apply_set(asked.body, effective_set, client_dialect, model);
+            let history_shape = (generates
+                && client_dialect == Some(tw_dialect::ir::Dialect::Chat))
+            .then(|| tw_dialect::history::shape_chat(&out, history_target.format))
+            .flatten();
+            let history_changed = history_shape.is_some();
+            let out = history_shape.map(Bytes::from).unwrap_or(out);
             if let (Some(tw_dialect::ir::Dialect::Gemini), Some(m)) =
                 (client_dialect, &effective_set.model)
             {
@@ -2110,12 +2135,17 @@ fn prepare(
             // DeepSeek Harness 发给别家：去掉只有 DeepSeek 认的扩展。**去掉了什么要说**，
             // 和转换丢了字段一样记在这一跳上
             let mut dropped = Vec::new();
+            if history_changed
+                && history_target.format == tw_dialect::history::HistoryFormat::Disabled
+            {
+                dropped.push("messages.reasoning_content".into());
+            }
             let out = match client_dialect
                 .filter(|_| harness && !to_deepseek)
                 .and_then(|d| tw_dialect::harness::clean(d, &out))
             {
                 Some(c) => {
-                    dropped = c.dropped;
+                    dropped.extend(c.dropped);
                     Bytes::from(c.body)
                 }
                 None => out,
@@ -2136,8 +2166,8 @@ fn prepare(
                     .and_then(|d| crate::egress::strip_body_identity(d, &out))
                     .unwrap_or(out)
             };
-            reshaped = !dropped.is_empty();
-            if let Some(d) = client_dialect.filter(|_| !dropped.is_empty()) {
+            reshaped = history_changed || !dropped.is_empty();
+            if let Some(d) = client_dialect.filter(|_| reshaped) {
                 let same = crate::wire::dialect(d);
                 state.bus.emit(tw_api::Event::Translated {
                     id,
@@ -2194,15 +2224,18 @@ fn prepare(
             } else {
                 None
             };
-            let p = d.encode(&tw_dialect::ir::Target {
-                dialect,
-                official: tw_dialect::official::is_official_host(&provider.base_url),
-                default_max_tokens: crate::translate::default_max_tokens(
-                    &state.pricing.load(),
-                    provider,
-                    &d.request.model,
-                ),
-            });
+            let p = d.encode_with_history(
+                &tw_dialect::ir::Target {
+                    dialect,
+                    official: tw_dialect::official::is_official_host(&provider.base_url),
+                    default_max_tokens: crate::translate::default_max_tokens(
+                        &state.pricing.load(),
+                        provider,
+                        &d.request.model,
+                    ),
+                },
+                &history_target,
+            );
             // 请求强制要用的工具发不过去：这一跳不发，换下一家（见 `unsendable_tool`）
             if let Some(err) = unsendable_tool(&d.request, &p.dropped, &provider.name) {
                 return Err(err);

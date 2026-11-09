@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::frame::{self, Frame};
+use crate::history::HistoryTarget;
 use crate::ir::*;
 use crate::{anthropic, bedrock, chat, gemini, responses};
 
@@ -28,6 +29,9 @@ pub struct Prepared {
     pub query: Option<String>,
     /// 客户端请求里转不过去、被丢掉的字段
     pub dropped: Vec<String>,
+    /// Do not send this request when true: signed reasoning cannot be replayed
+    /// to the selected upstream. A router may try another compatible target.
+    pub incompatible_history: bool,
     pub session: Session,
 }
 
@@ -87,6 +91,13 @@ pub fn decode(
 impl Decoded {
     /// 中间表示 → 发给某种格式上游的请求。
     pub fn encode(&self, target: &Target) -> Prepared {
+        self.encode_with_history(target, &HistoryTarget::default())
+    }
+
+    /// Encode with an explicitly resolved request-history capability and source.
+    /// The original `Target` and `encode` API remain compatible with callers
+    /// that do not configure route-specific history capabilities.
+    pub fn encode_with_history(&self, target: &Target, history: &HistoryTarget) -> Prepared {
         let mut dropped = self.dropped.clone();
         let request = &self.request;
         let (body, path, query) = match target.dialect {
@@ -96,7 +107,7 @@ impl Decoded {
                 None,
             ),
             Dialect::Chat => (
-                chat::encode_request(request, target, &mut dropped),
+                chat::request::encode_request_with_history(request, target, history, &mut dropped),
                 "/v1/chat/completions".to_string(),
                 None,
             ),
@@ -139,7 +150,21 @@ impl Decoded {
             path,
             query,
             dropped: dropped.into_vec(),
-            session: Session::new(self.client, target.dialect, request, self.shape.clone()),
+            incompatible_history: crate::history::incompatible(
+                request,
+                history,
+                target.dialect == Dialect::Chat,
+            ),
+            session: {
+                let mut session =
+                    Session::new(self.client, target.dialect, request, self.shape.clone());
+                session.history_origin = if target.dialect == Dialect::Chat {
+                    history.origin.clone()
+                } else {
+                    None
+                };
+                session
+            },
         }
     }
 }
@@ -151,13 +176,22 @@ impl Decoded {
 /// 这种格式里长什么样」只该有一个答案 —— 手写的那一份迟早和转发时真正发出去的
 /// 不一样，而那时「转发正常、测速失败」查起来毫无头绪。
 pub fn encode(request: &Request, target: &Target) -> Prepared {
+    encode_with_history(request, target, &HistoryTarget::default())
+}
+
+/// Encode a constructed request with route-specific history capabilities.
+pub fn encode_with_history(
+    request: &Request,
+    target: &Target,
+    history: &HistoryTarget,
+) -> Prepared {
     Decoded {
         client: target.dialect,
         request: request.clone(),
         dropped: Dropped::new(target.dialect),
         shape: ClientShape::default(),
     }
-    .encode(target)
+    .encode_with_history(target, history)
 }
 
 /// 客户端请求 → 上游请求，一步到位。
@@ -168,9 +202,21 @@ pub fn prepare(
     query: Option<&str>,
     target: &Target,
 ) -> Result<Prepared, Rejection> {
+    prepare_with_history(client, body, path, query, target, &HistoryTarget::default())
+}
+
+/// Decode and encode with route-specific history capabilities.
+pub fn prepare_with_history(
+    client: Dialect,
+    body: &[u8],
+    path: &str,
+    query: Option<&str>,
+    target: &Target,
+    history: &HistoryTarget,
+) -> Result<Prepared, Rejection> {
     let v: Value = serde_json::from_slice(body)
         .map_err(|_| Rejection("The request body is not valid JSON.".into()))?;
-    Ok(decode(client, &v, path, query)?.encode(target))
+    Ok(decode(client, &v, path, query)?.encode_with_history(target, history))
 }
 
 /// `/model/anthropic.claude-sonnet-4-v1:0/converse-stream` → (模型, 是否流式)
@@ -202,6 +248,7 @@ fn gemini_path(path: &str) -> Option<(String, bool)> {
 /// 一次请求转换之后，写响应时要用的东西。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
+    history_origin: Option<String>,
     pub client: Dialect,
     pub upstream: Dialect,
     /// 客户端请求的模型名。上游响应里没写模型时用它
@@ -224,6 +271,7 @@ impl Session {
         shape: ClientShape,
     ) -> Session {
         Session {
+            history_origin: None,
             client,
             upstream,
             model: r.model.clone(),
@@ -372,6 +420,11 @@ impl Session {
             chat::text_calls::rewrite(r, &self.tools);
         }
         for b in &mut r.blocks {
+            if let Block::Thinking(th) = b
+                && let Some(signature) = th.signature.as_mut()
+            {
+                crate::history::ChatHistory::stamp(signature, self.history_origin.as_deref());
+            }
             if let Block::ToolCall(c) = b
                 && self.is_freeform(&c.name)
                 && let ToolInput::Json(v) = &c.input
@@ -384,6 +437,7 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn for_test(client: Dialect, upstream: Dialect) -> Session {
         Session {
+            history_origin: None,
             client,
             upstream,
             model: "m".into(),
@@ -610,6 +664,7 @@ impl Writer {
 /// - **没有参数的函数调用**：有的上游一个参数片段都不发，补一个 `{}`，否则客户端解析
 ///   空串会失败
 struct Normalizer {
+    history_origin: Option<String>,
     text_calls: Option<chat::text_calls::Stage>,
     freeform: HashSet<String>,
     /// 上游把自由格式的输入包成 JSON（除 Responses 以外都是）
@@ -622,6 +677,7 @@ struct Normalizer {
 impl Normalizer {
     fn new(s: &Session) -> Normalizer {
         Normalizer {
+            history_origin: s.history_origin.clone(),
             text_calls: (s.upstream == Dialect::Chat && !s.tools.is_empty())
                 .then(|| chat::text_calls::Stage::new(s.tools.clone())),
             freeform: s.freeform.clone(),
@@ -641,7 +697,14 @@ impl Normalizer {
         }
     }
 
-    fn apply_one(&mut self, e: Event, out: &mut Vec<Event>) {
+    fn apply_one(&mut self, mut e: Event, out: &mut Vec<Event>) {
+        if let Event::Delta {
+            delta: Delta::Signature(signature),
+            ..
+        } = &mut e
+        {
+            crate::history::ChatHistory::stamp(signature, self.history_origin.as_deref());
+        }
         match &e {
             Event::BlockStart {
                 index,

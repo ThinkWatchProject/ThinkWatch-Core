@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use super::response::{
-    completion_id, content_parts, finish_reason, stop_reason, usage, usage_json,
+    completion_id, content_blocks, finish_reason, stop_reason, usage, usage_json,
 };
 use crate::convert::Session;
 use crate::frame::{self, Frame};
+use crate::history::{ChatHistory, HistoryFormat};
 use crate::ir::*;
 
 // ───────────────────────────────────────────────────────── 解析
@@ -20,13 +21,14 @@ use crate::ir::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Open {
     Text,
-    Thinking,
+    Thinking(HistoryFormat),
     /// OpenAI 的工具调用序号
     Tool(u64),
 }
 
 #[derive(Debug, Default)]
 pub struct Parser {
+    history: Option<ChatHistory>,
     started: bool,
     open: Option<(usize, Open)>,
     /// 已经开过的工具调用：OpenAI 的序号 → 块
@@ -71,33 +73,60 @@ impl Parser {
         };
         let delta = choice.get("delta").unwrap_or(&Value::Null);
 
-        // DeepSeek 叫 reasoning_content，OpenRouter、vLLM 叫 reasoning
-        if let Some(t) = str_of(delta, "reasoning_content")
-            .or_else(|| str_of(delta, "reasoning"))
-            .filter(|t| !t.is_empty())
-        {
-            let index = self.ensure(Open::Thinking, None, out);
-            out.push(Event::Delta {
-                index,
-                delta: Delta::Thinking(t.to_string()),
-            });
-        }
-        for key in ["content", "refusal"] {
-            content_parts(&delta[key], |thinking, text| {
-                let index = self.ensure(
-                    if thinking { Open::Thinking } else { Open::Text },
-                    None,
-                    out,
-                );
+        for (key, format) in [
+            ("reasoning_content", HistoryFormat::ReasoningContent),
+            ("reasoning", HistoryFormat::Reasoning),
+        ] {
+            if let Some(t) = str_of(delta, key).filter(|t| !t.is_empty()) {
+                let index = self.ensure(Open::Thinking(format), None, out);
+                self.history
+                    .get_or_insert_with(|| ChatHistory::field(format));
                 out.push(Event::Delta {
                     index,
-                    delta: if thinking {
-                        Delta::Thinking(text.to_string())
-                    } else {
-                        Delta::Text(text.to_string())
-                    },
+                    delta: Delta::Thinking(t.to_string()),
                 });
-            });
+                break;
+            }
+        }
+        for key in ["content", "refusal"] {
+            for block in content_blocks(&delta[key]) {
+                match block {
+                    Block::Text(text) => {
+                        let index = self.ensure(Open::Text, None, out);
+                        out.push(Event::Delta {
+                            index,
+                            delta: Delta::Text(text),
+                        });
+                    }
+                    Block::Thinking(th) => {
+                        let index =
+                            self.ensure(Open::Thinking(HistoryFormat::ContentBlocks), None, out);
+                        if let Some(history) = th.signature.as_ref().and_then(ChatHistory::read) {
+                            match &mut self.history {
+                                Some(current) => current.append(history),
+                                None => self.history = Some(history),
+                            }
+                        }
+                        if !th.text.is_empty() {
+                            out.push(Event::Delta {
+                                index,
+                                delta: Delta::Thinking(th.text),
+                            });
+                        }
+                        if self
+                            .history
+                            .as_ref()
+                            .and_then(|h| h.block.as_ref())
+                            .and_then(|b| b.get("closed"))
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            self.close(out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         for c in arr_of(delta, "tool_calls") {
             let k = u64_of(c, "index").unwrap_or(0);
@@ -154,11 +183,16 @@ impl Parser {
 
     fn close(&mut self, out: &mut Vec<Event>) {
         if let Some((index, o)) = self.open.take() {
-            // 推理块结束时打上 Chat 的厂商：下一轮认得出该原样写回 reasoning_content
-            if o == Open::Thinking {
+            // 记住原生回放结构，下一轮由目标的请求能力决定写法
+            if let Open::Thinking(format) = o {
                 out.push(Event::Delta {
                     index,
-                    delta: Delta::Signature(Signature::new(Vendor::Chat, "")),
+                    delta: Delta::Signature(
+                        self.history
+                            .take()
+                            .unwrap_or_else(|| ChatHistory::field(format))
+                            .signature(),
+                    ),
                 });
             }
             out.push(Event::BlockStop { index });

@@ -164,19 +164,27 @@ async fn set_model_spec(
     Json(req): Json<tw_api::ModelSpecSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let model = req.model.trim();
-    let spec = tw_config::ModelSpec {
+    let mut spec = tw_config::ModelSpec {
         context_window: req.context_window,
         max_output_tokens: req.max_output_tokens,
         reasoning: req.reasoning,
         image_input: req.image_input,
+        ..Default::default()
     };
-    let spec = (!spec.is_empty()).then_some(spec);
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
             if !cfg.providers.iter().any(|p| p.name == req.provider) {
                 return Err(not_found("upstream", &req.provider));
             }
+            // The UI edits the four public specifications, not the advanced history override.
+            spec.reasoning_history = cfg
+                .providers
+                .iter()
+                .find(|p| p.name == req.provider)
+                .and_then(|p| p.model_specs.get(model))
+                .and_then(|s| s.reasoning_history);
+            let spec = (!spec.is_empty()).then_some(spec);
             tw_config::check_model_spec(&req.provider, model, spec.as_ref())
                 .map_err(|e| invalid(e.msg()))?;
             Ok(edit::set_model_spec(
@@ -543,6 +551,8 @@ fn to_provider(
         aws,
         protocol: input.protocol.map(Into::into),
         forward_client_identity: input.forward_client_identity,
+        reasoning_history: existing.map(|e| e.reasoning_history).unwrap_or_default(),
+        reasoning_history_group: existing.and_then(|e| e.reasoning_history_group.clone()),
         models: input
             .models
             .iter()

@@ -39,7 +39,7 @@ pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
 pub use limits::{KeyLimit, LimitMeasure, LimitPer, UsageLimit};
-pub use model_specs::{ModelSpec, ResolvedSpec, Sourced, SpecSource};
+pub use model_specs::{ModelSpec, ReasoningHistory, ResolvedSpec, Sourced, SpecSource};
 pub use plugins::Plugin;
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
@@ -192,6 +192,8 @@ impl Default for Provider {
             aws: None,
             protocol: None,
             forward_client_identity: false,
+            reasoning_history: ReasoningHistory::Auto,
+            reasoning_history_group: None,
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
             models: Vec::new(),
@@ -776,6 +778,12 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
+    /// Request-side history format; model_specs can override it per model.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub reasoning_history: ReasoningHistory,
+    /// Explicitly share signed Chat history between compatible upstream identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_history_group: Option<String>,
     pub name: String,
     pub base_url: String,
     /// API 密钥，按接口协议放进它认的请求头。可以写 `${ENV}`。**不做 keychain。**

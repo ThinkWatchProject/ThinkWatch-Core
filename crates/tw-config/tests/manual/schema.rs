@@ -33,6 +33,9 @@ const fn row(name: &'static str, kind: Kind, def: Def, doc: T2) -> Row {
 fn protocols() -> Vec<&'static str> {
     super::fields::<Protocol>()
 }
+fn reasoning_histories() -> Vec<&'static str> {
+    super::fields::<ReasoningHistory>()
+}
 fn billings() -> Vec<&'static str> {
     super::fields::<Billing>()
 }
@@ -651,6 +654,24 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "reasoning_history",
+                    Kind::Enum(reasoning_histories),
+                    Def::Is("auto"),
+                    t(
+                        "Request-side Chat reasoning history: auto uses verified endpoint defaults, otherwise keeps native content blocks for the same source and the existing reasoning_content field convention. Select reasoning-content, reasoning, content-blocks, or disabled for a compatible gateway. Model-specific settings take precedence. Signed history cannot cross an incompatible source or format.",
+                        "Chat 请求的思考历史格式：auto 使用已验证的端点默认值，其余同来源保留原生内容块和既有的 reasoning_content 字段惯例。兼容网关可显式选择 reasoning-content、reasoning、content-blocks 或 disabled。模型级设置优先。带签名的历史不发送到来源或格式不兼容的上游。",
+                    ),
+                ),
+                row(
+                    "reasoning_history_group",
+                    Kind::Str,
+                    Def::Unset,
+                    t(
+                        "Explicit compatibility group for signed Chat history. Unset: isolated by upstream, model and configured credentials. Only share a group when the backends accept each other's signatures; blank is treated as unset.",
+                        "带签名的 Chat 历史的显式兼容组。不写时按上游、模型及配置凭据隔离；只有确认后端相互接受签名时才共享组。空白视为未设置。",
+                    ),
+                ),
+                row(
                     "forward_client_identity",
                     Kind::Bool,
                     Def::Is("false"),
@@ -783,6 +804,15 @@ pub fn sections() -> Vec<Section> {
             // 每项都可选，至少写一项由校验管
             ty: checked!(ModelSpec, "{}"),
             rows: vec![
+                row(
+                    "reasoning_history",
+                    Kind::Enum(reasoning_histories),
+                    Def::Unset,
+                    t(
+                        "Override this model's request-side reasoning-history format. Unset: use the upstream setting. This is independent of whether the model can reason.",
+                        "覆盖这个模型的请求侧思考历史格式。不写时遵从上游设置；与模型会不会推理是两项独立能力。",
+                    ),
+                ),
                 row(
                     "context_window",
                     Kind::Int,

@@ -428,9 +428,9 @@ pub enum Vendor {
     Anthropic,
     OpenAi,
     Google,
-    /// Chat 格式的上游（DeepSeek 等）的 `reasoning_content`。它们不签名，`value` 为空；
-    /// 打上厂商只为了下一轮认得出这段推理该原样写回 `reasoning_content` —— DeepSeek
-    /// 在工具调用的那几轮要求带回来，而 OpenAI 自己的 Chat 接口不认这个字段
+    /// Chat-compatible reasoning history. Empty values are legacy
+    /// `reasoning_content`; newer carriers retain the wire format, native blocks
+    /// and source identity (see `history::ChatHistory`).
     Chat,
 }
 

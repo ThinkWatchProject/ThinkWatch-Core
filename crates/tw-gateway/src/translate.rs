@@ -1,7 +1,7 @@
 //! 方言互转在管线上的接线。
 //!
 //! **只在客户端格式和上游协议不同、而且调的是生成回答时才醒过来。**同格式那条路
-//! 一个字节都不碰（例外有两个：去掉转换写出去的推理签名，见
+//! 默认不改正文（另外遵从显式的思考历史能力；其余例外有两个：去掉转换写出去的推理签名，见
 //! [`tw_dialect::convert::strip_carried`]；DeepSeek Harness 发给 DeepSeek 以外的上游时
 //! 去掉它的扩展，见 [`tw_dialect::harness`]）。转换本身在 `tw-dialect` 里，这里只管
 //! 三个接缝：
@@ -24,6 +24,71 @@ pub fn dialect_of(p: Protocol) -> Dialect {
         Protocol::OpenaiResponses | Protocol::Chatgpt => Dialect::Responses,
         Protocol::Gemini => Dialect::Gemini,
         Protocol::Bedrock => Dialect::Bedrock,
+    }
+}
+
+/// Resolve capabilities independently of the shared Chat API envelope. Exact
+/// endpoint defaults are conveniences; relays can override them per model.
+pub fn history_target(
+    provider: &tw_config::Provider,
+    model: &str,
+) -> tw_dialect::history::HistoryTarget {
+    use tw_config::ReasoningHistory as C;
+    use tw_dialect::history::{HistoryFormat as F, HistoryTarget};
+    let configured = provider
+        .model_specs
+        .get(model)
+        .and_then(|s| s.reasoning_history)
+        .unwrap_or(provider.reasoning_history);
+    let format = match configured {
+        C::ReasoningContent => F::ReasoningContent,
+        C::Reasoning => F::Reasoning,
+        C::ContentBlocks => F::ContentBlocks,
+        C::Disabled => F::Disabled,
+        C::Auto => match reqwest::Url::parse(&provider.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .as_deref()
+        {
+            Some("api.mistral.ai") => F::ContentBlocks,
+            Some("api.deepseek.com") => F::ReasoningContent,
+            Some("api.openai.com") => F::Disabled,
+            _ => F::Auto,
+        },
+    };
+    let mut identity = blake3::Hasher::new();
+    let mut add = |value: &str| {
+        identity.update(&(value.len() as u64).to_le_bytes());
+        identity.update(value.as_bytes());
+    };
+    if let Some(group) = provider
+        .reasoning_history_group
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+    {
+        add(group);
+    } else {
+        add(&provider.name);
+        add(&provider.base_url);
+        // A credential change cannot silently reuse another account's signature.
+        if let Some(key) = provider.key.as_ref().and_then(|k| k.resolve().ok()) {
+            add(&key);
+        }
+        if let Some(oauth) = &provider.oauth {
+            add(&oauth.refresh);
+        }
+        for header in provider.headers.iter() {
+            add(&header.name.to_ascii_lowercase());
+            if let Ok(value) = header.value.resolve() {
+                add(&value);
+            }
+        }
+    }
+    add(model);
+    HistoryTarget {
+        format,
+        origin: Some(identity.finalize().to_hex().to_string()),
     }
 }
 
@@ -123,6 +188,48 @@ pub fn default_max_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_capabilities_are_per_route_and_per_model_not_model_name_guesses() {
+        use tw_config::ReasoningHistory as C;
+        use tw_dialect::history::HistoryFormat as F;
+        let mut provider = tw_config::Provider {
+            name: "relay".into(),
+            base_url: "https://api.mistral.ai/v1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            history_target(&provider, "anything").format,
+            F::ContentBlocks
+        );
+        provider.base_url = "https://relay.example/api.mistral.ai".into();
+        assert_eq!(
+            history_target(&provider, "mistral-thinking").format,
+            F::Auto
+        );
+        provider.reasoning_history = C::Disabled;
+        provider.model_specs.insert(
+            "custom".into(),
+            tw_config::ModelSpec {
+                reasoning_history: Some(C::Reasoning),
+                ..Default::default()
+            },
+        );
+        assert_eq!(history_target(&provider, "custom").format, F::Reasoning);
+        assert_eq!(
+            history_target(&provider, "custom-other").format,
+            F::Disabled
+        );
+        let original = history_target(&provider, "custom").origin;
+        provider.key = Some("new-account".into());
+        assert_ne!(history_target(&provider, "custom").origin, original);
+        provider.reasoning_history_group = Some("verified-compatible".into());
+        let shared = history_target(&provider, "custom").origin;
+        provider.name = "other".into();
+        provider.key = Some("other-account".into());
+        assert_eq!(history_target(&provider, "custom").origin, shared);
+        assert_ne!(history_target(&provider, "custom-other").origin, shared);
+    }
 
     #[test]
     fn same_format_and_non_generating_calls_are_passthrough() {

@@ -304,6 +304,8 @@ clients:
 | `oauth` | 对象，见 [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth 凭据：用 refresh token 换取 access token。与 `key` 二选一。 |
 | `aws` | 对象，见 [`providers[].aws`](#cfg-providers-aws) | — | Bedrock 上游的 AWS 访问密钥，写在这里或者从 AWS 的 profile 读：每个请求用它们签名（SigV4）。与 `key`（Bedrock API Key）二选一。 |
 | `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` \| `bedrock` | — | 上游的接口格式。不写：官方地址按 `base_url` 识别（Bedrock 的推理地址是 `bedrock`），其余按 `anthropic` 处理。 |
+| `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | `auto` | Chat 请求的思考历史格式：auto 使用已验证的端点默认值，其余同来源保留原生内容块和既有的 reasoning_content 字段惯例。兼容网关可显式选择 reasoning-content、reasoning、content-blocks 或 disabled。模型级设置优先。带签名的历史不发送到来源或格式不兼容的上游。 |
+| `reasoning_history_group` | 字符串 | — | 带签名的 Chat 历史的显式兼容组。不写时按上游、模型及配置凭据隔离；只有确认后端相互接受签名时才共享组。空白视为未设置。 |
 | `forward_client_identity` | 布尔 | `false` | 同时发送客户端自己的身份：它的 `User-Agent`、`x-app` 和 `originator` 等身份请求头，以及请求体中的身份字段（如 `metadata.user_id`）。发送的都是客户端的原值，不做伪造。关闭时请求使用 ThinkWatch 的 `User-Agent`，不带客户端身份。用于只接受特定客户端的上游（Kimi For Coding、百炼 Coding Plan、只允许官方客户端的中转站）。`chatgpt` 不可用。 |
 | `proxy` | 字符串 | `direct` | `direct`；`system`，即 core 进程环境变量 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 中的代理；或 `proxies` 中某一项的名字。 |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | 代理不可用时：请求失败（`fail`），或改为直连（`direct`）。 |
@@ -505,6 +507,7 @@ providers:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
+| `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | — | 覆盖这个模型的请求侧思考历史格式。不写时遵从上游设置；与模型会不会推理是两项独立能力。 |
 | `context_window` | 整数 | — | 上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。 |
 | `max_output_tokens` | 整数 | — | 一次回答最多输出多少 token。不写：取价目表的。 |
 | `reasoning` | 布尔 | — | 这个模型会不会推理。模型列表（`GET /v1/models`）带着它，客户端据此给出推理档位。不写：取价目表的；价目表也没写时，列表里不给这一项。 |

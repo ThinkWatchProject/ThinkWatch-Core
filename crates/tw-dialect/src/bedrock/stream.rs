@@ -109,11 +109,10 @@ impl Parser {
                         self.begin(i, BlockKind::Thinking, out);
                         out.push(Event::Delta {
                             index: i,
-                            delta: Delta::Signature(Signature {
-                                vendor: Vendor::Anthropic,
-                                value: s.to_string(),
-                                redacted: false,
-                            }),
+                            delta: Delta::Signature(
+                                Signature::read(s, Vendor::Anthropic)
+                                    .unwrap_or_else(|| Signature::new(Vendor::Anthropic, s)),
+                            ),
                         });
                     }
                     if let Some(s) = r.get("redactedContent").and_then(Value::as_str) {
@@ -247,7 +246,7 @@ impl Writer {
                         json!({ "reasoningContent": { "redactedContent": s.value } })
                     }
                     Delta::Signature(s) => {
-                        json!({ "reasoningContent": { "signature": s.value } })
+                        json!({ "reasoningContent": { "signature": s.carried_in(Vendor::Anthropic) } })
                     }
                     Delta::ToolInput(t) => json!({ "toolUse": { "input": t } }),
                 };

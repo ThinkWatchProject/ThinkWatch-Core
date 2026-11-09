@@ -19,10 +19,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Config, Provider};
 
+/// Request-side reasoning-history capability. Independent of the API protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningHistory {
+    #[default]
+    Auto,
+    ReasoningContent,
+    Reasoning,
+    ContentBlocks,
+    Disabled,
+}
+
 /// `providers[].model_specs` 的一项。每项都可选，但至少写一项（校验管）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
+    /// Override this model's request-side reasoning-history format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_history: Option<ReasoningHistory>,
     /// 一次最多输入多少 token，也就是上下文窗口
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
