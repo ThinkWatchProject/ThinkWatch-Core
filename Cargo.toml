@@ -104,7 +104,7 @@ serde_yaml_ng = "0.10"
 # 文件监听，只有 tw-watch 直接用
 notify = "8"
 # 请求历史。bundled 是刻意的：零外部依赖，用户不必装 sqlite
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 libc = "0.2"
 # 问 Windows 要它自己才知道的东西：网卡清单（tw-config 的 nics）、
 # 一个 pid 在不在（twcore 的 proc）。**纯 Rust 的绑定**，不编译任何 C ——
