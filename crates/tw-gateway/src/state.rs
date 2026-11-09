@@ -200,6 +200,8 @@ pub struct AppState {
     pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
     /// 每个上游的模型清单，以及是什么时候、怎么来的。**跨重载存活**
     pub models: Arc<crate::models::Directory>,
+    /// Native Codex metadata only; live names and permissions are never cached.
+    pub(crate) codex_catalogs: Arc<crate::codex_catalog::Cache>,
     /// 请求体和响应体往哪儿交。
     ///
     /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
@@ -361,6 +363,7 @@ impl AppState {
             health,
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
             models,
+            codex_catalogs: Default::default(),
             body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             glm: Default::default(),

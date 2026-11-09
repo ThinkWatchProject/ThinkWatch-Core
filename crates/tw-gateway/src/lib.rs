@@ -18,6 +18,7 @@ pub mod cache_marks;
 pub mod chatgpt;
 pub mod client_api;
 pub mod clientprobe;
+mod codex_catalog;
 pub mod content;
 pub mod count;
 pub mod effort_memory;
