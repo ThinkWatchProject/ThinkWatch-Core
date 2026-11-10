@@ -155,7 +155,12 @@ pub(super) async fn list_models(
         .and_then(|c| c.allow.clone());
     let shape = ListingShape::of(uri.path(), &headers, position);
     let catalog = state.catalog.load();
-    let models = catalog.resolve_allowed(Some(&shape.protocols()), allow.as_deref());
+    let models = crate::discovery::models(
+        &rt.config,
+        &catalog,
+        Some(&shape.protocols()),
+        allow.as_deref(),
+    );
 
     let book = state.pricing.load();
     let objects: Vec<_> = models

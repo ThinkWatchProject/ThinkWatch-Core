@@ -459,3 +459,28 @@ async fn oversized_projected_catalog_is_rejected_instead_of_truncated() {
     let (_, gw) = serve(config(vec![p])).await;
     assert_eq!(request(gw).send().await.unwrap().status(), 413);
 }
+
+#[tokio::test]
+async fn alias_discovery_policy_reloads_over_cached_metadata_and_is_key_scoped() {
+    let up = Upstream::new(json!({"models":[native("raw")]}));
+    let addr = up.serve().await;
+    let mut cfg = config(vec![provider("native", addr, &["raw"])]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: raw").unwrap();
+    let (state, gw) = serve(cfg.clone()).await;
+    assert_eq!(slugs(&catalog(gw).await), ["coding", "raw"]);
+    cfg.aliases.0[0].hide_originals = true;
+    state.reload(cfg.clone()).unwrap();
+    assert_eq!(slugs(&catalog(gw).await), ["coding"]);
+    assert_eq!(
+        up.requests.lock().unwrap().len(),
+        1,
+        "reuse metadata, not the old discovery result"
+    );
+    cfg.clients[0].allow = Some(vec![]);
+    state.reload(cfg.clone()).unwrap();
+    assert!(slugs(&catalog(gw).await).is_empty());
+    cfg.clients[0].allow = None;
+    cfg.aliases.0.clear();
+    state.reload(cfg).unwrap();
+    assert_eq!(slugs(&catalog(gw).await), ["raw"]);
+}

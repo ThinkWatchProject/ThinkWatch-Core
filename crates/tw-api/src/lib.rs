@@ -4023,6 +4023,10 @@ pub struct ProxyTest {
 pub struct AliasInput {
     pub name: String,
     pub models: Vec<String>,
+    /// Hide target original names in client discovery only. Omission preserves an
+    /// existing alias's setting; new aliases default to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hide_originals: Option<bool>,
 }
 
 /// 新建或保存一个别名（`POST /aliases`、`PUT /aliases/{name}`）。保存时名字可以改：
@@ -4050,6 +4054,9 @@ pub struct AliasModel {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AliasView {
     pub name: String,
+    /// Hide original model names from client discovery without changing access.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_originals: bool,
     /// 按书写顺序
     pub models: Vec<AliasModel>,
     /// 每家能服务它的上游实际发出的名称，按配置里的顺序。停用的上游不在里面；没有清单
@@ -4086,6 +4093,10 @@ pub struct AliasSuggestion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AliasesView {
+    /// This Core understands hide_originals. Absent/false on older servers;
+    /// clients must not offer the setting there.
+    #[serde(default)]
+    pub hide_originals_supported: bool,
     /// 按书写顺序
     pub aliases: Vec<AliasView>,
     /// 同一个模型在不同上游上叫不同名称的几组。**只认 Claude**：各家清单里的名称归一之后
@@ -4123,6 +4134,10 @@ pub struct AliasPreview {
     /// 规则同 [`AliasesView::suggestions`]。列表里已经有的名称、已经有列表里某个名称的
     /// 上游不在里面
     pub same_model: Vec<PinnedModel>,
+    /// Original names hidden by this alias in an unrestricted client catalog.
+    /// Actual client lists still apply protocol, availability and key permissions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_originals: Vec<String>,
 }
 
 /// 一条写着这个名称的规则。
@@ -4305,6 +4320,10 @@ pub struct KnownModel {
     pub alias: Option<Vec<String>>,
     /// 列出了这个模型名的别名，按别名表的顺序。别名自己这一项是空的
     pub aliases: Vec<String>,
+    /// Available aliases that hide this original name in an unrestricted client
+    /// catalog. Admins still receive the complete directory and original IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_by: Vec<String>,
 }
 
 /// 聚合类端点的时间窗（`GET /summary`、`/latency`）。**缺省是「今天」而不是

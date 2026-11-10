@@ -516,6 +516,7 @@ async fn a_plugin_renaming_to_an_alias_sends_each_upstream_its_own_name() {
             aliases: tw_config::Aliases(vec![tw_config::Alias {
                 name: "sonnet".into(),
                 models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
+                hide_originals: false,
             }]),
             ..config()
         },
@@ -566,10 +567,12 @@ async fn a_plugin_renaming_to_an_alias_inherits_the_keys_allow_like_a_request_fo
                 tw_config::Alias {
                     name: "sonnet".into(),
                     models: vec!["claude-sonnet-5".into()],
+                    hide_originals: false,
                 },
                 tw_config::Alias {
                     name: "opus".into(),
                     models: vec!["claude-opus-5".into()],
+                    hide_originals: false,
                 },
             ]),
             ..config()

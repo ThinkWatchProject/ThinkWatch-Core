@@ -853,3 +853,62 @@ async fn a_preview_lists_what_would_stop_the_save() {
         ["config.edit.not_found"]
     );
 }
+
+#[tokio::test]
+async fn discovery_policy_preview_persistence_legacy_edit_and_admin_inventory() {
+    let b = bed(BASE, None);
+    let input = json!({"name":"sonnet", "models":["claude-sonnet-4-5"], "hide_originals":true});
+    let (_, preview) = call(
+        &b.app,
+        "POST",
+        "/alias-preview",
+        json!({"alias":input, "original":"sonnet"}),
+    )
+    .await;
+    assert_eq!(preview["hidden_originals"], json!(["claude-sonnet-4-5"]));
+    assert!(
+        !b.parsed().aliases[0].hide_originals,
+        "preview must not write"
+    );
+    let (st, v) = call(&b.app, "PUT", "/aliases/sonnet", json!({"alias": input})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().aliases[0].hide_originals);
+    let (_, aliases) = call(&b.app, "GET", "/aliases", Value::Null).await;
+    assert_eq!(aliases["hide_originals_supported"], true);
+    assert_eq!(aliases["aliases"][0]["hide_originals"], true);
+    let (_, known) = call(&b.app, "GET", "/models", Value::Null).await;
+    assert_eq!(
+        known
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "claude-sonnet-4-5")
+            .unwrap()["hidden_by"],
+        json!(["sonnet"])
+    );
+    // Old UI omits the new field while renaming: preserve it and its references.
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/aliases/sonnet",
+        json!({"alias":{"name":"renamed", "models":["claude-sonnet-4-5"]}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().aliases.find("renamed").unwrap().hide_originals);
+    let (_, unavailable) = call(&b.app, "POST", "/alias-preview", json!({"original":"renamed", "alias":{"name":"renamed", "models":["missing"], "hide_originals":true}})).await;
+    assert!(
+        unavailable
+            .get("hidden_originals")
+            .is_none_or(|v| v.as_array().unwrap().is_empty())
+    );
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/aliases/renamed",
+        json!({"alias":{"name":"renamed", "models":["claude-sonnet-4-5"], "hide_originals":false}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!b.parsed().aliases[0].hide_originals);
+}

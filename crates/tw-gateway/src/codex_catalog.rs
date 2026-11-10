@@ -273,8 +273,14 @@ fn candidates<'a>(
         .collect()
 }
 
-fn names(catalog: &tw_engine::Catalog, allow: Option<&[String]>) -> Vec<String> {
-    catalog.resolve_allowed(
+fn names(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    allow: Option<&[String]>,
+) -> Vec<String> {
+    crate::discovery::models(
+        cfg,
+        catalog,
         Some(&crate::client_api::slugs(
             crate::client_api::ClientApi::OpenaiResponses.servable_by(true),
         )),
@@ -291,7 +297,7 @@ pub(crate) async fn list(
     let (mut rt, mut allow) = authorize(&state, peer, &headers, query.as_deref())?;
     let version = version(query.as_deref())?;
     let catalog = state.catalog.load_full();
-    let listed = names(&catalog, allow.as_deref());
+    let listed = names(&rt.config, &catalog, allow.as_deref());
     let mut providers = BTreeMap::new();
     for name in &listed {
         for (provider, _) in candidates(&rt, &catalog, name) {
@@ -342,7 +348,7 @@ pub(crate) async fn list(
     allow = current_allow;
     let catalog = state.catalog.load();
     let book = state.pricing.load();
-    let models: Vec<_> = names(&catalog, allow.as_deref())
+    let models: Vec<_> = names(&rt.config, &catalog, allow.as_deref())
         .iter()
         .map(|name| project(name, &candidates(&rt, &catalog, name), &book, &upstreams))
         .collect();

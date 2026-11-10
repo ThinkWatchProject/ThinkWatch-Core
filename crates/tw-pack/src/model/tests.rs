@@ -1128,3 +1128,17 @@ fn a_plugin_refers_to_the_upstreams_its_scope_names() {
     let script = String::from_utf8(out.plugins["scoped"].script.clone()).unwrap();
     assert!(script.contains("relay (2)"), "{script}");
 }
+
+#[test]
+fn alias_visibility_survives_pack_normalization_and_reconstruction() {
+    let text = rich().replace(
+        "fast: [claude-haiku, gpt-mini]",
+        "fast: {models: [claude-haiku, gpt-mini], hide_originals: true}",
+    );
+    let source = pack(&text);
+    let model = snap(&source);
+    let rebuilt = mat(&pack(&rich()), &model);
+    let cfg = tw_config::try_parse(&rebuilt.config_yaml).unwrap();
+    assert!(cfg.aliases.find("fast").unwrap().hide_originals);
+    assert_eq!(snap(&rebuilt), model);
+}

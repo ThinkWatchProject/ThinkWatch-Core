@@ -2012,10 +2012,12 @@ groups:
             crate::Alias {
                 name: "x".into(),
                 models: vec!["a".into()],
+                hide_originals: false,
             },
             crate::Alias {
                 name: "x".into(),
                 models: vec!["b".into()],
+                hide_originals: false,
             },
         ]);
         assert_eq!(

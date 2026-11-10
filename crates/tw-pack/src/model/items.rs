@@ -68,9 +68,11 @@ pub(crate) fn of_config(
         let id = ItemId::new(ItemKind::Alias, &a.name);
         put(
             id,
-            one(Json::Array(
-                a.models.iter().cloned().map(Json::String).collect(),
-            )),
+            one(if a.hide_originals {
+                serde_json::json!({ "models": a.models, "hide_originals": true })
+            } else {
+                Json::Array(a.models.iter().cloned().map(Json::String).collect())
+            }),
         );
     }
     for g in &cfg.groups {
@@ -383,21 +385,21 @@ where
 }
 
 /// 别名的模型列表
-pub(crate) fn alias_models(
+pub(crate) fn alias_definition(
     id: &ItemId,
     units: &BTreeMap<String, Json>,
-) -> Result<Vec<String>, ModelError> {
-    match units.get(unit::ALL) {
-        Some(Json::Array(a)) => a
-            .iter()
-            .map(|m| {
-                m.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| shape(id, "a model is not a string"))
-            })
-            .collect(),
-        _ => Err(shape(id, "unit `all` is not a list of models")),
-    }
+) -> Result<tw_config::Alias, ModelError> {
+    let value = units
+        .get(unit::ALL)
+        .ok_or_else(|| shape(id, "unit `all` is missing"))?;
+    let aliases: tw_config::Aliases =
+        serde_json::from_value(serde_json::json!({ id.name.clone(): value }))
+            .map_err(|e| shape(id, e))?;
+    aliases
+        .0
+        .into_iter()
+        .next()
+        .ok_or_else(|| shape(id, "alias definition is missing"))
 }
 
 /// 顺序项目里的名字

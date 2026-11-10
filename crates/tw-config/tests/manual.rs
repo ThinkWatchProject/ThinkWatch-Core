@@ -178,8 +178,8 @@ pub enum Kind {
     Objs(&'static str),
     /// 键 → 对象，见那一节
     ObjMap(T2, &'static str),
-    /// 键 → 一个字符串或一组字符串
-    OneOrManyMap(T2),
+    /// 别名 → 字符串、列表或带展示选项的对象
+    AliasMap,
     /// 一个字符串，或者一组对象（见那一节）
     StrOrObjs(&'static str),
     /// 一个列表，每一项是字符串或者对象（见那一节）
@@ -307,12 +307,11 @@ fn kind(k: &Kind, l: Lang) -> String {
         Kind::ObjMap(key, p) => {
             format!("{} {} → {}", pick("map of", "映射："), key.get(l), link(p))
         }
-        Kind::OneOrManyMap(key) => format!(
-            "{} {} → {}",
-            pick("map of", "映射："),
-            key.get(l),
-            pick("string or list of strings", "字符串或字符串列表")
-        ),
+        Kind::AliasMap => pick(
+            "map of alias → string, list of strings or object",
+            "映射：别名 → 字符串、字符串列表或对象",
+        )
+        .to_string(),
         Kind::StrOrObjs(p) => format!(
             "{} {}",
             pick("string, or list of", "字符串，或对象列表，见"),

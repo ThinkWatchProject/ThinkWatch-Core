@@ -205,7 +205,7 @@ means.
 | `security` | object, [`security`](#cfg-security) | — | The three guards. All of them start in `observe`, so out of the box nothing is changed or refused. |
 | `retention` | object, [`retention`](#cfg-retention) | — | How long request logs are kept. |
 | `failover` | object, [`failover`](#cfg-failover) | — | How long an upstream is set aside after it fails, and how long the start of a stream is awaited. |
-| `aliases` | map of alias → string or list of strings | `{}` | Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias. |
+| `aliases` | map of alias → string, list of strings or object | `{}` | Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias. The object form accepts `models` and `hide_originals` (default false); hiding only affects client discovery, not access. |
 | `groups` | list of [`groups[]`](#cfg-groups) | `[]` | Strategy groups: several upstreams behind one name, with a way to pick among them. |
 | `routes` | list of [`routes[]`](#cfg-routes) | `[]` | Routes. Without any, requests fail over across all upstreams in the order they are declared. |
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
@@ -1452,11 +1452,29 @@ aliases:
     - anthropic/claude-sonnet-5
 ```
 
+To hide the mapped original names from client model lists, use the object form:
+
+```yaml
+aliases:
+  coding:
+    models: [provider-model-2026]
+    hide_originals: true  # optional; defaults to false
+```
+
+`models` accepts the same string or list forms as a simple alias. The option
+only changes discovery (`/v1/models`, Gemini lists and `/codex/models`);
+original-name requests and single-model lookups keep their existing permissions
+and routing. Filtering runs after protocol, availability and key permissions:
+only a usable, visible alias can hide its exact targets. Alias identities stay
+visible, and shared targets remain hidden until the last effective hiding alias
+is disabled or removed. Changes reload live; clients may cache their picker and
+need a model-list refresh. Admin inventories and permission editors stay complete.
+
 - An upstream serves an alias when it offers one of the listed names within
   its `models_only`, and receives the first such name in the list. Every
   upstream that serves an alias takes part in failover for it.
 - `GET /v1/models` lists aliases next to the upstream models, and the
-  original names stay available.
+  original names stay available unless hidden from the list as above.
 - An alias takes precedence over an upstream model of the same name: a
   request for `claude-sonnet-5` above goes only to upstreams offering one of
   the three names. List an upstream's own name when it should keep serving it.

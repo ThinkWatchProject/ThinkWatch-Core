@@ -825,6 +825,7 @@ routes:
         let renamed = crate::Alias {
             name: "claude-sonnet".into(),
             models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
+            hide_originals: false,
         };
         let text = edit::upsert_alias(ALIASED, Some("sonnet"), &renamed).unwrap();
         let (out, done) = rename_alias(&text, &c, "sonnet", &renamed).unwrap();
@@ -869,6 +870,7 @@ routes:
         let renamed = crate::Alias {
             name: "sonnet".into(),
             models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
+            hide_originals: false,
         };
         let edited = edit::upsert_alias(&text, Some("claude-sonnet-5"), &renamed).unwrap();
         let (out, done) = rename_alias(&edited, &c, "claude-sonnet-5", &renamed).unwrap();
@@ -898,6 +900,7 @@ routes:
         let narrowed = crate::Alias {
             name: "sonnet".into(),
             models: vec!["anthropic/claude-sonnet-5".into()],
+            hide_originals: false,
         };
         let edited = edit::upsert_alias(&text, Some("claude-sonnet-5"), &narrowed).unwrap();
         let (out, done) = rename_alias(&edited, &c, "claude-sonnet-5", &narrowed).unwrap();

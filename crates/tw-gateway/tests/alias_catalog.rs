@@ -348,3 +348,53 @@ async fn a_phase_two_rename_is_admitted_as_written_even_when_an_alias_has_its_na
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn hiding_originals_changes_all_public_lists_but_not_raw_requests_or_lookup() {
+    let mut cfg = setup(
+        vec![
+            client("all", None, None),
+            client("alias-only", Some(&["sonnet"]), None),
+            client("none", Some(&[]), None),
+        ],
+        "",
+    )
+    .await;
+    cfg.aliases.0[0].hide_originals = true;
+    let gw = serve(cfg).await;
+    let names = listed(gw, "all").await;
+    assert!(names.contains(&"sonnet".into()));
+    assert!(!names.contains(&"claude-sonnet-4-5".into()));
+    assert!(!names.contains(&"anthropic/claude-sonnet-4-5".into()));
+    assert_eq!(listed(gw, "alias-only").await, ["sonnet"]);
+    assert!(listed(gw, "none").await.is_empty());
+    let (_, anthropic) = get_json(gw, "all", "/v1/models", true).await;
+    assert!(
+        !anthropic["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "claude-sonnet-4-5")
+    );
+    let (status, gemini) = get_json(gw, "all", "/v1beta/models", false).await;
+    assert_eq!(status, 200);
+    assert!(
+        !gemini["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "models/claude-sonnet-4-5")
+    );
+    assert_eq!(
+        get_json(gw, "all", "/v1/models/claude-sonnet-4-5", false)
+            .await
+            .0,
+        200
+    );
+    let (status, answer) = ask(gw, "all", "claude-sonnet-4-5").await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["sent"], "claude-sonnet-4-5");
+    let (status, denied) = ask(gw, "alias-only", "claude-sonnet-4-5").await;
+    assert_eq!(status, 400, "{denied}");
+    assert!(message(&denied).contains("claude-sonnet-4-5"));
+}

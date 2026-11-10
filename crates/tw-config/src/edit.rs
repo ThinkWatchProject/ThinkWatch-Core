@@ -536,7 +536,7 @@ pub fn upsert_alias(
     let doc = parse(text)?;
     let mut table = alias_table(&doc);
     let taken = table.iter().position(|(k, _)| *k == alias.name);
-    let value = alias_value(&alias.models);
+    let value = alias_value(alias);
     let (index, changed) = match current {
         None => {
             if taken.is_some() {
@@ -563,7 +563,13 @@ pub fn upsert_alias(
                     name: alias.name.clone(),
                 });
             }
-            let changed = models_of(&table[index].1).as_deref() != Some(alias.models.as_slice());
+            let changed = models_of(&table[index].1).as_deref() != Some(alias.models.as_slice())
+                || table[index]
+                    .1
+                    .get("hide_originals")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    != alias.hide_originals;
             table[index].0 = alias.name.clone();
             if changed {
                 table[index].1 = value.clone();
@@ -804,8 +810,22 @@ fn key_string(k: &Value) -> Option<String> {
 }
 
 /// 一个模型写成字符串，几个写成列表 —— 和 `Aliases` 写回去的样子一样
-fn alias_value(models: &[String]) -> Value {
-    match models {
+fn alias_value(alias: &crate::Alias) -> Value {
+    let models = &alias.models;
+    if alias.hide_originals {
+        return Value::Mapping(
+            [
+                (
+                    Value::String("models".into()),
+                    Value::Sequence(models.iter().cloned().map(Value::String).collect()),
+                ),
+                (Value::String("hide_originals".into()), Value::Bool(true)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+    }
+    match models.as_slice() {
         [one] => Value::String(one.clone()),
         many => Value::Sequence(many.iter().cloned().map(Value::String).collect()),
     }
@@ -817,6 +837,7 @@ fn models_of(v: &Value) -> Option<Vec<String>> {
         Value::String(s) => Some(vec![s.clone()]),
         Value::Sequence(xs) => xs.iter().map(|x| x.as_str().map(str::to_string)).collect(),
         Value::Null => Some(Vec::new()),
+        Value::Mapping(_) => v.get("models").and_then(models_of),
         _ => None,
     }
 }
@@ -1224,6 +1245,7 @@ providers:
         crate::Alias {
             name: name.into(),
             models: models.iter().map(|m| m.to_string()).collect(),
+            hide_originals: false,
         }
     }
 
@@ -1238,6 +1260,22 @@ aliases:
   opus: [claude-opus-5]
 routes: []
 ";
+
+    #[test]
+    fn alias_policy_changes_rename_and_noop_preserve_other_text() {
+        let text = "version: 1\naliases:\n  short: {models: [raw], hide_originals: true} # keep\n  other: original # untouched\n";
+        let mut a = alias("short", &["raw"]);
+        a.hide_originals = true;
+        assert_eq!(upsert_alias(text, Some("short"), &a).unwrap(), text);
+        a.name = "renamed".into();
+        let renamed = upsert_alias(text, Some("short"), &a).unwrap();
+        assert!(aliases_of(&renamed)[0].hide_originals);
+        assert!(renamed.contains("other: original # untouched"));
+        a.hide_originals = false;
+        let cleared = upsert_alias(&renamed, Some("renamed"), &a).unwrap();
+        assert!(!aliases_of(&cleared)[0].hide_originals);
+        assert!(cleared.contains("other: original # untouched"));
+    }
 
     fn aliases_of(text: &str) -> Vec<crate::Alias> {
         crate::try_parse(&format!("{text}listen:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: default\n    key: tw-a\n"))
