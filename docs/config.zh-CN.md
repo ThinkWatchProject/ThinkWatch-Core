@@ -331,11 +331,7 @@ clients:
 
 只有调整后被接受的请求才会留下学习记录。缓存只在内存中，最多 1024 条、24 小时过期，
 按上游及解析后的凭据、模型、实际接口路径、工具和思考设置隔离；重载配置或重启后清空。
-`GET /providers/{name}/reasoning-history` 查看显式设置与已验证的记录，
-`DELETE /providers/{name}/reasoning-history/cache` 清除记录并取消尚在途的学习。
-`PUT /reasoning-history` 只修改相应上游或模型的设置，字段为 `provider`、可选 `model`、
-`format` 和可选 `base_version`；模型级 `auto` 删除覆盖、继承上游设置。
-普通上游编辑和模型规格编辑会保留这些设置。
+学习记录完全由程序内部管理，正常使用无需额外设置。高级配置仍可显式覆盖上游或模型的历史格式。
 
 凭据有四种写法：`key`，放进协议规定的请求头；`oauth`，用 refresh token 换取 token；`aws`，Bedrock 上游签名请求用的访问密钥；`headers`，用于上游自有的鉴权方式。`headers` 可以和其余几种同时使用，但不能再设置已经承载凭据的那个请求头。
 

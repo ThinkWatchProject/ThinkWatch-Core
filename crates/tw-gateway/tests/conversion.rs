@@ -1342,11 +1342,10 @@ async fn history_negotiation_is_bounded_scoped_and_redacted_on_every_attempt() {
         state
             .runtime()
             .history_memory
-            .view("up", tw_gateway::history_memory::now_ms())
-            .len(),
+            .entries_for("up", tw_gateway::history_memory::now_ms()),
         1
     );
-    state.runtime().history_memory.clear("up");
+    state.reload(cfg.clone()).unwrap();
     assert_eq!(
         post(gw, "/v1/chat/completions", &auth, request.clone())
             .await
@@ -1356,7 +1355,7 @@ async fn history_negotiation_is_bounded_scoped_and_redacted_on_every_attempt() {
     assert_eq!(
         seen.lock().unwrap().len(),
         6,
-        "clear must force fresh evidence"
+        "configuration reload must force fresh evidence"
     );
     // Explicit policy takes precedence and does not get silently repaired.
     cfg.providers[0].reasoning_history = tw_config::ReasoningHistory::ReasoningContent;

@@ -101,8 +101,8 @@ async fn unsuccessful_adjustment_is_not_cached() {
             state
                 .runtime()
                 .history_memory
-                .view("up", tw_gateway::history_memory::now_ms())
-                .is_empty()
+                .entries_for("up", tw_gateway::history_memory::now_ms())
+                == 0
         );
     }
 }
@@ -157,8 +157,8 @@ async fn later_candidates_receive_original_history_and_share_the_repair_budget()
         state
             .runtime()
             .history_memory
-            .view("up", tw_gateway::history_memory::now_ms())
-            .is_empty()
+            .entries_for("up", tw_gateway::history_memory::now_ms())
+            == 0
     );
 }
 
@@ -184,8 +184,8 @@ async fn sse_errors_neither_trigger_negotiation_nor_confirm_a_trial() {
         state
             .runtime()
             .history_memory
-            .view("up", tw_gateway::history_memory::now_ms())
-            .is_empty()
+            .entries_for("up", tw_gateway::history_memory::now_ms())
+            == 0
     );
     assert_eq!(post(gw, &v).await, 200);
     assert_eq!(
@@ -219,8 +219,7 @@ async fn tool_and_thinking_modes_are_independently_verified_and_reload_clears_th
         state
             .runtime()
             .history_memory
-            .view("up", tw_gateway::history_memory::now_ms())
-            .len(),
+            .entries_for("up", tw_gateway::history_memory::now_ms()),
         3
     );
     state.reload((*state.config()).clone()).unwrap();
@@ -228,8 +227,8 @@ async fn tool_and_thinking_modes_are_independently_verified_and_reload_clears_th
         state
             .runtime()
             .history_memory
-            .view("up", tw_gateway::history_memory::now_ms())
-            .is_empty()
+            .entries_for("up", tw_gateway::history_memory::now_ms())
+            == 0
     );
     assert_eq!(post(gw, &original).await, 200);
     assert_eq!(seen.lock().unwrap().len(), 8);

@@ -690,10 +690,12 @@ pub(super) async fn try_upstreams<'a>(
                     .fields
                     .iter()
                     .map(|f| match f {
-                        tw_api::HistoryField::ReasoningContent => {
+                        crate::history_memory::HistoryField::ReasoningContent => {
                             "messages.reasoning_content".into()
                         }
-                        tw_api::HistoryField::Reasoning => "messages.reasoning".into(),
+                        crate::history_memory::HistoryField::Reasoning => {
+                            "messages.reasoning".into()
+                        }
                     })
                     .collect(),
                 at_ms: now_ms(),

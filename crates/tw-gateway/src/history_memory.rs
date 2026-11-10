@@ -6,8 +6,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use tw_api::{HistoryField, HistoryObservation};
 use tw_dialect::ir::{Part, Request, Vendor};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryField {
+    ReasoningContent,
+    Reasoning,
+}
 
 const TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX: usize = 1024;
@@ -70,7 +75,6 @@ struct Entry {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<Key, Entry>,
-    epochs: HashMap<String, u64>,
 }
 #[derive(Default)]
 pub struct Cache {
@@ -80,7 +84,6 @@ pub struct Cache {
 #[derive(Clone)]
 pub struct Policy {
     pub fields: Vec<HistoryField>,
-    epoch: u64,
 }
 
 impl Cache {
@@ -95,16 +98,12 @@ impl Cache {
                 .get(key)
                 .map(|e| e.fields.clone())
                 .unwrap_or_default(),
-            epoch: *inner.epochs.get(&key.provider).unwrap_or(&0),
         }
     }
 
     pub fn accepted(&self, key: Key, policy: Policy, now: u64) {
         let mut inner = self.inner.lock().unwrap();
-        // Clearing from the UI also cancels learning by requests in flight.
-        if *inner.epochs.get(&key.provider).unwrap_or(&0) != policy.epoch
-            || policy.fields.is_empty()
-        {
+        if policy.fields.is_empty() {
             return;
         }
         if inner.entries.len() >= MAX
@@ -126,42 +125,17 @@ impl Cache {
         );
     }
 
-    pub fn clear(&self, provider: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.entries.retain(|k, _| k.provider != provider);
-        let epoch = inner.epochs.entry(provider.to_owned()).or_default();
-        *epoch = epoch.wrapping_add(1);
-    }
-
-    pub fn view(&self, provider: &str, now: u64) -> Vec<HistoryObservation> {
+    /// Internal diagnostics/tests; no control-plane endpoint or user setting.
+    pub fn entries_for(&self, provider: &str, now: u64) -> usize {
         let mut inner = self.inner.lock().unwrap();
         inner
             .entries
             .retain(|_, e| now.saturating_sub(e.at_ms) < TTL_MS);
-        let mut rows: Vec<_> = inner
+        inner
             .entries
-            .iter()
-            .filter(|(k, _)| k.provider == provider)
-            .map(|(k, e)| HistoryObservation {
-                model: k.model.clone(),
-                path: k.path.clone(),
-                tools: k.tools,
-                thinking: k.thinking,
-                omitted: e.fields.clone(),
-                observed_at_ms: e.at_ms,
-                expires_at_ms: e.at_ms + TTL_MS,
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            (&a.model, &a.path, a.tools, a.thinking, a.observed_at_ms).cmp(&(
-                &b.model,
-                &b.path,
-                b.tools,
-                b.thinking,
-                b.observed_at_ms,
-            ))
-        });
-        rows
+            .keys()
+            .filter(|k| k.provider == provider)
+            .count()
     }
 }
 
@@ -429,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_expiring_cache_is_isolated_and_clear_cancels_inflight_learning() {
+    fn bounded_expiring_cache_is_isolated_by_account_model_api_and_mode() {
         let p = tw_config::Provider {
             name: "relay".into(),
             base_url: "https://unknown.example/v1".into(),
@@ -439,7 +413,7 @@ mod tests {
         let cache = Cache::default();
         let mut pending = cache.policy(&key, 1);
         pending.fields.push(HistoryField::ReasoningContent);
-        assert!(cache.view("relay", 1).is_empty());
+        assert!(cache.entries_for("relay", 1) == 0);
         cache.accepted(key.clone(), pending.clone(), 2);
         assert_eq!(cache.policy(&key, 3).fields, pending.fields);
         for different in [
@@ -468,9 +442,6 @@ mod tests {
             key,
             Key::of(&other_p, "m", "/v1/chat/completions", br#"{}"#).unwrap()
         );
-        cache.clear("relay");
-        cache.accepted(key.clone(), pending, 4);
-        assert!(cache.view("relay", 4).is_empty());
         let mut pending = cache.policy(&key, 5);
         pending.fields.push(HistoryField::Reasoning);
         cache.accepted(key.clone(), pending, 5);
@@ -481,6 +452,6 @@ mod tests {
             policy.fields.push(HistoryField::Reasoning);
             cache.accepted(key, policy, 10 + i as u64);
         }
-        assert_eq!(cache.view("relay", MAX as u64 + 10).len(), MAX);
+        assert_eq!(cache.entries_for("relay", MAX as u64 + 10), MAX);
     }
 }

@@ -142,9 +142,6 @@ endpoints! {
     ProviderModels: GET "/providers/{name}/models" [name], () => api::ProviderModelsView;
     /// 手写一家上游的一个模型的上下文窗口、输出上限，优先于价目表；两项都空就删掉。
     /// **不在 `/providers/` 底下**：写死的一段会盖住 `/providers/{name}`
-    ReasoningHistory: GET "/providers/{name}/reasoning-history" [name], () => api::ReasoningHistoryView;
-    SaveReasoningHistory: PUT "/reasoning-history", api::ReasoningHistorySave => api::ConfigWritten;
-    ClearReasoningHistory: DELETE "/providers/{name}/reasoning-history/cache" [name], () => api::ReasoningHistoryView;
     SetModelSpec: PUT "/provider-model-spec", api::ModelSpecSave => api::ConfigWritten;
     /// 换掉一家上游手动添加的模型（整份清单，空的就是清掉）：上游能服务、却没列进清单的
     /// 模型，和列出的一样算这家提供。**不在 `/providers/` 底下**，同上

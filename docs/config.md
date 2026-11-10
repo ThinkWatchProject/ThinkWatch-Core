@@ -464,12 +464,8 @@ after generation starts do not initiate negotiation.
 Only an accepted adjusted request is remembered. The in-memory cache is bounded
 at 1,024 entries, expires after 24 hours, is isolated by upstream/resolved credentials,
 model, actual API path and tool/thinking mode, and resets on configuration reload or
-restart. `GET /providers/{name}/reasoning-history` shows explicit settings and verified
-observations; `DELETE /providers/{name}/reasoning-history/cache` clears observations
-and cancels pending learning. `PUT /reasoning-history` updates only the upstream or
-model override (`provider`, optional `model`, `format`, optional `base_version`);
-model `auto` removes the override and inherits the upstream setting. Ordinary upstream
-and model-spec saves retain these settings.
+restart. These runtime observations are internal and require no user settings.
+Explicit upstream/model overrides remain available in advanced configuration.
 
 A credential is one of four things: `key`, which goes in the header the
 protocol expects; `oauth`, a token obtained from a refresh token; `aws`, the
