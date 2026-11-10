@@ -1153,7 +1153,7 @@ fn alias_visibility_survives_pack_normalization_and_reconstruction() {
     )
     .unwrap();
     assert!(
-        tw_config::try_parse(&exported.pack.config_yaml)
+        serde_yaml_ng::from_str::<tw_config::Config>(&exported.pack.config_yaml)
             .unwrap()
             .aliases[0]
             .hide_originals
