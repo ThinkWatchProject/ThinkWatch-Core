@@ -59,6 +59,7 @@ async fn list(State(s): State<ControlState>) -> Json<tw_api::AliasesView> {
                 .unwrap_or_default();
             tw_api::AliasView {
                 name: a.name.clone(),
+                hide_originals: a.hide_originals,
                 models: a
                     .models
                     .iter()
@@ -80,6 +81,7 @@ async fn list(State(s): State<ControlState>) -> Json<tw_api::AliasesView> {
         })
         .collect();
     Json(tw_api::AliasesView {
+        hide_originals_supported: true,
         aliases,
         suggestions: suggestions(&lists, &cfg.aliases),
     })
@@ -114,7 +116,11 @@ async fn preview(
     let cfg = s.config();
     let catalog = s.gateway.catalog.load();
     let lists = lists(&s, &cfg);
-    let draft = draft(&req.alias);
+    let previous = req
+        .original
+        .as_deref()
+        .and_then(|name| cfg.aliases.find(name));
+    let draft = draft(&req.alias, previous.is_some_and(|a| a.hide_originals));
     let mut problems = Vec::new();
     if let Err(m) = crate::resources::checked_name(&req.alias.name, edit::ALIAS) {
         problems.push(m);
@@ -144,9 +150,9 @@ async fn preview(
         problems.push(e.msg());
     }
 
-    // 「存了之后」：这张表里只有这一个别名就够 resolve 用 —— 重名的时候也不会认错
+    // 用完整候选表重建展示目录，避免编辑/改名后沿用旧别名的可用性。
     let mut with = (*cfg).clone();
-    with.aliases = tw_config::Aliases(vec![draft.clone()]);
+    with.aliases = table;
     let listed = |m: &String| draft.models.contains(m);
     let reached: HashSet<&str> = lists
         .iter()
@@ -169,9 +175,30 @@ async fn preview(
     // 准入就会拒掉的话，列表里的每个名称都算没有上游提供：没有清单的上游当作有，也
     // 轮不到它（见 `served_by`）
     let admitted = admitted(&with, &catalog, &draft);
+    let served_by = served_by(&with, &catalog, &draft);
+    let sources: Vec<_> = lists
+        .iter()
+        .map(|(provider, models)| tw_engine::ProviderModels {
+            provider: provider.clone(),
+            protocol: String::new(),
+            known: true,
+            models: models.clone(),
+        })
+        .collect();
+    let preview_catalog = tw_engine::Catalog::build(&sources).with_aliases(
+        with.aliases
+            .iter()
+            .map(|a| (a.name.as_str(), a.models.as_slice())),
+    );
+    let allowed = preview_catalog.resolve_allowed(None, None);
+    let hidden_originals = tw_gateway::discovery::hidden_originals(&with, &allowed)
+        .into_iter()
+        .filter(|(_, names)| names.contains(&draft.name))
+        .map(|(name, _)| name)
+        .collect();
     Json(tw_api::AliasPreview {
         problems,
-        served_by: served_by(&with, &catalog, &draft),
+        served_by,
         unserved: draft
             .models
             .iter()
@@ -180,6 +207,7 @@ async fn preview(
             .collect(),
         shadows: shadows(&lists, &draft),
         same_model,
+        hidden_originals,
     })
 }
 
@@ -192,7 +220,7 @@ async fn create(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let a = to_alias(&req.alias)?;
+            let a = to_alias(&req.alias, false)?;
             Ok(edit::upsert_alias(text, None, &a)?)
         })
         .await
@@ -212,7 +240,10 @@ async fn update(
             if !cfg.aliases.contains(&name) {
                 return Err(not_found(&name));
             }
-            let a = to_alias(&req.alias)?;
+            let a = to_alias(
+                &req.alias,
+                cfg.aliases.find(&name).is_some_and(|a| a.hide_originals),
+            )?;
             let out = edit::upsert_alias(text, Some(&name), &a)?;
             if a.name == name {
                 return Ok(out);
@@ -253,7 +284,7 @@ async fn delete_alias(
 
 /// 交过来的别名，模型名去掉首尾空白、去掉重复（顺序不变）。**不在这里挡空的**：
 /// 那一句由校验说（`config.alias_blank_model`），和手改配置时说的一样
-fn draft(input: &tw_api::AliasInput) -> tw_config::Alias {
+fn draft(input: &tw_api::AliasInput, previous_hide_originals: bool) -> tw_config::Alias {
     let mut models: Vec<String> = Vec::new();
     for m in input.models.iter().map(|m| m.trim()) {
         if !models.iter().any(|x| x == m) {
@@ -263,12 +294,16 @@ fn draft(input: &tw_api::AliasInput) -> tw_config::Alias {
     tw_config::Alias {
         name: input.name.clone(),
         models,
+        hide_originals: input.hide_originals.unwrap_or(previous_hide_originals),
     }
 }
 
-fn to_alias(input: &tw_api::AliasInput) -> Result<tw_config::Alias, ApplyError> {
+fn to_alias(
+    input: &tw_api::AliasInput,
+    previous_hide_originals: bool,
+) -> Result<tw_config::Alias, ApplyError> {
     crate::resources::checked_name(&input.name, edit::ALIAS).map_err(crate::resources::invalid)?;
-    Ok(draft(input))
+    Ok(draft(input, previous_hide_originals))
 }
 
 fn usage_view(r: AliasRefs, requests_24h: u64) -> tw_api::AliasUsage {
@@ -690,6 +725,7 @@ mod tests {
         tw_config::Alias {
             name: name.into(),
             models: models.iter().map(|m| m.to_string()).collect(),
+            hide_originals: false,
         }
     }
 

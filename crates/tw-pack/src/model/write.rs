@@ -18,7 +18,7 @@ use tw_config::{Config, Plugin};
 use tw_yaml::Step;
 
 use super::items::{
-    alias_models, approved_source, global_path, order_names, provider_mapping, rule_name,
+    alias_definition, approved_source, global_path, order_names, provider_mapping, rule_name,
     sha256_hex, whole_mapping,
 };
 use super::json::{key, to_yaml, unflatten};
@@ -541,10 +541,7 @@ fn upsert(
     plugins: &BTreeMap<String, PluginOut>,
 ) -> Result<String, ModelError> {
     if id.kind == ItemKind::Alias {
-        let alias = tw_config::Alias {
-            name: id.name.clone(),
-            models: alias_models(id, &item.units)?,
-        };
+        let alias = alias_definition(id, &item.units)?;
         let current = exists.then_some(id.name.as_str());
         return Ok(edit::upsert_alias(text, current, &alias)?);
     }
@@ -770,11 +767,18 @@ fn rebuild(
         cfg.aliases.iter().map(|a| a.name.clone()).collect(),
     ) {
         let id = ItemId::new(ItemKind::Alias, n.clone());
-        let models = alias_models(&id, &target.items[&id].units)?;
-        let v = match models.as_slice() {
-            [one] => Yaml::String(one.clone()),
-            many => Yaml::Sequence(many.iter().cloned().map(Yaml::String).collect()),
-        };
+        let alias = alias_definition(&id, &target.items[&id].units)?;
+        let mut value = serde_yaml_ng::to_value(tw_config::Aliases(vec![alias])).map_err(|e| {
+            ModelError::Shape {
+                item: id.to_string(),
+                detail: e.to_string(),
+            }
+        })?;
+        let v = value
+            .as_mapping_mut()
+            .expect("aliases serialize as a map")
+            .remove(key(&n))
+            .expect("the serialized alias is present");
         aliases.insert(key(&n), v);
     }
     if !aliases.is_empty() {

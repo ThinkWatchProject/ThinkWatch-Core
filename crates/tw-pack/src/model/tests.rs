@@ -1128,3 +1128,45 @@ fn a_plugin_refers_to_the_upstreams_its_scope_names() {
     let script = String::from_utf8(out.plugins["scoped"].script.clone()).unwrap();
     assert!(script.contains("relay (2)"), "{script}");
 }
+
+#[test]
+fn alias_visibility_survives_pack_normalization_and_reconstruction() {
+    let text = rich().replace(
+        "fast: [claude-haiku, gpt-mini]",
+        "fast: {models: [claude-haiku, gpt-mini], hide_originals: true}",
+    );
+    let source = pack(&text);
+    let model = snap(&source);
+    let rebuilt = mat(&pack(&rich()), &model);
+    let cfg = tw_config::try_parse(&rebuilt.config_yaml).unwrap();
+    assert!(cfg.aliases.find("fast").unwrap().hide_originals);
+    assert_eq!(snap(&rebuilt), model);
+    let exported = crate::export::export_with(
+        &source,
+        crate::export::Options {
+            scope: None,
+            secrets: false,
+            client_prefs: None,
+            origin: PackOrigin::Ui,
+        },
+        &Fake::new(),
+    )
+    .unwrap();
+    assert!(
+        serde_yaml_ng::from_str::<tw_config::Config>(&exported.pack.config_yaml)
+            .unwrap()
+            .aliases[0]
+            .hide_originals
+    );
+    let mut renamed = model;
+    rename(&mut renamed, &id(ItemKind::Alias, "fast"), "quick");
+    let landed = mat(&pack(&rich()), &renamed);
+    assert!(
+        tw_config::try_parse(&landed.config_yaml)
+            .unwrap()
+            .aliases
+            .find("quick")
+            .unwrap()
+            .hide_originals
+    );
+}

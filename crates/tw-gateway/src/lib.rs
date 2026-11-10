@@ -21,6 +21,7 @@ pub mod clientprobe;
 mod codex_catalog;
 pub mod content;
 pub mod count;
+pub mod discovery;
 pub mod effort_memory;
 pub mod egress;
 pub mod ending;
