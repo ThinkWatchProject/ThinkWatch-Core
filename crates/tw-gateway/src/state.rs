@@ -38,6 +38,8 @@ pub struct Runtime {
     /// **和配置一起建、一起换**，而不是每个请求现编一次 —— 自定义规则是
     /// 正则，摆在数据面上现编就是每个请求白付一次编译。
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
+    /// Verified request-side omissions; replaced on configuration reload.
+    pub history_memory: Arc<crate::history_memory::Cache>,
     /// 出站脱敏的扫描缓存：对话历史里没变的消息不再扫（见 [`tw_guard::redact::cache`]）。
     /// **跟着规则一起换**：重载配置换上一份空的，旧规则下扫出来的结果不会留到新规则下
     pub scan_cache: Arc<tw_guard::redact::cache::ScanCache>,
@@ -124,6 +126,7 @@ impl Runtime {
             clients,
             allow,
             redact: Arc::new(redact),
+            history_memory: Arc::new(crate::history_memory::Cache::default()),
             scan_cache: Arc::new(tw_guard::redact::cache::ScanCache::new()),
             tools: Arc::new(tools),
             content: Arc::new(content),
@@ -142,6 +145,7 @@ impl Runtime {
             redact: self.redact.clone(),
             // 规则没变，扫过的照样作数
             scan_cache: self.scan_cache.clone(),
+            history_memory: self.history_memory.clone(),
             tools: self.tools.clone(),
             content: self.content.clone(),
             answer: self.answer.clone(),

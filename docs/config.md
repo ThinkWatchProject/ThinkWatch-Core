@@ -432,6 +432,8 @@ Upstreams: the APIs requests are forwarded to.
 | `oauth` | object, [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth credential: an access token obtained from a refresh token. Instead of `key`. |
 | `aws` | object, [`providers[].aws`](#cfg-providers-aws) | — | AWS access keys of a Bedrock upstream, written there or read from an AWS profile: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key. |
 | `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` \| `bedrock` | — | API format of the upstream. Unset: recognized from `base_url` for the official endpoints (a Bedrock runtime endpoint is `bedrock`), otherwise treated as `anthropic`. |
+| `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | `auto` | Request-side Chat reasoning history: auto uses verified endpoint defaults, otherwise keeps native content blocks for the same source and the existing reasoning_content field convention. Select reasoning-content, reasoning, content-blocks, or disabled for a compatible gateway. Model-specific settings take precedence. Signed history cannot cross an incompatible source or format. |
+| `reasoning_history_group` | string | — | Explicit compatibility group for signed Chat history. Unset: isolated by upstream, model and configured credentials. Only share a group when the backends accept each other's signatures; blank is treated as unset. |
 | `forward_client_identity` | bool | `false` | Also send the client's own identity: its `User-Agent`, identity headers such as `x-app` and `originator`, and identity fields in the request body such as `metadata.user_id`. Values are the client's, never made up. Off: requests carry ThinkWatch's `User-Agent` and no client identity. For upstreams that admit only certain clients (Kimi For Coding, Bailian Coding Plan, relays restricted to official clients). Not available for `chatgpt`. |
 | `proxy` | string | `direct` | `direct`; `system`, the proxy in the core process's `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` environment variables; or the name of an entry in `proxies`. |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | When the proxy cannot be reached: `fail` the request, or go `direct`. |
@@ -447,6 +449,23 @@ Upstreams: the APIs requests are forwarded to.
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | Where the upstream's balance is read from, with its own key and proxy: `openrouter`, `deepseek`, `moonshot`, `sub2api`, `newapi` (New API and One API) or `thinkwatch` (a ThinkWatch Enterprise gateway). `auto`: recognized from `base_url` for OpenRouter, DeepSeek and Moonshot; any other address, except Anthropic's, OpenAI's and Gemini's own, is asked once whether it is a Sub2API, ThinkWatch Enterprise or New API relay, and the answer is kept in memory only. `off`: no balance. ChatGPT and Z.ai accounts and Bedrock have no balance whatever is written here. |
 | `signed_in` | `zai` \| `bigmodel` | — | Which account sign-in the `key` came from: `zai` (Z.ai) or `bigmodel` (BigModel). Signing in to the account in the desktop app writes it; replacing the key there removes it. It does not change how requests are sent. Unset: the key was written by hand. |
 <!-- /generated -->
+
+In `auto`, unknown Chat-compatible endpoints can also learn a narrowly scoped
+omission from a structured HTTP 400/422 `extra_forbidden` validation error for
+`messages[n].reasoning_content` or `messages[n].reasoning`. This does **not**
+establish support for an alternate format. The gateway re-encodes from the original
+history, removes only the rejected unsigned field, applies outbound redaction again,
+and makes at most one request-schema repair per logical request (shared with effort,
+automatic cache-breakpoint and sealed-history repairs). Explicit overrides and signed
+history are never changed by this negotiation. Profiles that require reasoning
+replay do not negotiate omissions. Ambiguous errors, SSE errors, timeouts and failures
+after generation starts do not initiate negotiation.
+
+Only an accepted adjusted request is remembered. The in-memory cache is bounded
+at 1,024 entries, expires after 24 hours, is isolated by upstream/resolved credentials,
+model, actual API path and tool/thinking mode, and resets on configuration reload or
+restart. These runtime observations are internal and require no user settings.
+Explicit upstream/model overrides remain available in advanced configuration.
 
 A credential is one of four things: `key`, which goes in the header the
 protocol expects; `oauth`, a token obtained from a refresh token; `aws`, the
@@ -728,6 +747,7 @@ offer the same model, `/v1/models` describes it by the first of them in
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | — | Override this model's request-side reasoning-history format. Unset: use the upstream setting. This is independent of whether the model can reason. |
 | `context_window` | integer | — | Context window: the most tokens a request can take in. Unset: the price table's. |
 | `max_output_tokens` | integer | — | The most tokens an answer can have. Unset: the price table's. |
 | `reasoning` | bool | — | Whether the model reasons. The model list (`GET /v1/models`) carries it, so clients offer reasoning levels for it. Unset: the price table's; the list leaves it out when the price table does not say. |

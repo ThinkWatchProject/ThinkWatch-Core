@@ -2,6 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::history::{ChatHistory, HistoryFormat, HistoryTarget};
 use crate::ir::*;
 use crate::think;
 
@@ -255,25 +256,33 @@ fn user_parts(content: &Value, dropped: &mut Dropped) -> Vec<Part> {
 
 fn assistant_parts(m: &Value, dropped: &mut Dropped) -> Vec<Part> {
     let mut parts = Vec::new();
-    // DeepSeek 等实现的推理字段，不在 OpenAI 的定义里。DeepSeek 叫 reasoning_content，
-    // OpenRouter、vLLM 叫 reasoning
-    if let Some(t) = str_of(m, "reasoning_content")
-        .or_else(|| str_of(m, "reasoning"))
-        .filter(|t| !t.is_empty())
-    {
-        parts.push(Part::Thinking(Thinking {
-            text: t.to_string(),
-            signature: Some(Signature::new(Vendor::Chat, "")),
-        }));
+    for (key, format) in [
+        ("reasoning_content", HistoryFormat::ReasoningContent),
+        ("reasoning", HistoryFormat::Reasoning),
+    ] {
+        if let Some(t) = str_of(m, key).filter(|t| !t.is_empty()) {
+            parts.push(Part::Thinking(Thinking {
+                text: t.to_string(),
+                signature: Some(ChatHistory::field(format).signature()),
+            }));
+            break;
+        }
     }
-    match m.get("content") {
-        Some(Value::String(s)) if !s.is_empty() => parts.push(Part::Text(s.clone())),
-        Some(Value::Array(items)) => parts.extend(items.iter().filter_map(|p| {
-            str_of(p, "text")
-                .or_else(|| str_of(p, "refusal"))
-                .map(|t| Part::Text(t.to_string()))
-        })),
-        _ => {}
+    let content = &m["content"];
+    if let Some(items) = content.as_array() {
+        for item in items {
+            if str_of(item, "type") == Some("thinking") {
+                for block in super::response::content_blocks(&json!([item])) {
+                    if let Block::Thinking(thinking) = block {
+                        parts.push(Part::Thinking(thinking));
+                    }
+                }
+            } else if let Some(text) = str_of(item, "text").or_else(|| str_of(item, "refusal")) {
+                parts.push(Part::Text(text.to_string()));
+            }
+        }
+    } else if let Some(text) = content.as_str().filter(|t| !t.is_empty()) {
+        parts.push(Part::Text(text.to_string()));
     }
     for c in arr_of(m, "tool_calls") {
         let call = match str_of(c, "type") {
@@ -302,6 +311,15 @@ fn assistant_parts(m: &Value, dropped: &mut Dropped) -> Vec<Part> {
 
 /// 中间表示 → 发给 Chat 上游的请求。
 pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
+    encode_request_with_history(r, t, &HistoryTarget::default(), dropped)
+}
+
+pub fn encode_request_with_history(
+    r: &Request,
+    t: &Target,
+    history: &HistoryTarget,
+    dropped: &mut Dropped,
+) -> Value {
     // 对话中途的系统消息写成带标记的用户消息（见 `fold_system_turns`）
     let folded = fold_system_turns(r);
     let r = folded.as_ref();
@@ -319,7 +337,7 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
         match m.role {
             Role::User | Role::System => user_messages(m, dropped, &mut messages),
             Role::Assistant => {
-                if let Some(a) = assistant_message(m, dropped) {
+                if let Some(a) = assistant_message(m, history, dropped) {
                     messages.push(a);
                 }
             }
@@ -519,39 +537,58 @@ fn merge_assistant_turns(messages: &[Message]) -> Vec<Message> {
     out
 }
 
-fn assistant_message(m: &Message, dropped: &mut Dropped) -> Option<Value> {
+fn assistant_message(m: &Message, target: &HistoryTarget, dropped: &mut Dropped) -> Option<Value> {
     let mut texts = Vec::new();
-    let mut reasoning = Vec::new();
+    let mut content = Vec::new();
+    let mut fields: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
     let mut calls = Vec::new();
+    let mut typed = false;
     for p in &m.parts {
         match p {
-            Part::Text(s) if !s.is_empty() => texts.push(s.as_str()),
+            Part::Text(s) if !s.is_empty() => {
+                texts.push(s.as_str());
+                content.push(json!({"type": "text", "text": s}));
+            }
             Part::ToolCall(c) => calls.push(json!({
-                "id": c.id,
-                "type": "function",
+                "id": c.id, "type": "function",
                 "function": { "name": c.name, "arguments": c.input.to_json_text() },
             })),
-            // 只写回 Chat 上游自己给的推理：DeepSeek 在工具调用的那几轮要它原样带回；
-            // 别家签发的写过去没有意义，而且 OpenAI 自己的接口不认 reasoning_content
-            Part::Thinking(th) => match &th.signature {
-                Some(s) if s.vendor == Vendor::Chat && !th.text.is_empty() => {
-                    reasoning.push(th.text.as_str())
+            Part::Thinking(th) => {
+                let Some(history) = th.signature.as_ref().and_then(ChatHistory::read) else {
+                    dropped.feature(Feature::ReasoningHistory);
+                    continue;
+                };
+                if !history.compatible(target) {
+                    dropped.feature(Feature::ReasoningHistory);
+                    continue;
                 }
-                Some(s) if s.vendor == Vendor::Chat => {}
-                _ => dropped.feature(Feature::ReasoningHistory),
-            },
+                match history.format_for(target) {
+                    HistoryFormat::ContentBlocks => {
+                        typed = true;
+                        content.push(history.block.unwrap_or_else(|| json!({"type": "thinking", "thinking": [{"type": "text", "text": th.text}]})));
+                    }
+                    HistoryFormat::ReasoningContent | HistoryFormat::Reasoning => {
+                        if !th.text.is_empty() {
+                            let key = if history.format_for(target) == HistoryFormat::Reasoning {
+                                "reasoning"
+                            } else {
+                                "reasoning_content"
+                            };
+                            fields.entry(key).or_default().push(th.text.as_str());
+                        }
+                    }
+                    _ => dropped.feature(Feature::ReasoningHistory),
+                }
+            }
             _ => {}
         }
     }
-    if texts.is_empty() && calls.is_empty() {
+    if texts.is_empty() && calls.is_empty() && !typed && fields.is_empty() {
         return None;
     }
-    let mut msg = json!({
-        "role": "assistant",
-        "content": if texts.is_empty() { Value::Null } else { json!(texts.join("\n")) },
-    });
-    if !reasoning.is_empty() {
-        msg["reasoning_content"] = json!(reasoning.join("\n\n"));
+    let mut msg = json!({ "role": "assistant", "content": if typed { Value::Array(content) } else if texts.is_empty() { Value::Null } else { json!(texts.join("\n")) } });
+    for (key, reasoning) in fields {
+        msg[key] = json!(reasoning.join("\n\n"));
     }
     if !calls.is_empty() {
         msg["tool_calls"] = Value::Array(calls);
@@ -690,7 +727,7 @@ mod tests {
             r.messages[0].parts[0],
             Part::Thinking(Thinking {
                 text: "想".into(),
-                signature: Some(Signature::new(Vendor::Chat, "")),
+                signature: Some(ChatHistory::field(HistoryFormat::Reasoning).signature()),
             })
         );
     }

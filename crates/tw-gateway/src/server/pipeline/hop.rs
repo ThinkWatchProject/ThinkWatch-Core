@@ -195,6 +195,11 @@ pub(super) async fn try_upstreams<'a>(
     // 退避重试的账（见 `crate::retry`）：最后一个失败是不是暂时的错、这一轮里暂时出错的是哪几家、
     // 重试过的那几轮
     let mut retries = Retries::default();
+    // One request-schema repair across fields, providers and backoff rounds.
+    // OAuth refresh remains separate: it never changes request semantics.
+    let mut repair_used = false;
+    let mut history_trial: Option<(crate::history_memory::Key, crate::history_memory::Policy)> =
+        None;
     // 客户端收的是 SSE 流：压着开头过了时限先交响应头、发保活（见 `super::commit`）。最后一家的
     // 开头只在这时为重试压着
     let early = super::commit::early(state, req, reading).is_some();
@@ -622,7 +627,7 @@ pub(super) async fn try_upstreams<'a>(
             _ => None,
         };
         // `hop_effort`：这一跳的推理强度改了什么（见 `adjust_effort`）
-        let (out, mut hop_effort) = match super::heavy(asked.body, || {
+        let (mut out, mut hop_effort) = match super::heavy(asked.body, || {
             prepare(state, req, reading, &asked, provider, &effective_set, id).map(|mut out| {
                 let effort = adjust_effort(
                     state,
@@ -652,6 +657,61 @@ pub(super) async fn try_upstreams<'a>(
                 continue;
             }
         };
+
+        // Capabilities apply to the actual routed model/API/mode. Re-encode
+        // from Asked on every attempt, then redact this exact outbound body.
+        let history_safe = reading.generates && !counting
+            && wire(req, &out) == Some(tw_dialect::ir::Dialect::Chat)
+            && crate::history_memory::automatic(provider, &sent_model)
+            // This protocol profile requires reasoning during thinking/tool replay.
+            && crate::translate::history_target(provider, &sent_model).format != tw_dialect::history::HistoryFormat::ReasoningContent
+            && asked.decoded.is_some_and(|d| d.as_ref().is_ok_and(|d| crate::history_memory::unsigned(&d.request)));
+        let history_key = history_safe
+            .then(|| crate::history_memory::Key::of(provider, &sent_model, &out.path, &out.body))
+            .flatten();
+        let history_policy = history_key.as_ref().map(|key| {
+            history_trial
+                .as_ref()
+                .filter(|(k, _)| k == key)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| rt.history_memory.policy(key, now_ms()))
+        });
+        // Plugins run again on a history retry and may change the request.
+        // Accepting a different body proves nothing about an unapplied repair.
+        let history_trial_applied = history_key.as_ref().is_some_and(|key| {
+            history_trial.as_ref().is_some_and(|(trial, policy)| {
+                trial == key
+                    && policy
+                        .fields
+                        .iter()
+                        .all(|field| crate::history_memory::omit(&out.body, &[*field]).is_some())
+            })
+        });
+        if let Some(policy) = &history_policy
+            && let Some(body) = crate::history_memory::omit(&out.body, &policy.fields)
+        {
+            out.body = Bytes::from(body);
+            out.reshaped = true;
+            state.bus.emit(tw_api::Event::Translated {
+                id,
+                provider: provider.name.clone(),
+                from: crate::wire::dialect(tw_dialect::ir::Dialect::Chat),
+                to: crate::wire::dialect(tw_dialect::ir::Dialect::Chat),
+                dropped: policy
+                    .fields
+                    .iter()
+                    .map(|f| match f {
+                        crate::history_memory::HistoryField::ReasoningContent => {
+                            "messages.reasoning_content".into()
+                        }
+                        crate::history_memory::HistoryField::Reasoning => {
+                            "messages.reasoning".into()
+                        }
+                    })
+                    .collect(),
+                at_ms: now_ms(),
+            });
+        }
 
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
         // 格式）。规则是全局的，每一跳换掉的是同一批东西；**接着原文那本账换**，
@@ -820,8 +880,16 @@ pub(super) async fn try_upstreams<'a>(
                             conversation: started.conversation.as_deref(),
                             tap: &tap,
                         };
-                        let (r, uncached) =
-                            resend_uncached(state, req, provider, http, resend, r).await?;
+                        let (r, uncached) = resend_uncached(
+                            state,
+                            req,
+                            provider,
+                            http,
+                            resend,
+                            r,
+                            &mut repair_used,
+                        )
+                        .await?;
                         let resend = Resend {
                             out: &out,
                             body: uncached.as_ref().unwrap_or(&body),
@@ -830,7 +898,8 @@ pub(super) async fn try_upstreams<'a>(
                             conversation: started.conversation.as_deref(),
                             tap: &tap,
                         };
-                        resend_unsealed(state, req, provider, http, resend, r).await
+                        resend_unsealed(state, req, provider, http, resend, r, &mut repair_used)
+                            .await
                     }
                     Err(e) => Err(e),
                 }
@@ -918,11 +987,47 @@ pub(super) async fn try_upstreams<'a>(
                 if !matches!(verdict, Verdict::Failed(Cause::RateLimited { .. })) {
                     to_throttle(state, &provider.name, sent_at, verdict);
                 }
+                if !repair_used && tokio::time::Instant::now() < until
+                    && let (Some(key), Some(mut policy)) = (history_key.clone(), history_policy.clone())
+                    && let Some(fields) = crate::history_memory::refusal(status, &head, &body)
+                    // Every reported field must actually be present. Do not
+                    // "repair" a stale error or infer an alternate encoding.
+                    && fields.iter().all(|f| crate::history_memory::omit(&body, &[*f]).is_some())
+                {
+                    for field in fields {
+                        if !policy.fields.contains(&field) {
+                            policy.fields.push(field);
+                        }
+                    }
+                    repair_used = true;
+                    history_trial = Some((key, policy));
+                    tap.said(&head);
+                    state.note_proxy_ok(&provider.proxy);
+                    note_health(
+                        &state.bus,
+                        &state.health,
+                        &provider.name,
+                        state.health.record_success(&provider.name),
+                    );
+                    chain.push(hop(
+                        &provider.name,
+                        model.clone(),
+                        tw_api::AttemptOutcome::Status,
+                        status,
+                        hop_started,
+                    ));
+                    // Reuse the slot, but create a real new attempt with normal
+                    // usage accounting, plugins, conversion and redaction.
+                    effort_hold = Some((name, slot, probe.take()));
+                    queue.push_front(name);
+                    continue;
+                }
                 // 上游因为推理强度拒了它（见 `crate::effort_memory`）：这一跳是一跳普通的 400，同一家
                 // 改一档（或者去掉强度）马上再发一次，是尝试链上新的一跳，接着用这一跳占着的位置。
                 // **一家只重发一次**，再被拒照常交给客户端。上游好好的，不算失败。记着的改法自己
                 // 被拒了：那一条删掉
                 if status == 400
+                    && !repair_used
                     && reading.generates
                     && !counting
                     && !effort_resent.contains(&name)
@@ -953,6 +1058,7 @@ pub(super) async fn try_upstreams<'a>(
                         status,
                         hop_started,
                     ));
+                    repair_used = true;
                     effort_resent.push(name);
                     effort_resend = Some((name, pre, fix));
                     effort_hold = Some((name, slot, probe.take()));
@@ -1113,7 +1219,9 @@ pub(super) async fn try_upstreams<'a>(
                 // 吞掉；等不起的没有下一家可换、也不能再试。不压的由回程按无响应超时收尾（见 `relay`）
                 let hold = hold_of(req, reading, provider, &out, &r);
                 let held = hold.as_ref().is_some_and(|h| {
-                    !last
+                    history_key.as_ref().is_some_and(|k| {
+                        history_trial.as_ref().is_some_and(|(trial, _)| trial == k)
+                    }) || !last
                         || (matches!(h, Hold::Stream(..))
                             && tokio::time::Instant::now() < until
                             && (early || state.throttles.wary(&provider.name)))
@@ -1339,6 +1447,16 @@ pub(super) async fn try_upstreams<'a>(
                         fix,
                         crate::effort_memory::now_secs(),
                     );
+                }
+                if answered
+                    && !unconfirmed
+                    && history_trial_applied
+                    && let Some(key) = &history_key
+                    && let Some((trial, policy)) = &history_trial
+                    && trial == key
+                {
+                    rt.history_memory
+                        .accepted(key.clone(), policy.clone(), now_ms());
                 }
                 chain.push(hop(
                     &provider.name,
@@ -2069,9 +2187,32 @@ fn prepare(
     id: u64,
 ) -> Result<Outbound, Skip> {
     let generates = reading.generates;
-    // 方言互转。**同格式时是 None，这一整段零成本**
     let client_dialect = req.api.map(|a| a.dialect());
     let target = crate::translate::plan(req.api, generates, provider.effective_protocol());
+    let model = effective_set
+        .model
+        .as_deref()
+        .unwrap_or(&reading.facts.model);
+    let history_target = crate::translate::history_target(provider, model);
+    if generates
+        && asked.decoded.is_some_and(|decoded| {
+            decoded.as_ref().is_ok_and(|d| {
+                tw_dialect::history::incompatible(
+                    &d.request,
+                    &history_target,
+                    target.or(client_dialect) == Some(tw_dialect::ir::Dialect::Chat),
+                )
+            })
+        })
+    {
+        return Err(GatewayError::new(
+            crate::error::Source::Request,
+            msg!(
+                "gw.convert.reasoning_history_incompatible", upstream = provider.name.clone() =>
+                "Signed reasoning history cannot be replayed to upstream `{upstream}`: its source or request format is incompatible."
+            ),
+        ));
+    }
     let chatgpt = generates && provider.effective_protocol() == Some(tw_config::Protocol::Chatgpt);
     // DeepSeek Harness 的扩展只有 DeepSeek 官方认。**发给它时一个字节都不改**。
     // 不止生成请求：数 token 这样的请求一样带着它的头，也可能带着会话日志
@@ -2088,11 +2229,13 @@ fn prepare(
             // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
             // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
             // 一个用户显式要求的例外，不是默认行为。
-            let model = effective_set
-                .model
-                .as_deref()
-                .unwrap_or(&reading.facts.model);
             let out = forward::apply_set(asked.body, effective_set, client_dialect, model);
+            let history_shape = (generates
+                && client_dialect == Some(tw_dialect::ir::Dialect::Chat))
+            .then(|| tw_dialect::history::shape_chat(&out, history_target.format))
+            .flatten();
+            let history_changed = history_shape.is_some();
+            let out = history_shape.map(Bytes::from).unwrap_or(out);
             if let (Some(tw_dialect::ir::Dialect::Gemini), Some(m)) =
                 (client_dialect, &effective_set.model)
             {
@@ -2110,12 +2253,17 @@ fn prepare(
             // DeepSeek Harness 发给别家：去掉只有 DeepSeek 认的扩展。**去掉了什么要说**，
             // 和转换丢了字段一样记在这一跳上
             let mut dropped = Vec::new();
+            if history_changed
+                && history_target.format == tw_dialect::history::HistoryFormat::Disabled
+            {
+                dropped.push("messages.reasoning_content".into());
+            }
             let out = match client_dialect
                 .filter(|_| harness && !to_deepseek)
                 .and_then(|d| tw_dialect::harness::clean(d, &out))
             {
                 Some(c) => {
-                    dropped = c.dropped;
+                    dropped.extend(c.dropped);
                     Bytes::from(c.body)
                 }
                 None => out,
@@ -2136,8 +2284,8 @@ fn prepare(
                     .and_then(|d| crate::egress::strip_body_identity(d, &out))
                     .unwrap_or(out)
             };
-            reshaped = !dropped.is_empty();
-            if let Some(d) = client_dialect.filter(|_| !dropped.is_empty()) {
+            reshaped = history_changed || !dropped.is_empty();
+            if let Some(d) = client_dialect.filter(|_| reshaped) {
                 let same = crate::wire::dialect(d);
                 state.bus.emit(tw_api::Event::Translated {
                     id,
@@ -2194,15 +2342,18 @@ fn prepare(
             } else {
                 None
             };
-            let p = d.encode(&tw_dialect::ir::Target {
-                dialect,
-                official: tw_dialect::official::is_official_host(&provider.base_url),
-                default_max_tokens: crate::translate::default_max_tokens(
-                    &state.pricing.load(),
-                    provider,
-                    &d.request.model,
-                ),
-            });
+            let p = d.encode_with_history(
+                &tw_dialect::ir::Target {
+                    dialect,
+                    official: tw_dialect::official::is_official_host(&provider.base_url),
+                    default_max_tokens: crate::translate::default_max_tokens(
+                        &state.pricing.load(),
+                        provider,
+                        &d.request.model,
+                    ),
+                },
+                &history_target,
+            );
             // 请求强制要用的工具发不过去：这一跳不发，换下一家（见 `unsendable_tool`）
             if let Some(err) = unsendable_tool(&d.request, &p.dropped, &provider.name) {
                 return Err(err);
@@ -2487,12 +2638,13 @@ async fn resend_uncached(
     http: &reqwest::Client,
     resend: Resend<'_>,
     r: reqwest::Response,
+    repair_used: &mut bool,
 ) -> Result<(reqwest::Response, Option<Bytes>), SendError> {
     let (Some(model), Some(wire)) = (resend.out.auto_cache.as_deref(), wire(req, resend.out))
     else {
         return Ok((r, None));
     };
-    if r.status() != 400 {
+    if *repair_used || r.status() != 400 {
         return Ok((r, None));
     }
     let Some(stripped) = tw_dialect::cache::strip_marks(wire, resend.body) else {
@@ -2510,6 +2662,7 @@ async fn resend_uncached(
     state
         .cache_marks
         .note(&provider.name, model, crate::server::now_ms());
+    *repair_used = true;
     tracing::info!(
         provider = %provider.name,
         model = %model,
@@ -2543,11 +2696,12 @@ async fn resend_unsealed(
     http: &reqwest::Client,
     resend: Resend<'_>,
     r: reqwest::Response,
+    repair_used: &mut bool,
 ) -> Result<reqwest::Response, SendError> {
     let Some(wire) = wire(req, resend.out) else {
         return Ok(r);
     };
-    if r.status() != 400 {
+    if *repair_used || r.status() != 400 {
         return Ok(r);
     }
     let Some((stripped, removed)) = crate::seal::strip(wire, resend.body, None) else {
@@ -2567,6 +2721,7 @@ async fn resend_unsealed(
             .seals
             .note(c, &provider.name, &removed, crate::server::now_ms());
     }
+    *repair_used = true;
     tracing::info!(
         provider = %provider.name,
         removed = removed.len(),

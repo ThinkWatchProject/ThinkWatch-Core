@@ -34,6 +34,7 @@ pub mod guard;
 pub mod handover;
 pub mod health;
 pub mod hint;
+pub mod history_memory;
 pub mod inflate;
 pub mod key_limits;
 pub mod l1;

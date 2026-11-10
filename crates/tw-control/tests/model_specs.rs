@@ -354,3 +354,45 @@ async fn specs_stay_with_their_upstream_through_edits_renames_and_deletes() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(!b.file().contains("model_specs"), "{}", b.file());
 }
+
+#[tokio::test]
+async fn editing_public_specs_and_provider_forms_preserves_history_capabilities() {
+    let up = upstream().await;
+    let b = bed(&config(
+        up,
+        "    reasoning_history: content-blocks\n    reasoning_history_group: shared\n    model_specs:\n      custom: { context_window: 32000, reasoning_history: reasoning }\n",
+        "",
+    ));
+    let (st, result) = call(
+        &b.app,
+        "PUT",
+        "/provider-model-spec",
+        json!({"provider":"relay","model":"custom","context_window":64000}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    let cfg = tw_config::try_parse(&b.file()).unwrap();
+    assert_eq!(
+        cfg.providers[0].model_specs["custom"].context_window,
+        Some(64000)
+    );
+    assert_eq!(
+        cfg.providers[0].model_specs["custom"].reasoning_history,
+        Some(tw_config::ReasoningHistory::Reasoning)
+    );
+    let (st,result)=call(&b.app,"PUT","/providers/relay",json!({"provider":{"name":"renamed","base_url":format!("http://{up}"),"key":"sk-good","protocol":"openai-chat"}})).await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    let cfg = tw_config::try_parse(&b.file()).unwrap();
+    assert_eq!(
+        cfg.providers[0].reasoning_history,
+        tw_config::ReasoningHistory::ContentBlocks
+    );
+    assert_eq!(
+        cfg.providers[0].reasoning_history_group.as_deref(),
+        Some("shared")
+    );
+    assert_eq!(
+        cfg.providers[0].model_specs["custom"].reasoning_history,
+        Some(tw_config::ReasoningHistory::Reasoning)
+    );
+}

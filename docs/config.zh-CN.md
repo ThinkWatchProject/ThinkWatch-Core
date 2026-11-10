@@ -304,6 +304,8 @@ clients:
 | `oauth` | 对象，见 [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth 凭据：用 refresh token 换取 access token。与 `key` 二选一。 |
 | `aws` | 对象，见 [`providers[].aws`](#cfg-providers-aws) | — | Bedrock 上游的 AWS 访问密钥，写在这里或者从 AWS 的 profile 读：每个请求用它们签名（SigV4）。与 `key`（Bedrock API Key）二选一。 |
 | `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` \| `bedrock` | — | 上游的接口格式。不写：官方地址按 `base_url` 识别（Bedrock 的推理地址是 `bedrock`），其余按 `anthropic` 处理。 |
+| `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | `auto` | Chat 请求的思考历史格式：auto 使用已验证的端点默认值，其余同来源保留原生内容块和既有的 reasoning_content 字段惯例。兼容网关可显式选择 reasoning-content、reasoning、content-blocks 或 disabled。模型级设置优先。带签名的历史不发送到来源或格式不兼容的上游。 |
+| `reasoning_history_group` | 字符串 | — | 带签名的 Chat 历史的显式兼容组。不写时按上游、模型及配置凭据隔离；只有确认后端相互接受签名时才共享组。空白视为未设置。 |
 | `forward_client_identity` | 布尔 | `false` | 同时发送客户端自己的身份：它的 `User-Agent`、`x-app` 和 `originator` 等身份请求头，以及请求体中的身份字段（如 `metadata.user_id`）。发送的都是客户端的原值，不做伪造。关闭时请求使用 ThinkWatch 的 `User-Agent`，不带客户端身份。用于只接受特定客户端的上游（Kimi For Coding、百炼 Coding Plan、只允许官方客户端的中转站）。`chatgpt` 不可用。 |
 | `proxy` | 字符串 | `direct` | `direct`；`system`，即 core 进程环境变量 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 中的代理；或 `proxies` 中某一项的名字。 |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | 代理不可用时：请求失败（`fail`），或改为直连（`direct`）。 |
@@ -319,6 +321,17 @@ clients:
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | 从哪里读这家上游的余额，用它自己的密钥、走它自己的代理：`openrouter`、`deepseek`、`moonshot`、`sub2api`、`newapi`（New API 和 One API）或 `thinkwatch`（ThinkWatch 企业网关）。`auto`：OpenRouter、DeepSeek、Moonshot 按 `base_url` 识别；其他地址（Anthropic、OpenAI、Gemini 的官方地址除外）询问一次它是不是 Sub2API、ThinkWatch 企业网关或 New API 中转站，结果只保存在内存中。`off`：不读余额。ChatGPT、Z.ai 账号和 Bedrock 不读余额，与这里写什么无关。 |
 | `signed_in` | `zai` \| `bigmodel` | — | `key` 来自哪一家的账号登录：`zai`（Z.ai）或 `bigmodel`（BigModel）。在桌面端登录账号时写入，在桌面端更换密钥时删除。不影响请求的发送方式。不写：密钥是手动填写的。 |
 <!-- /generated -->
+
+`auto` 也能从未知 Chat 兼容接口的结构化 HTTP 400/422 校验错误中学习：只识别
+`messages[n].reasoning_content` 或 `messages[n].reasoning` 的 `extra_forbidden`，
+不会据此猜另一种格式。网关从原始历史重新编码，只省略明确被拒绝的普通字段，再次执行
+出站脱敏；每个逻辑请求最多修复一次，与推理强度、自动缓存断点和封存历史的修复共用预算。
+显式设置和签名历史不参与自动协商，要求回传思考历史的协议配置也不自动省略。
+含糊的报错、SSE 错误、超时或已经开始生成后的错误都不触发协商。
+
+只有调整后被接受的请求才会留下学习记录。缓存只在内存中，最多 1024 条、24 小时过期，
+按上游及解析后的凭据、模型、实际接口路径、工具和思考设置隔离；重载配置或重启后清空。
+学习记录完全由程序内部管理，正常使用无需额外设置。高级配置仍可显式覆盖上游或模型的历史格式。
 
 凭据有四种写法：`key`，放进协议规定的请求头；`oauth`，用 refresh token 换取 token；`aws`，Bedrock 上游签名请求用的访问密钥；`headers`，用于上游自有的鉴权方式。`headers` 可以和其余几种同时使用，但不能再设置已经承载凭据的那个请求头。
 
@@ -505,6 +518,7 @@ providers:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
+| `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | — | 覆盖这个模型的请求侧思考历史格式。不写时遵从上游设置；与模型会不会推理是两项独立能力。 |
 | `context_window` | 整数 | — | 上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。 |
 | `max_output_tokens` | 整数 | — | 一次回答最多输出多少 token。不写：取价目表的。 |
 | `reasoning` | 布尔 | — | 这个模型会不会推理。模型列表（`GET /v1/models`）带着它，客户端据此给出推理档位。不写：取价目表的；价目表也没写时，列表里不给这一项。 |

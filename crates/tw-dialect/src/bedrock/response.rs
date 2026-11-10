@@ -165,7 +165,7 @@ pub fn encode_response(r: &Response, _s: &Session) -> Value {
                     "reasoningContent": {
                         "reasoningText": {
                             "text": th.text,
-                            "signature": sig.as_ref().map(|s| s.value.clone()).unwrap_or_default(),
+                            "signature": sig.as_ref().map(|s| s.carried_in(Vendor::Anthropic)).unwrap_or_else(unsigned_marker),
                         },
                     },
                 })),

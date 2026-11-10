@@ -1,5 +1,6 @@
 //! OpenAI Chat Completions 整包响应 ⇄ 中间表示。
 
+use crate::history::{ChatHistory, HistoryFormat};
 use serde_json::{Value, json};
 
 use crate::convert::Session;
@@ -57,32 +58,38 @@ pub fn usage_json(u: &Usage) -> Value {
 
 /// Chat 兼容端点的正文：标准字符串，或 Mistral 的有序内容块。
 /// 只读文本和显式的推理文字，引用、图片与未知块不能当作回答正文。
-pub(super) fn content_parts(v: &Value, mut emit: impl FnMut(bool, &str)) {
+pub(super) fn content_blocks(v: &Value) -> Vec<Block> {
     if let Some(text) = v.as_str() {
-        if !text.is_empty() {
-            emit(false, text);
-        }
-    } else if let Some(parts) = v.as_array() {
-        for part in parts {
-            match str_of(part, "type") {
-                Some("text") => {
-                    if let Some(text) = str_of(part, "text").filter(|t| !t.is_empty()) {
-                        emit(false, text);
-                    }
-                }
-                Some("thinking") => {
-                    for thought in arr_of(part, "thinking") {
-                        if str_of(thought, "type") == Some("text")
-                            && let Some(text) = str_of(thought, "text").filter(|t| !t.is_empty())
-                        {
-                            emit(true, text);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Block::Text(text.to_string())]
+        };
     }
+    arr(v)
+        .iter()
+        .filter_map(|part| match str_of(part, "type") {
+            Some("text") => str_of(part, "text")
+                .filter(|t| !t.is_empty())
+                .map(|t| Block::Text(t.to_string())),
+            Some("thinking") => {
+                let text: String = arr_of(part, "thinking")
+                    .iter()
+                    .filter(|t| str_of(t, "type") == Some("text"))
+                    .filter_map(|t| str_of(t, "text"))
+                    .collect();
+                Some(Block::Thinking(Thinking {
+                    text,
+                    signature: Some(ChatHistory::content(part).signature()),
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn arr(v: &Value) -> &[Value] {
+    v.as_array().map(Vec::as_slice).unwrap_or_default()
 }
 
 /// 上游 Chat 的整包响应 → 中间表示。
@@ -93,27 +100,20 @@ pub fn decode_response(v: &Value) -> Response {
         .unwrap_or(&Value::Null);
     let msg = choice.get("message").unwrap_or(&Value::Null);
     let mut blocks = Vec::new();
-    // DeepSeek 叫 reasoning_content，OpenRouter、vLLM 叫 reasoning
-    if let Some(t) = str_of(msg, "reasoning_content")
-        .or_else(|| str_of(msg, "reasoning"))
-        .filter(|t| !t.is_empty())
-    {
-        blocks.push(Block::Thinking(Thinking {
-            text: t.to_string(),
-            signature: Some(Signature::new(Vendor::Chat, "")),
-        }));
+    for (key, format) in [
+        ("reasoning_content", HistoryFormat::ReasoningContent),
+        ("reasoning", HistoryFormat::Reasoning),
+    ] {
+        if let Some(t) = str_of(msg, key).filter(|t| !t.is_empty()) {
+            blocks.push(Block::Thinking(Thinking {
+                text: t.to_string(),
+                signature: Some(ChatHistory::field(format).signature()),
+            }));
+            break;
+        }
     }
     for key in ["content", "refusal"] {
-        content_parts(&msg[key], |thinking, text| {
-            blocks.push(if thinking {
-                Block::Thinking(Thinking {
-                    text: text.to_string(),
-                    signature: Some(Signature::new(Vendor::Chat, "")),
-                })
-            } else {
-                Block::Text(text.to_string())
-            });
-        });
+        blocks.extend(content_blocks(&msg[key]));
     }
     for c in arr_of(msg, "tool_calls") {
         let id = str_of(c, "id").unwrap_or_default().to_string();

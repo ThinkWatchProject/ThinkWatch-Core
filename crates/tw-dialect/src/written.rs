@@ -362,7 +362,7 @@ fn chat(c: &mut Collect, v: &Value) {
     });
 }
 
-/// 字符串，或者各块的 `text`、`refusal`
+/// 字符串，或者正文、拒答和原生思考块里的文字。签名仍是协议元数据。
 fn chat_content(c: &mut Collect, content: &Value, in_tool_result: bool) {
     match content {
         Value::String(_) => c.here(content, in_tool_result),
@@ -371,6 +371,15 @@ fn chat_content(c: &mut Collect, content: &Value, in_tool_result: bool) {
                 c.index(i, |c| match str_of(p, "type").unwrap_or("") {
                     "text" => c.field(p, "text", in_tool_result),
                     "refusal" => c.field(p, "refusal", in_tool_result),
+                    "thinking" => c.key("thinking", |c| {
+                        for (j, thought) in each(p, "thinking") {
+                            c.index(j, |c| {
+                                if str_of(thought, "type") == Some("text") {
+                                    c.field(thought, "text", in_tool_result);
+                                }
+                            });
+                        }
+                    }),
                     _ => {}
                 });
             }
@@ -757,6 +766,19 @@ mod tests {
         assert_eq!(
             found(Shape::Generate(Dialect::Chat), &body),
             sorted(["s", "u", "think", "{}", "out", "d"])
+        );
+    }
+
+    #[test]
+    fn chat_native_thinking_is_written_text_but_signatures_and_unknown_blocks_are_not() {
+        let body = json!({"messages":[{"role":"assistant","content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"thought"},{"type":"reference","text":"reference metadata"}],"signature":"opaque signature","closed":true},
+            {"type":"text","text":"answer"},
+            {"type":"unknown","text":"unknown metadata"}
+        ]}]});
+        assert_eq!(
+            found(Shape::Generate(Dialect::Chat), &body),
+            sorted(["thought", "answer"])
         );
     }
 
