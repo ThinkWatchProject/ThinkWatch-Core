@@ -39,6 +39,7 @@ pub fn history_target(
         .model_specs
         .get(model)
         .and_then(|s| s.reasoning_history)
+        .filter(|f| *f != C::Auto)
         .unwrap_or(provider.reasoning_history);
     let format = match configured {
         C::ReasoningContent => F::ReasoningContent,

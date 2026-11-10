@@ -450,6 +450,27 @@ Upstreams: the APIs requests are forwarded to.
 | `signed_in` | `zai` \| `bigmodel` | — | Which account sign-in the `key` came from: `zai` (Z.ai) or `bigmodel` (BigModel). Signing in to the account in the desktop app writes it; replacing the key there removes it. It does not change how requests are sent. Unset: the key was written by hand. |
 <!-- /generated -->
 
+In `auto`, unknown Chat-compatible endpoints can also learn a narrowly scoped
+omission from a structured HTTP 400/422 `extra_forbidden` validation error for
+`messages[n].reasoning_content` or `messages[n].reasoning`. This does **not**
+establish support for an alternate format. The gateway re-encodes from the original
+history, removes only the rejected unsigned field, applies outbound redaction again,
+and makes at most one request-schema repair per logical request (shared with effort,
+automatic cache-breakpoint and sealed-history repairs). Explicit overrides and signed
+history are never changed by this negotiation. Profiles that require reasoning
+replay do not negotiate omissions. Ambiguous errors, SSE errors, timeouts and failures
+after generation starts do not initiate negotiation.
+
+Only an accepted adjusted request is remembered. The in-memory cache is bounded
+at 1,024 entries, expires after 24 hours, is isolated by upstream/resolved credentials,
+model, actual API path and tool/thinking mode, and resets on configuration reload or
+restart. `GET /providers/{name}/reasoning-history` shows explicit settings and verified
+observations; `DELETE /providers/{name}/reasoning-history/cache` clears observations
+and cancels pending learning. `PUT /reasoning-history` updates only the upstream or
+model override (`provider`, optional `model`, `format`, optional `base_version`);
+model `auto` removes the override and inherits the upstream setting. Ordinary upstream
+and model-spec saves retain these settings.
+
 A credential is one of four things: `key`, which goes in the header the
 protocol expects; `oauth`, a token obtained from a refresh token; `aws`, the
 access keys a Bedrock upstream signs its requests with; or `headers`, when the

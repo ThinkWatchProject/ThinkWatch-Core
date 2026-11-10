@@ -1264,3 +1264,129 @@ async fn native_history_capabilities_keep_reasoning_text_inside_outbound_redacti
         assert_eq!(sent["custom_metadata"], secret);
     }
 }
+
+/// Unknown Chat-compatible endpoints learn from schema errors without a host
+/// allowlist. The second logical request uses the verified omission immediately.
+#[tokio::test]
+async fn history_negotiation_is_bounded_scoped_and_redacted_on_every_attempt() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().fallback({
+        let seen = seen.clone();
+        move |body: bytes::Bytes| {
+            let seen = seen.clone();
+            async move {
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                seen.lock().unwrap().push(v.clone());
+                let rejected = v["messages"].as_array().unwrap().iter().position(|m| m.get("reasoning_content").is_some());
+                let (status, reply) = if let Some(i) = rejected {
+                    (422, json!({"detail":[{"type":"extra_forbidden","loc":["body","messages",i,"assistant","reasoning_content"],"msg":"Extra inputs are not permitted"}]}))
+                } else {
+                    (200, json!({"id":"r","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok","reasoning_content":"thought"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}))
+                };
+                axum::response::Response::builder().status(status).header("content-type","application/json").body(axum::body::Body::from(reply.to_string())).unwrap()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut cfg = Config {
+        version: 1,
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+            ..Default::default()
+        }],
+        providers: vec![provider(up, Protocol::OpenaiChat)],
+        ..Default::default()
+    };
+    cfg.security.redact.mode = SecurityMode::Enforce;
+    let state = tw_gateway::AppState::new(cfg.clone()).unwrap();
+    let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    let auth = [("authorization", "Bearer tw-k")];
+    let (status, _, first) = post(
+        gw,
+        "/v1/chat/completions",
+        &auth,
+        json!({"model":"m","messages":[{"role":"user","content":"first"}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let first: Value = serde_json::from_str(&first).unwrap();
+    let thought = first["choices"][0]["message"]["reasoning_content"].clone();
+    let secret = format!("ghp_{}", "b".repeat(36));
+    let request = json!({"model":"m","unknown":42,"messages":[
+        {"role":"assistant","content":format!("contact {secret}"),"reasoning_content":thought,"tool_calls":[{"id":"t1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"t1","content":format!("found {secret}")},
+        {"role":"user","content":"next"}
+    ]});
+    for expected in [3, 4] {
+        let (status, _, body) = post(gw, "/v1/chat/completions", &auth, request.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(seen.lock().unwrap().len(), expected);
+    }
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1]["messages"][0]["reasoning_content"], thought);
+        for sent in seen.iter().skip(1) {
+            assert_eq!(sent["unknown"], 42);
+            assert_eq!(sent["messages"][0]["tool_calls"][0]["id"], "t1");
+            assert_eq!(sent["messages"][1]["tool_call_id"], "t1");
+            assert!(!sent.to_string().contains(&secret));
+        }
+        assert!(seen[2]["messages"][0].get("reasoning_content").is_none());
+    }
+    assert_eq!(
+        state
+            .runtime()
+            .history_memory
+            .view("up", tw_gateway::history_memory::now_ms())
+            .len(),
+        1
+    );
+    state.runtime().history_memory.clear("up");
+    assert_eq!(
+        post(gw, "/v1/chat/completions", &auth, request.clone())
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        6,
+        "clear must force fresh evidence"
+    );
+    // Explicit policy takes precedence and does not get silently repaired.
+    cfg.providers[0].reasoning_history = tw_config::ReasoningHistory::ReasoningContent;
+    state.reload(cfg).unwrap();
+    assert_eq!(
+        post(gw, "/v1/chat/completions", &auth, request).await.0,
+        422
+    );
+    assert_eq!(seen.lock().unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn history_rejection_does_not_guess_formats_or_loop_on_a_second_rejection() {
+    let error = json!({"detail":[{"type":"extra_forbidden","loc":["body","messages",0,"assistant","reasoning_content"]}]}).to_string();
+    let (up, _) = upstream(422, "application/json", error).await;
+    let (gw, mut events) = gateway(provider(up, Protocol::OpenaiChat), SecurityMode::Observe).await;
+    let (status,_,_) = post(gw,"/v1/chat/completions",&[("authorization","Bearer tw-k")],json!({"model":"m","messages":[{"role":"assistant","content":"answer","reasoning_content":"thought"},{"role":"user","content":"next"}]})).await;
+    assert_eq!(status, 422);
+    let mut attempts = None;
+    while let Ok(event) = events.try_recv() {
+        if let tw_api::Event::RequestRouted {
+            attempts: chain, ..
+        } = event
+        {
+            attempts = Some(chain);
+        }
+    }
+    assert_eq!(
+        attempts.unwrap().len(),
+        2,
+        "one logical request may negotiate only once"
+    );
+}

@@ -396,3 +396,89 @@ async fn editing_public_specs_and_provider_forms_preserves_history_capabilities(
         Some(tw_config::ReasoningHistory::Reasoning)
     );
 }
+
+#[tokio::test]
+async fn history_overrides_are_versioned_preserve_specs_and_can_be_cleared() {
+    let b = bed(&config(
+        upstream().await,
+        "    reasoning_history: content-blocks\n    model_specs:\n      m: { context_window: 32000, reasoning: true }\n",
+        "",
+    ));
+    let path = "/providers/relay/reasoning-history";
+    let (st, view) = call(&b.app, "GET", path, Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{view}");
+    assert_eq!(view["format"], "content-blocks");
+    assert_eq!(view["observations"], json!([]));
+    let save =
+        |format: &str| json!({"provider":"relay","model":"m","format":format,"base_version":null});
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/reasoning-history",
+        save("reasoning-content"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let parsed = tw_config::try_parse(&b.file()).unwrap();
+    let p = &parsed.providers[0];
+    assert_eq!(
+        p.reasoning_history,
+        tw_config::ReasoningHistory::ContentBlocks
+    );
+    assert_eq!(p.model_specs["m"].context_window, Some(32000));
+    assert_eq!(p.model_specs["m"].reasoning, Some(true));
+    assert_eq!(
+        p.model_specs["m"].reasoning_history,
+        Some(tw_config::ReasoningHistory::ReasoningContent)
+    );
+    // An older/public model editor must retain the advanced override.
+    let (st, _) = call(&b.app,"PUT","/provider-model-spec",json!({"provider":"relay","model":"m","context_window":64000,"max_output_tokens":null,"reasoning":true,"image_input":null})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        tw_config::try_parse(&b.file()).unwrap().providers[0].model_specs["m"].reasoning_history,
+        Some(tw_config::ReasoningHistory::ReasoningContent)
+    );
+    let (st, _) = call(&b.app, "PUT", "/reasoning-history", save("auto")).await;
+    assert_eq!(st, StatusCode::OK);
+    let parsed = tw_config::try_parse(&b.file()).unwrap();
+    assert_eq!(
+        parsed.providers[0].model_specs["m"].context_window,
+        Some(64000)
+    );
+    assert!(
+        parsed.providers[0].model_specs["m"]
+            .reasoning_history
+            .is_none()
+    );
+    let before = b.file();
+    let (st, _) = call(
+        &b.app,
+        "DELETE",
+        "/providers/relay/reasoning-history/cache",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        b.file(),
+        before,
+        "clearing runtime observations must not rewrite configuration"
+    );
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/reasoning-history",
+        json!({"provider":"relay","model":null,"format":"disabled","base_version":"stale"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(b.file(), before);
+    let (st, _) = call(
+        &b.app,
+        "GET",
+        "/providers/missing/reasoning-history",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

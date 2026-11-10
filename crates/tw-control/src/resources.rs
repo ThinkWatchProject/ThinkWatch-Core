@@ -35,6 +35,9 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::UpdateProvider, update_provider)
         .at(ep::DeleteProvider, delete_provider)
         .at(ep::ProviderModels, provider_models)
+        .at(ep::ReasoningHistory, reasoning_history)
+        .at(ep::SaveReasoningHistory, save_reasoning_history)
+        .at(ep::ClearReasoningHistory, clear_reasoning_history)
         .at(ep::SetModelSpec, set_model_spec)
         .at(ep::SetManualModels, set_manual_models)
         .at(ep::RefreshProviderModels, refresh_models)
@@ -381,6 +384,98 @@ async fn provider_models(
         .find(|p| p.name == name)
         .ok_or_else(|| crate::no_such_upstream(&name))?;
     Ok(Json(models_view(&s, p, s.gateway.models.listing(p))))
+}
+
+fn history_format(f: tw_config::ReasoningHistory) -> tw_api::ReasoningHistory {
+    // Both public enums use the same stable wire spellings.
+    serde_json::from_value(serde_json::to_value(f).expect("history format"))
+        .expect("history format")
+}
+
+async fn reasoning_history(
+    State(s): State<ControlState>,
+    Path(name): Path<String>,
+) -> Result<Json<tw_api::ReasoningHistoryView>, Fail> {
+    let rt = s.gateway.runtime();
+    let p = rt
+        .config
+        .providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| crate::no_such_upstream(&name))?;
+    Ok(Json(tw_api::ReasoningHistoryView {
+        provider: name.clone(),
+        format: history_format(p.reasoning_history),
+        models: p
+            .model_specs
+            .iter()
+            .filter_map(|(m, s)| s.reasoning_history.map(|f| (m.clone(), history_format(f))))
+            .collect(),
+        observations: rt
+            .history_memory
+            .view(&name, tw_gateway::history_memory::now_ms()),
+    }))
+}
+
+async fn clear_reasoning_history(
+    State(s): State<ControlState>,
+    Path(name): Path<String>,
+) -> Result<Json<tw_api::ReasoningHistoryView>, Fail> {
+    let rt = s.gateway.runtime();
+    if !rt.config.providers.iter().any(|p| p.name == name) {
+        return Err(crate::no_such_upstream(&name));
+    }
+    rt.history_memory.clear(&name);
+    reasoning_history(State(s), Path(name)).await
+}
+
+async fn save_reasoning_history(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ReasoningHistorySave>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    use tw_api::ReasoningHistory as A;
+    use tw_config::ReasoningHistory as C;
+    let format = match req.format {
+        A::Auto => C::Auto,
+        A::ReasoningContent => C::ReasoningContent,
+        A::Reasoning => C::Reasoning,
+        A::ContentBlocks => C::ContentBlocks,
+        A::Disabled => C::Disabled,
+    };
+    let version = s
+        .cfg
+        .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
+            let p = cfg
+                .providers
+                .iter()
+                .find(|p| p.name == req.provider)
+                .ok_or_else(|| not_found("upstream", &req.provider))?;
+            if let Some(model) = &req.model {
+                let mut spec = p.model_specs.get(model).cloned().unwrap_or_default();
+                spec.reasoning_history =
+                    (format != tw_config::ReasoningHistory::Auto).then_some(format);
+                tw_config::check_model_spec(&req.provider, model, Some(&spec))
+                    .map_err(|e| invalid(e.msg()))?;
+                Ok(edit::set_model_spec(
+                    text,
+                    &req.provider,
+                    model,
+                    (!spec.is_empty()).then_some(&spec),
+                )?)
+            } else {
+                let mut p = p.clone();
+                p.reasoning_history = format;
+                Ok(edit::upsert(
+                    text,
+                    edit::PROVIDERS,
+                    Some(&req.provider),
+                    &mapping(&p)?,
+                )?)
+            }
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
 }
 
 /// 马上向上游重新获取模型清单。

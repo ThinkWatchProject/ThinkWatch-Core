@@ -1144,7 +1144,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 速度，请求记录里照记。新码：`gw.upstream.too_slow`、`config.min_speed_range`（`upstream`、
 /// `field`、`value`、`min`、`max`）；一键修复修得了它：速度越界删掉 `min_speed`，判定时长越界改回
 /// 20。请求库 SCHEMA 不变
-pub const CONTROL_API_VERSION: u32 = 58;
+///
+/// **59 起增加思考历史能力查看与覆盖，以及运行时学习缓存的清除接口。**
+/// Reasoning-history capability inspection, explicit overrides, and
+/// clearing of the runtime-only, 24-hour evidence cache. Existing provider and
+/// model editors preserve overrides when they do not edit this setting.
+pub const CONTROL_API_VERSION: u32 = 59;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -3724,6 +3729,58 @@ pub struct ProviderInput {
     /// 余额从哪儿读。不给就是 `auto`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceSetting>,
+}
+
+/// Explicit request-side encoding. Auto uses protocol defaults and verified
+/// runtime omissions; a response field never declares request support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningHistory {
+    Auto,
+    ReasoningContent,
+    Reasoning,
+    ContentBlocks,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryField {
+    ReasoningContent,
+    Reasoning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HistoryObservation {
+    pub model: String,
+    pub path: String,
+    pub tools: bool,
+    pub thinking: bool,
+    pub omitted: Vec<HistoryField>,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ReasoningHistoryView {
+    pub provider: String,
+    pub format: ReasoningHistory,
+    pub models: std::collections::BTreeMap<String, ReasoningHistory>,
+    pub observations: Vec<HistoryObservation>,
+}
+
+/// Change only this override. A model's Auto inherits the upstream setting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ReasoningHistorySave {
+    pub provider: String,
+    pub model: Option<String>,
+    pub format: ReasoningHistory,
+    pub base_version: Option<String>,
 }
 
 /// 一家上游的最低生成速度（配置的 `providers[].min_speed`）。

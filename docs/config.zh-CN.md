@@ -322,6 +322,21 @@ clients:
 | `signed_in` | `zai` \| `bigmodel` | — | `key` 来自哪一家的账号登录：`zai`（Z.ai）或 `bigmodel`（BigModel）。在桌面端登录账号时写入，在桌面端更换密钥时删除。不影响请求的发送方式。不写：密钥是手动填写的。 |
 <!-- /generated -->
 
+`auto` 也能从未知 Chat 兼容接口的结构化 HTTP 400/422 校验错误中学习：只识别
+`messages[n].reasoning_content` 或 `messages[n].reasoning` 的 `extra_forbidden`，
+不会据此猜另一种格式。网关从原始历史重新编码，只省略明确被拒绝的普通字段，再次执行
+出站脱敏；每个逻辑请求最多修复一次，与推理强度、自动缓存断点和封存历史的修复共用预算。
+显式设置和签名历史不参与自动协商，要求回传思考历史的协议配置也不自动省略。
+含糊的报错、SSE 错误、超时或已经开始生成后的错误都不触发协商。
+
+只有调整后被接受的请求才会留下学习记录。缓存只在内存中，最多 1024 条、24 小时过期，
+按上游及解析后的凭据、模型、实际接口路径、工具和思考设置隔离；重载配置或重启后清空。
+`GET /providers/{name}/reasoning-history` 查看显式设置与已验证的记录，
+`DELETE /providers/{name}/reasoning-history/cache` 清除记录并取消尚在途的学习。
+`PUT /reasoning-history` 只修改相应上游或模型的设置，字段为 `provider`、可选 `model`、
+`format` 和可选 `base_version`；模型级 `auto` 删除覆盖、继承上游设置。
+普通上游编辑和模型规格编辑会保留这些设置。
+
 凭据有四种写法：`key`，放进协议规定的请求头；`oauth`，用 refresh token 换取 token；`aws`，Bedrock 上游签名请求用的访问密钥；`headers`，用于上游自有的鉴权方式。`headers` 可以和其余几种同时使用，但不能再设置已经承载凭据的那个请求头。
 
 ```yaml
