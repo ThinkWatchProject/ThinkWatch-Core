@@ -22,10 +22,12 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// 一个别名：它的名字，和它在各家上游叫什么（有序）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Alias {
     pub name: String,
     pub models: Vec<String>,
+    /// 只从客户端模型列表隐藏目标原名；不改变权限、准入或上游清单。
+    pub hide_originals: bool,
 }
 
 /// 整张别名表，按书写顺序。
@@ -62,6 +64,21 @@ impl Serialize for Aliases {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(Some(self.0.len()))?;
         for a in &self.0 {
+            if a.hide_originals {
+                #[derive(Serialize)]
+                struct Expanded<'a> {
+                    models: &'a [String],
+                    hide_originals: bool,
+                }
+                m.serialize_entry(
+                    &a.name,
+                    &Expanded {
+                        models: &a.models,
+                        hide_originals: true,
+                    },
+                )?;
+                continue;
+            }
             match a.models.as_slice() {
                 [one] => m.serialize_entry(&a.name, one)?,
                 many => m.serialize_entry(&a.name, many)?,
@@ -86,14 +103,90 @@ impl<'de> Deserialize<'de> for Aliases {
                 // **重名不在这里拒**：这里拒的话说出来的是解析器的话，而校验那一句
                 // 带码、说得出是哪个别名（`config.alias_duplicate`）
                 let mut out = Vec::new();
-                while let Some((name, Models(models))) = map.next_entry::<String, Models>()? {
-                    out.push(Alias { name, models });
+                while let Some((name, definition)) = map.next_entry::<String, Definition>()? {
+                    let (models, hide_originals) = match definition {
+                        Definition::Simple(Models(models)) => (models, false),
+                        Definition::Expanded(Expanded {
+                            models: Models(models),
+                            hide_originals,
+                        }) => (models, hide_originals),
+                    };
+                    out.push(Alias {
+                        name,
+                        models,
+                        hide_originals,
+                    });
                 }
                 Ok(Aliases(out))
             }
         }
         d.deserialize_map(Table)
     }
+}
+
+enum Definition {
+    Simple(Models),
+    Expanded(Expanded),
+}
+
+impl<'de> Deserialize<'de> for Definition {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Definition;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a model name, a list of model names, or {models, hide_originals}")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Definition, A::Error> {
+                Expanded::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(Definition::Expanded)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Definition, A::Error> {
+                Models::deserialize(de::value::SeqAccessDeserializer::new(seq))
+                    .map(Definition::Simple)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Definition, E> {
+                Ok(Definition::Simple(Models(Vec::new())))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Definition, E> {
+                Models::deserialize(de::value::StrDeserializer::<E>::new(v)).map(Definition::Simple)
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Definition, E> {
+                Models::deserialize(de::value::StringDeserializer::<E>::new(v))
+                    .map(Definition::Simple)
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Definition, E> {
+                Models::deserialize(de::value::BoolDeserializer::<E>::new(v))
+                    .map(Definition::Simple)
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Definition, E> {
+                Models::deserialize(de::value::I64Deserializer::<E>::new(v)).map(Definition::Simple)
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Definition, E> {
+                Models::deserialize(de::value::U64Deserializer::<E>::new(v)).map(Definition::Simple)
+            }
+            fn visit_i128<E: de::Error>(self, v: i128) -> Result<Definition, E> {
+                Models::deserialize(de::value::I128Deserializer::<E>::new(v))
+                    .map(Definition::Simple)
+            }
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<Definition, E> {
+                Models::deserialize(de::value::U128Deserializer::<E>::new(v))
+                    .map(Definition::Simple)
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Definition, E> {
+                Models::deserialize(de::value::F64Deserializer::<E>::new(v)).map(Definition::Simple)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Expanded {
+    models: Models,
+    #[serde(default)]
+    hide_originals: bool,
 }
 
 /// 一个别名的值：一个名称，或者一组名称。
@@ -157,6 +250,26 @@ impl<'de> Deserialize<'de> for Models {
 mod tests {
     use super::*;
 
+    #[test]
+    fn expanded_definition_preserves_policy_and_rejects_unknown_fields() {
+        let a: Aliases = serde_yaml_ng::from_str(
+            "short: {models: [raw-a, raw-b], hide_originals: true}\nlegacy: raw-c\n",
+        )
+        .unwrap();
+        assert!(a[0].hide_originals);
+        assert!(!a[1].hide_originals);
+        let text = serde_yaml_ng::to_string(&a).unwrap();
+        assert!(text.contains("hide_originals: true"));
+        assert!(text.contains("legacy: raw-c"));
+        assert_eq!(serde_yaml_ng::from_str::<Aliases>(&text).unwrap(), a);
+        let plain: Aliases = serde_yaml_ng::from_str("short: {models: raw-a}").unwrap();
+        assert_eq!(serde_yaml_ng::to_string(&plain).unwrap(), "short: raw-a\n");
+        let err = serde_yaml_ng::from_str::<Aliases>("short: {models: raw-a, hide_original: true}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `hide_original`"), "{err}");
+    }
+
     const TABLE: &str = "\
 deepseek-v4.1: DeepSeek-v4.1-flash
 claude-sonnet-5:
@@ -170,6 +283,7 @@ a-model: [x]
         Alias {
             name: name.into(),
             models: models.iter().map(|m| m.to_string()).collect(),
+            hide_originals: false,
         }
     }
 
@@ -244,7 +358,7 @@ a-model: [x]
         let e = serde_yaml_ng::from_str::<Aliases>("x: {a: b}\n")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("a model name or a list of model names"), "{e}");
+        assert!(e.contains("unknown field `a`"), "{e}");
         let e = serde_yaml_ng::from_str::<Aliases>("[a, b]\n")
             .unwrap_err()
             .to_string();

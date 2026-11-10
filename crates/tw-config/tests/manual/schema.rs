@@ -262,11 +262,11 @@ pub fn sections() -> Vec<Section> {
                 ),
                 row(
                     "aliases",
-                    Kind::OneOrManyMap(t("alias", "别名")),
+                    Kind::AliasMap,
                     Def::Is("{}"),
                     t(
-                        "Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias.",
-                        "模型别名：同一个模型在各上游的名称合用一个名字，按顺序列出各上游的名称。请求别名时，提供其中任一名称的上游都能服务，发给它的是列表中它提供的第一个名称。别名不能列出别的别名。",
+                        "Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias. The object form accepts `models` and `hide_originals` (default false); hiding only affects client discovery, not access.",
+                        "模型别名：同一个模型在各上游的名称合用一个名字，按顺序列出各上游的名称。请求别名时，提供其中任一名称的上游都能服务，发给它的是列表中它提供的第一个名称。别名不能列出别的别名。对象写法接受 `models` 和 `hide_originals`（默认 false）；隐藏只影响客户端列表，不改变访问权限。",
                     ),
                 ),
                 row(

@@ -737,7 +737,7 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
 
 /// 网关知道的全部模型，以及能提供它们的上游。
 ///
-/// **和 `/v1/models` 同一份目录**：停用的上游、启用范围外的模型都不在里面。另加
+/// **使用公开列表过滤前的完整目录**：停用的上游、启用范围外的模型都不在里面。另加
 /// 别名表里的每个别名，见 [`known`]。规则条件和试算的模型建议用它。
 async fn known_models(State(s): State<ControlState>) -> Json<Vec<tw_api::KnownModel>> {
     Json(known(&s.config(), &s.gateway.catalog.load()))
@@ -751,6 +751,7 @@ async fn known_models(State(s): State<ControlState>) -> Json<Vec<tw_api::KnownMo
 ///   要能选到它。上游是有清单、`resolve` 在这家有结果的那几家 —— 和真模型一样只算
 ///   有清单的；没有清单的上游照样收它的请求，只是不知道它有什么。
 fn known(cfg: &tw_config::Config, catalog: &tw_engine::Catalog) -> Vec<tw_api::KnownModel> {
+    let hidden = tw_gateway::discovery::hidden_originals(cfg, &catalog.resolve_allowed(None, None));
     let mut out: Vec<tw_api::KnownModel> = catalog
         .all()
         .into_iter()
@@ -760,6 +761,7 @@ fn known(cfg: &tw_config::Config, catalog: &tw_engine::Catalog) -> Vec<tw_api::K
             providers: catalog.providers_for(id).to_vec(),
             alias: None,
             aliases: aliases_listing(cfg, id),
+            hidden_by: hidden.get(id).cloned().unwrap_or_default(),
         })
         .collect();
     out.extend(cfg.aliases.iter().map(|a| tw_api::KnownModel {
@@ -767,6 +769,7 @@ fn known(cfg: &tw_config::Config, catalog: &tw_engine::Catalog) -> Vec<tw_api::K
         providers: serving_alias(cfg, catalog, &a.name),
         alias: Some(a.models.clone()),
         aliases: Vec::new(),
+        hidden_by: Vec::new(),
     }));
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
