@@ -676,6 +676,17 @@ pub(super) async fn try_upstreams<'a>(
                 .map(|(_, p)| p.clone())
                 .unwrap_or_else(|| rt.history_memory.policy(key, now_ms()))
         });
+        // Plugins run again on a history retry and may change the request.
+        // Accepting a different body proves nothing about an unapplied repair.
+        let history_trial_applied = history_key.as_ref().is_some_and(|key| {
+            history_trial.as_ref().is_some_and(|(trial, policy)| {
+                trial == key
+                    && policy
+                        .fields
+                        .iter()
+                        .all(|field| crate::history_memory::omit(&out.body, &[*field]).is_some())
+            })
+        });
         if let Some(policy) = &history_policy
             && let Some(body) = crate::history_memory::omit(&out.body, &policy.fields)
         {
@@ -1439,6 +1450,7 @@ pub(super) async fn try_upstreams<'a>(
                 }
                 if answered
                     && !unconfirmed
+                    && history_trial_applied
                     && let Some(key) = &history_key
                     && let Some((trial, policy)) = &history_trial
                     && trial == key

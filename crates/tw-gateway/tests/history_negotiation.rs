@@ -233,3 +233,46 @@ async fn tool_and_thinking_modes_are_independently_verified_and_reload_clears_th
     assert_eq!(post(gw, &original).await, 200);
     assert_eq!(seen.lock().unwrap().len(), 8);
 }
+
+#[tokio::test]
+async fn a_plugin_removing_history_does_not_confirm_an_unapplied_adjustment() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tw_gateway::plugin::host::double::{self, Double};
+    use tw_gateway::plugin::{Invocation, PluginSet, RequestOutcome};
+
+    let (up, seen) = upstream(|v, _| {
+        if v["messages"][0].get("reasoning_content").is_some() {
+            rejected()
+        } else {
+            accepted()
+        }
+    })
+    .await;
+    let (gw, state) = gateway(&[up]).await;
+    let calls = AtomicUsize::new(0);
+    let plugin = Double::new("changing history")
+        .permit(&[tw_api::Permission::Messages])
+        .on_request(move |mut view, _| {
+            if calls.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+                Invocation::ok(RequestOutcome::Unchanged)
+            } else {
+                view["messages"].as_array_mut().unwrap().remove(0);
+                Invocation::ok(RequestOutcome::Changed(view))
+            }
+        });
+    state.swap_plugins(PluginSet::new(vec![Arc::new(double::active(
+        "changing", plugin,
+    ))]));
+    for count in [2, 4] {
+        assert_eq!(post(gw, &request()).await, 200);
+        assert_eq!(seen.lock().unwrap().len(), count);
+        assert_eq!(
+            state
+                .runtime()
+                .history_memory
+                .entries_for("up", tw_gateway::history_memory::now_ms()),
+            0,
+            "a retry that did not apply the proposed omission is not evidence"
+        );
+    }
+}
