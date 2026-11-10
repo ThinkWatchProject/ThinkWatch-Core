@@ -247,9 +247,7 @@ pub fn refusal(status: u16, body: &[u8], sent: &[u8]) -> Option<Vec<HistoryField
             HistoryField::ReasoningContent => "reasoning_content",
             HistoryField::Reasoning => "reasoning",
         };
-        if message.get(name).is_none() {
-            return None;
-        }
+        message.get(name)?;
         if !fields.contains(&f) {
             fields.push(f);
         }
