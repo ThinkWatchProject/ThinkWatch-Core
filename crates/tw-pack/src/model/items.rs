@@ -384,7 +384,7 @@ where
     typed_mapping::<T>(Yaml::Mapping(m)).map_err(|e| shape(id, e))
 }
 
-/// 别名的模型列表
+/// 别名的模型及展示策略，兼容旧快照里的模型数组。
 pub(crate) fn alias_definition(
     id: &ItemId,
     units: &BTreeMap<String, Json>,

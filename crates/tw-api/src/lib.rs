@@ -7198,6 +7198,28 @@ pub struct PluginRunView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn alias_discovery_fields_are_additive_and_keep_omission_distinct_from_false() {
+        let omitted: AliasInput =
+            serde_json::from_str(r#"{"name":"short","models":["raw"]}"#).unwrap();
+        assert_eq!(omitted.hide_originals, None);
+        let clear: AliasInput =
+            serde_json::from_str(r#"{"name":"short","models":["raw"],"hide_originals":false}"#)
+                .unwrap();
+        assert_eq!(clear.hide_originals, Some(false));
+        assert!(
+            serde_json::to_value(&omitted)
+                .unwrap()
+                .get("hide_originals")
+                .is_none()
+        );
+        let old: AliasesView = serde_json::from_str(r#"{"aliases":[],"suggestions":[]}"#).unwrap();
+        assert!(!old.hide_originals_supported);
+        let known: KnownModel =
+            serde_json::from_str(r#"{"id":"raw","providers":[],"aliases":[]}"#).unwrap();
+        assert!(known.hidden_by.is_empty());
+    }
+
     /// 手动加入例外的请求带着原值：调试输出里不能有它
     #[test]
     fn an_exception_request_does_not_print_its_value() {

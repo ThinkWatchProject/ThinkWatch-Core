@@ -1141,4 +1141,32 @@ fn alias_visibility_survives_pack_normalization_and_reconstruction() {
     let cfg = tw_config::try_parse(&rebuilt.config_yaml).unwrap();
     assert!(cfg.aliases.find("fast").unwrap().hide_originals);
     assert_eq!(snap(&rebuilt), model);
+    let exported = crate::export::export_with(
+        &source,
+        crate::export::Options {
+            scope: None,
+            secrets: false,
+            client_prefs: None,
+            origin: PackOrigin::Ui,
+        },
+        &Fake::new(),
+    )
+    .unwrap();
+    assert!(
+        tw_config::try_parse(&exported.pack.config_yaml)
+            .unwrap()
+            .aliases[0]
+            .hide_originals
+    );
+    let mut renamed = model;
+    rename(&mut renamed, &id(ItemKind::Alias, "fast"), "quick");
+    let landed = mat(&pack(&rich()), &renamed);
+    assert!(
+        tw_config::try_parse(&landed.config_yaml)
+            .unwrap()
+            .aliases
+            .find("quick")
+            .unwrap()
+            .hide_originals
+    );
 }
