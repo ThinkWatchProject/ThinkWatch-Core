@@ -20,6 +20,8 @@ use tw_types::msg;
 use crate::error::GatewayError;
 use crate::state::{AppState, Runtime};
 
+mod reasoning;
+
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_CACHED: usize = 32;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -350,7 +352,15 @@ pub(crate) async fn list(
     let book = state.pricing.load();
     let models: Vec<_> = names(&rt.config, &catalog, allow.as_deref())
         .iter()
-        .map(|name| project(name, &candidates(&rt, &catalog, name), &book, &upstreams))
+        .map(|name| {
+            project(
+                name,
+                &candidates(&rt, &catalog, name),
+                &book,
+                &upstreams,
+                &version,
+            )
+        })
         .collect();
     let body = serde_json::to_vec(&json!({"models":models})).expect("catalog is JSON");
     if body.len() > MAX_BYTES {
@@ -411,6 +421,7 @@ fn project(
     candidates: &[(&Provider, &str)],
     book: &tw_pricing::PriceBook,
     upstreams: &HashMap<String, Models>,
+    version: &str,
 ) -> Value {
     let definitions: Vec<_> = candidates
         .iter()
@@ -440,14 +451,22 @@ fn project(
                     .or_else(|| d["context_window"].as_u64())
             }),
         ));
-        reasoning.push(pick(
+        // Only effort choices use the bundled profiles. Instructions, tools
+        // and other native fields still come exclusively from the upstream.
+        let profile = definition.or_else(|| reasoning::profile(model, version));
+        let enabled = pick(
             spec.reasoning,
-            definition.map(|d| {
+            profile.map(|d| {
                 d["supported_reasoning_levels"]
                     .as_array()
                     .is_some_and(|v| !v.is_empty())
             }),
-        ));
+        );
+        reasoning.push(if enabled == Some(false) {
+            None
+        } else {
+            profile
+        });
         images.push(pick(
             spec.image_input,
             definition
@@ -472,10 +491,13 @@ fn project(
         object.remove("context_window");
         object.remove("max_context_window");
     }
-    if reasoning.contains(&Some(false)) {
-        out["supported_reasoning_levels"] = json!([]);
-        out["default_reasoning_level"] = Value::Null;
-    }
+    let requires_translation = candidates.iter().any(|(provider, _)| {
+        !matches!(
+            provider.effective_protocol(),
+            Some(tw_config::Protocol::OpenaiResponses | tw_config::Protocol::Chatgpt)
+        )
+    });
+    reasoning::apply(&mut out, &reasoning, requires_translation);
     if !images.is_empty() && images.iter().all(|v| *v == Some(true)) {
         out["input_modalities"] = json!(["text", "image"]);
     } else {

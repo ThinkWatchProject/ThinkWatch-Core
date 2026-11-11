@@ -60,8 +60,28 @@ names become the exposed slugs, with no migration target. If routing candidates
 have different native definitions, Core uses the generic profile and intersects
 their known capabilities. Explicit model specifications override native values;
 native values take precedence over the price table. Unknown context windows
-are omitted, and reasoning effort choices are only taken from native metadata.
-Image input requires affirmative support from every candidate.
+are omitted. Image input requires affirmative support from every candidate.
+
+Reasoning choices come from upstream native metadata when available. For
+ordinary model lists or unavailable native metadata, Core also includes
+[documented reasoning profiles](../crates/tw-gateway/data/codex_reasoning.md)
+for known OpenAI and DeepSeek models. DeepSeek Flash/V4.1-Flash and V4-Pro
+offer `low`, `high` and `max`, with `high` as the default. These profiles supply
+only effort choices; the generic instructions and tools remain unchanged.
+Profiles respect their minimum Codex version. An unknown model does not gain
+invented levels merely because its model specification says `reasoning: true`.
+
+Aliases inherit choices from their actual upstream model IDs, including names
+with a provider namespace or different ASCII case. A name that merely resembles
+a known model does not confer that model's capabilities. Across routing
+candidates, Core intersects effort choices independently of instructions and
+tools, and chooses a default from the resulting list. A manual
+`model_specs.reasoning: false` or a candidate with no known choices removes
+effort choices for that alias. An upstream's explicit native list, including an
+empty one, takes precedence over a bundled profile.
+When a candidate requires protocol translation, choices are also limited to
+efforts Core can represent in that translation. Responses and ChatGPT
+passthrough can retain newer native efforts such as `ultra`.
 
 ## Cache and limits
 
