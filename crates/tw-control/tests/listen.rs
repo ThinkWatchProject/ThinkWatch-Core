@@ -324,3 +324,31 @@ async fn interfaces_come_one_per_name() {
     unique.dedup();
     assert_eq!(names.len(), unique.len(), "{names:?}");
 }
+
+#[tokio::test]
+async fn additional_listeners_are_saved_and_explicit_loopback_removes_them() {
+    let b = bed(&yaml(spare_port()));
+    let port = spare_port();
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/listen",
+        serde_json::json!({
+            "bind": "127.0.0.1", "additional": ["::1"], "port": port, "allow_from": []
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b.listen().additional.len(), 1);
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/listen",
+        serde_json::json!({
+            "bind": "loopback", "port": port, "allow_from": []
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(b.listen().additional.is_empty());
+}

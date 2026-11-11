@@ -379,6 +379,10 @@ impl ControlListen {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayListen {
+    /// Additional interfaces or pinned addresses, sharing the port and source allowlist.
+    /// Loopback remains available; wildcard listeners subsume addresses of the same family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional: Vec<Bind>,
     /// `loopback` | `all` | 一张网卡的 IP。默认 loopback —— 学 Surge，
     /// 但默认值要保守。
     #[serde(default)]
@@ -425,21 +429,65 @@ impl GatewayListen {
     /// `127.0.0.1`。用户选「局域网」是想让别的设备也能连，不是想让这台
     /// 电脑上的客户端全部断线。`0.0.0.0` 本来就包含回环，不用另加。
     pub fn addrs(&self) -> Result<Vec<std::net::SocketAddr>, BindError> {
-        let ip = self.bind.resolve()?;
-        let at = |ip| std::net::SocketAddr::new(ip, self.port);
-        if ip.is_loopback() || ip.is_unspecified() {
-            return Ok(vec![at(ip)]);
+        let ips = self
+            .additional
+            .iter()
+            .chain(std::iter::once(&self.bind))
+            .map(Bind::resolve)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::sockets(ips, self.port))
+    }
+
+    /// Resolve independently so an offline secondary NIC does not take the LAN down.
+    pub fn available_addrs(&self) -> (Vec<std::net::SocketAddr>, Option<BindError>) {
+        let mut error = None;
+        let ips = self
+            .additional
+            .iter()
+            .chain(std::iter::once(&self.bind))
+            .filter_map(|b| match b.resolve() {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    error.get_or_insert(e);
+                    None
+                }
+            })
+            .collect();
+        (Self::sockets(ips, self.port), error)
+    }
+
+    fn sockets(mut ips: Vec<std::net::IpAddr>, port: u16) -> Vec<std::net::SocketAddr> {
+        use std::net::{IpAddr, Ipv4Addr};
+        if ips.len() == 1 && (ips[0].is_loopback() || ips[0].is_unspecified()) {
+            return vec![std::net::SocketAddr::new(ips[0], port)];
         }
-        Ok(vec![
-            at(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            at(ip),
-        ])
+        if !ips.contains(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+            ips.insert(0, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        }
+        let wild4 = ips.iter().any(|ip| ip.is_ipv4() && ip.is_unspecified());
+        let wild6 = ips.iter().any(|ip| ip.is_ipv6() && ip.is_unspecified());
+        let mut out = Vec::new();
+        for ip in ips {
+            if !ip.is_unspecified() && ((ip.is_ipv4() && wild4) || (ip.is_ipv6() && wild6)) {
+                continue;
+            }
+            let addr = std::net::SocketAddr::new(ip, port);
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+        out
+    }
+
+    pub fn is_exposed(&self) -> bool {
+        self.bind.is_exposed() || self.additional.iter().any(Bind::is_exposed)
     }
 }
 
 impl Default for GatewayListen {
     fn default() -> Self {
         Self {
+            additional: Vec::new(),
             bind: Bind::default(),
             port: DEFAULT_GATEWAY_PORT,
             allow_from: default_allow_from(),
@@ -1382,6 +1430,41 @@ mod tests {
     /// **默认值不进文件**是这份配置的一条规矩：用户打开 config.yaml
     /// 看到一屏自己没配过的东西，就分不清哪些是他的决定。
     #[test]
+    fn secondary_listeners_preserve_loopback_and_deduplicate_wildcards() {
+        let mut l = GatewayListen {
+            bind: Bind::Addr("192.168.1.5".parse().unwrap()),
+            additional: vec![Bind::Addr("172.23.80.1".parse().unwrap())],
+            ..Default::default()
+        };
+        assert_eq!(
+            l.addrs()
+                .unwrap()
+                .iter()
+                .map(|a| a.ip().to_string())
+                .collect::<Vec<_>>(),
+            ["127.0.0.1", "172.23.80.1", "192.168.1.5"]
+        );
+        l.additional.push(Bind::All);
+        assert_eq!(l.addrs().unwrap(), vec!["0.0.0.0:8788".parse().unwrap()]);
+        l.bind = Bind::Loopback;
+        assert!(l.is_exposed());
+        l.additional.clear();
+        assert!(!l.is_exposed());
+    }
+
+    #[test]
+    fn an_offline_secondary_interface_does_not_remove_other_listeners() {
+        let l = GatewayListen {
+            additional: vec![Bind::Nic("missing-test-interface".into())],
+            ..Default::default()
+        };
+        assert!(l.addrs().is_err());
+        let (addrs, error) = l.available_addrs();
+        assert_eq!(addrs, vec!["127.0.0.1:8788".parse().unwrap()]);
+        assert!(error.is_some());
+    }
+
+    #[test]
     fn retention_defaults_stay_out_of_the_file_but_a_choice_does_not() {
         let cfg = Config::default();
         let out = serde_yaml_ng::to_string(&cfg).unwrap();
@@ -1559,6 +1642,7 @@ providers:
     fn a_concrete_interface_is_listened_on_alongside_loopback() {
         // 只绑网卡地址的话，接管时写进客户端的 127.0.0.1 就连不上了
         let listen = |bind: &str| GatewayListen {
+            additional: Vec::new(),
             bind: serde_yaml_ng::from_str(bind).unwrap(),
             port: 18790,
             allow_from: Vec::new(),

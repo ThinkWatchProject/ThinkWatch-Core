@@ -44,6 +44,19 @@ async fn save(
                 ),
             )
         })?;
+    let additional: Vec<tw_config::Bind> = req
+        .additional
+        .iter()
+        .map(|s| {
+            serde_yaml_ng::from_value(Value::String(s.trim().to_string())).map_err(|_| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    msg!("control.listen.bind_invalid", bind = s =>
+                "Invalid listen interface or address: {bind}"),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
     if req.port == 0 {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -58,6 +71,7 @@ async fn save(
         .collect();
     let listen = tw_config::GatewayListen {
         bind: bind.clone(),
+        additional: additional.clone(),
         port: req.port,
         allow_from: allow.clone(),
     };
@@ -83,6 +97,15 @@ async fn save(
             let allow_v = (allow != tw_config::default_allow_from())
                 .then(|| Value::Sequence(allow.iter().cloned().map(Value::String).collect()));
             let out = edit::set(text, &at("bind"), bind_v.as_ref())?;
+            let extra_v = (!additional.is_empty()).then(|| {
+                Value::Sequence(
+                    additional
+                        .iter()
+                        .map(|b| Value::String(b.to_string()))
+                        .collect(),
+                )
+            });
+            let out = edit::set(&out, &at("additional"), extra_v.as_ref())?;
             let out = edit::set(&out, &at("port"), port_v.as_ref())?;
             Ok(edit::set(&out, &at("allow_from"), allow_v.as_ref())?)
         })

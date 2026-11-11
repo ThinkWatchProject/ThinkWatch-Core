@@ -22,7 +22,10 @@ mod upgrade;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/healthz",
+            get(|| async { ([("x-thinkwatch-gateway", crate::probe_id())], "ok") }),
+        )
         // Claude Code（和内嵌它的 Claude Desktop）启动时发一个 `HEAD /api/hello` 预热
         // 连接。**不鉴权、不转发**：它不带密钥也不需要上游，掉进透传的话会被当成一次
         // 没有密钥的请求拒成 401。`get` 也接 HEAD

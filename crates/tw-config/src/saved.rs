@@ -65,6 +65,9 @@ impl Config {
             );
         };
         add(&self.listen.gateway.bind);
+        for bind in &self.listen.gateway.additional {
+            add(bind);
+        }
         if let Some(r) = &self.listen.control.remote
             && r.enabled
         {

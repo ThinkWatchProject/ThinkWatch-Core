@@ -431,14 +431,8 @@ const RECHECK: std::time::Duration = std::time::Duration::from_secs(3);
 /// 网卡让整个网关起不来：开机自启时 WSL 还没起，这台电脑上的客户端也跟着
 /// 全部断线。
 fn plan(listen: &tw_config::GatewayListen) -> (Vec<SocketAddr>, Option<Msg>) {
-    match listen.addrs() {
-        Ok(a) => (a, None),
-        Err(e) => (loopback_only(listen.port), Some(unresolved(&e))),
-    }
-}
-
-fn loopback_only(port: u16) -> Vec<SocketAddr> {
-    vec![SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port)]
+    let (addrs, error) = listen.available_addrs();
+    (addrs, error.as_ref().map(unresolved))
 }
 
 /// 这个地址此刻不是这台机器的 —— 网卡的地址刚被收走，或者写死的那个地址还没
@@ -536,7 +530,7 @@ pub async fn serve_with(
     // 眼下这些监听器是照着哪份设置绑的。**设置没变、网卡却解析不出来了**，是
     // 我们跟着的那张网卡没了（WSL 关了）：退回只听回环，等它回来。设置变了
     // 而新的解析不出来，那是另一回事，见下面
-    let mut following = (listen.bind.clone(), listen.port);
+    let mut following = (listen.bind.clone(), listen.additional.clone(), listen.port);
     let mut recheck = tokio::time::interval(RECHECK);
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     recheck.tick().await;
@@ -560,7 +554,7 @@ pub async fn serve_with(
         } else {
             listen.clone()
         };
-        let spec = (listen.bind.clone(), listen.port);
+        let spec = (listen.bind.clone(), listen.additional.clone(), listen.port);
         let (want, note) = match listen.addrs() {
             Ok(a) => (a, None),
             // 跟着的那张网卡没了：它那一个退场，回环照听，等它回来再补上。
@@ -573,7 +567,10 @@ pub async fn serve_with(
                 if asked || bound.iter().any(|b| !b.want.ip().is_loopback()) {
                     tracing::warn!(%e, "the interface is gone; listening on loopback only until it is back");
                 }
-                (loopback_only(listen.port), Some(unresolved(&e)))
+                {
+                    let (addrs, _) = listen.available_addrs();
+                    (addrs, Some(unresolved(&e)))
+                }
             }
             // **新配置的地址算不出来就守住旧的。**`bind` 刚改成一张此刻不在
             // 的网卡时，正确的动作不是把一个正在工作的监听器拆掉 —— 那会

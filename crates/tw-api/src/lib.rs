@@ -1144,7 +1144,7 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 速度，请求记录里照记。新码：`gw.upstream.too_slow`、`config.min_speed_range`（`upstream`、
 /// `field`、`value`、`min`、`max`）；一键修复修得了它：速度越界删掉 `min_speed`，判定时长越界改回
 /// 20。请求库 SCHEMA 不变
-pub const CONTROL_API_VERSION: u32 = 58;
+pub const CONTROL_API_VERSION: u32 = 59;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -1152,6 +1152,12 @@ pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Status {
+    /// Actual bound sockets, including loopback and secondary interfaces.
+    #[serde(default)]
+    pub gateway_addrs: Vec<String>,
+    /// Public identity echoed in the gateway health response header.
+    #[serde(default)]
+    pub gateway_probe: String,
     pub api_version: u32,
     /// 二进制的 CalVer
     pub version: String,
@@ -3143,6 +3149,8 @@ pub struct KeyRotated {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ListenSave {
+    #[serde(default)]
+    pub additional: Vec<String>,
     /// 同配置里的 `listen.gateway.bind`：`loopback` / `all` / 网卡名 / 地址
     pub bind: String,
     pub port: u16,
@@ -3174,6 +3182,8 @@ pub struct KeyValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ListenView {
+    #[serde(default)]
+    pub additional: Vec<String>,
     pub bind: String,
     pub port: u16,
     /// 放行网段，就是生效的那一份：配置里没写时是默认名单，空 = 除本机外
@@ -8025,6 +8035,8 @@ mod tests {
     #[test]
     fn status_round_trips() {
         let s = Status {
+            gateway_addrs: vec!["127.0.0.1:8788".into()],
+            gateway_probe: "public-process-id".into(),
             api_version: CONTROL_API_VERSION,
             version: "2026.9.0".into(),
             pid: 1,
