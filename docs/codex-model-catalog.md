@@ -50,8 +50,8 @@ and configured proxy. The inbound gateway key is never forwarded. ChatGPT uses
 its native models URL. Direct OpenAI API providers use OpenAI's documented native
 Codex endpoint; other providers use their models endpoint. A full native
 `models` entry retains its instructions, tools and unknown version-specific
-fields. A standard OpenAI `data` list contains no native Codex instructions and
-uses a generic coding profile instead. Core does not copy bundled OpenAI model
+fields. A standard OpenAI `data` list uses a generic coding profile; reported model
+capabilities are projected onto it without adopting native instructions or tools. Core does not copy bundled OpenAI model
 instructions onto unrelated providers.
 
 Only models already in the shared gateway directory are exposed. A native
@@ -60,12 +60,28 @@ names become the exposed slugs, with no migration target. If routing candidates
 have different native definitions, Core uses the generic profile and intersects
 their known capabilities. Explicit model specifications override native values;
 native values take precedence over the price table. Unknown context windows
-are omitted, and reasoning effort choices are only taken from native metadata.
-Image input requires affirmative support from every candidate.
+are omitted. Image input requires affirmative support from every candidate.
+
+For ordinary upstream model lists, Core reads `data[].context_window`,
+`data[].input_modalities`, `data[].effort.supported_levels`, and
+`data[].effort.default_level`. For example, DeepSeek documents these fields in
+its [models endpoint](https://api-docs.deepseek.com/api/list-models). The effort
+list becomes Codex's `supported_reasoning_levels`; the reported default is kept
+when it is in the list. Optional or malformed fields do not create capabilities.
+No model-name table or inference from `reasoning: true` supplies missing levels.
+A relay must preserve the metadata for Core to use it.
+
+Aliases inherit the actual routing targets' reported capabilities. Effort
+choices are intersected separately from full native definitions, so differences
+in prompts or tools do not discard shared levels. Defaults must belong to the
+intersection. Manual `model_specs.reasoning: false` removes choices. When any
+candidate requires protocol translation, choices are also limited to efforts
+Core can translate; Responses and ChatGPT passthrough can retain newer native
+efforts such as `ultra`.
 
 ## Cache and limits
 
-Only upstream native metadata is cached. Entries are isolated by the provider,
+Only upstream metadata is cached. Entries are isolated by the provider,
 resolved credentials and headers, URL, client version and proxy configuration.
 There are at most 32 cache entries and four concurrent metadata fetches. Fetches
 have an eight-second deadline. Successful upstream cache lifetimes are capped at

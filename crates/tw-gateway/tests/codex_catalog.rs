@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use axum::extract::{OriginalUri, State};
 use axum::http::HeaderMap;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tw_config::{Client, Config, ModelSpec, Protocol, Provider};
@@ -16,6 +16,7 @@ use tw_gateway::AppState;
 struct Upstream {
     body: Arc<Mutex<Value>>,
     requests: Arc<Mutex<Vec<(String, String)>>>,
+    forwarded: Arc<Mutex<Vec<Value>>>,
     control: &'static str,
     gate: Option<Arc<tokio::sync::Notify>>,
     started: Arc<tokio::sync::Notify>,
@@ -26,6 +27,7 @@ impl Upstream {
         Self {
             body: Arc::new(Mutex::new(body)),
             requests: Default::default(),
+            forwarded: Default::default(),
             control: "private, max-age=300",
             gate: None,
             started: Default::default(),
@@ -55,9 +57,20 @@ impl Upstream {
                 Json(up.body.lock().unwrap().clone()),
             )
         }
+        async fn completion(State(up): State<Upstream>, Json(body): Json<Value>) -> Json<Value> {
+            up.forwarded.lock().unwrap().push(body.clone());
+            Json(json!({
+                "id":"chatcmpl-test","object":"chat.completion","created":0,
+                "model":body["model"],
+                "choices":[{"index":0,"message":{"role":"assistant","content":"OK"},
+                    "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            }))
+        }
         let app = Router::new()
             .route("/v1/models", get(models))
             .route("/models", get(models))
+            .route("/v1/chat/completions", post(completion))
             .with_state(self.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -231,6 +244,300 @@ async fn ordinary_model_lists_get_a_generic_profile_and_standard_listing_is_unch
         .unwrap();
     assert_eq!(standard["data"][0]["id"], "unknown-model");
     assert!(standard.get("models").is_none());
+}
+
+fn reported_model(id: &str, levels: &[&str], default: &str) -> Value {
+    json!({"id":id,"effort":{"supported_levels":levels,"default_level":default}})
+}
+
+fn efforts(model: &Value) -> Vec<&str> {
+    model["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|level| level["effort"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn ordinary_deepseek_models_and_aliases_offer_levels_that_reach_the_original_model() {
+    let original = "DeepSeek/DeepSeek-V4.1-Flash";
+    let up =
+        Upstream::new(json!({"data":[reported_model(original, &["low","high","max"], "high")]}));
+    let mut p = provider("ordinary", up.serve().await, &[original]);
+    p.protocol = Some(Protocol::OpenaiChat);
+    let mut cfg = config(vec![p]);
+    cfg.aliases = serde_yaml_ng::from_str(&format!("coding: {original}")).unwrap();
+    let (_, gw) = serve(cfg).await;
+    let body = catalog(gw).await;
+    for model in body["models"].as_array().unwrap() {
+        assert_eq!(efforts(model), ["low", "high", "max"]);
+        assert_eq!(model["default_reasoning_level"], "high");
+        assert_eq!(
+            model["base_instructions"],
+            body["models"][0]["base_instructions"]
+        );
+    }
+    assert_eq!(slugs(&body), [original, "coding"]);
+    let alias = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "coding")
+        .unwrap();
+    for effort in efforts(alias) {
+        let response = http()
+            .post(format!("http://{gw}/v1/responses"))
+            .bearer_auth("gateway-test-key")
+            .json(&json!({"model":"coding","input":"Hello","reasoning":{"effort":effort}}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        let sent = up.forwarded.lock().unwrap().last().unwrap().clone();
+        assert_eq!(sent["model"], original);
+        assert_eq!(sent["reasoning_effort"], effort);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_upstream_capabilities_are_projected_without_native_tools_or_model_name_guesses() {
+    let mut model = reported_model("private-model", &["low", "high", "max"], "high");
+    model["context_window"] = json!(1048576);
+    model["input_modalities"] = json!(["text", "image"]);
+    model["base_instructions"] = json!("Must not become native instructions");
+    model["experimental_supported_tools"] = json!(["not_a_native_tool"]);
+    let up = Upstream::new(json!({"data":[model]}));
+    let mut cfg = config(vec![provider(
+        "ordinary",
+        up.serve().await,
+        &["private-model"],
+    )]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: private-model").unwrap();
+    let (_, gw) = serve(cfg).await;
+    let body = catalog(gw).await;
+    for model in body["models"].as_array().unwrap() {
+        assert_eq!(efforts(model), ["low", "high", "max"]);
+        assert_eq!(model["default_reasoning_level"], "high");
+        assert_eq!(model["context_window"], 1048576);
+        assert_eq!(model["max_context_window"], 1048576);
+        assert_eq!(model["input_modalities"], json!(["text", "image"]));
+        assert_eq!(model["node_repl_disabled"], true);
+        assert_eq!(model["experimental_supported_tools"], json!([]));
+        assert_ne!(
+            model["base_instructions"],
+            "Must not become native instructions"
+        );
+    }
+}
+
+#[tokio::test]
+async fn advertised_efforts_must_survive_the_candidate_protocol_translation() {
+    let up = Upstream::new(
+        json!({"data":[reported_model("gpt-6.1-sol", &["low","medium","high","xhigh","max","ultra"], "low")]}),
+    );
+    let addr = up.serve().await;
+    let mut translated = provider("chat", addr, &["gpt-6.1-sol"]);
+    translated.protocol = Some(Protocol::OpenaiChat);
+    let mut cfg = config(vec![
+        provider("responses", addr, &["gpt-6.1-sol"]),
+        translated,
+    ]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: gpt-6.1-sol").unwrap();
+    let (state, gw) = serve(cfg.clone()).await;
+    for model in catalog(gw).await["models"].as_array().unwrap() {
+        assert_eq!(efforts(model), ["low", "medium", "high", "xhigh", "max"]);
+    }
+    cfg.providers.remove(1);
+    state.reload(cfg).unwrap();
+    for model in catalog(gw).await["models"].as_array().unwrap() {
+        assert_eq!(
+            efforts(model),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordinary_choices_follow_manual_overrides_and_conditional_reload() {
+    let up = Upstream::new(
+        json!({"data":[reported_model("deepseek-v4.1-flash", &["low","high","max"], "high")]}),
+    );
+    let mut cfg = config(vec![provider(
+        "ordinary",
+        up.serve().await,
+        &["deepseek-v4.1-flash"],
+    )]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: deepseek-v4.1-flash").unwrap();
+    let (state, gw) = serve(cfg.clone()).await;
+    let first = request(gw).send().await.unwrap();
+    let etag = first.headers()["etag"].clone();
+    assert_eq!(
+        efforts(&first.json::<Value>().await.unwrap()["models"][0]),
+        ["low", "high", "max"]
+    );
+    cfg.providers[0].model_specs.insert(
+        "deepseek-v4.1-flash".into(),
+        ModelSpec {
+            reasoning: Some(false),
+            ..Default::default()
+        },
+    );
+    state.reload(cfg).unwrap();
+    let changed = request(gw)
+        .header("if-none-match", etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), 200);
+    let body: Value = changed.json().await.unwrap();
+    for model in body["models"].as_array().unwrap() {
+        assert!(efforts(model).is_empty());
+        assert!(model["default_reasoning_level"].is_null());
+    }
+    assert_eq!(up.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unknown_reasoning_models_and_lookalike_aliases_get_no_guessed_levels() {
+    let up = Upstream::new(json!({"data":[{"id":"private-model"}]}));
+    let mut cfg = config(vec![provider(
+        "ordinary",
+        up.serve().await,
+        &["private-model"],
+    )]);
+    cfg.providers[0].model_specs.insert(
+        "private-model".into(),
+        ModelSpec {
+            reasoning: Some(true),
+            ..Default::default()
+        },
+    );
+    cfg.aliases = serde_yaml_ng::from_str("deepseek-flash: private-model").unwrap();
+    let (_, gw) = serve(cfg).await;
+    for model in catalog(gw).await["models"].as_array().unwrap() {
+        assert!(efforts(model).is_empty());
+        assert!(model["default_reasoning_level"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn upstream_native_choices_take_precedence_over_ordinary_capabilities() {
+    let mut model = native("deepseek-flash");
+    model["supported_reasoning_levels"] = json!([]);
+    model["default_reasoning_level"] = Value::Null;
+    let up = Upstream::new(
+        json!({"models":[model], "data":[reported_model("deepseek-flash", &["low","high","max"], "high")]}),
+    );
+    let (_, gw) = serve(config(vec![provider(
+        "native",
+        up.serve().await,
+        &["deepseek-flash"],
+    )]))
+    .await;
+    let body = catalog(gw).await;
+    assert!(efforts(&body["models"][0]).is_empty());
+    assert!(body["models"][0]["default_reasoning_level"].is_null());
+    assert_eq!(
+        body["models"][0]["base_instructions"],
+        "Native coding instructions"
+    );
+}
+
+#[tokio::test]
+async fn aliases_keep_common_native_levels_even_when_complete_definitions_differ() {
+    let mut first = native("one");
+    first["supported_reasoning_levels"] = json!([
+        {"effort":"low","description":"Faster"},
+        {"effort":"high","description":"Deeper"}
+    ]);
+    first["default_reasoning_level"] = json!("low");
+    let mut second = native("two");
+    second["base_instructions"] = json!("Different instructions");
+    second["supported_reasoning_levels"] = json!([
+        {"effort":"high","description":"Other high description"},
+        {"effort":"max","description":"Maximum"}
+    ]);
+    second["default_reasoning_level"] = json!("max");
+    let up = Upstream::new(json!({"models":[first,second]}));
+    let addr = up.serve().await;
+    let mut cfg = config(vec![
+        provider("first", addr, &["one"]),
+        provider("second", addr, &["two"]),
+    ]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: [one, two]").unwrap();
+    let (_, gw) = serve(cfg).await;
+    let alias = &catalog(gw).await["models"][0];
+    assert_eq!(alias["slug"], "coding");
+    assert_eq!(efforts(alias), ["high"]);
+    assert_eq!(alias["default_reasoning_level"], "high");
+    assert_ne!(alias["base_instructions"], "Native coding instructions");
+}
+
+#[tokio::test]
+async fn aliases_intersect_reported_capabilities_and_unknown_candidates_remove_choices() {
+    let up = Upstream::new(
+        json!({"data":[reported_model("deepseek-flash", &["low","high","max"], "high"),reported_model("gpt-5.5", &["low","medium","high","xhigh"], "medium"),{"id":"private-model"}]}),
+    );
+    let addr = up.serve().await;
+    let mut cfg = config(vec![
+        provider("deepseek", addr, &["deepseek-flash"]),
+        provider("openai", addr, &["gpt-5.5"]),
+        provider("private", addr, &["private-model"]),
+    ]);
+    cfg.aliases = serde_yaml_ng::from_str(
+        "coding: [gpt-5.5, deepseek-flash]\nmixed: [deepseek-flash, private-model]",
+    )
+    .unwrap();
+    let (_, gw) = serve(cfg).await;
+    let body = catalog(gw).await;
+    let alias = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "coding")
+        .unwrap();
+    assert_eq!(efforts(alias), ["low", "high"]);
+    assert!(efforts(alias).contains(&alias["default_reasoning_level"].as_str().unwrap()));
+    let mixed = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "mixed")
+        .unwrap();
+    assert!(efforts(mixed).is_empty());
+    assert!(mixed["default_reasoning_level"].is_null());
+}
+
+#[tokio::test]
+async fn changed_ordinary_efforts_and_defaults_change_the_conditional_catalog() {
+    let mut up =
+        Upstream::new(json!({"data":[reported_model("private-model", &["high","max"], "high")]}));
+    up.control = "no-store";
+    let (_, gw) = serve(config(vec![provider(
+        "ordinary",
+        up.serve().await,
+        &["private-model"],
+    )]))
+    .await;
+    let first = request(gw).send().await.unwrap();
+    let etag = first.headers()["etag"].clone();
+    assert_eq!(
+        efforts(&first.json::<Value>().await.unwrap()["models"][0]),
+        ["high", "max"]
+    );
+    up.body.lock().unwrap()["data"][0] = reported_model("private-model", &["low", "high"], "low");
+    let changed = request(gw)
+        .header("if-none-match", etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), 200);
+    let body: Value = changed.json().await.unwrap();
+    assert_eq!(efforts(&body["models"][0]), ["low", "high"]);
+    assert_eq!(body["models"][0]["default_reasoning_level"], "low");
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@
 //! Only upstream metadata is cached. Names, aliases, permissions and manual
 //! capabilities are resolved again on every read, including conditional reads.
 //! A version/credential-scoped upstream catalog preserves native instructions
-//! and tools; ordinary API model lists use a conservative gateway profile.
+//! and tools; ordinary model capabilities are projected onto a generic profile.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,8 @@ use tw_types::msg;
 
 use crate::error::GatewayError;
 use crate::state::{AppState, Runtime};
+
+mod metadata;
 
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_CACHED: usize = 32;
@@ -151,14 +153,22 @@ async fn fetch(
     }
     let value: Value = serde_json::from_slice(&body).ok()?;
     let mut models = BTreeMap::new();
-    for model in value.get("models")?.as_array()? {
-        // A list of IDs is not a native Codex definition. Unknown fields in a
-        // valid definition survive unchanged, including version-specific tools.
-        if native(model) {
-            models
-                .entry(model["slug"].as_str()?.to_string())
-                .or_insert_with(|| model.clone());
-        }
+    let entries = value["models"]
+        .as_array()
+        .or_else(|| value["data"].as_array())?;
+    for model in entries {
+        // Native definitions retain version-specific fields. Ordinary API
+        // entries supply only the capabilities their endpoint actually reports.
+        let definition = if native(model) {
+            model.clone()
+        } else if let Some(definition) = metadata::ordinary(model) {
+            definition
+        } else {
+            continue;
+        };
+        models
+            .entry(definition["slug"].as_str()?.to_string())
+            .or_insert(definition);
     }
     Some((Arc::new(models), ttl))
 }
@@ -416,11 +426,9 @@ fn project(
         .iter()
         .map(|(p, model)| upstreams.get(&p.name).and_then(|models| models.get(*model)))
         .collect();
-    let native = definitions
-        .first()
-        .copied()
-        .flatten()
-        .filter(|first| definitions.iter().all(|v| v.is_some_and(|v| v == *first)));
+    let native = definitions.first().copied().flatten().filter(|first| {
+        native(first) && definitions.iter().all(|v| v.is_some_and(|v| v == *first))
+    });
     let mut out = native.cloned().unwrap_or_else(|| generic(name));
     let mut contexts = Vec::new();
     let mut max_contexts = Vec::new();
@@ -440,14 +448,19 @@ fn project(
                     .or_else(|| d["context_window"].as_u64())
             }),
         ));
-        reasoning.push(pick(
+        let enabled = pick(
             spec.reasoning,
-            definition.map(|d| {
+            definition.and_then(|d| {
                 d["supported_reasoning_levels"]
                     .as_array()
-                    .is_some_and(|v| !v.is_empty())
+                    .map(|v| !v.is_empty())
             }),
-        ));
+        );
+        reasoning.push(if enabled == Some(false) {
+            None
+        } else {
+            *definition
+        });
         images.push(pick(
             spec.image_input,
             definition
@@ -472,10 +485,13 @@ fn project(
         object.remove("context_window");
         object.remove("max_context_window");
     }
-    if reasoning.contains(&Some(false)) {
-        out["supported_reasoning_levels"] = json!([]);
-        out["default_reasoning_level"] = Value::Null;
-    }
+    let requires_translation = candidates.iter().any(|(provider, _)| {
+        !matches!(
+            provider.effective_protocol(),
+            Some(tw_config::Protocol::OpenaiResponses | tw_config::Protocol::Chatgpt)
+        )
+    });
+    metadata::apply_reasoning(&mut out, &reasoning, requires_translation);
     if !images.is_empty() && images.iter().all(|v| *v == Some(true)) {
         out["input_modalities"] = json!(["text", "image"]);
     } else {
