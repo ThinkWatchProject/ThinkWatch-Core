@@ -368,8 +368,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Is("[]"),
                     t(
-                        "Additional interface names or pinned IP addresses, sharing the gateway port and source allowlist. Loopback stays available. An offline interface does not remove other available listeners. Omit or clear this list when selecting loopback only.",
-                        "额外监听的网卡名或固定 IP，与网关共用端口和来源白名单。保留本机回环；某张网卡离线不影响其余可用监听。仅本机监听时应清空此列表。",
+                        "Additional interface names or pinned IP addresses, sharing the gateway port and source allowlist. Loopback stays available. A loopback primary bind disables all additional listeners. An offline interface does not remove other available listeners. Omit or clear this list when selecting loopback only.",
+                        "额外监听的网卡名或固定 IP，与网关共用端口和来源白名单。保留本机回环；主绑定设为回环时停用所有额外监听。某张网卡离线不影响其余可用监听。仅本机监听时应清空此列表。",
                     ),
                 ),
                 row(

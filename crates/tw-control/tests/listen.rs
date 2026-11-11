@@ -334,7 +334,7 @@ async fn additional_listeners_are_saved_and_explicit_loopback_removes_them() {
         "PUT",
         "/listen",
         serde_json::json!({
-            "bind": "127.0.0.1", "additional": ["::1"], "port": port, "allow_from": []
+            "bind": "all", "additional": ["::1"], "port": port, "allow_from": []
         }),
     )
     .await;

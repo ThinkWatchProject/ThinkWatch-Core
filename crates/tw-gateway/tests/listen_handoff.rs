@@ -193,6 +193,7 @@ async fn a_released_listener_is_not_kept_alive_by_the_handoff() {
 #[tokio::test]
 async fn secondary_listeners_share_identity_and_are_included_in_handover() {
     let mut c = cfg(0);
+    c.listen.gateway.bind = tw_config::Bind::All;
     c.listen.gateway.additional = vec![tw_config::Bind::Addr("::1".parse().unwrap())];
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     let hand = Handoff::default();
@@ -208,15 +209,20 @@ async fn secondary_listeners_share_identity_and_are_included_in_handover() {
     assert_eq!(addrs.len(), 2);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for addr in &addrs {
+        let endpoint = if addr.ip().is_unspecified() {
+            SocketAddr::new("127.0.0.1".parse().unwrap(), addr.port())
+        } else {
+            *addr
+        };
         let r = client
-            .get(format!("http://{addr}/healthz"))
+            .get(format!("http://{endpoint}/healthz"))
             .send()
             .await
             .unwrap();
         assert_eq!(r.headers()["x-thinkwatch-gateway"], tw_gateway::probe_id());
         assert_eq!(r.text().await.unwrap(), "ok");
         let denied = client
-            .get(format!("http://{addr}/v1/models"))
+            .get(format!("http://{endpoint}/v1/models"))
             .send()
             .await
             .unwrap();

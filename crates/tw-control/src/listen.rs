@@ -44,7 +44,7 @@ async fn save(
                 ),
             )
         })?;
-    let additional: Vec<tw_config::Bind> = req
+    let mut additional: Vec<tw_config::Bind> = req
         .additional
         .iter()
         .map(|s| {
@@ -57,6 +57,9 @@ async fn save(
             })
         })
         .collect::<Result<_, _>>()?;
+    if !bind.is_exposed() {
+        additional.clear();
+    }
     if req.port == 0 {
         return Err(fail(
             StatusCode::BAD_REQUEST,

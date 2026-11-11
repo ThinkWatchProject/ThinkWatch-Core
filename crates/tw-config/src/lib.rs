@@ -380,6 +380,7 @@ impl ControlListen {
 #[serde(deny_unknown_fields)]
 pub struct GatewayListen {
     /// Additional interfaces or pinned addresses, sharing the port and source allowlist.
+    /// Active only when the primary bind is exposed: selecting loopback is authoritative.
     /// Loopback remains available; wildcard listeners subsume addresses of the same family.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional: Vec<Bind>,
@@ -432,6 +433,7 @@ impl GatewayListen {
         let ips = self
             .additional
             .iter()
+            .filter(|_| self.bind.is_exposed())
             .chain(std::iter::once(&self.bind))
             .map(Bind::resolve)
             .collect::<Result<Vec<_>, _>>()?;
@@ -444,6 +446,7 @@ impl GatewayListen {
         let ips = self
             .additional
             .iter()
+            .filter(|_| self.bind.is_exposed())
             .chain(std::iter::once(&self.bind))
             .filter_map(|b| match b.resolve() {
                 Ok(ip) => Some(ip),
@@ -480,7 +483,7 @@ impl GatewayListen {
     }
 
     pub fn is_exposed(&self) -> bool {
-        self.bind.is_exposed() || self.additional.iter().any(Bind::is_exposed)
+        self.bind.is_exposed()
     }
 }
 
@@ -1447,7 +1450,8 @@ mod tests {
         l.additional.push(Bind::All);
         assert_eq!(l.addrs().unwrap(), vec!["0.0.0.0:8788".parse().unwrap()]);
         l.bind = Bind::Loopback;
-        assert!(l.is_exposed());
+        assert!(!l.is_exposed());
+        assert_eq!(l.addrs().unwrap(), vec!["127.0.0.1:8788".parse().unwrap()]);
         l.additional.clear();
         assert!(!l.is_exposed());
     }
@@ -1455,12 +1459,19 @@ mod tests {
     #[test]
     fn an_offline_secondary_interface_does_not_remove_other_listeners() {
         let l = GatewayListen {
+            bind: Bind::Addr("192.168.1.5".parse().unwrap()),
             additional: vec![Bind::Nic("missing-test-interface".into())],
             ..Default::default()
         };
         assert!(l.addrs().is_err());
         let (addrs, error) = l.available_addrs();
-        assert_eq!(addrs, vec!["127.0.0.1:8788".parse().unwrap()]);
+        assert_eq!(
+            addrs,
+            vec![
+                "127.0.0.1:8788".parse().unwrap(),
+                "192.168.1.5:8788".parse().unwrap()
+            ]
+        );
         assert!(error.is_some());
     }
 

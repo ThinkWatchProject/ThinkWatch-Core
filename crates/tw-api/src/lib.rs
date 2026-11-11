@@ -1144,6 +1144,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 速度，请求记录里照记。新码：`gw.upstream.too_slow`、`config.min_speed_range`（`upstream`、
 /// `field`、`value`、`min`、`max`）；一键修复修得了它：速度越界删掉 `min_speed`，判定时长越界改回
 /// 20。请求库 SCHEMA 不变
+///
+/// **59 起网关可额外监听多张网卡或固定 IP**：[`ListenSave`]、[`ListenView`] 增加
+/// `additional`。主绑定设为回环时停用全部额外监听；来源白名单和密钥校验共用。
+/// [`Status`] 增加 `gateway_addrs`（全部实际绑定的套接字）和 `gateway_probe`（公开的进程标识，
+/// `/healthz` 的 `x-thinkwatch-gateway` 响应头原样返回），用于从其他网络命名空间确认连到的
+/// 是当前网关。请求库 SCHEMA 不变。
 pub const CONTROL_API_VERSION: u32 = 59;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
