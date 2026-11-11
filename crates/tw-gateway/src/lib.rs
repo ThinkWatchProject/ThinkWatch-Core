@@ -143,3 +143,9 @@ pub fn opaque_token(bytes: usize) -> String {
         out
     })
 }
+
+/// Public, process-scoped gateway identity for reachability checks. Not an authentication key.
+pub fn probe_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+}

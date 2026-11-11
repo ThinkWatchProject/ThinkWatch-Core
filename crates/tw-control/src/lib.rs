@@ -212,9 +212,10 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
     let listening = s.gateway.listening();
     let rl = s.remote.listening();
     let gateway_reachable = listening
-        .primary()
-        .map(remote::reachable)
-        .unwrap_or_default();
+        .addrs
+        .iter()
+        .flat_map(|a| remote::reachable(*a))
+        .collect();
     let rcfg = cfg.listen.control.remote.as_ref();
     let remote_control = tw_api::RemoteControlView {
         enabled: rcfg.is_some_and(|r| r.enabled),
@@ -224,6 +225,8 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
         reachable: rl.addr.map(remote::reachable).unwrap_or_default(),
     };
     Json(tw_api::Status {
+        gateway_addrs: listening.addrs.iter().map(ToString::to_string).collect(),
+        gateway_probe: tw_gateway::probe_id().to_string(),
         api_version: tw_api::CONTROL_API_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -434,6 +437,13 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             }
         },
         listen: tw_api::ListenView {
+            additional: cfg
+                .listen
+                .gateway
+                .additional
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             // **`Display` 不是 `Debug`。**`{:?}` 对 `Loopback` / `All`
             // 碰巧给出正确的小写词，对 `Addr(192.168.1.5)` 给的是
             // `addr(192.168.1.5)` —— 界面拿它去比对档位，永远不相等。
@@ -441,7 +451,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             port: cfg.listen.gateway.port,
             allow_from: cfg.listen.gateway.allow_from.clone(),
             default_allow_from: tw_config::default_allow_from(),
-            exposed: cfg.listen.gateway.bind.is_exposed(),
+            exposed: cfg.listen.gateway.is_exposed(),
         },
     })
 }
