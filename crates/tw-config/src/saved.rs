@@ -65,7 +65,13 @@ impl Config {
             );
         };
         add(&self.listen.gateway.bind);
-        for bind in &self.listen.gateway.additional {
+        for bind in self
+            .listen
+            .gateway
+            .additional
+            .iter()
+            .filter(|_| self.listen.gateway.is_exposed())
+        {
             add(bind);
         }
         if let Some(r) = &self.listen.control.remote
@@ -268,6 +274,17 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn inactive_secondary_listeners_are_not_credential_destinations() {
+        let mut cfg = Config::default();
+        cfg.listen.gateway.additional = vec![Bind::Addr("172.23.80.1".parse().unwrap())];
+        assert!(cfg.own_hosts().is_empty());
+        cfg.listen.gateway.bind = Bind::Addr("192.168.1.5".parse().unwrap());
+        assert_eq!(cfg.own_hosts(), ["172.23.80.1", "192.168.1.5"]);
+        cfg.listen.gateway.bind = Bind::Addr("127.0.0.1".parse().unwrap());
+        assert!(cfg.own_hosts().is_empty());
     }
 
     /// IPv6 字面量的上游地址：主机是 `fd00::1`，和工具调用审查取出的一样（曾经取成 `[fd00`）
