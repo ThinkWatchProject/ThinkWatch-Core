@@ -169,7 +169,12 @@ impl Provider {
             reported_over_table(&mut out.reasoning_effort, reported.reasoning_effort.clone());
         }
         // 禁止推理时不提供可调档位；空档位本身不表示模型不会推理。
-        if let Some(reasoning) = out.reasoning.filter(|s| !s.value) {
+        if let Some(reasoning) = out.reasoning.filter(|s| !s.value)
+            && out
+                .reasoning_effort
+                .as_ref()
+                .is_none_or(|effort| !effort.value.supported_levels.is_empty())
+        {
             out.reasoning_effort = Some(Sourced {
                 value: ReasoningEffort::default(),
                 source: reasoning.source,
@@ -450,6 +455,16 @@ mod effort_tests {
         assert_eq!(
             resolved.reasoning_effort.unwrap().value,
             ReasoningEffort::default()
+        );
+        let reported = ReportedSpec {
+            reasoning: Some(false),
+            ..Default::default()
+        };
+        let resolved = provider.model_spec_with_metadata(&book, "private", Some(&reported));
+        assert_eq!(
+            resolved.reasoning_effort.unwrap().source,
+            SpecSource::Manual,
+            "an explicit empty manual profile retains its source even when another source also disables reasoning"
         );
     }
 
