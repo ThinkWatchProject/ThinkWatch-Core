@@ -760,18 +760,18 @@ region in `aws.region`; the model list is asked of that address too.
 
 #### `providers[].model_specs`
 
-A model's context window and output limit come from the price table. A relay's
-own models are often missing from it, and now and then it is wrong. Write the
-numbers here, for this upstream and by the exact id in its model list. A value
-written here takes precedence over the price table; one left out still comes
-from it. At least one of the two is written, and neither can be 0.
+Model discovery uses upstream-reported capabilities automatically, with the price table supplying
+known specifications that the upstream omits. Write overrides here for missing or incorrect values,
+scoped to this upstream and an exact model ID. Each entry must set at least one specification;
+context and output token counts must be positive.
 
-The same numbers are used everywhere: in `/v1/models` for every client format,
-for an alias this upstream serves, when the gateway judges whether a
-conversation still fits the model it is on, and as the output limit of a
-request converted to Anthropic that does not set one. When several upstreams
-offer the same model, `/v1/models` describes it by the first of them in
-`providers`.
+Manual values also apply when checking context capacity and supplying an omitted Anthropic output
+limit. For discovery, manual values take precedence over reported metadata, then the price table.
+Reasoning effort has no price-table fallback: use `reasoning_effort` to supply its levels and optional
+default. Nonempty levels imply reasoning support, an empty list explicitly declares no adjustable
+effort, and removing the override restores automatic discovery. Public effort choices are intersected
+across all routing candidates and limited to values the required protocol conversions can represent.
+See [Codex model discovery](codex-model-catalog.md#automatic-discovery-and-manual-overrides).
 
 <!-- generated: table providers[].model_specs.* -->
 <a id="cfg-providers-model_specs"></a>
@@ -781,8 +781,18 @@ offer the same model, `/v1/models` describes it by the first of them in
 | `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | — | Override this model's request-side reasoning-history format. Unset: use the upstream setting. This is independent of whether the model can reason. |
 | `context_window` | integer | — | Context window: the most tokens a request can take in. Unset: the price table's. |
 | `max_output_tokens` | integer | — | The most tokens an answer can have. Unset: the price table's. |
-| `reasoning` | bool | — | Whether the model reasons. The model list (`GET /v1/models`) carries it, so clients offer reasoning levels for it. Unset: the price table's; the list leaves it out when the price table does not say. |
+| `reasoning` | bool | — | Whether the model reasons. This boolean does not declare adjustable effort levels; use reasoning_effort for those. False conflicts with nonempty manual levels. Unset: use known metadata or the price table. |
+| `reasoning_effort` | object, [`providers[].model_specs.*.reasoning_effort`](#cfg-providers-model_specs-reasoning_effort) | — | Override the entire reasoning effort profile. Unset: automatic upstream metadata; an empty supported_levels list explicitly disables adjustable effort. Nonempty levels imply reasoning support. |
 | `image_input` | bool | — | Whether the model takes images as input. The model list carries it, as `input_modalities`. Unset: the price table's; the list leaves it out when the price table does not say. |
+<!-- /generated -->
+
+<!-- generated: table providers[].model_specs.*.reasoning_effort -->
+<a id="cfg-providers-model_specs-reasoning_effort"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `supported_levels` | list of strings | **required** | Supported levels: minimal, low, medium, high, xhigh, max, ultra. No duplicates. Empty explicitly means no adjustable effort; protocol conversion may further restrict these choices. |
+| `default_level` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `ultra` | — | Must be one of supported_levels. Unset: prefer medium in the final available set, otherwise its lowest level. The manual profile does not inherit the upstream default. |
 <!-- /generated -->
 
 ```yaml

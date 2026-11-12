@@ -27,6 +27,7 @@ impl From<SpecSource> for tw_api::SpecSource {
         match s {
             SpecSource::PriceTable => Self::PriceTable,
             SpecSource::Manual => Self::Manual,
+            SpecSource::Upstream => Self::Upstream,
         }
     }
 }

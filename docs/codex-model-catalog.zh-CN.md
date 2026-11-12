@@ -53,12 +53,44 @@ Codex `client_version`，使用该上游的凭据和代理，不转发入站网�
 [模型接口文档](https://api-docs.deepseek.com/api/list-models)已定义这些字段。档位列表转为
 Codex 的 `supported_reasoning_levels`，报告的默认值在列表内时保留。可选字段缺失或
 格式错误时不编造能力，也不按模型名查表或仅凭 `reasoning: true` 推导档位；中转站需要
-透传这些元数据才能使用。
+透传这些元数据即可自动获取；没有透传时可在模型规格中手动声明。
 
 别名继承实际路由目标报告的能力。推理档位独立于完整原生定义取交集，不会因为指令或
 工具不同而丢掉共有档位，默认值必须在交集内。手动 `model_specs.reasoning: false`
 移除档位选项。任一候选需要协议转换时，只保留 Core 能表达的档位；Responses 和
 ChatGPT 直通可以保留 `ultra` 等更新的原生档位。
+
+## 自动获取与手动覆盖
+
+默认读取上游实际报告的能力。后台模型清单保留同样的规格信息，供 Lite 和标准模型发现使用；
+Codex 的版本化目录优先使用对应客户端版本的元数据。没有报告的档位保持未知，
+不根据模型名称猜测，也不从价目表中的推理开关生成档位。
+
+上游缺少模型列表时，先在 `models` 中手动添加真实模型 ID；缺少或错误的推理档位则按
+该上游、该模型填写覆盖值：
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com/v1
+    protocol: openai-chat
+    models: [private-model]
+    model_specs:
+      private-model:
+        reasoning_effort:
+          supported_levels: [low, high, max]
+          default_level: high
+```
+
+`reasoning_effort` 整组替换上游档位，非空列表自动表示支持推理，不必另写 `reasoning: true`。
+不写这一项是自动；`supported_levels: []` 明确表示不可调。`default_level` 可省略，
+Core 在最终可用集合中优先选择 `medium`，否则选择最低档；手写默认值必须属于所列档位。
+档位不能重复，`reasoning: false` 不能与非空手动档位并存。恢复自动时移除整项覆盖，
+上游元数据和其默认值重新生效。别名交集与协议转换限制同样作用于手动档位。
+
+控制 API 的模型行分别提供上游报告、手动原值、保存后的生效结果及协议过滤掉的档位。
+`PUT /provider-model-spec` 的 `reasoning_effort` 以 `mode: keep`（省略时亦如此）、
+`mode: auto`、`mode: set` 加 `value` 区分保留、清除和整组替换；编辑其他规格不会误删档位。
 
 ## 缓存和限制
 

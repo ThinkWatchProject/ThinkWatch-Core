@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
-use tw_config::{Provider, SpecSource};
+use tw_config::Provider;
 use tw_types::msg;
 
 use crate::error::GatewayError;
@@ -360,7 +360,15 @@ pub(crate) async fn list(
     let book = state.pricing.load();
     let models: Vec<_> = names(&rt.config, &catalog, allow.as_deref())
         .iter()
-        .map(|name| project(name, &candidates(&rt, &catalog, name), &book, &upstreams))
+        .map(|name| {
+            project(
+                name,
+                &candidates(&rt, &catalog, name),
+                &book,
+                &upstreams,
+                &state.models,
+            )
+        })
         .collect();
     let body = serde_json::to_vec(&json!({"models":models})).expect("catalog is JSON");
     if body.len() > MAX_BYTES {
@@ -409,18 +417,12 @@ fn generic(name: &str) -> Value {
     })
 }
 
-fn pick<T: Copy>(spec: Option<tw_config::Sourced<T>>, native: Option<T>) -> Option<T> {
-    match spec {
-        Some(s) if s.source == SpecSource::Manual => Some(s.value),
-        _ => native.or(spec.map(|s| s.value)),
-    }
-}
-
 fn project(
     name: &str,
     candidates: &[(&Provider, &str)],
     book: &tw_pricing::PriceBook,
     upstreams: &HashMap<String, Models>,
+    directory: &crate::models::Directory,
 ) -> Value {
     let definitions: Vec<_> = candidates
         .iter()
@@ -435,38 +437,30 @@ fn project(
     let mut reasoning = Vec::new();
     let mut images = Vec::new();
     for ((p, model), definition) in candidates.iter().zip(&definitions) {
-        let spec = p.model_spec(book, model);
-        contexts.push(pick(
-            spec.context_window,
-            definition.and_then(|d| d["context_window"].as_u64()),
-        ));
-        max_contexts.push(pick(
-            spec.context_window,
-            definition.and_then(|d| {
-                d["max_context_window"]
-                    .as_u64()
-                    .or_else(|| d["context_window"].as_u64())
-            }),
-        ));
-        let enabled = pick(
-            spec.reasoning,
-            definition.and_then(|d| {
-                d["supported_reasoning_levels"]
-                    .as_array()
-                    .map(|v| !v.is_empty())
-            }),
+        let reported = definition
+            .map(crate::model_capabilities::reported)
+            .or_else(|| directory.capabilities(&p.name, model));
+        let spec = p.model_spec_with_metadata(book, model, reported.as_ref());
+        contexts.push(spec.context_window());
+        max_contexts.push(
+            if spec
+                .context_window
+                .as_ref()
+                .is_some_and(|s| s.source == tw_config::SpecSource::Manual)
+            {
+                spec.context_window()
+            } else {
+                definition
+                    .and_then(|d| d["max_context_window"].as_u64())
+                    .or(spec.context_window())
+            },
         );
-        reasoning.push(if enabled == Some(false) {
-            None
-        } else {
-            *definition
-        });
-        images.push(pick(
-            spec.image_input,
-            definition
-                .and_then(|d| d["input_modalities"].as_array())
-                .map(|v| v.iter().any(|v| v == "image")),
-        ));
+        reasoning.push(
+            spec.reasoning_effort
+                .as_ref()
+                .map(|effort| effort.value.clone()),
+        );
+        images.push(spec.image_input());
     }
     let context = (!contexts.is_empty() && contexts.iter().all(Option::is_some))
         .then(|| contexts.iter().flatten().copied().min())
@@ -486,12 +480,14 @@ fn project(
         object.remove("max_context_window");
     }
     let requires_translation = candidates.iter().any(|(provider, _)| {
-        !matches!(
-            provider.effective_protocol(),
-            Some(tw_config::Protocol::OpenaiResponses | tw_config::Protocol::Chatgpt)
-        )
+        crate::model_capabilities::requires_translation(provider.effective_protocol())
     });
-    metadata::apply_reasoning(&mut out, &reasoning, requires_translation);
+    metadata::apply_reasoning(
+        &mut out,
+        &reasoning,
+        requires_translation,
+        definitions.first().copied().flatten(),
+    );
     if !images.is_empty() && images.iter().all(|v| *v == Some(true)) {
         out["input_modalities"] = json!(["text", "image"]);
     } else {

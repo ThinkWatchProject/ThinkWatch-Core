@@ -518,9 +518,9 @@ providers:
 
 #### `providers[].model_specs`
 
-模型的上下文窗口和输出上限取自价目表。中转站自有的模型常常不在价目表里，价目表偶尔也会写错。这时在这里按这家上游、按它模型清单里的 ID（完全匹配）手写。写了的一项优先于价目表，没写的一项仍取价目表。两项至少写一项，都不能是 0。
+模型发现默认读取上游报告的能力，上游缺少的已知规格由价目表补充。在这里按上游、按真实模型 ID（完全匹配）覆盖缺失或错误的值。每项至少填写一个规格；上下文窗口和输出上限必须是正整数。
 
-各处用的是同一个数：各种客户端格式的 `/v1/models`、由这家上游服务的别名、网关判断一段对话是否还装得下当前模型，以及请求转换为 Anthropic 格式且没有写输出上限时补上的值。同一个模型由几家上游提供时，`/v1/models` 按 `providers` 中排在最前的那一家给出。
+手动值也用于上下文容量判断，以及补充转换到 Anthropic 请求时缺少的输出上限。模型发现按手动值、上游报告、价目表的顺序取值。推理档位没有价目表回退：在 `reasoning_effort` 中填写支持的档位和可选默认值。非空档位自动表示支持推理，空列表明确表示不可调，移除覆盖恢复自动获取。对外提供的档位取所有路由候选的交集，并受实际协议转换能力限制。参见 [Codex 模型发现](codex-model-catalog.zh-CN.md#自动获取与手动覆盖)。
 
 <!-- generated: table providers[].model_specs.* -->
 <a id="cfg-providers-model_specs"></a>
@@ -530,8 +530,18 @@ providers:
 | `reasoning_history` | `auto` \| `reasoning-content` \| `reasoning` \| `content-blocks` \| `disabled` | — | 覆盖这个模型的请求侧思考历史格式。不写时遵从上游设置；与模型会不会推理是两项独立能力。 |
 | `context_window` | 整数 | — | 上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。 |
 | `max_output_tokens` | 整数 | — | 一次回答最多输出多少 token。不写：取价目表的。 |
-| `reasoning` | 布尔 | — | 这个模型会不会推理。模型列表（`GET /v1/models`）带着它，客户端据此给出推理档位。不写：取价目表的；价目表也没写时，列表里不给这一项。 |
+| `reasoning` | 布尔 | — | 这个模型会不会推理。此开关不声明可调档位，档位由 reasoning_effort 指定。false 不能与非空手动档位并存。不写：使用已知元数据或价目表。 |
+| `reasoning_effort` | 对象，见 [`providers[].model_specs.*.reasoning_effort`](#cfg-providers-model_specs-reasoning_effort) | — | 整组覆盖推理档位。不写时自动使用上游元数据；supported_levels 空列表明确表示不可调。非空档位自动表示支持推理。 |
 | `image_input` | 布尔 | — | 这个模型收不收图。模型列表里以 `input_modalities` 给出。不写：取价目表的；价目表也没写时，列表里不给这一项。 |
+<!-- /generated -->
+
+<!-- generated: table providers[].model_specs.*.reasoning_effort -->
+<a id="cfg-providers-model_specs-reasoning_effort"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `supported_levels` | 字符串列表 | **必填** | 支持的档位：minimal、low、medium、high、xhigh、max、ultra，不可重复。空列表明确表示不可调；协议转换可能进一步限制可用档位。 |
+| `default_level` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `ultra` | — | 必须属于 supported_levels。不写时在最终可用集合中优先 medium，否则最低档；手动档位不混用上游默认值。 |
 <!-- /generated -->
 
 ```yaml

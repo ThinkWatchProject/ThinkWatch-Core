@@ -134,6 +134,16 @@ pub enum ValidationError {
     ModelSpecWildcard { upstream: String, model: String },
     #[error("{}", self.msg())]
     ModelSpecEmpty { upstream: String, model: String },
+    #[error("{}", self.msg())]
+    ModelSpecEffortDuplicate {
+        upstream: String,
+        model: String,
+        level: String,
+    },
+    #[error("{}", self.msg())]
+    ModelSpecEffortDefault { upstream: String, model: String },
+    #[error("{}", self.msg())]
+    ModelSpecEffortDisabled { upstream: String, model: String },
     /// `field` 是字段名本身（`context_window`、`max_output_tokens`），不翻
     #[error("{}", self.msg())]
     ModelSpecZero {
@@ -484,8 +494,23 @@ impl ValidationError {
             ),
             ModelSpecEmpty { upstream, model } => msg!(
                 "config.model_spec_nothing_set", upstream = upstream, model = model =>
-                "the model spec `{model}` of upstream `{upstream}` sets none of context_window, \
-                 max_output_tokens, reasoning and image_input. Set at least one, or remove it"
+                "the model spec `{model}` of upstream `{upstream}` sets no specifications. Set at least one, or remove it"
+            ),
+            ModelSpecEffortDuplicate {
+                upstream,
+                model,
+                level,
+            } => msg!(
+                "config.model_spec_effort_duplicate", upstream = upstream, model = model, level = level =>
+                "the model spec `{model}` of upstream `{upstream}` repeats reasoning level `{level}`"
+            ),
+            ModelSpecEffortDefault { upstream, model } => msg!(
+                "config.model_spec_effort_default", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` has a default reasoning level outside supported_levels"
+            ),
+            ModelSpecEffortDisabled { upstream, model } => msg!(
+                "config.model_spec_effort_disabled", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` disables reasoning but declares nonempty reasoning levels"
             ),
             ModelSpecZero {
                 upstream,
@@ -1234,6 +1259,29 @@ pub fn check_model_spec(
     if spec.is_empty() {
         let (upstream, model) = named();
         return Err(ValidationError::ModelSpecEmpty { upstream, model });
+    }
+    if let Some(effort) = &spec.reasoning_effort {
+        for (index, level) in effort.supported_levels.iter().enumerate() {
+            if effort.supported_levels[..index].contains(level) {
+                let (upstream, model) = named();
+                return Err(ValidationError::ModelSpecEffortDuplicate {
+                    upstream,
+                    model,
+                    level: level.to_string(),
+                });
+            }
+        }
+        if effort
+            .default_level
+            .is_some_and(|level| !effort.supported_levels.contains(&level))
+        {
+            let (upstream, model) = named();
+            return Err(ValidationError::ModelSpecEffortDefault { upstream, model });
+        }
+        if spec.reasoning == Some(false) && !effort.supported_levels.is_empty() {
+            let (upstream, model) = named();
+            return Err(ValidationError::ModelSpecEffortDisabled { upstream, model });
+        }
     }
     // 0 不是「不知道」：上下文窗口是 0 的模型什么都装不下，输出上限是 0 的什么都答不出
     for (field, v) in [

@@ -152,8 +152,8 @@ fn chatgpt_login(cfg: &tw_config::Config, name: &str, token_endpoint: &str) -> O
     (ours && !shared).then(|| o.refresh.clone())
 }
 
-/// 手写一家上游的一个模型的上下文窗口、输出上限、会不会推理、收不收图；四项都空就删掉
-/// 那一项，回到价目表。
+/// 编辑一家上游的模型规格。推理档位区分保留、设置和恢复自动，高级历史字段保持原值。
+/// 所有字段都空才删除这一项。
 ///
 /// **只动这一家 `model_specs` 里的这一项**（[`edit::set_model_spec`]），不走编辑上游那条
 /// 路：那条路按读进来的结构把整项写回去，用户写成和默认值一样的字段会被顺手删掉。
@@ -177,14 +177,20 @@ async fn set_model_spec(
             if !cfg.providers.iter().any(|p| p.name == req.provider) {
                 return Err(not_found("upstream", &req.provider));
             }
-            // The UI edits the four public specifications, not the advanced history override.
-            spec.reasoning_history = cfg
+            let previous = cfg
                 .providers
                 .iter()
                 .find(|p| p.name == req.provider)
-                .and_then(|p| p.model_specs.get(model))
-                .and_then(|s| s.reasoning_history);
-            let spec = (!spec.is_empty()).then_some(spec);
+                .and_then(|p| p.model_specs.get(model));
+            spec.reasoning_history = previous.and_then(|s| s.reasoning_history);
+            spec.reasoning_effort = match &req.reasoning_effort {
+                tw_api::ReasoningEffortChange::Keep => {
+                    previous.and_then(|s| s.reasoning_effort.clone())
+                }
+                tw_api::ReasoningEffortChange::Auto => None,
+                tw_api::ReasoningEffortChange::Set { value } => Some(value.clone()),
+            };
+            let spec = (!spec.is_empty()).then_some(spec.clone());
             tw_config::check_model_spec(&req.provider, model, spec.as_ref())
                 .map_err(|e| invalid(e.msg()))?;
             Ok(edit::set_model_spec(
@@ -431,7 +437,19 @@ fn models_view(
             .map(|id| {
                 let r = book.resolve_for(&p.name, &id);
                 // 规格和 `/v1/models` 给客户端的是同一个查法
-                let spec = p.model_spec(&book, &id);
+                let reported = listing.capabilities.get(&id);
+                let spec = p.model_spec_with_metadata(&book, &id, reported);
+                let (effort, filtered) = spec
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|s| {
+                        tw_gateway::model_capabilities::usable_effort(
+                            &s.value,
+                            p.effective_protocol(),
+                        )
+                    })
+                    .map(|(e, f)| (Some(e), f))
+                    .unwrap_or_default();
                 tw_api::ModelRow {
                     enabled: p.uses_model(&id),
                     context_window: spec.context_window(),
@@ -440,6 +458,18 @@ fn models_view(
                     max_output_tokens_source: spec.max_output_tokens.map(|s| s.source.into()),
                     reasoning: spec.reasoning(),
                     reasoning_source: spec.reasoning.map(|s| s.source.into()),
+                    manual_reasoning: p.model_specs.get(&id).and_then(|s| s.reasoning),
+                    reasoning_effort: effort,
+                    reasoning_effort_source: spec
+                        .reasoning_effort
+                        .as_ref()
+                        .map(|s| s.source.into()),
+                    reported_reasoning_effort: reported.and_then(|s| s.reasoning_effort.clone()),
+                    manual_reasoning_effort: p
+                        .model_specs
+                        .get(&id)
+                        .and_then(|s| s.reasoning_effort.clone()),
+                    reasoning_effort_filtered_levels: filtered,
                     image_input: spec.image_input(),
                     image_input_source: spec.image_input.map(|s| s.source.into()),
                     price: r.as_ref().map(|r| {

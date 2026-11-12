@@ -44,6 +44,7 @@ pub mod lenient;
 pub mod limits;
 pub mod listen;
 pub mod live;
+pub mod model_capabilities;
 pub mod models;
 pub mod oauth;
 pub mod outbound;

@@ -791,3 +791,198 @@ async fn alias_discovery_policy_reloads_over_cached_metadata_and_is_key_scoped()
     state.reload(cfg).unwrap();
     assert_eq!(slugs(&catalog(gw).await), ["raw"]);
 }
+
+fn manual_effort(levels: &[&str], default: Option<&str>) -> ModelSpec {
+    ModelSpec {
+        reasoning_effort: Some(tw_config::ReasoningEffort {
+            supported_levels: levels
+                .iter()
+                .map(|v| tw_config::ReasoningLevel::from_slug(v).unwrap())
+                .collect(),
+            default_level: default.map(|v| tw_config::ReasoningLevel::from_slug(v).unwrap()),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn manual_effort_works_without_model_lists_and_reloads_before_conditional_reads() {
+    let up = Upstream::new(json!({"error":"no model list"}));
+    let mut cfg = config(vec![provider(
+        "relay",
+        up.serve().await,
+        &["private-model"],
+    )]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: private-model").unwrap();
+    cfg.providers[0].model_specs.insert(
+        "private-model".into(),
+        manual_effort(&["low", "high", "max"], Some("high")),
+    );
+    let (state, gw) = serve(cfg.clone()).await;
+    let first = request(gw).send().await.unwrap();
+    let etag = first.headers()["etag"].clone();
+    for model in first.json::<Value>().await.unwrap()["models"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(efforts(model), ["low", "high", "max"]);
+        assert_eq!(model["default_reasoning_level"], "high");
+    }
+    cfg.providers[0].model_specs.clear();
+    state.reload(cfg).unwrap();
+    let response = request(gw)
+        .header("if-none-match", etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    for model in response.json::<Value>().await.unwrap()["models"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(efforts(model).is_empty());
+        assert!(model["default_reasoning_level"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn manual_profiles_override_upstream_atomically_and_reset_to_discovery() {
+    let up =
+        Upstream::new(json!({"data":[reported_model("private", &["low","high","max"], "max")]}));
+    let mut cfg = config(vec![provider("relay", up.serve().await, &["private"])]);
+    let (state, gw) = serve(cfg.clone()).await;
+    assert_eq!(
+        efforts(&catalog(gw).await["models"][0]),
+        ["low", "high", "max"]
+    );
+    cfg.providers[0]
+        .model_specs
+        .insert("private".into(), manual_effort(&["medium", "high"], None));
+    state.reload(cfg.clone()).unwrap();
+    let manual = catalog(gw).await;
+    assert_eq!(efforts(&manual["models"][0]), ["medium", "high"]);
+    assert_eq!(manual["models"][0]["default_reasoning_level"], "medium");
+    cfg.providers[0]
+        .model_specs
+        .insert("private".into(), manual_effort(&[], None));
+    state.reload(cfg.clone()).unwrap();
+    assert!(efforts(&catalog(gw).await["models"][0]).is_empty());
+    cfg.providers[0].model_specs.clear();
+    state.reload(cfg).unwrap();
+    let automatic = catalog(gw).await;
+    assert_eq!(efforts(&automatic["models"][0]), ["low", "high", "max"]);
+    assert_eq!(automatic["models"][0]["default_reasoning_level"], "max");
+    assert_eq!(
+        up.requests.lock().unwrap().len(),
+        1,
+        "only metadata is cached"
+    );
+}
+
+#[tokio::test]
+async fn manual_candidates_intersect_and_conversion_filters_the_final_default() {
+    let up = Upstream::new(json!({"data":[]}));
+    let addr = up.serve().await;
+    let mut cfg = config(vec![
+        provider("first", addr, &["one"]),
+        provider("second", addr, &["two"]),
+    ]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: [one, two]").unwrap();
+    cfg.providers[0].model_specs.insert(
+        "one".into(),
+        manual_effort(&["low", "medium", "high", "ultra"], Some("ultra")),
+    );
+    let (state, gw) = serve(cfg.clone()).await;
+    assert!(
+        efforts(&catalog(gw).await["models"][0]).is_empty(),
+        "an unknown candidate cannot promise shared choices"
+    );
+    cfg.providers[1].model_specs.insert(
+        "two".into(),
+        manual_effort(&["medium", "high", "ultra"], Some("high")),
+    );
+    cfg.providers[1].protocol = Some(Protocol::OpenaiChat);
+    state.reload(cfg).unwrap();
+    let body = catalog(gw).await;
+    let alias = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "coding")
+        .unwrap();
+    assert_eq!(efforts(alias), ["medium", "high"]);
+    assert_eq!(alias["default_reasoning_level"], "medium");
+}
+
+#[tokio::test]
+async fn background_metadata_is_used_by_both_normal_and_codex_discovery() {
+    let up = Upstream::new(json!({"data":[reported_model("private", &["low","high"], "high")]}));
+    let addr = up.serve().await;
+    let mut p = provider("relay", addr, &[]);
+    // This protocol does not trigger an extra Codex metadata request.
+    p.protocol = Some(Protocol::Anthropic);
+    let (state, gw) = serve(config(vec![p])).await;
+    tw_gateway::models::refresh_one(&state, "relay")
+        .await
+        .unwrap();
+    let codex = catalog(gw).await;
+    assert_eq!(efforts(&codex["models"][0]), ["low", "high"]);
+    let normal: Value = http()
+        .get(format!("http://{gw}/v1/models"))
+        .bearer_auth("gateway-test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        normal["data"][0]["effort"],
+        json!({"supported_levels":["low","high"],"default_level":"high"})
+    );
+    let single: Value = http()
+        .get(format!("http://{gw}/v1/models/private"))
+        .bearer_auth("gateway-test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(single, normal["data"][0]);
+    assert_eq!(up.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn manually_advertised_levels_reach_the_real_upstream_model() {
+    let up = Upstream::new(json!({"data":[]}));
+    let mut p = provider("relay", up.serve().await, &["private"]);
+    p.protocol = Some(Protocol::OpenaiChat);
+    p.model_specs.insert(
+        "private".into(),
+        manual_effort(&["low", "high", "max"], Some("high")),
+    );
+    let mut cfg = config(vec![p]);
+    cfg.aliases = serde_yaml_ng::from_str("coding: private").unwrap();
+    let (_, gw) = serve(cfg).await;
+    let body = catalog(gw).await;
+    let alias = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "coding")
+        .unwrap();
+    for effort in efforts(alias) {
+        let response = http()
+            .post(format!("http://{gw}/v1/responses"))
+            .bearer_auth("gateway-test-key")
+            .json(&json!({"model":"coding","input":"Hello","reasoning":{"effort":effort}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        let sent = up.forwarded.lock().unwrap().last().unwrap().clone();
+        assert_eq!(sent["model"], "private");
+        assert_eq!(sent["reasoning_effort"], effort);
+    }
+}
