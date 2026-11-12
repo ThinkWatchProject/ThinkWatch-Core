@@ -1,4 +1,4 @@
-//! Negotiate an upstream's response mode only after an explicit rejection.
+//! Try an alternative response mode after an eligible request rejection.
 //! The client mode stays on the conversion session; only the outbound request
 //! changes. An accepted alternative is remembered locally until reload or expiry.
 
@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use serde_json::Value;
 use tw_dialect::ir::Dialect;
 
-const TTL_MS: u64 = 24 * 60 * 60 * 1000;
+// Fixed expiry: successful cached uses do not postpone retrying the default.
+const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -249,88 +250,144 @@ pub fn rewrite(
     }
 }
 
-/// Only a top-level API error describing the actual rejected mode is evidence.
-/// Never infer capabilities from rate limits, answer text, or stream_options.
-pub fn refusal(status: u16, body: &[u8], sent_stream: bool) -> bool {
-    if !matches!(status, 400 | 422 | 501) || body.len() > 64 * 1024 {
+/// A bounded experiment, not a claim that the requested mode is unsupported.
+/// Known repairs run first. Reject non-mode parameter errors and recognizable
+/// account, capacity or timeout errors, even when an upstream mislabels them.
+pub fn can_probe(
+    status: u16,
+    headers: &http::HeaderMap,
+    body: &[u8],
+    verdict: crate::failure::Verdict,
+) -> bool {
+    use crate::failure::{Cause, Verdict};
+    if !matches!(status, 400 | 422 | 501)
+        || body.len() > crate::failure::BODY_PEEK
+        || crate::cache_marks::refusal(body)
+        || !matches!(verdict, Verdict::ClientError)
+            && !(status == 501 && verdict == Verdict::Failed(Cause::Unexplained))
+        || headers.contains_key("retry-after")
+        || headers.contains_key("retry-after-ms")
+        || headers.get("x-should-retry").is_some_and(|v| v == "true")
+    {
         return false;
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
-    let e = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
-    if let Some(param) = e.get("param").and_then(Value::as_str)
+    let error = match v.get("error") {
+        Some(e) if e.is_object() || e.is_string() => e,
+        None if ["message", "detail", "code", "type", "status"]
+            .iter()
+            .any(|name| v.get(name).is_some_and(Value::is_string)) =>
+        {
+            &v
+        }
+        _ => return false,
+    };
+    if let Some(param) = error.get("param").and_then(Value::as_str)
+        && !param.is_empty()
         && param != "stream"
     {
         return false;
     }
-    let message = e.get("message").and_then(Value::as_str).unwrap_or_default();
-    let text = message.to_ascii_lowercase();
-    if text.contains("rate limit") || text.contains("quota") || text.contains("overload") {
+    if error
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(names_other_parameter)
+    {
         return false;
     }
-    let code = e.get("code").and_then(Value::as_str).unwrap_or_default();
-    let codes: &[&str] = if sent_stream {
-        &[
-            "streaming_not_supported",
-            "stream_not_supported",
-            "unsupported_streaming",
-        ]
+    // Read error fields only: an echoed prompt or metadata must not affect
+    // eligibility. No list of positive English mode-refusal phrases is needed.
+    let text = if let Some(text) = error.as_str() {
+        text.to_lowercase()
     } else {
-        &[
-            "non_streaming_not_supported",
-            "stream_required",
-            "streaming_required",
-        ]
+        ["code", "type", "status", "message", "detail"]
+            .into_iter()
+            .filter_map(|name| error.get(name).and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\0")
+            .to_lowercase()
     };
-    if codes.contains(&code) {
-        return true;
+    ![
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too_many_requests",
+        "quota",
+        "resource_exhausted",
+        "overload",
+        "authentication",
+        "unauthenticated",
+        "unauthorized",
+        "permission",
+        "forbidden",
+        "api key",
+        "api_key",
+        "credential",
+        "access denied",
+        "access_denied",
+        "billing",
+        "payment",
+        "balance",
+        "credit",
+        "timeout",
+        "timed out",
+        "deadline_exceeded",
+        "content_policy",
+        "content_filter",
+        "safety",
+        "限流",
+        "频率",
+        "额度",
+        "余额",
+        "欠费",
+        "鉴权",
+        "认证",
+        "凭据",
+        "权限",
+        "超时",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+/// Some APIs put a field path in the message instead of `param`. Keep known
+/// request validation errors intact, including explicit reasoning budgets.
+fn names_other_parameter(message: &str) -> bool {
+    let text = message.trim().to_lowercase();
+    if text.contains("stream") {
+        return false;
     }
-    // Intentionally narrow phrases: "streaming" inside "non-streaming" must
-    // never be mistaken for a refusal in the opposite direction.
-    let text = text
-        .replace("non streaming", "non-streaming")
-        .replace("nonstreaming", "non-streaming");
-    let phrases: &[&str] = if sent_stream {
-        &[
-            "streaming is not supported",
-            "streaming not supported",
-            "streaming is unsupported",
-            "does not support streaming",
-            "doesn't support streaming",
-            "only supports non-streaming",
-            "only non-streaming requests are supported",
-            "only non-streaming responses are supported",
-            "only non-streaming is supported",
-            "supports only non-streaming",
-            "stream must be false",
-            "stream must be set to false",
-            "stream=false is required",
-        ]
-    } else {
-        &[
-            "non-streaming is not supported",
-            "non-streaming not supported",
-            "non-streaming is unsupported",
-            "does not support non-streaming",
-            "doesn't support non-streaming",
-            "only supports streaming",
-            "only streaming requests are supported",
-            "only streaming responses are supported",
-            "only streaming is supported",
-            "supports only streaming",
-            "stream must be true",
-            "stream must be set to true",
-            "stream=true is required",
-        ]
-    };
-    phrases.iter().any(|p| {
-        text.match_indices(p).any(|(at, _)| {
-            at == 0
-                || !text.as_bytes()[at - 1].is_ascii_alphanumeric()
-                    && !matches!(text.as_bytes()[at - 1], b'-' | b'_')
-        })
-    })
+    let field = text
+        .trim_start_matches(['`', '\'', '"'])
+        .split(|c: char| c.is_whitespace() || matches!(c, ':' | '`' | '\'' | '"'))
+        .next()
+        .unwrap_or_default();
+    let root = field.split(['.', '[', '/']).next().unwrap_or_default();
+    matches!(
+        root,
+        "messages"
+            | "input"
+            | "contents"
+            | "system"
+            | "instructions"
+            | "tools"
+            | "max_tokens"
+            | "max_output_tokens"
+            | "max_completion_tokens"
+            | "temperature"
+            | "top_p"
+            | "top_k"
+            | "stop"
+            | "stop_sequences"
+            | "thinking"
+            | "reasoning"
+            | "reasoning_effort"
+            | "output_config"
+            | "generationconfig"
+            | "inferenceconfig"
+    )
 }
 
 /// Evidence of a complete stream, used only while learning a new mode.
@@ -413,42 +470,81 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn only_explicit_refusals_for_the_sent_mode_trigger_a_switch() {
-        let error = |text| json!({"error":{"message":text}}).to_string();
-        for (stream, text) in [
-            (false, "This model only supports streaming."),
-            (false, "Non-streaming is not supported."),
-            (false, "stream must be set to true"),
-            (true, "This model does not support streaming."),
-            (true, "stream must be false"),
-            (true, "Only non-streaming requests are supported."),
+    fn probes_unknown_rejections_without_requiring_mode_error_phrases() {
+        let headers = http::HeaderMap::new();
+        for body in [
+            json!({"error":{"message":"Use the other response framing."}}),
+            json!({"error":{"message":"请换一种返回方式。"}}),
+            json!({"error":{"code":"vendor_1027"}}),
+            json!({"message":"Request rejected", "type":"invalid_request_error"}),
+            json!({"error":"Request rejected"}),
+            json!({"error":{"message":"Tools require streaming for this model"}}),
         ] {
-            assert!(refusal(400, error(text).as_bytes(), stream), "{text}");
-            assert!(!refusal(400, error(text).as_bytes(), !stream), "{text}");
-            for status in [200, 401, 403, 404, 429, 500, 503] {
-                assert!(!refusal(status, error(text).as_bytes(), stream));
+            for status in [400, 422, 501] {
+                let body = body.to_string();
+                let verdict = crate::failure::classify(status, &headers, body.as_bytes(), 0);
+                assert!(
+                    can_probe(status, &headers, body.as_bytes(), verdict),
+                    "{body}"
+                );
             }
         }
-        for text in [
-            "Rate limit exceeded",
-            "streaming failed",
-            "invalid stream_options",
-            "Quota exceeded; only streaming allowed",
-        ] {
-            for stream in [false, true] {
-                assert!(!refusal(400, error(text).as_bytes(), stream));
-            }
+        for status in [200, 401, 402, 403, 404, 408, 429, 500, 502, 503] {
+            assert!(!can_probe(
+                status,
+                &headers,
+                br#"{"error":{}}"#,
+                crate::failure::classify(status, &headers, b"{}", 0)
+            ));
         }
-        assert!(!refusal(
-            400,
-            br#"{"choices":[{"message":{"content":"only streaming"}}]}"#,
-            false
-        ));
-        assert!(!refusal(
-            400,
-            br#"{"error":{"param":"stream_options","message":"streaming not supported"}}"#,
-            true
-        ));
+        for body in [
+            json!({"error":{"message":"Rate limit exceeded"}}),
+            json!({"error":{"code":"rate_limit_exceeded", "message":"opaque"}}),
+            json!({"error":{"type":"authentication_error", "message":"opaque"}}),
+            json!({"error":{"status":"RESOURCE_EXHAUSTED", "message":"opaque"}}),
+            json!({"error":{"message":"Quota exceeded; only streaming allowed"}}),
+            json!({"error":{"message":"invalid api key"}}),
+            json!({"error":{"message":"Insufficient balance"}}),
+            json!({"error":{"message":"Model not found"}}),
+            json!({"error":{"message":"Request timed out"}}),
+            json!({"error":{"message":"请求频率过高"}}),
+            json!({"error":{"message":"messages.0.content: field required"}}),
+            json!({"error":{"message":"max_output_tokens is too large"}}),
+            json!({"error":{"message":"thinking.budget_tokens: budget too large"}}),
+            json!({"message":"cachePoint is not supported for this model"}),
+            json!({"error":{"param":"messages", "message":"invalid messages"}}),
+            json!({"error":{"param":"stream_options", "message":"not supported"}}),
+            json!({"choices":[{"message":{"content":"only streaming"}}]}),
+            json!({"error":null}),
+        ] {
+            let body = body.to_string();
+            let verdict = crate::failure::classify(400, &headers, body.as_bytes(), 0);
+            assert!(
+                !can_probe(400, &headers, body.as_bytes(), verdict),
+                "{body}"
+            );
+        }
+        for name in ["retry-after", "retry-after-ms", "x-should-retry"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::HeaderName::from_static(name), "true".parse().unwrap());
+            assert!(!can_probe(
+                400,
+                &headers,
+                br#"{"error":{}}"#,
+                crate::failure::Verdict::ClientError
+            ));
+        }
+        for body in [
+            b"not JSON".as_slice(),
+            &[b'x'; crate::failure::BODY_PEEK + 1],
+        ] {
+            assert!(!can_probe(
+                400,
+                &headers,
+                body,
+                crate::failure::Verdict::ClientError
+            ));
+        }
     }
 
     #[test]
@@ -481,6 +577,7 @@ mod tests {
             key,
             Key::of(&changed, "m", Dialect::Chat, "/v1/chat/completions", b"{}").unwrap()
         );
+        assert_eq!(cache.lookup(&key, TTL_MS), Some(true));
         assert_eq!(cache.lookup(&key, TTL_MS + 1), None);
         for i in 0..MAX + 1 {
             cache.accepted(

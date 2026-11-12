@@ -58,8 +58,40 @@ pub(super) struct Served<'a> {
     /// 内容、在开头报了限流以外的错，原样交了出去。成败的账等回程看到第一段内容才记（见
     /// `relay`）。没有内容就超时了记失败，和压着开头时一样
     pub(super) unconfirmed: bool,
+    /// This error's headers were already accounted before trying another mode.
+    pub(super) replayed_error: bool,
     /// Learn an alternative only after a complete, clean response.
     pub(super) stream_trial: Option<(crate::stream_mode::Key, bool)>,
+}
+
+/// Return the original error with its own response context. The probe's real
+/// outcome stays in the chain; the active slot follows the selected response.
+fn restore_mode_error<'a>(
+    mut original: Served<'a>,
+    slot: crate::slots::Slot,
+    chain: &mut [tw_api::AttemptView],
+) -> Served<'a> {
+    chain[original.attempt].outcome = tw_api::AttemptOutcome::Served;
+    original.slot = slot;
+    original.replayed_error = true;
+    original
+}
+
+/// A failed probe ends repair on this provider. An original server error still
+/// permits failover; keep it in case no later provider can serve the request.
+fn failed_mode_probe<'a>(
+    original: Served<'a>,
+    slot: crate::slots::Slot,
+    chain: &mut [tw_api::AttemptView],
+    last: bool,
+    fallback: &mut Option<Served<'a>>,
+) -> Option<Served<'a>> {
+    if original.upstream.status().is_server_error() && !last {
+        *fallback = Some(original);
+        None
+    } else {
+        Some(restore_mode_error(original, slot, chain))
+    }
 }
 
 /// 这个请求的着落。
@@ -203,6 +235,9 @@ pub(super) async fn try_upstreams<'a>(
     let mut history_trial: Option<(crate::history_memory::Key, crate::history_memory::Policy)> =
         None;
     let mut stream_trial: Option<(crate::stream_mode::Key, bool)> = None;
+    // The probe must not replace a useful original request error with its own.
+    let mut stream_original: Option<Served<'a>> = None;
+    let mut stream_failure: Option<Served<'a>> = None;
     // 客户端收的是 SSE 流：压着开头过了时限先交响应头、发保活（见 `super::commit`）。最后一家的
     // 开头只在这时为重试压着
     let early = super::commit::early(state, req, reading).is_some();
@@ -997,6 +1032,14 @@ pub(super) async fn try_upstreams<'a>(
                     },
                     &mut chain,
                 ));
+                if stream_trial_applied && let Some(original) = stream_original.take() {
+                    served =
+                        failed_mode_probe(original, slot, &mut chain, last, &mut stream_failure);
+                    if served.is_some() {
+                        break;
+                    }
+                    continue;
+                }
                 continue;
             }
         };
@@ -1032,36 +1075,41 @@ pub(super) async fn try_upstreams<'a>(
                 if !matches!(verdict, Verdict::Failed(Cause::RateLimited { .. })) {
                     to_throttle(state, &provider.name, sent_at, verdict);
                 }
-                if let (Some(key), Some(mode)) = (&stream_key, stream_sent)
-                    && crate::stream_mode::refusal(status, &head, mode)
-                {
-                    // A remembered capability may have changed. Forget even
-                    // when this request has already spent its repair budget.
-                    rt.stream_modes.forget(key);
-                    if !repair_used && tokio::time::Instant::now() < until {
-                        repair_used = true;
-                        stream_trial = Some((key.clone(), !mode));
-                        tap.said(&head);
-                        state.note_proxy_ok(&provider.proxy);
-                        note_health(
-                            &state.bus,
-                            &state.health,
+                if stream_trial_applied && let Some(original) = stream_original.take() {
+                    reached = true;
+                    tap.said(&head);
+                    state.note_quota(id, &provider.name, &headers);
+                    state.note_proxy_ok(&provider.proxy);
+                    state.note_auth(&provider.name, status);
+                    let mut failed = hop(
+                        &provider.name,
+                        model.clone(),
+                        tw_api::AttemptOutcome::Status,
+                        status,
+                        hop_started,
+                    );
+                    let change = match verdict {
+                        Verdict::Failed(Cause::RateLimited { .. }) => {
+                            let hint = crate::throttle::pause_hint(&headers, &head, now_ms());
+                            let pause = state.throttles.limited(&provider.name, sent_at, hint);
+                            usage_hold.release();
+                            failed.pause_ms = Some(pause.as_millis() as u64);
+                            None
+                        }
+                        Verdict::Failed(cause) => state.health.record_cause(
                             &provider.name,
-                            state.health.record_success(&provider.name),
-                        );
-                        chain.push(hop(
-                            &provider.name,
-                            model.clone(),
-                            tw_api::AttemptOutcome::Status,
-                            status,
-                            hop_started,
-                        ));
-                        // Account and record a separate attempt, reusing the
-                        // slot. Other providers still start from the original.
-                        effort_hold = Some((name, slot, probe.take()));
-                        queue.push_front(name);
-                        continue;
+                            known_reset(state, &provider.name, cause),
+                        ),
+                        Verdict::ClientError => state.health.record_success(&provider.name),
+                    };
+                    note_health(&state.bus, &state.health, &provider.name, change);
+                    chain.push(failed);
+                    served =
+                        failed_mode_probe(original, slot, &mut chain, last, &mut stream_failure);
+                    if served.is_some() {
+                        break;
                     }
+                    continue;
                 }
                 if !repair_used && tokio::time::Instant::now() < until
                     && let (Some(key), Some(mut policy)) = (history_key.clone(), history_policy.clone())
@@ -1140,6 +1188,54 @@ pub(super) async fn try_upstreams<'a>(
                     effort_hold = Some((name, slot, probe.take()));
                     queue.push_front(name);
                     continue;
+                }
+                if let (Some(key), Some(mode)) = (&stream_key, stream_sent)
+                    && crate::stream_mode::can_probe(status, &headers, &head, verdict)
+                {
+                    // A rejected remembered preference is no longer useful.
+                    // Learn the replacement only if the whole answer succeeds.
+                    rt.stream_modes.forget(key);
+                    if !repair_used && tokio::time::Instant::now() < until {
+                        repair_used = true;
+                        stream_trial = Some((key.clone(), !mode));
+                        state.note_quota(id, &provider.name, &headers);
+                        state.note_auth(&provider.name, status);
+                        tap.said(&head);
+                        state.note_proxy_ok(&provider.proxy);
+                        note_health(
+                            &state.bus,
+                            &state.health,
+                            &provider.name,
+                            state.health.record_success(&provider.name),
+                        );
+                        chain.push(hop(
+                            &provider.name,
+                            model.clone(),
+                            tw_api::AttemptOutcome::Status,
+                            status,
+                            hop_started,
+                        ));
+                        // Account and record a separate attempt, reusing the
+                        // slot. Other providers still start from the original.
+                        stream_original = Some(Served {
+                            upstream: r,
+                            provider,
+                            model: sent_model,
+                            attempt,
+                            bridge: plugged.bridge,
+                            ledger,
+                            session: out.session,
+                            refusal: None,
+                            slot: crate::slots::Slot::free(),
+                            sent_at,
+                            unconfirmed: false,
+                            replayed_error: false,
+                            stream_trial: None,
+                        });
+                        effort_hold = Some((name, slot, probe.take()));
+                        queue.push_front(name);
+                        continue;
+                    }
                 }
                 // **最后一家的 4xx 交给客户端**：没有下一家可换了，上游自己的原话
                 // （「invalid x-api-key」）比我们转述的一句「回了 401」有用得多。
@@ -1277,6 +1373,7 @@ pub(super) async fn try_upstreams<'a>(
                             slot,
                             sent_at,
                             unconfirmed: false,
+                            replayed_error: false,
                             stream_trial: None,
                         });
                         break;
@@ -1341,6 +1438,9 @@ pub(super) async fn try_upstreams<'a>(
                                 Hold::Stream(dialect, eventstream) => {
                                     super::opening::watch(r, dialect, eventstream, quiet_by).await
                                 }
+                                Hold::Body if stream_trial_applied => {
+                                    check_mode_body(r, stream_dialect.unwrap(), quiet_by).await
+                                }
                                 Hold::Body => super::opening::first_bytes(r, quiet_by).await,
                             }
                         };
@@ -1374,6 +1474,36 @@ pub(super) async fn try_upstreams<'a>(
                             // 到点了还没有内容：这一跳没有结论
                             Some(super::opening::Opening::Slow { response, usage }) => {
                                 state.throttles.released(&provider.name, sent_at);
+                                if stream_trial_applied
+                                    && let Some(original) = stream_original.take()
+                                {
+                                    drop(response);
+                                    last_err = Some(gave_up(
+                                        state,
+                                        started,
+                                        reading,
+                                        Abandoned {
+                                            provider,
+                                            model: model.clone(),
+                                            status: Some(status),
+                                            usage,
+                                            quiet,
+                                            hop_started,
+                                        },
+                                        &mut chain,
+                                    ));
+                                    served = failed_mode_probe(
+                                        original,
+                                        slot,
+                                        &mut chain,
+                                        last,
+                                        &mut stream_failure,
+                                    );
+                                    if served.is_some() {
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 if last {
                                     // 最后一家：和不压开头时一样交给回程，由它按无响应超时收尾
                                     unconfirmed = true;
@@ -1414,6 +1544,58 @@ pub(super) async fn try_upstreams<'a>(
                             }) => {
                                 let verdict =
                                     crate::failure::classify(status, &headers, &body, now_ms());
+                                if stream_trial_applied
+                                    && let Some(original) = stream_original.take()
+                                {
+                                    tap.said(&body);
+                                    state.note_quota(id, &provider.name, &headers);
+                                    let mut failed = hop_failed(
+                                        &provider.name,
+                                        model.clone(),
+                                        msg!("gw.upstream.stream_opening_error",
+                                            upstream = provider.name.clone(), kind = kind, message = message =>
+                                            "Upstream `{upstream}` started the answer and reported an error \
+                                             before any content ({kind}): {message}"),
+                                        hop_started,
+                                    );
+                                    let change = match verdict {
+                                        Verdict::Failed(Cause::RateLimited { .. }) => {
+                                            let hint = crate::throttle::pause_hint(
+                                                &headers,
+                                                &body,
+                                                now_ms(),
+                                            );
+                                            let pause = state.throttles.limited(
+                                                &provider.name,
+                                                sent_at,
+                                                hint,
+                                            );
+                                            usage_hold.release();
+                                            failed.pause_ms = Some(pause.as_millis() as u64);
+                                            None
+                                        }
+                                        Verdict::Failed(cause) => state.health.record_cause(
+                                            &provider.name,
+                                            known_reset(state, &provider.name, cause),
+                                        ),
+                                        Verdict::ClientError => {
+                                            state.health.record_success(&provider.name)
+                                        }
+                                    };
+                                    note_health(&state.bus, &state.health, &provider.name, change);
+                                    chain.push(failed);
+                                    served = failed_mode_probe(
+                                        original,
+                                        slot,
+                                        &mut chain,
+                                        last,
+                                        &mut stream_failure,
+                                    );
+                                    if served.is_some() {
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 let limited =
                                     matches!(verdict, Verdict::Failed(Cause::RateLimited { .. }));
                                 if !limited {
@@ -1502,7 +1684,9 @@ pub(super) async fn try_upstreams<'a>(
                             }
                             Some(super::opening::Opening::Broken(err)) => {
                                 reached = true;
-                                retries.shaky(name, None);
+                                if !stream_trial_applied {
+                                    retries.shaky(name, None);
+                                }
                                 state.throttles.released(&provider.name, sent_at);
                                 note_health(
                                     &state.bus,
@@ -1517,6 +1701,21 @@ pub(super) async fn try_upstreams<'a>(
                                     hop_started,
                                 ));
                                 last_err = Some(err);
+                                if stream_trial_applied
+                                    && let Some(original) = stream_original.take()
+                                {
+                                    served = failed_mode_probe(
+                                        original,
+                                        slot,
+                                        &mut chain,
+                                        last,
+                                        &mut stream_failure,
+                                    );
+                                    if served.is_some() {
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 continue;
                             }
                         }
@@ -1572,6 +1771,7 @@ pub(super) async fn try_upstreams<'a>(
                     slot,
                     sent_at,
                     unconfirmed,
+                    replayed_error: false,
                     stream_trial: stream_trial.clone().filter(|_| stream_trial_applied),
                 });
                 break;
@@ -1588,7 +1788,9 @@ pub(super) async fn try_upstreams<'a>(
                     SendError::Http(e) if e.is_connect() => {
                         usage_hold.release();
                         reached = true;
-                        retries.shaky(name, None);
+                        if !stream_trial_applied {
+                            retries.shaky(name, None);
+                        }
                         // 没有结论：探路的不再探，交给熔断（见 `crate::throttle`）
                         state.throttles.released(&provider.name, sent_at);
                         state.check_proxy(&provider.proxy);
@@ -1597,7 +1799,9 @@ pub(super) async fn try_upstreams<'a>(
                     SendError::Http(e) => {
                         reached = true;
                         // 响应头之前断了：和连不上一样是暂时的错
-                        retries.shaky(name, None);
+                        if !stream_trial_applied {
+                            retries.shaky(name, None);
+                        }
                         state.throttles.released(&provider.name, sent_at);
                         // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                         state.check_proxy(&provider.proxy);
@@ -1624,11 +1828,30 @@ pub(super) async fn try_upstreams<'a>(
                     hop_started,
                 ));
                 last_err = Some(err);
+                if stream_trial_applied && let Some(original) = stream_original.take() {
+                    served =
+                        failed_mode_probe(original, slot, &mut chain, last, &mut stream_failure);
+                    if served.is_some() {
+                        break;
+                    }
+                    continue;
+                }
                 continue;
             }
         }
     }
 
+    if halt.is_none()
+        && served.is_none()
+        && estimated.is_none()
+        && let Some(original) = stream_failure
+    {
+        served = Some(restore_mode_error(
+            original,
+            crate::slots::Slot::free(),
+            &mut chain,
+        ));
+    }
     stamp_queued(&mut chain, queued.take());
     stamp_effort(&mut chain, effort_note.take());
     stamp_retries(&mut chain, &retries.rounds);
@@ -3109,6 +3332,34 @@ async fn bedrock_refusal(
         http::HeaderValue::from_static("application/json"),
     );
     (reqwest::Response::from(resp), text)
+}
+
+/// Some compatible APIs reject a probe inside an HTTP-200 JSON body. Inspect a
+/// bounded prefix before handing the trial to relay; all bytes remain replayable.
+async fn check_mode_body(
+    r: reqwest::Response,
+    dialect: tw_dialect::ir::Dialect,
+    deadline: tokio::time::Instant,
+) -> super::opening::Opening {
+    let (head, r) = peek_body(r).await;
+    if head.len() <= crate::failure::BODY_PEEK
+        && let Some(message) = tw_dialect::convert::error_message(dialect, &head)
+    {
+        let status = std::str::from_utf8(&head)
+            .ok()
+            .and_then(|text| super::opening::stream_error(dialect, text))
+            .map_or(502, |(status, _)| status);
+        return super::opening::Opening::Failed {
+            status,
+            headers: r.headers().clone(),
+            body: head,
+            kind: "error".into(),
+            message,
+            transient: false,
+            response: r,
+        };
+    }
+    super::opening::first_bytes(r, deadline).await
 }
 
 /// 读错误响应的开头（最多 [`crate::failure::BODY_PEEK`]），交回读到的和一个照旧能从头

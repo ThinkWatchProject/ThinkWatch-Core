@@ -16,10 +16,13 @@ fn response(status: u16, ct: &str, body: String) -> Response {
         .chunks(7)
         .map(|b| Ok::<_, std::io::Error>(Bytes::copy_from_slice(b)))
         .collect();
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .header("content-type", ct)
-        .header("retry-after", "3600")
+        .header("content-type", ct);
+    if status == 429 {
+        builder = builder.header("retry-after", "3600");
+    }
+    builder
         .body(Body::from_stream(futures::stream::iter(chunks)))
         .unwrap()
 }
@@ -220,6 +223,204 @@ async fn both_directions_keep_the_client_protocol_tools_usage_and_learn_the_mode
 }
 
 #[tokio::test]
+async fn opaque_rejections_can_probe_both_directions_and_learn_only_a_working_mode() {
+    for status in [400, 422, 501] {
+        for client_stream in [false, true] {
+            let (up, seen) = upstream(move |_, v, _| {
+                if v["stream"].as_bool().unwrap_or(false) == client_stream {
+                    response(
+                        status,
+                        "application/json",
+                        json!({"error":{
+                            "code":"vendor_1027", "message":"请使用另一种返回方式。"
+                        }})
+                        .to_string(),
+                    )
+                } else if client_stream {
+                    response(200, "application/json", whole().to_string())
+                } else {
+                    response(200, "text/event-stream", sse())
+                }
+            })
+            .await;
+            let (gw, _) = gateway(up, Protocol::OpenaiChat).await;
+            let (path, req) = request(Dialect::Chat, client_stream);
+            for count in [2, 3] {
+                let (status, ct, body) = post(gw, path, &req).await;
+                assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+                assert_answer(Dialect::Chat, client_stream, path, &req, &ct, &body);
+                assert_eq!(seen.lock().unwrap().len(), count);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_probes_preserve_the_original_response_and_both_attempt_outcomes() {
+    for probe_status in [400, 422, 501, 503, 401, 403, 429, 200] {
+        let original = json!({"error":{"code":"vendor_1027", "message":"Original rejection"}});
+        let first = original.clone();
+        let (up, seen) = upstream(move |_, _, n| {
+            if n == 1 {
+                let mut r = response(422, "application/json", first.to_string());
+                r.headers_mut()
+                    .insert("x-request-id", "original-id".parse().unwrap());
+                r
+            } else if probe_status == 200 {
+                response(200, "text/event-stream", format!("data: {}\n\n", json!({"error":{"type":"invalid_request_error","message":"probe failed before content"}})))
+            } else {
+                response(
+                    probe_status,
+                    "application/json",
+                    json!({"error":{"message":"Probe rejection"}}).to_string(),
+                )
+            }
+        })
+        .await;
+        let (gw, state) = gateway(up, Protocol::OpenaiChat).await;
+        let mut events = state.bus.subscribe();
+        let (path, req) = request(Dialect::Chat, false);
+        let r = reqwest::Client::new()
+            .post(format!("http://{gw}{path}"))
+            .header("authorization", "Bearer tw-k")
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 422, "probe {probe_status}");
+        assert_eq!(r.headers()["x-request-id"], "original-id");
+        assert_eq!(r.json::<Value>().await.unwrap(), original);
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "probe {probe_status}");
+        assert_eq!(sent[0].1["stream"], false);
+        assert_eq!(sent[1].1["stream"], true);
+        let mut routed = None;
+        let mut auth = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                tw_api::Event::RequestRouted { attempts, .. } => routed = Some(attempts),
+                tw_api::Event::AuthChanged { state, .. } => auth.push(state),
+                _ => {}
+            }
+        }
+        let attempts = routed.unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, Some(422));
+        assert_eq!(attempts[0].outcome, tw_api::AttemptOutcome::Served);
+        if probe_status == 200 {
+            assert_eq!(attempts[1].outcome, tw_api::AttemptOutcome::Error);
+            assert!(
+                attempts[1]
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .contains("probe failed before content")
+            );
+        } else {
+            assert_eq!(attempts[1].status, Some(probe_status));
+            assert_eq!(attempts[1].outcome, tw_api::AttemptOutcome::Status);
+        }
+        if matches!(probe_status, 401 | 403) {
+            assert_eq!(auth.last(), Some(&tw_api::AuthState::Rejected));
+        }
+        if probe_status == 429 {
+            assert!(attempts[1].pause_ms.is_some());
+            assert!(!attempts[1].counts_for_upstream());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_server_error_probe_still_fails_over_with_the_original_request_mode() {
+    let (up, first) = upstream(|_, _, n| {
+        response(
+            if n == 1 { 501 } else { 503 },
+            "application/json",
+            json!({"error":{"message":"Request rejected"}}).to_string(),
+        )
+    })
+    .await;
+    let (backup, second) =
+        upstream(|_, _, _| response(200, "application/json", whole().to_string())).await;
+    let cfg: Config = serde_yaml_ng::from_str(&format!(
+        "version: 1\ndefault_route: all\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: up\n    base_url: http://{up}\n    protocol: openai-chat\n  - name: next\n    base_url: http://{backup}\n    protocol: openai-chat\ngroups:\n  - name: pool\n    type: fallback\n    providers: [up, next]\nroutes:\n  - name: all\n    rules:\n      - name: all\n        to: pool\n"
+    )).unwrap();
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    let mut events = state.bus.subscribe();
+    let (path, req) = request(Dialect::Chat, false);
+    let (status, ct, body) = post(gw, path, &req).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_answer(Dialect::Chat, false, path, &req, &ct, &body);
+    let first = first.lock().unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].1["stream"], false);
+    assert_eq!(first[1].1["stream"], true);
+    let second = second.lock().unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].1["stream"], false);
+    let mut routed = None;
+    while let Ok(event) = events.try_recv() {
+        if let tw_api::Event::RequestRouted { attempts, .. } = event {
+            routed = Some(attempts);
+        }
+    }
+    let attempts = routed.unwrap();
+    assert_eq!(
+        attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
+        vec![Some(501), Some(503), Some(200)]
+    );
+}
+
+#[tokio::test]
+async fn an_unrelated_opaque_rejection_can_cost_one_probe_but_never_teaches_a_preference() {
+    let original = json!({"error":{"message":"Invalid request"}});
+    let error = original.clone();
+    let (up, seen) =
+        upstream(move |_, _, _| response(400, "application/json", error.to_string())).await;
+    let (gw, _) = gateway(up, Protocol::OpenaiChat).await;
+    let (path, req) = request(Dialect::Chat, false);
+    for count in [2, 4] {
+        let (status, _, body) = post(gw, path, &req).await;
+        assert_eq!(status, 400);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), original);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), count);
+        assert_eq!(seen[count - 2].1["stream"], false);
+        assert_eq!(seen[count - 1].1["stream"], true);
+    }
+}
+
+#[tokio::test]
+async fn retry_hints_and_mislabelled_account_errors_do_not_probe() {
+    for error in [
+        json!({"type":"authentication_error","message":"opaque"}),
+        json!({"code":"rate_limit_exceeded","message":"opaque"}),
+        json!({"status":"RESOURCE_EXHAUSTED","message":"opaque"}),
+        json!({"message":"Request timed out"}),
+        json!({"message":"请求频率过高"}),
+        json!({"message":"Retry later"}),
+    ] {
+        let with_hint = error["message"] == "Retry later";
+        let (up, seen) = upstream(move |_, _, _| {
+            let mut r = response(400, "application/json", json!({"error":error}).to_string());
+            if with_hint {
+                r.headers_mut().insert("retry-after", "30".parse().unwrap());
+            }
+            r
+        })
+        .await;
+        let (gw, _) = gateway(up, Protocol::OpenaiChat).await;
+        let (path, req) = request(Dialect::Chat, false);
+        assert_eq!(post(gw, path, &req).await.0, 400);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn successful_opposite_mode_is_converted_without_an_extra_request() {
     for client_stream in [false, true] {
         let (up, seen) = upstream(move |_, _, _| {
@@ -283,7 +484,7 @@ async fn failed_alternatives_and_incomplete_or_error_streams_are_not_cached() {
 }
 
 #[tokio::test]
-async fn rate_limits_authentication_and_unrelated_validation_never_switch_modes() {
+async fn rate_limits_authentication_and_explicit_non_mode_validation_never_switch_modes() {
     for (status, message, param) in [
         (429, "This model only supports streaming.", "stream"),
         (400, "Rate limit exceeded", "stream"),
@@ -331,7 +532,7 @@ async fn native_response_features_the_mode_converter_cannot_preserve_are_not_ret
 }
 
 #[tokio::test]
-async fn a_json_error_inside_http_200_is_kept_as_an_error_during_mode_conversion() {
+async fn a_json_error_inside_http_200_preserves_the_original_error_and_is_not_cached() {
     for client_stream in [false, true] {
         let (up, seen) = upstream(move |_, v, _| {
             let stream = v["stream"].as_bool().unwrap_or(false);
@@ -349,15 +550,18 @@ async fn a_json_error_inside_http_200_is_kept_as_an_error_during_mode_conversion
         let (gw, _) = gateway(up, Protocol::OpenaiChat).await;
         let (path, req) = request(Dialect::Chat, client_stream);
         for count in [2, 4] {
-            let (_, ct, body) = post(gw, path, &req).await;
-            assert!(ct.starts_with(if client_stream {
-                "text/event-stream"
-            } else {
-                "application/json"
-            }));
-            let text = String::from_utf8_lossy(&body);
-            assert!(text.contains("generation failed"), "{text}");
-            assert!(text.contains("error"), "{text}");
+            let (status, ct, body) = post(gw, path, &req).await;
+            assert_eq!(status, 400);
+            assert!(ct.starts_with("application/json"));
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                error["error"]["message"],
+                if client_stream {
+                    "Streaming is not supported."
+                } else {
+                    "This model only supports streaming."
+                }
+            );
             assert_eq!(seen.lock().unwrap().len(), count);
         }
     }

@@ -53,6 +53,7 @@ pub(super) fn respond(
         slot,
         sent_at,
         unconfirmed,
+        replayed_error,
         stream_trial,
         attempt,
         ..
@@ -68,14 +69,16 @@ pub(super) fn respond(
         status: status.as_u16(),
         ttfb_ms,
     });
-    // 订阅额度。**零成本** —— 这些头本来就在响应里，读一下
-    // 就有了。按量付费的账号没有它们，那时什么都不发。
-    state.note_quota(id, &provider.name, upstream.headers());
-    // GLM Coding Plan 的额度不在响应头里：有请求的时候隔一阵去问一次
-    state.glm_traffic(provider);
-    // 上游收不收我们的凭据、经过的代理通不通：**都是状态变化，各只报一次**
-    state.note_auth(&provider.name, status.as_u16());
-    state.note_proxy_ok(&provider.proxy);
+    if !replayed_error {
+        // 订阅额度。**零成本** —— 这些头本来就在响应里，读一下
+        // 就有了。按量付费的账号没有它们，那时什么都不发。
+        state.note_quota(id, &provider.name, upstream.headers());
+        // GLM Coding Plan 的额度不在响应头里：有请求的时候隔一阵去问一次
+        state.glm_traffic(provider);
+        // 上游收不收我们的凭据、经过的代理通不通：**都是状态变化，各只报一次**
+        state.note_auth(&provider.name, status.as_u16());
+        state.note_proxy_ok(&provider.proxy);
+    }
 
     let mut out_headers = forward::response_headers(upstream.headers());
     // **哪一家服务的，写在头上。**错误契约要求上游的错误原样透传、不加
