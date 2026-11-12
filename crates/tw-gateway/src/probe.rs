@@ -25,7 +25,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelList {
     /// 拿到了
-    Listed { models: Vec<String> },
+    Listed {
+        models: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        capabilities: std::collections::BTreeMap<String, tw_config::ReportedSpec>,
+    },
     /// 上游没有这个接口。**不是错误**，很多中转站就是不实现 —— 但要说
     /// 出来，因为按模型路由、模型清单这些功能对它就用不了。
     NotImplemented { status: u16 },
@@ -42,7 +46,7 @@ pub enum ModelList {
 impl ModelList {
     pub fn models(&self) -> &[String] {
         match self {
-            ModelList::Listed { models } => models,
+            ModelList::Listed { models, .. } => models,
             _ => &[],
         }
     }
@@ -131,7 +135,13 @@ pub async fn probe_bedrock(
             ),
         ),
         Ok(Ok(models)) if models.is_empty() => ok(ModelList::Empty, None),
-        Ok(Ok(models)) => ok(ModelList::Listed { models }, None),
+        Ok(Ok(models)) => ok(
+            ModelList::Listed {
+                models,
+                capabilities: Default::default(),
+            },
+            None,
+        ),
         Ok(Err(Failure::Status {
             status,
             kind,
@@ -283,12 +293,29 @@ pub async fn probe(
 
 /// Codex 后端的模型清单：`{models:[{slug, visibility}]}`。后端隐藏的不列
 fn classify_chatgpt_models(body: &str) -> ModelList {
-    let parsed = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| crate::chatgpt::parse_models(&v));
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let parsed = value.as_ref().and_then(crate::chatgpt::parse_models);
     match parsed {
         Some(models) if models.is_empty() => ModelList::Empty,
-        Some(models) => ModelList::Listed { models },
+        Some(models) => {
+            let capabilities = value
+                .as_ref()
+                .and_then(|v| v["models"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    let id = m["slug"].as_str()?;
+                    models
+                        .iter()
+                        .any(|model| model == id)
+                        .then(|| (id.to_string(), crate::model_capabilities::reported(m)))
+                })
+                .collect();
+            ModelList::Listed {
+                models,
+                capabilities,
+            }
+        }
         None => ModelList::Unrecognized {
             sample: body.trim().chars().take(200).collect(),
         },
@@ -341,7 +368,20 @@ fn classify_models(body: &str) -> ModelList {
         (true, _) => ModelList::Empty,
         // 数组在、有元素、一个名字都抠不出来 —— 那是新格式，不是空。
         (false, true) => ModelList::Unrecognized { sample: sample() },
-        (false, false) => ModelList::Listed { models },
+        (false, false) => {
+            let capabilities = arr
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("id").or_else(|| m.get("name"))?.as_str()?;
+                    let id = id.strip_prefix("models/").unwrap_or(id);
+                    Some((id.to_string(), crate::model_capabilities::reported(m)))
+                })
+                .collect();
+            ModelList::Listed {
+                models,
+                capabilities,
+            }
+        }
     }
 }
 

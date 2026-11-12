@@ -612,7 +612,7 @@ fn one_or_many(v: &tw_engine::rule::OneOrMany) -> Vec<String> {
 /// 不该被拖上整个数据面。
 pub(crate) fn model_list(m: tw_gateway::ModelList) -> tw_api::ModelList {
     match m {
-        tw_gateway::ModelList::Listed { models } => tw_api::ModelList::Listed { models },
+        tw_gateway::ModelList::Listed { models, .. } => tw_api::ModelList::Listed { models },
         tw_gateway::ModelList::NotImplemented { status } => {
             tw_api::ModelList::NotImplemented { status }
         }

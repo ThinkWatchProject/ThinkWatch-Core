@@ -26,7 +26,7 @@
 //! 界面没有别的办法知道它问完了：以前启动那一刻读到的「还没问」会一直挂在
 //! 上游页上，直到别的什么事让它重读一次概览。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -108,6 +108,7 @@ pub struct Listing {
     pub models: Vec<String>,
     /// 其中上游自己列出的。上游没给出清单时是空的
     pub listed: Vec<String>,
+    pub capabilities: BTreeMap<String, tw_config::ReportedSpec>,
     /// 最近一次向上游问的时间。还没问过是空
     pub checked_at_ms: Option<u64>,
     /// 没从上游拿到清单的原因
@@ -120,7 +121,7 @@ enum Answer {
     /// 还没问过
     Pending,
     /// 列出来了
-    Listed(Vec<String>),
+    Listed(Vec<String>, BTreeMap<String, tw_config::ReportedSpec>),
     /// 问到了，但上游没给出清单：没有这个接口、格式认不出、空的
     NoList(tw_types::Msg),
     /// 没问到：连不上、密钥被拒、取不到密钥
@@ -199,6 +200,14 @@ impl Directory {
     pub fn listing(&self, p: &tw_config::Provider) -> Listing {
         let entry = self.lock().get(&p.name).cloned();
         listing_of(entry.as_ref(), p)
+    }
+
+    /// One model's declared capabilities, without cloning the entire provider listing.
+    pub fn capabilities(&self, provider: &str, model: &str) -> Option<tw_config::ReportedSpec> {
+        match &self.lock().get(provider)?.answer {
+            Answer::Listed(_, capabilities) => capabilities.get(model).cloned(),
+            _ => None,
+        }
     }
 
     /// 按目录和配置推出汇总，并换进 `into`。
@@ -291,7 +300,7 @@ impl Directory {
                 }
                 match e.answer {
                     Answer::Pending | Answer::Failed(_) => true,
-                    Answer::Listed(_) | Answer::NoList(_) => {
+                    Answer::Listed(..) | Answer::NoList(_) => {
                         age >= REFRESH_EVERY.as_millis() as u64
                     }
                 }
@@ -344,23 +353,24 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
     let fetching = entry.is_some_and(|e| e.in_flight > 0);
     let error = entry.and_then(|e| match &e.answer {
         Answer::NoList(why) | Answer::Failed(why) => Some(why.clone()),
-        Answer::Pending | Answer::Listed(_) => None,
+        Answer::Pending | Answer::Listed(..) => None,
     });
     let status = match entry.map(|e| &e.answer) {
         None | Some(Answer::Pending) => Status::Pending,
-        Some(Answer::Listed(_)) => Status::Listed,
+        Some(Answer::Listed(..)) => Status::Listed,
         Some(Answer::NoList(_)) => Status::NoList,
         Some(Answer::Failed(_)) => Status::Failed,
     };
     match entry.map(|e| &e.answer) {
         // 上游列出的在前，手动添加的接在后面。**删得掉的只有手动添加的那些**：上游列出
         // 的模型不该用的话，用启用范围把它排除在外
-        Some(Answer::Listed(listed)) => Listing {
+        Some(Answer::Listed(listed, capabilities)) => Listing {
             source: Source::Discovered,
             status,
             fetching,
             models: with_manual(listed, &p.models),
             listed: listed.clone(),
+            capabilities: capabilities.clone(),
             checked_at_ms,
             error: None,
         },
@@ -371,6 +381,7 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
             fetching,
             models: with_manual(&[], &p.models),
             listed: Vec::new(),
+            capabilities: BTreeMap::new(),
             checked_at_ms,
             error,
         },
@@ -380,6 +391,7 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
             fetching,
             models: Vec::new(),
             listed: Vec::new(),
+            capabilities: BTreeMap::new(),
             checked_at_ms,
             error,
         },
@@ -424,7 +436,10 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
         );
     }
     match r.models {
-        ModelList::Listed { models } => Answer::Listed(models),
+        ModelList::Listed {
+            models,
+            capabilities,
+        } => Answer::Listed(models, capabilities),
         // 探测说了为什么列不出（Bedrock 没有列模型的权限）就用它的话
         ModelList::NotImplemented { status } => Answer::NoList(r.error.unwrap_or_else(|| {
             msg!(
@@ -498,7 +513,7 @@ async fn finish(state: &AppState, asking: Vec<Asking>) {
             continue;
         };
         match &answer {
-            Answer::Listed(models) => {
+            Answer::Listed(models, _) => {
                 tracing::debug!(provider = %a.name, models = models.len(), "fetched the model list")
             }
             Answer::NoList(why) | Answer::Failed(why) => {
@@ -896,7 +911,7 @@ mod tests {
             d.record(
                 &p.name,
                 &identity(&c, p),
-                Answer::Listed(vec![format!("{}-m", p.name)]),
+                Answer::Listed(vec![format!("{}-m", p.name)], BTreeMap::new()),
                 1,
             );
         }
@@ -1004,7 +1019,12 @@ mod tests {
         ] {
             let i = c.providers.iter().position(|x| x.name == p).unwrap();
             let models = models.into_iter().map(String::from).collect();
-            d.record(p, &identity(&c, &c.providers[i]), Answer::Listed(models), 1);
+            d.record(
+                p,
+                &identity(&c, &c.providers[i]),
+                Answer::Listed(models, BTreeMap::new()),
+                1,
+            );
         }
         d.record(
             "no-list",
@@ -1124,7 +1144,12 @@ mod tests {
         let before = identity(&c, &c.providers[0]);
         c.providers[0].base_url = "https://elsewhere.example".into();
         d.reconcile(&c);
-        d.record("a", &before, Answer::Listed(vec!["stale".into()]), 1);
+        d.record(
+            "a",
+            &before,
+            Answer::Listed(vec!["stale".into()], BTreeMap::new()),
+            1,
+        );
         assert_eq!(d.listing(&c.providers[0]).source, Source::None);
     }
 
@@ -1137,7 +1162,10 @@ mod tests {
             d.record(
                 &p.name,
                 &identity(&c, p),
-                Answer::Listed(vec![format!("{}-1", p.name), format!("{}-2", p.name)]),
+                Answer::Listed(
+                    vec![format!("{}-1", p.name), format!("{}-2", p.name)],
+                    BTreeMap::new(),
+                ),
                 1,
             );
         }
@@ -1234,13 +1262,13 @@ mod tests {
         d.record(
             "listed",
             &id("listed"),
-            Answer::Listed(vec!["m".into()]),
+            Answer::Listed(vec!["m".into()], BTreeMap::new()),
             now - minute,
         );
         d.record(
             "listed-old",
             &id("listed-old"),
-            Answer::Listed(vec!["m".into()]),
+            Answer::Listed(vec!["m".into()], BTreeMap::new()),
             now - day,
         );
         d.record(
@@ -1274,7 +1302,12 @@ mod tests {
         assert_eq!(l.error.as_ref().map(|m| m.text.as_str()), Some("连不上"));
         // 正在问的不再排进后台那一轮
         assert!(d.due(&c, REFRESH_EVERY.as_millis() as u64).is_empty());
-        d.record("a", &id, Answer::Listed(vec!["m".into()]), 2);
+        d.record(
+            "a",
+            &id,
+            Answer::Listed(vec!["m".into()], BTreeMap::new()),
+            2,
+        );
         let l = d.listing(p);
         assert!(!l.fetching);
         assert_eq!((l.status, l.source), (Status::Listed, Source::Discovered));
@@ -1298,7 +1331,12 @@ mod tests {
         let fresh = provider("fresh");
         let id = identity(&c, &fresh);
         d.begin("fresh", &id);
-        d.record("fresh", &id, Answer::Listed(vec!["m".into()]), 1);
+        d.record(
+            "fresh",
+            &id,
+            Answer::Listed(vec!["m".into()], BTreeMap::new()),
+            1,
+        );
         assert_eq!(d.listing(&fresh).status, Status::Listed);
     }
 
@@ -1316,7 +1354,7 @@ mod tests {
             d.record(
                 &p.name,
                 &identity(&c, p),
-                Answer::Listed(vec!["gpt-5".into(), "gpt-5-mini".into()]),
+                Answer::Listed(vec!["gpt-5".into(), "gpt-5-mini".into()], BTreeMap::new()),
                 1,
             );
         }

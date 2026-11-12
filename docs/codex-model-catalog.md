@@ -69,7 +69,7 @@ its [models endpoint](https://api-docs.deepseek.com/api/list-models). The effort
 list becomes Codex's `supported_reasoning_levels`; the reported default is kept
 when it is in the list. Optional or malformed fields do not create capabilities.
 No model-name table or inference from `reasoning: true` supplies missing levels.
-A relay must preserve the metadata for Core to use it.
+A relay can preserve this metadata for automatic discovery; missing or incorrect effort profiles can also be overridden manually.
 
 Aliases inherit the actual routing targets' reported capabilities. Effort
 choices are intersected separately from full native definitions, so differences
@@ -78,6 +78,41 @@ intersection. Manual `model_specs.reasoning: false` removes choices. When any
 candidate requires protocol translation, choices are also limited to efforts
 Core can translate; Responses and ChatGPT passthrough can retain newer native
 efforts such as `ultra`.
+
+## Automatic discovery and manual overrides
+
+Core uses reported capabilities automatically. Background inventory retains the same specifications
+for Lite and standard model discovery; the Codex catalog prefers metadata for the requesting client
+version. Missing effort metadata remains unknown. Model names and price-table reasoning flags
+do not generate effort choices.
+
+If the upstream has no model list, first add its actual model ID to `models`. Supply missing or
+incorrect effort metadata for that exact model and provider:
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com/v1
+    protocol: openai-chat
+    models: [private-model]
+    model_specs:
+      private-model:
+        reasoning_effort:
+          supported_levels: [low, high, max]
+          default_level: high
+```
+
+The entire manual profile replaces the upstream profile. Nonempty levels imply reasoning support;
+`reasoning: true` is unnecessary. Omitting `reasoning_effort` restores automatic discovery, while
+`supported_levels: []` explicitly declares no adjustable effort. `default_level` is optional: Core
+prefers `medium` in the final available set, otherwise its lowest level. An explicit default must
+belong to the declared set. Duplicate levels and `reasoning: false` with nonempty manual levels
+are rejected. Alias intersections and protocol restrictions apply to manual profiles as well.
+
+Control API model rows expose reported, manual and effective efforts separately, together with
+levels excluded by protocol conversion. In `PUT /provider-model-spec`, `reasoning_effort` uses
+`mode: keep` (also the omitted default), `mode: auto`, or `mode: set` with `value` to retain,
+remove or replace the override. Editing other specifications preserves the effort override.
 
 ## Cache and limits
 

@@ -39,7 +39,10 @@ pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
 pub use limits::{KeyLimit, LimitMeasure, LimitPer, UsageLimit};
-pub use model_specs::{ModelSpec, ReasoningHistory, ResolvedSpec, Sourced, SpecSource};
+pub use model_specs::{
+    ModelSpec, ReasoningEffort, ReasoningHistory, ReasoningLevel, ReportedSpec, ResolvedSpec,
+    Sourced, SpecSource,
+};
 pub use plugins::Plugin;
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;

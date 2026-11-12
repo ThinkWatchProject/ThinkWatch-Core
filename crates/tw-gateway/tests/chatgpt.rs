@@ -782,7 +782,7 @@ async fn models_come_from_the_codex_models_endpoint() {
     .await;
     assert!(got.ok, "{got:?}");
     match &got.models {
-        tw_gateway::ModelList::Listed { models } => {
+        tw_gateway::ModelList::Listed { models, .. } => {
             assert_eq!(models, &vec!["gpt-5.5".to_string()], "后端隐藏的模型不列")
         }
         other => panic!("{other:?}"),
