@@ -58,6 +58,8 @@ pub(super) struct Served<'a> {
     /// 内容、在开头报了限流以外的错，原样交了出去。成败的账等回程看到第一段内容才记（见
     /// `relay`）。没有内容就超时了记失败，和压着开头时一样
     pub(super) unconfirmed: bool,
+    /// Learn an alternative only after a complete, clean response.
+    pub(super) stream_trial: Option<(crate::stream_mode::Key, bool)>,
 }
 
 /// 这个请求的着落。
@@ -200,6 +202,7 @@ pub(super) async fn try_upstreams<'a>(
     let mut repair_used = false;
     let mut history_trial: Option<(crate::history_memory::Key, crate::history_memory::Policy)> =
         None;
+    let mut stream_trial: Option<(crate::stream_mode::Key, bool)> = None;
     // 客户端收的是 SSE 流：压着开头过了时限先交响应头、发保活（见 `super::commit`）。最后一家的
     // 开头只在这时为重试压着
     let early = super::commit::early(state, req, reading).is_some();
@@ -713,6 +716,48 @@ pub(super) async fn try_upstreams<'a>(
             });
         }
 
+        // Keep the client mode on the response session; change only this hop's
+        // wire mode. A trial and a cached choice use the same conversion path.
+        let stream_dialect = wire(req, &out).filter(|_| {
+            reading.generates
+                && !counting
+                && !out.chatgpt
+                && asked.decoded.is_some_and(|d| d.is_ok())
+        });
+        let stream_key = stream_dialect.and_then(|dialect| {
+            crate::stream_mode::Key::of(provider, &sent_model, dialect, &out.path, &out.body)
+        });
+        let preferred_stream = stream_key.as_ref().and_then(|key| {
+            stream_trial
+                .as_ref()
+                .filter(|(k, _)| k == key)
+                .map(|(_, mode)| *mode)
+                .or_else(|| rt.stream_modes.lookup(key, now_ms()))
+        });
+        if let (Some(dialect), Some(mode)) = (stream_dialect, preferred_stream)
+            && crate::stream_mode::requested(dialect, &out.path, &out.body) != Some(mode)
+            && let Some(body) =
+                crate::stream_mode::rewrite(dialect, &mut out.path, &mut out.query, &out.body, mode)
+        {
+            out.body = Bytes::from(body);
+            out.reshaped = true;
+            mode_session(&asked, provider, &sent_model, dialect, &mut out);
+            tracing::info!(provider = %provider.name, model = %sent_model, stream = mode,
+                "using an alternative upstream response mode");
+        }
+        let stream_sent =
+            stream_dialect.and_then(|d| crate::stream_mode::requested(d, &out.path, &out.body));
+        let stream_trial_applied = stream_key.as_ref().is_some_and(|key| {
+            stream_trial
+                .as_ref()
+                .is_some_and(|(trial, mode)| trial == key && stream_sent == Some(*mode))
+        });
+        if stream_trial_applied && let Some(dialect) = stream_dialect {
+            // Relearning may return to the client's original mode. Still keep
+            // a session so the complete trial response can be validated.
+            mode_session(&asked, provider, &sent_model, dialect, &mut out);
+        }
+
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
         // 格式）。规则是全局的，每一跳换掉的是同一批东西；**接着原文那本账换**，
         // 同一个值在每一跳、在存下来的那份请求里都是同一个占位符。插件改过的一跳接着
@@ -826,7 +871,7 @@ pub(super) async fn try_upstreams<'a>(
             .map(|r| (r.body.clone(), ledger.clone()));
         // 这一跳接下了的话，回答钩子要的：插件改了名的是改过的
         let sent_model = effective_set.model.clone().unwrap_or(sent_model);
-        let (attempt, bridge) = (chain.len(), plugged.bridge);
+        let attempt = chain.len();
         // 这一跳在报文记录里记到哪儿（见 `crate::content`）：尝试链上的第几跳，从 1 数
         let tap = crate::content::Tap::new(
             req.seat.get(),
@@ -986,6 +1031,37 @@ pub(super) async fn try_upstreams<'a>(
                 let verdict = crate::failure::classify(status, &headers, &head, now_ms());
                 if !matches!(verdict, Verdict::Failed(Cause::RateLimited { .. })) {
                     to_throttle(state, &provider.name, sent_at, verdict);
+                }
+                if let (Some(key), Some(mode)) = (&stream_key, stream_sent)
+                    && crate::stream_mode::refusal(status, &head, mode)
+                {
+                    // A remembered capability may have changed. Forget even
+                    // when this request has already spent its repair budget.
+                    rt.stream_modes.forget(key);
+                    if !repair_used && tokio::time::Instant::now() < until {
+                        repair_used = true;
+                        stream_trial = Some((key.clone(), !mode));
+                        tap.said(&head);
+                        state.note_proxy_ok(&provider.proxy);
+                        note_health(
+                            &state.bus,
+                            &state.health,
+                            &provider.name,
+                            state.health.record_success(&provider.name),
+                        );
+                        chain.push(hop(
+                            &provider.name,
+                            model.clone(),
+                            tw_api::AttemptOutcome::Status,
+                            status,
+                            hop_started,
+                        ));
+                        // Account and record a separate attempt, reusing the
+                        // slot. Other providers still start from the original.
+                        effort_hold = Some((name, slot, probe.take()));
+                        queue.push_front(name);
+                        continue;
+                    }
                 }
                 if !repair_used && tokio::time::Instant::now() < until
                     && let (Some(key), Some(mut policy)) = (history_key.clone(), history_policy.clone())
@@ -1194,19 +1270,37 @@ pub(super) async fn try_upstreams<'a>(
                             provider,
                             model: sent_model,
                             attempt,
-                            bridge,
+                            bridge: plugged.bridge,
                             ledger,
                             session: out.session,
                             refusal,
                             slot,
                             sent_at,
                             unconfirmed: false,
+                            stream_trial: None,
                         });
                         break;
                     }
                 }
             }
             Ok(r) => {
+                // Some compatible APIs silently ignore `stream`. Successful
+                // responses in the other mode need conversion, not a resend.
+                if out.session.is_none()
+                    && stream_key.is_some()
+                    && let (Some(dialect), Some(Ok(decoded))) = (stream_dialect, asked.decoded)
+                    && let Some(ct) = r
+                        .headers()
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                {
+                    let sse = ct.starts_with("text/event-stream");
+                    let json = ct.starts_with("application/json")
+                        && dialect != tw_dialect::ir::Dialect::Gemini;
+                    if (sse && !decoded.request.stream) || (json && decoded.request.stream) {
+                        mode_session(&asked, provider, &sent_model, dialect, &mut out);
+                    }
+                }
                 // 回答的开头：**第一段内容到之前**上游在流里报的错照样换下一家（报的是限流就排队
                 // 等它，和回 429 一样），一直没有内容也换（见 `opening`）。
                 //
@@ -1221,7 +1315,8 @@ pub(super) async fn try_upstreams<'a>(
                 let held = hold.as_ref().is_some_and(|h| {
                     history_key.as_ref().is_some_and(|k| {
                         history_trial.as_ref().is_some_and(|(trial, _)| trial == k)
-                    }) || !last
+                    }) || stream_trial_applied
+                        || !last
                         || (matches!(h, Hold::Stream(..))
                             && tokio::time::Instant::now() < until
                             && (early || state.throttles.wary(&provider.name)))
@@ -1470,13 +1565,14 @@ pub(super) async fn try_upstreams<'a>(
                     provider,
                     model: sent_model,
                     attempt,
-                    bridge,
+                    bridge: plugged.bridge,
                     ledger,
                     session: out.session,
                     refusal: None,
                     slot,
                     sent_at,
                     unconfirmed,
+                    stream_trial: stream_trial.clone().filter(|_| stream_trial_applied),
                 });
                 break;
             }
@@ -2172,6 +2268,33 @@ fn unsendable_tool(
         _ => return None,
     };
     Some(GatewayError::new(crate::error::Source::Request, msg))
+}
+
+/// A native-protocol hop normally needs no session. Changing only its response
+/// mode still needs the client's shape, tools and original stream preference.
+fn mode_session(
+    asked: &Asked<'_>,
+    provider: &tw_config::Provider,
+    model: &str,
+    dialect: tw_dialect::ir::Dialect,
+    out: &mut Outbound,
+) {
+    if out.session.is_none()
+        && let Some(Ok(decoded)) = asked.decoded
+    {
+        let mut session = decoded
+            .encode_with_history(
+                &tw_dialect::ir::Target {
+                    dialect,
+                    official: tw_dialect::official::is_official_host(&provider.base_url),
+                    default_max_tokens: 0,
+                },
+                &crate::translate::history_target(provider, model),
+            )
+            .session;
+        session.model = model.into();
+        out.session = Some(session);
+    }
 }
 
 /// 把这一跳的请求（客户端那种格式，插件改过的话是改过的，见 [`Asked`]）改成要发的

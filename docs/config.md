@@ -539,6 +539,26 @@ A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude
 and Google subscription sign-ins are not supported; use an API key.
 
+Generation requests first use the client's streaming or non-streaming mode.
+When an upstream explicitly rejects that mode in an HTTP 400, 422 or 501 API
+error, the gateway can try the opposite mode once on the same upstream. It
+collects a streaming answer into a complete JSON response, or writes a complete
+answer as the stream the client requested. The latter still waits for the whole
+upstream answer. This shares the request's single automatic repair budget with
+history, reasoning-effort and cache-mark repairs, and respects its wait deadline.
+Rate limits, authentication errors, timeouts and errors inside a successful
+stream do not trigger a mode switch. A successful response already in the other
+mode is converted without resending it.
+
+After a complete successful answer, the accepted alternative is remembered in
+memory for 24 hours, isolated by upstream account, model, API and request options
+such as tools and reasoning. Reloading the configuration clears this memory;
+an explicit rejection invalidates a remembered mode. No upstream setting is
+required. ChatGPT account backends keep their existing stream-only behavior.
+Native requests for multiple candidates, log probabilities or non-text output
+are not switched automatically: the current response converters cannot preserve
+those response fields. WebSocket requests are not negotiated.
+
 Some relays and accounts accept only a few requests at a time and refuse the
 rest. `max_concurrent` keeps the gateway within that number: a request takes a
 slot on the upstream when it is sent, and gives it back when the answer has

@@ -53,6 +53,7 @@ pub(super) fn respond(
         slot,
         sent_at,
         unconfirmed,
+        stream_trial,
         attempt,
         ..
     } = served;
@@ -139,6 +140,9 @@ pub(super) fn respond(
         session.as_ref(),
     );
     let upstream_dialect = upstream_dialect(req, session.as_ref());
+    let mut mode_completion = (stream_trial.is_some() && plan.is_sse)
+        .then(|| crate::stream_mode::Completion::new(upstream_dialect));
+    let stream_modes = rt.stream_modes.clone();
     // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
     if generates && plan.is_sse && status.is_success() {
         ending.streaming(upstream_dialect, &provider.name, &state.pace);
@@ -332,6 +336,9 @@ pub(super) fn respond(
                     // **旁路嗅探和留档，不缓冲**：看的是上游原话（带占位符的那一版），
                     // usage 和请求记录不受后面的还原、转换影响。先认错误，再记这一家的成败。
                     ending.feed(&chunk);
+                    if let Some(proof) = mode_completion.as_mut() {
+                        proof.feed(&chunk);
+                    }
                     // 真内容才重新计时：心跳、开头的例行事件不算
                     if pulse.feed(&chunk) {
                         said = true;
@@ -380,6 +387,10 @@ pub(super) fn respond(
             (None, None)
         } else {
             (Some(chunks), Some(_slot))
+        };
+        let mode_complete = stream_trial.is_some() && match mode_completion {
+            Some(proof) => proof.finish(),
+            None => crate::stream_mode::whole_answer(upstream_dialect, &relay.whole),
         };
         let (tail, denied) = relay.finish(broke.is_some()).await;
         // 回答里的命中这时报：一次回答一条规则一条
@@ -431,6 +442,11 @@ pub(super) fn respond(
         }
         match broke {
             None => {
+                if mode_complete && ending.upstream_fault().is_none()
+                    && let Some((key, mode)) = stream_trial
+                {
+                    stream_modes.accepted(key, mode, crate::server::now_ms());
+                }
                 if !tail.is_empty() {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
                 }
@@ -1025,6 +1041,21 @@ impl Relay {
                     Vec::new()
                 } else {
                     self.whole.extend_from_slice(&tail);
+                    // Some compatible APIs put an error inside HTTP 200. A
+                    // mode conversion must not turn it into an empty answer.
+                    if status.is_success()
+                        && let Some(message) =
+                            tw_dialect::convert::error_message(s.upstream, &self.whole)
+                    {
+                        let message: String = message.chars().take(500).collect();
+                        return (
+                            Vec::new(),
+                            Some(GatewayError::upstream(msg!(
+                                "gw.upstream.response_error", upstream = self.provider.clone(), message = message =>
+                                "Upstream `{upstream}` returned an error in the response: {message}"
+                            ))),
+                        );
+                    }
                     if !status.is_success() {
                         s.error(status.as_u16(), &self.whole)
                     } else if s.stream {
