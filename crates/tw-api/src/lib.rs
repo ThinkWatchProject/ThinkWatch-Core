@@ -183,6 +183,75 @@ slug_enum! {
         PriceTable = "price_table",
         /// 这一家上游手写的（配置里的 `model_specs`），优先于价目表
         Manual = "manual",
+        /// 上游模型目录报告的能力
+        Upstream = "upstream",
+    }
+}
+
+slug_enum! {
+    /// 客户端可选择的推理强度，按从低到高排列。是否能转发还取决于协议。
+    pub enum ReasoningLevel {
+        Minimal = "minimal",
+        Low = "low",
+        Medium = "medium",
+        High = "high",
+        Xhigh = "xhigh",
+        Max = "max",
+        Ultra = "ultra",
+    }
+}
+
+/// 一整组推理档位。空列表明确表示不可调；没有这项才是自动或未知。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffort {
+    pub supported_levels: Vec<ReasoningLevel>,
+    /// 省略时在最终可用档位里优先 medium，否则取最低档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_level: Option<ReasoningLevel>,
+}
+
+impl ReasoningEffort {
+    /// 排序、去重并在最终集合内选择默认值。手写值另由配置校验严格检查。
+    pub fn normalized(&self) -> Self {
+        let supported_levels: Vec<_> = ReasoningLevel::ALL
+            .iter()
+            .copied()
+            .filter(|level| self.supported_levels.contains(level))
+            .collect();
+        let default_level = self
+            .default_level
+            .filter(|level| supported_levels.contains(level))
+            .or_else(|| {
+                supported_levels
+                    .contains(&ReasoningLevel::Medium)
+                    .then_some(ReasoningLevel::Medium)
+            })
+            .or_else(|| supported_levels.first().copied());
+        Self {
+            supported_levels,
+            default_level,
+        }
+    }
+}
+
+/// 编辑推理档位：旧客户端省略时保留，恢复自动必须显式提交 auto。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ReasoningEffortChange {
+    #[default]
+    Keep,
+    Auto,
+    Set {
+        value: ReasoningEffort,
+    },
+}
+
+impl ReasoningEffortChange {
+    fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
     }
 }
 
@@ -1150,7 +1219,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`Status`] 增加 `gateway_addrs`（全部实际绑定的套接字）和 `gateway_probe`（公开的进程标识，
 /// `/healthz` 的 `x-thinkwatch-gateway` 响应头原样返回），用于从其他网络命名空间确认连到的
 /// 是当前网关。请求库 SCHEMA 不变。
-pub const CONTROL_API_VERSION: u32 = 59;
+/// **60 起模型规格支持手动推理档位**：[`ModelSpecSave::reasoning_effort`] 区分保留、
+/// 设置和恢复自动。[`ModelRow`] 带上游报告、手动覆盖、实际可用档位和过滤结果。
+/// [`SpecSource::Upstream`] 表示上游报告的规格。请求库 SCHEMA 不变。
+pub const CONTROL_API_VERSION: u32 = 60;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -3845,25 +3917,42 @@ pub struct ModelRow {
     pub id: String,
     /// 在启用范围里
     pub enabled: bool,
-    /// 上下文窗口：这一家手写的（`model_specs`），没写时来自价目表
+    /// 上下文窗口：手动覆盖优先，然后上游报告，最后价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// `context_window` 从哪儿来。不知道上下文窗口时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_source: Option<SpecSource>,
-    /// 一次最多输出多少 token：这一家手写的，没写时来自价目表
+    /// 一次最多输出多少 token：手动覆盖优先，然后上游报告，最后价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
     /// `max_output_tokens` 从哪儿来。不知道输出上限时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens_source: Option<SpecSource>,
-    /// 会不会推理：这一家手写的，没写时来自价目表。不知道时没有
+    /// 会不会推理：手动覆盖优先，然后上游报告，最后价目表。不知道时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     /// `reasoning` 从哪儿来。不知道时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_source: Option<SpecSource>,
-    /// 收不收图：这一家手写的，没写时来自价目表。不知道时没有
+    /// 推理开关的手动原值；非空手动档位推导出的 true 不会写进这里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_reasoning: Option<bool>,
+    /// 实际可用的档位（已应用推理开关和协议转换限制）。没有表示未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_source: Option<SpecSource>,
+    /// 上游实际报告的档位；手动覆盖时仍保留，供界面解释和恢复自动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_reasoning_effort: Option<ReasoningEffort>,
+    /// 配置原值，包含省略的默认值。不能从生效值反推它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_reasoning_effort: Option<ReasoningEffort>,
+    /// 当前协议转换不能表示、因而没有向客户端提供的档位。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_effort_filtered_levels: Vec<ReasoningLevel>,
+    /// 收不收图：手动覆盖优先，然后上游报告，最后价目表。不知道时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_input: Option<bool>,
     /// `image_input` 从哪儿来。不知道时没有
@@ -3939,7 +4028,8 @@ pub struct ProviderSave {
 }
 
 /// 设一家上游的一个模型的规格（`PUT /provider-model-spec`）：价目表不认识这个模型、
-/// 或者写错了时手写。**四项都空就是删掉这一项**，回到价目表。
+/// 或者写错了时手写。旧的四项按请求替换；推理档位必须显式 auto 才清除。
+/// 所有规格（含保留的高级字段）都空时删除模型项。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModelSpecSave {
@@ -3955,6 +4045,9 @@ pub struct ModelSpecSave {
     /// 会不会推理。空 = 用价目表的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// 省略或 keep 保留原值，auto 移除覆盖，set 整组替换。
+    #[serde(default, skip_serializing_if = "ReasoningEffortChange::is_keep")]
+    pub reasoning_effort: ReasoningEffortChange,
     /// 收不收图。空 = 用价目表的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_input: Option<bool>,

@@ -396,3 +396,95 @@ async fn editing_public_specs_and_provider_forms_preserves_history_capabilities(
         Some(tw_config::ReasoningHistory::Reasoning)
     );
 }
+
+#[tokio::test]
+async fn effort_overrides_are_set_preserved_validated_and_explicitly_reset() {
+    let up = upstream().await;
+    let b = bed(&config(
+        up,
+        "    models: [private]\n    model_specs:\n      private: { reasoning_history: reasoning }\n",
+        "",
+    ));
+    let mut request = json!({"provider":"relay","model":"private","reasoning_effort":{"mode":"set","value":{"supported_levels":["high","ultra"]}}});
+    let (st, written) = call(&b.app, "PUT", "/provider-model-spec", request.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{written}");
+    let original = tw_config::try_parse(&b.file()).unwrap().providers[0].model_specs["private"]
+        .reasoning_effort
+        .clone();
+    let model = row(&rows(&b).await, "private").clone();
+    assert_eq!(
+        model["manual_reasoning_effort"],
+        json!({"supported_levels":["high","ultra"]})
+    );
+    assert_eq!(model["reasoning"], true);
+    assert!(
+        model.get("manual_reasoning").is_none(),
+        "inferred support is not a manual boolean"
+    );
+    assert_eq!(
+        model["reasoning_effort"],
+        json!({"supported_levels":["high"],"default_level":"high"})
+    );
+    assert_eq!(model["reasoning_effort_filtered_levels"], json!(["ultra"]));
+    // Old clients omit the new field; editing another specification must preserve it.
+    let (st, result) = call(
+        &b.app,
+        "PUT",
+        "/provider-model-spec",
+        json!({"provider":"relay","model":"private","context_window":64000}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    let cfg = tw_config::try_parse(&b.file()).unwrap();
+    assert_eq!(
+        cfg.providers[0].model_specs["private"].reasoning_effort,
+        original
+    );
+    assert_eq!(
+        cfg.providers[0].model_specs["private"].reasoning_history,
+        Some(tw_config::ReasoningHistory::Reasoning)
+    );
+    let before = b.file();
+    request["reasoning_effort"]["value"]["default_level"] = json!("medium");
+    let (st, result) = call(&b.app, "PUT", "/provider-model-spec", request).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(result["code"], "config.model_spec_effort_default");
+    assert_eq!(b.file(), before);
+    let (st, result) = call(&b.app,"PUT","/provider-model-spec",json!({"provider":"relay","model":"private","reasoning_effort":{"mode":"auto"},"base_version":"stale"})).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{result}");
+    let (st, result) = call(
+        &b.app,
+        "PUT",
+        "/provider-model-spec",
+        json!({"provider":"relay","model":"private","reasoning_effort":{"mode":"auto"}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    assert!(
+        tw_config::try_parse(&b.file()).unwrap().providers[0].model_specs["private"]
+            .reasoning_effort
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn model_rows_expose_reported_manual_and_effective_effort_separately() {
+    let app = axum::Router::new().route("/v1/models", axum::routing::get(|| async { axum::Json(json!({"data":[{"id":"private","effort":{"supported_levels":["low","high"],"default_level":"high"}}]})) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let b = bed(&config(address, "", ""));
+    let model = row(&rows(&b).await, "private").clone();
+    assert_eq!(model["reasoning_effort_source"], "upstream");
+    assert_eq!(
+        model["reasoning_effort"],
+        model["reported_reasoning_effort"]
+    );
+    assert!(model.get("manual_reasoning_effort").is_none());
+    let (st,result)=call(&b.app,"PUT","/provider-model-spec",json!({"provider":"relay","model":"private","reasoning_effort":{"mode":"set","value":{"supported_levels":[]}}})).await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    let model = row(&rows(&b).await, "private").clone();
+    assert_eq!(model["reasoning_effort_source"], "manual");
+    assert_eq!(model["reasoning_effort"], json!({"supported_levels":[]}));
+    assert_eq!(model["reported_reasoning_effort"]["default_level"], "high");
+}

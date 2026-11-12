@@ -1,7 +1,5 @@
 //! Project reported API model capabilities without adopting native instructions.
 
-use std::collections::BTreeSet;
-
 use serde_json::{Value, json};
 
 pub(super) fn ordinary(model: &Value) -> Option<Value> {
@@ -18,60 +16,48 @@ pub(super) fn ordinary(model: &Value) -> Option<Value> {
                 .collect::<Vec<_>>()
         );
     }
-    if let Some(levels) = model["effort"]["supported_levels"].as_array() {
-        let mut seen = BTreeSet::new();
-        let levels: Vec<_> = levels
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|effort| {
-                matches!(*effort, "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
-                    && seen.insert(*effort)
-            })
-            .map(|effort| json!({"effort": effort, "description": format!("Reasoning effort: {effort}")}))
-            .collect();
-        let default = model["effort"]["default_level"]
-            .as_str()
-            .filter(|effort| levels.iter().any(|level| level["effort"] == *effort));
-        out["supported_reasoning_levels"] = json!(levels);
-        out["default_reasoning_level"] = json!(default);
+    let reported = crate::model_capabilities::reported(model);
+    if let Some(effort) = reported.reasoning_effort {
+        set_reasoning(&mut out, &effort);
+    }
+    if let Some(reasoning) = reported.reasoning {
+        out["reasoning"] = json!(reasoning);
+    }
+    if let Some(max_output) = reported.max_output_tokens {
+        out["max_output_tokens"] = json!(max_output);
     }
     Some(out)
+}
+
+/// Preserve native descriptions for discovered levels; hand-written levels get plain labels.
+pub(super) fn set_reasoning(out: &mut Value, effort: &tw_config::ReasoningEffort) {
+    let levels: Vec<_> = effort.supported_levels.iter().map(|level| {
+        out["supported_reasoning_levels"].as_array()
+            .and_then(|levels| levels.iter().find(|v| v["effort"] == level.slug())).cloned()
+            .unwrap_or_else(|| json!({"effort":level.slug(),"description":format!("Reasoning effort: {level}")}))
+    }).collect();
+    out["supported_reasoning_levels"] = json!(levels);
+    out["default_reasoning_level"] = json!(effort.default_level);
 }
 
 /// Definitions may disagree on prompts or tools while sharing effort choices.
 /// Keep only levels that every routing candidate explicitly supports.
 pub(super) fn apply_reasoning(
     out: &mut Value,
-    profiles: &[Option<&Value>],
+    profiles: &[Option<tw_config::ReasoningEffort>],
     requires_translation: bool,
+    first_definition: Option<&Value>,
 ) {
-    let first = profiles.first().copied().flatten();
-    let mut levels = first
-        .and_then(|p| p["supported_reasoning_levels"].as_array())
-        .cloned()
-        .unwrap_or_default();
-    levels.retain(|level| {
-        level["effort"].as_str().is_some_and(|effort| {
-            (!requires_translation || tw_dialect::think::parse_openai(effort).is_some())
-                && profiles.iter().all(|profile| {
-                    profile
-                        .and_then(|p| p["supported_reasoning_levels"].as_array())
-                        .is_some_and(|levels| levels.iter().any(|v| v["effort"] == effort))
-                })
-        })
-    });
-    let default = first
-        .and_then(|p| p["default_reasoning_level"].as_str())
-        .filter(|effort| levels.iter().any(|v| v["effort"] == *effort))
-        .or_else(|| {
-            levels
-                .iter()
-                .find(|v| v["effort"] == "medium")
-                .or_else(|| levels.first())
-                .and_then(|v| v["effort"].as_str())
-        });
-    out["default_reasoning_level"] = json!(default);
-    out["supported_reasoning_levels"] = json!(levels);
+    let common = crate::model_capabilities::common_effort(
+        &profiles.iter().map(Option::as_ref).collect::<Vec<_>>(),
+        requires_translation,
+    )
+    .unwrap_or_default();
+    if let Some(levels) = first_definition.and_then(|p| p["supported_reasoning_levels"].as_array())
+    {
+        out["supported_reasoning_levels"] = json!(levels);
+    }
+    set_reasoning(out, &common);
 }
 
 #[cfg(test)]
@@ -107,7 +93,12 @@ mod tests {
         .unwrap();
         assert!(profile["default_reasoning_level"].is_null());
         out = json!({});
-        apply_reasoning(&mut out, &[Some(&profile)], false);
+        apply_reasoning(
+            &mut out,
+            &[crate::model_capabilities::reported(&profile).reasoning_effort],
+            false,
+            Some(&profile),
+        );
         assert_eq!(
             out["supported_reasoning_levels"].as_array().unwrap().len(),
             2

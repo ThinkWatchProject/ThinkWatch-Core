@@ -113,19 +113,77 @@ fn listed_meta(
     catalog: &tw_engine::Catalog,
     cfg: &tw_config::Config,
     name: &str,
+    directory: &crate::models::Directory,
 ) -> ModelMeta {
+    let resolved = |provider: &str, model: &str| {
+        let Some(p) = cfg.providers.iter().find(|p| p.name == provider) else {
+            return model_meta(cfg, book, Some(provider), model);
+        };
+        let reported = directory.capabilities(provider, model);
+        let spec = p.model_spec_with_metadata(book, model, reported.as_ref());
+        ModelMeta {
+            max_input_tokens: spec.context_window(),
+            max_output_tokens: spec.max_output_tokens(),
+            reasoning: spec.reasoning(),
+            image_input: spec.image_input(),
+        }
+    };
     if let Some((provider, model)) = catalog.first_served(name) {
-        return model_meta(cfg, book, Some(provider), model);
+        return resolved(provider, model);
     }
     if !cfg.aliases.contains(name)
         && let Some(provider) = catalog.providers_for(name).first()
     {
-        return model_meta(cfg, book, Some(provider), name);
+        return resolved(provider, name);
     }
     match cfg.aliases.find(name).and_then(|a| a.models.first()) {
         Some(model) => model_meta(cfg, book, None, model),
         None => model_meta(cfg, book, None, name),
     }
+}
+
+/// Normal model discovery shares the same effort intersection as the Codex catalog.
+fn listed_object(
+    shape: ListingShape,
+    name: &str,
+    book: &tw_pricing::PriceBook,
+    catalog: &tw_engine::Catalog,
+    cfg: &tw_config::Config,
+    directory: &crate::models::Directory,
+) -> serde_json::Value {
+    let mut out = shape.object(name, &listed_meta(book, catalog, cfg, name, directory));
+    let candidates: Vec<_> = if catalog.alias(name).is_some() {
+        catalog
+            .served(name)
+            .iter()
+            .map(|(p, m)| (p.as_str(), m.as_str()))
+            .collect()
+    } else {
+        catalog
+            .providers_for(name)
+            .iter()
+            .map(|p| (p.as_str(), name))
+            .collect()
+    };
+    let mut translate = false;
+    let profiles: Vec<_> = candidates
+        .iter()
+        .map(|(provider, model)| {
+            let p = cfg.providers.iter().find(|p| p.name == *provider)?;
+            translate |= crate::model_capabilities::requires_translation(p.effective_protocol());
+            let reported = directory.capabilities(provider, model);
+            p.model_spec_with_metadata(book, model, reported.as_ref())
+                .reasoning_effort
+                .map(|s| s.value)
+        })
+        .collect();
+    if let Some(effort) = crate::model_capabilities::common_effort(
+        &profiles.iter().map(Option::as_ref).collect::<Vec<_>>(),
+        translate,
+    ) {
+        out["effort"] = serde_json::to_value(effort).expect("effort is JSON");
+    }
+    out
 }
 
 /// `GET /v1/models`。
@@ -165,7 +223,7 @@ pub(super) async fn list_models(
     let book = state.pricing.load();
     let objects: Vec<_> = models
         .iter()
-        .map(|m| shape.object(m, &listed_meta(&book, &catalog, &rt.config, m)))
+        .map(|m| listed_object(shape, m, &book, &catalog, &rt.config, &state.models))
         .collect();
 
     let body = match shape {
@@ -365,8 +423,15 @@ pub(super) async fn get_model(
             ),
         ));
     }
-    let meta = listed_meta(&state.pricing.load(), &catalog, &rt.config, &model);
-    Ok(axum::Json(shape.object(&model, &meta)).into_response())
+    Ok(axum::Json(listed_object(
+        shape,
+        &model,
+        &state.pricing.load(),
+        &catalog,
+        &rt.config,
+        &state.models,
+    ))
+    .into_response())
 }
 
 #[cfg(test)]

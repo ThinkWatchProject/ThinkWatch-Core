@@ -36,6 +36,9 @@ fn protocols() -> Vec<&'static str> {
 fn reasoning_histories() -> Vec<&'static str> {
     super::fields::<ReasoningHistory>()
 }
+fn reasoning_levels() -> Vec<&'static str> {
+    super::fields::<ReasoningLevel>()
+}
 fn billings() -> Vec<&'static str> {
     super::fields::<Billing>()
 }
@@ -845,8 +848,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Bool,
                     Def::Unset,
                     t(
-                        "Whether the model reasons. The model list (`GET /v1/models`) carries it, so clients offer reasoning levels for it. Unset: the price table's; the list leaves it out when the price table does not say.",
-                        "这个模型会不会推理。模型列表（`GET /v1/models`）带着它，客户端据此给出推理档位。不写：取价目表的；价目表也没写时，列表里不给这一项。",
+                        "Whether the model reasons. This boolean does not declare adjustable effort levels; use reasoning_effort for those. False conflicts with nonempty manual levels. Unset: use known metadata or the price table.",
+                        "这个模型会不会推理。此开关不声明可调档位，档位由 reasoning_effort 指定。false 不能与非空手动档位并存。不写：使用已知元数据或价目表。",
+                    ),
+                ),
+                row(
+                    "reasoning_effort",
+                    Kind::Obj("providers[].model_specs.*.reasoning_effort"),
+                    Def::Unset,
+                    t(
+                        "Override the entire reasoning effort profile. Unset: automatic upstream metadata; an empty supported_levels list explicitly disables adjustable effort. Nonempty levels imply reasoning support.",
+                        "整组覆盖推理档位。不写时自动使用上游元数据；supported_levels 空列表明确表示不可调。非空档位自动表示支持推理。",
                     ),
                 ),
                 row(
@@ -856,6 +868,30 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Whether the model takes images as input. The model list carries it, as `input_modalities`. Unset: the price table's; the list leaves it out when the price table does not say.",
                         "这个模型收不收图。模型列表里以 `input_modalities` 给出。不写：取价目表的；价目表也没写时，列表里不给这一项。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "providers[].model_specs.*.reasoning_effort",
+            ty: checked!(ReasoningEffort, "{supported_levels: []}"),
+            rows: vec![
+                row(
+                    "supported_levels",
+                    Kind::Strs,
+                    Def::Required,
+                    t(
+                        "Supported levels: minimal, low, medium, high, xhigh, max, ultra. No duplicates. Empty explicitly means no adjustable effort; protocol conversion may further restrict these choices.",
+                        "支持的档位：minimal、low、medium、high、xhigh、max、ultra，不可重复。空列表明确表示不可调；协议转换可能进一步限制可用档位。",
+                    ),
+                ),
+                row(
+                    "default_level",
+                    Kind::Enum(reasoning_levels),
+                    Def::Unset,
+                    t(
+                        "Must be one of supported_levels. Unset: prefer medium in the final available set, otherwise its lowest level. The manual profile does not inherit the upstream default.",
+                        "必须属于 supported_levels。不写时在最终可用集合中优先 medium，否则最低档；手动档位不混用上游默认值。",
                     ),
                 ),
             ],

@@ -92,6 +92,9 @@ config.manual_model_too_long
 config.manual_model_wildcard
 config.min_speed_range
 config.model_spec_blank_model
+config.model_spec_effort_default
+config.model_spec_effort_disabled
+config.model_spec_effort_duplicate
 config.model_spec_nothing_set
 config.model_spec_wildcard
 config.model_spec_zero
