@@ -539,6 +539,36 @@ A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude
 and Google subscription sign-ins are not supported; use an API key.
 
+Generation requests first use the client's streaming or non-streaming mode.
+Known backend requirements take priority: ChatGPT account backends keep their
+existing stream-only behavior. For other backends, an HTTP 400, 422 or 501 JSON
+API rejection can trigger one trial of the opposite mode on the same upstream.
+No particular mode-error code or English message is required. Known history,
+reasoning-effort and cache-mark repairs run first and share the request's single
+automatic repair budget; a trial also respects its wait deadline. Explicit errors
+about another parameter, recognizable authentication, quota, rate-limit, overload
+or timeout errors, and responses carrying a retry hint do not trigger a trial.
+An unrelated opaque request error can therefore cost one extra rejected attempt.
+
+The gateway collects a streaming answer into complete JSON, or writes a complete
+answer as the stream the client requested. The latter still waits for the whole
+upstream answer. A successful response already in the other mode is converted
+without resending it. If the trial is itself rejected over HTTP, or fails before
+its answer starts, the original error is retained; both attempt outcomes remain
+in the request record. An original server error can still fail over to another
+upstream. Partially received answers are never replayed, and errors inside a
+successful stream do not initiate mode negotiation.
+
+Only a complete successful answer teaches a working preference. It is kept in
+memory for 30 minutes from that trial, isolated by upstream account, model, API
+and request options such as tools and reasoning. Using the preference does not
+extend its expiry: after expiry the next request tries the client's mode again.
+Reloading the configuration clears this memory; an eligible rejection invalidates
+a remembered preference. No upstream setting is required.
+Native requests for multiple candidates, log probabilities or non-text output
+are not switched automatically: the current response converters cannot preserve
+those response fields. WebSocket requests are not negotiated.
+
 Some relays and accounts accept only a few requests at a time and refuse the
 rest. `max_concurrent` keeps the gateway within that number: a request takes a
 slot on the upstream when it is sent, and gives it back when the answer has

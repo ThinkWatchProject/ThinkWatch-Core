@@ -65,6 +65,7 @@ pub mod slots;
 pub mod slow;
 mod splice;
 pub mod state;
+pub mod stream_mode;
 pub mod throttle;
 pub mod traffic;
 pub mod translate;

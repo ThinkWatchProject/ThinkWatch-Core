@@ -293,7 +293,11 @@ async fn an_upstream_that_answers_gzip_json_reaches_the_client_decoded() {
 async fn an_upstream_that_streams_gzip_sse_reaches_the_client_decoded_event_by_event() {
     let (up, _) = upstream(Reply::GzipStream(STREAM)).await;
     let gw = gateway(up).await;
-    let r = post(gw, "/v1/messages", None, claude_request().into_bytes()).await;
+    // Ask for a stream: a whole-answer client now correctly receives collected
+    // JSON when an upstream ignores its mode and returns SSE.
+    let mut request: Value = serde_json::from_str(&claude_request()).unwrap();
+    request["stream"] = json!(true);
+    let r = post(gw, "/v1/messages", None, request.to_string().into_bytes()).await;
     assert_eq!(r.status(), 200);
     assert!(
         r.headers().get("content-encoding").is_none(),
