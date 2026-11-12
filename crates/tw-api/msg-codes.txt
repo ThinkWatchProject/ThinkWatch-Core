@@ -454,6 +454,7 @@ gw.upstream.idle_timeout_mid_stream
 gw.upstream.paused
 gw.upstream.period_used_up
 gw.upstream.rate_limited
+gw.upstream.response_error
 gw.upstream.sealed_elsewhere
 gw.upstream.sign_failed
 gw.upstream.status
