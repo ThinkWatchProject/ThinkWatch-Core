@@ -333,46 +333,85 @@ async fn failed_probes_preserve_the_original_response_and_both_attempt_outcomes(
 
 #[tokio::test]
 async fn a_failed_server_error_probe_still_fails_over_with_the_original_request_mode() {
-    let (up, first) = upstream(|_, _, n| {
-        response(
-            if n == 1 { 501 } else { 503 },
-            "application/json",
-            json!({"error":{"message":"Request rejected"}}).to_string(),
-        )
-    })
-    .await;
-    let (backup, second) =
-        upstream(|_, _, _| response(200, "application/json", whole().to_string())).await;
-    let cfg: Config = serde_yaml_ng::from_str(&format!(
-        "version: 1\ndefault_route: all\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: up\n    base_url: http://{up}\n    protocol: openai-chat\n  - name: next\n    base_url: http://{backup}\n    protocol: openai-chat\ngroups:\n  - name: pool\n    type: fallback\n    providers: [up, next]\nroutes:\n  - name: all\n    rules:\n      - name: all\n        to: pool\n"
-    )).unwrap();
-    let state = tw_gateway::AppState::new(cfg).unwrap();
-    let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
-        .await
-        .unwrap();
-    let mut events = state.bus.subscribe();
-    let (path, req) = request(Dialect::Chat, false);
-    let (status, ct, body) = post(gw, path, &req).await;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_answer(Dialect::Chat, false, path, &req, &ct, &body);
-    let first = first.lock().unwrap();
-    assert_eq!(first.len(), 2);
-    assert_eq!(first[0].1["stream"], false);
-    assert_eq!(first[1].1["stream"], true);
-    let second = second.lock().unwrap();
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0].1["stream"], false);
-    let mut routed = None;
-    while let Ok(event) = events.try_recv() {
-        if let tw_api::Event::RequestRouted { attempts, .. } = event {
-            routed = Some(attempts);
+    for (probe_status, backup_status) in [(503, 200), (200, 200), (200, 429)] {
+        let (up, first) = upstream(move |_, _, n| {
+            if n == 1 {
+                response(
+                    501,
+                    "application/json",
+                    json!({"error":{"message":"Request rejected"}}).to_string(),
+                )
+            } else if probe_status == 200 {
+                response(
+                    200,
+                    "text/event-stream",
+                    format!(
+                        "data: {}\n\n",
+                        json!({"error":{"type":"invalid_request_error","message":"probe failed"}})
+                    ),
+                )
+            } else {
+                response(
+                    probe_status,
+                    "application/json",
+                    json!({"error":{"message":"Request rejected"}}).to_string(),
+                )
+            }
+        })
+        .await;
+        let (backup, second) = upstream(move |_, _, _| {
+            response(backup_status, "application/json", whole().to_string())
+        })
+        .await;
+        let mut cfg: Config = serde_yaml_ng::from_str(&format!(
+            "version: 1\ndefault_route: all\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: up\n    base_url: http://{up}\n    protocol: openai-chat\n  - name: next\n    base_url: http://{backup}\n    protocol: openai-chat\ngroups:\n  - name: pool\n    type: fallback\n    providers: [up, next]\nroutes:\n  - name: all\n    rules:\n      - name: all\n        to: pool\n"
+        )).unwrap();
+        cfg.failover.wait_secs = 1;
+        let state = tw_gateway::AppState::new(cfg).unwrap();
+        let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let mut events = state.bus.subscribe();
+        let (path, req) = request(Dialect::Chat, false);
+        let (status, ct, body) = post(gw, path, &req).await;
+        if backup_status == 200 {
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            assert_answer(Dialect::Chat, false, path, &req, &ct, &body);
+        } else {
+            // A limited backup must not hide the original server rejection.
+            assert_eq!(status, 501, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["error"]["message"],
+                "Request rejected"
+            );
         }
+        let first = first.lock().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].1["stream"], false);
+        assert_eq!(first[1].1["stream"], true);
+        let second = second.lock().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1["stream"], false);
+        let mut routed = None;
+        while let Ok(event) = events.try_recv() {
+            if let tw_api::Event::RequestRouted { attempts, .. } = event {
+                routed = Some(attempts);
+            }
+        }
+        let attempts = routed.unwrap();
+        assert_eq!(
+            attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
+            vec![
+                Some(501),
+                if probe_status == 200 {
+                    None
+                } else {
+                    Some(probe_status)
+                },
+                Some(backup_status)
+            ]
+        );
     }
-    let attempts = routed.unwrap();
-    assert_eq!(
-        attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
-        vec![Some(501), Some(503), Some(200)]
-    );
 }
 
 #[tokio::test]

@@ -1196,6 +1196,7 @@ pub(super) async fn try_upstreams<'a>(
                     // Learn the replacement only if the whole answer succeeds.
                     rt.stream_modes.forget(key);
                     if !repair_used && tokio::time::Instant::now() < until {
+                        reached = true;
                         repair_used = true;
                         stream_trial = Some((key.clone(), !mode));
                         state.note_quota(id, &provider.name, &headers);
