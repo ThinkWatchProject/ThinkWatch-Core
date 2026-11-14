@@ -28,7 +28,9 @@ pub struct WebToolsConfig {
     pub engines: Vec<SearchEngine>,
     /// An existing proxy name, "system", or "direct".
     pub proxy: String,
+    /// Empty follows the system language on the host running Core.
     pub language: String,
+    /// Empty follows the region in that host's system locale, when available.
     pub region: String,
     pub allowed_domains: Vec<String>,
     pub blocked_domains: Vec<String>,
@@ -73,6 +75,15 @@ impl Default for WebToolsConfig {
 pub struct WebToolsView {
     pub config: WebToolsConfig,
     pub config_version: String,
+    /// Detected on the Core host, which may be remote. Empty fields mean unavailable.
+    pub system_locale: WebSearchLocale,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WebSearchLocale {
+    pub language: String,
+    pub region: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

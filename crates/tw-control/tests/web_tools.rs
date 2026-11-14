@@ -71,6 +71,12 @@ async fn web_settings_persist_validate_versions_and_use_the_same_public_url_poli
     let (status, view) = call(&bed.app, "GET", "/web-tools", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(view["config"]["mode"], "upstream");
+    assert_eq!(
+        view["system_locale"],
+        serde_json::to_value(tw_config::web_tools::system_locale()).unwrap()
+    );
+    assert_eq!(view["config"]["language"], "");
+    assert_eq!(view["config"]["region"], "");
     let mut config = view["config"].clone();
     config["mode"] = json!("core");
     config["engines"] = json!(["bing"]);
@@ -80,6 +86,14 @@ async fn web_settings_persist_validate_versions_and_use_the_same_public_url_poli
     assert_eq!(
         tw_config::try_parse(&bed.file()).unwrap().web_tools.mode,
         tw_api::WebToolsMode::Core
+    );
+    // Saving unrelated preferences must not freeze auto to today's system locale.
+    assert!(
+        tw_config::try_parse(&bed.file())
+            .unwrap()
+            .web_tools
+            .language
+            .is_empty()
     );
     assert_eq!(
         call(&bed.app, "PUT", "/web-tools", request).await.0,

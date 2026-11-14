@@ -1328,8 +1328,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Is("''"),
                     t(
-                        "Language code; empty uses the engine default.",
-                        "语言代码，空值使用引擎默认值。",
+                        "BCP 47 language tag. Empty follows the system language on the Core host (including a remote Core); if unavailable, the engine decides. Lite provides a language picker.",
+                        "BCP 47 语言标签。空值跟随运行 Core 的主机系统语言（包括远程 Core），无法识别时由引擎决定。Lite 中通过语言列表选择。",
                     ),
                 ),
                 row(
@@ -1337,8 +1337,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Is("''"),
                     t(
-                        "Region code; empty uses the engine default.",
-                        "地区代码，空值使用引擎默认值。",
+                        "Two-letter country/region code. Empty follows the region in the Core host’s system locale; if unavailable, the engine decides. Search engines apply supported regional preferences on a best-effort basis.",
+                        "两字母国家或地区代码。空值跟随 Core 主机系统语言中的地区，无法识别时由引擎决定。搜索引擎按支持范围尽量应用偏好。",
                     ),
                 ),
                 row(

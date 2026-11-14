@@ -33,7 +33,7 @@ pub mod store;
 pub mod sync;
 mod validate;
 pub mod watch;
-mod web_tools;
+pub mod web_tools;
 mod wire;
 
 pub use aliases::{Alias, Aliases};

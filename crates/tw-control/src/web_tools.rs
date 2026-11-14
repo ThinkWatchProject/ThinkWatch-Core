@@ -14,6 +14,7 @@ async fn view(State(s): State<ControlState>) -> Json<tw_api::WebToolsView> {
     Json(tw_api::WebToolsView {
         config: s.config().web_tools.clone(),
         config_version: s.cfg.current().map(|c| c.version()).unwrap_or_default(),
+        system_locale: tw_config::web_tools::system_locale(),
     })
 }
 

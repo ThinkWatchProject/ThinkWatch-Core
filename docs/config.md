@@ -2041,8 +2041,8 @@ Search uses Bing RSS and DuckDuckGo HTML without API keys. Challenges and unreco
 | `mode` | `upstream` \| `core` | `upstream` | upstream forwards hosted tools; core executes supported web operations. |
 | `engines` | list of strings | `[]` | Empty selects available engines automatically. Otherwise list bing and/or duckduckgo in priority order. |
 | `proxy` | string | `system` | system, direct, or an existing proxy name. |
-| `language` | string | `''` | Language code; empty uses the engine default. |
-| `region` | string | `''` | Region code; empty uses the engine default. |
+| `language` | string | `''` | BCP 47 language tag. Empty follows the system language on the Core host (including a remote Core); if unavailable, the engine decides. Lite provides a language picker. |
+| `region` | string | `''` | Two-letter country/region code. Empty follows the region in the Core host’s system locale; if unavailable, the engine decides. Search engines apply supported regional preferences on a best-effort basis. |
 | `allowed_domains` | list of strings | `[]` | Only these domains and their subdomains; also applies to page reads. Empty allows all public domains. |
 | `blocked_domains` | list of strings | `[]` | Excluded domains and their subdomains; exclusions take precedence. |
 | `max_results` | integer | `8` | Search results, 1–20. |

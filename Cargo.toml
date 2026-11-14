@@ -156,6 +156,10 @@ aws-smithy-types = "1"
 percent-encoding = "2"
 # 地址解析（同步位置的 `http://` 只给内网）。reqwest 本来就依赖它
 url = "2"
+# Read the Core host's preferred language on macOS, Windows, and Unix.
+sys-locale = "0.3.2"
+# Already used by URL parsing; normalize BCP 47 without maintaining our own parser.
+icu_locale_core = { version = "2", features = ["alloc"] }
 # WebDAV 的 PROPFIND、S3 的 ListObjectsV2 回的是 XML
 quick-xml = "0.42"
 

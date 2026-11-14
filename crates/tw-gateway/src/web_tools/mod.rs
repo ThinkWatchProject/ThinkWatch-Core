@@ -2,6 +2,7 @@
 
 mod collect;
 mod history;
+mod locale;
 pub(crate) mod protocol;
 mod public;
 pub(crate) mod wire;
@@ -92,6 +93,18 @@ pub(crate) async fn execute_scoped(
 }
 
 impl WebTools {
+    fn locale(&self) -> tw_api::WebSearchLocale {
+        tw_config::web_tools::resolve_locale(&self.config, &tw_config::web_tools::system_locale())
+    }
+
+    fn cache_key(
+        identity: &str,
+        request: &WebToolRequest,
+        locale: &tw_api::WebSearchLocale,
+    ) -> Result<String, Msg> {
+        serde_json::to_string(&(identity, request, locale)).map_err(|_| error("invalid request"))
+    }
+
     #[cfg(test)]
     pub(crate) async fn seed(
         &self,
@@ -99,7 +112,7 @@ impl WebTools {
         request: &WebToolRequest,
         result: WebToolResult,
     ) {
-        let key = format!("{identity}\n{}", serde_json::to_string(request).unwrap());
+        let key = Self::cache_key(identity, request, &self.locale()).unwrap();
         self.cache.lock().unwrap().insert(
             key,
             Arc::new(AsyncMutex::new(Some((Instant::now(), result)))),
@@ -135,10 +148,8 @@ impl WebTools {
     ) -> Result<WebToolResult, Msg> {
         let started = Instant::now();
         let run = async {
-            let key = format!(
-                "{identity}\n{}",
-                serde_json::to_string(request).map_err(|_| error("invalid request"))?
-            );
+            let locale = self.locale();
+            let key = Self::cache_key(identity, request, &locale)?;
             let key = if allowed.is_empty() && blocked.is_empty() {
                 key
             } else {
@@ -174,7 +185,7 @@ impl WebTools {
                 .map_err(|_| error("executor stopped"))?;
             let deadline = started + Duration::from_secs(u64::from(self.config.timeout_secs));
             let result = self
-                .run(identity, request, allowed, blocked, deadline)
+                .run(identity, request, (allowed, blocked), deadline, &locale)
                 .await?;
             if self.config.cache_secs > 0 {
                 *cached = Some((Instant::now(), result.clone()));
@@ -195,9 +206,9 @@ impl WebTools {
         &self,
         identity: &str,
         request: &WebToolRequest,
-        scope_allowed: &[String],
-        scope_blocked: &[String],
+        (scope_allowed, scope_blocked): (&[String], &[String]),
         deadline: Instant,
+        locale: &tw_api::WebSearchLocale,
     ) -> Result<WebToolResult, Msg> {
         let mut result = WebToolResult {
             sources: Vec::new(),
@@ -236,7 +247,7 @@ impl WebTools {
                         if !self.reserve(engine).await {
                             return Ok(None);
                         }
-                        self.search(engine, query, allowed_domains, blocked_domains)
+                        self.search(engine, query, allowed_domains, blocked_domains, locale)
                             .await
                             .map(Some)
                     })
@@ -354,6 +365,7 @@ impl WebTools {
         query: &str,
         allowed: &[String],
         blocked: &[String],
+        locale: &tw_api::WebSearchLocale,
     ) -> Result<Vec<tw_api::WebSource>, Msg> {
         let mut q = query.to_string();
         if !allowed.is_empty() {
@@ -382,30 +394,10 @@ impl WebTools {
         })
         .expect("built-in URL");
         url.query_pairs_mut().append_pair("q", &q);
-        match engine {
-            SearchEngine::Bing => {
-                url.query_pairs_mut().append_pair("format", "rss");
-                if !self.config.language.is_empty() {
-                    url.query_pairs_mut()
-                        .append_pair("setlang", &self.config.language);
-                }
-                if !self.config.region.is_empty() {
-                    url.query_pairs_mut().append_pair("cc", &self.config.region);
-                }
-            }
-            SearchEngine::Duckduckgo => {
-                if !self.config.region.is_empty() && !self.config.language.is_empty() {
-                    url.query_pairs_mut().append_pair(
-                        "kl",
-                        &format!(
-                            "{}-{}",
-                            self.config.region.to_lowercase(),
-                            self.config.language.to_lowercase()
-                        ),
-                    );
-                }
-            }
+        if engine == SearchEngine::Bing {
+            url.query_pairs_mut().append_pair("format", "rss");
         }
+        locale::apply(&mut url, engine, locale);
         let (_, body) = self.fetch(url, None).await?;
         let mut sources = collect::search(engine, &body)?;
         sources.retain(|s| {
