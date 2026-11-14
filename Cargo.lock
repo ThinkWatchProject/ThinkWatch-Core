@@ -4013,7 +4013,7 @@ dependencies = [
 
 [[package]]
 name = "tw-api"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4024,7 +4024,7 @@ dependencies = [
 
 [[package]]
 name = "tw-bedrock"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "tw-breaker"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4053,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "tw-config"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "blake3",
  "icu_locale_core",
@@ -4081,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "tw-control"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4127,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "tw-dialect"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "memchr",
  "serde",
@@ -4136,7 +4136,7 @@ dependencies = [
 
 [[package]]
 name = "tw-engine"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4150,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "tw-gateway"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "tw-guard"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -4225,7 +4225,7 @@ dependencies = [
 
 [[package]]
 name = "tw-handover"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "libc",
  "serde",
@@ -4238,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "tw-link"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4252,7 +4252,7 @@ dependencies = [
 
 [[package]]
 name = "tw-observe"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -4261,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pack"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "age",
  "blake3",
@@ -4285,7 +4285,7 @@ dependencies = [
 
 [[package]]
 name = "tw-plugin"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "libc",
  "rand 0.10.2",
@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pricing"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "arc-swap",
  "flate2",
@@ -4314,14 +4314,14 @@ dependencies = [
 
 [[package]]
 name = "tw-secret"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "tw-store"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -4341,7 +4341,7 @@ dependencies = [
 
 [[package]]
 name = "tw-sync"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "age",
  "axum",
@@ -4369,7 +4369,7 @@ dependencies = [
 
 [[package]]
 name = "tw-types"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4378,7 +4378,7 @@ dependencies = [
 
 [[package]]
 name = "tw-watch"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "libc",
  "notify",
@@ -4389,7 +4389,7 @@ dependencies = [
 
 [[package]]
 name = "tw-yaml"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "saphyr-parser",
  "serde_yaml_ng",
@@ -4399,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "twcore"
-version = "0.96.0"
+version = "0.97.0"
 dependencies = [
  "anyhow",
  "axum",

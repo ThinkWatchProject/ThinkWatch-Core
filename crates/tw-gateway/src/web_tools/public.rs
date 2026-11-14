@@ -412,9 +412,11 @@ mod network_tests {
         });
         let settings = ClientSettings {
             proxy: hyper_util::client::proxy::matcher::Matcher::builder()
-                .all(format!("http://localhost:{port}"))
+                // Match the IPv4 listener exactly: resolving localhost may try
+                // ::1 first, whose refusal can consume the Windows CI timeout.
+                .all(format!("http://127.0.0.1:{port}"))
                 .build(),
-            timeout: std::time::Duration::from_secs(2),
+            timeout: std::time::Duration::from_secs(10),
         };
         let url = parse("http://example.org/").unwrap();
         assert_eq!(

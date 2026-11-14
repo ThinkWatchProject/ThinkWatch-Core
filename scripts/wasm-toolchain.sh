@@ -38,7 +38,9 @@ if [ "${1:-}" = record ]; then
         echo '```'
       } >> "$GITHUB_STEP_SUMMARY"
     fi
-  done < <(find "$dir" -path '*/tw-plugin-*/out/guest-build.txt' 2>/dev/null | sort)
+  # Cargo owns the intermediate directory layout. Locate the build script's
+  # dedicated manifest by name, including when the target root is a symlink.
+  done < <(find -L "$dir" -type f -name 'guest-build.txt' 2>/dev/null | sort)
   if [ "$found" = 0 ]; then
     echo "no guest-build.txt under $dir: tw-plugin was not built" >&2
     exit 1
