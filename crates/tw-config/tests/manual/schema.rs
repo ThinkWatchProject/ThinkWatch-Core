@@ -231,6 +231,15 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "web_tools",
+                    Kind::Obj("web_tools"),
+                    Def::Section,
+                    t(
+                        "Gateway-owned search and public-page tools. Configured under Routing → Auxiliary in Lite.",
+                        "网关执行的搜索与公开网页工具，在 Lite 的「路由 → 辅助请求」中配置。",
+                    ),
+                ),
+                row(
                     "client_probes",
                     Kind::Obj("client_probes"),
                     Def::Section,
@@ -1279,6 +1288,150 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Output price once a request's input, cache reads and writes included, exceeds 200K tokens.",
                         "单次请求的输入（连同缓存读写）超过 200K token 后的输出单价。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "web_tools",
+            ty: checked!(tw_api::WebToolsConfig, "{}"),
+            rows: vec![
+                row(
+                    "mode",
+                    Kind::Enum(super::fields::<tw_api::WebToolsMode>),
+                    Def::Is("upstream"),
+                    t(
+                        "upstream forwards hosted tools; core executes supported web operations.",
+                        "upstream 沿用上游；core 执行已适配的联网工具。",
+                    ),
+                ),
+                row(
+                    "engines",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Empty selects available engines automatically. Otherwise list bing and/or duckduckgo in priority order.",
+                        "空列表自动选择可用引擎；手动填写 bing、duckduckgo，按顺序尝试。",
+                    ),
+                ),
+                row(
+                    "proxy",
+                    Kind::Str,
+                    Def::Is("system"),
+                    t(
+                        "system, direct, or an existing proxy name.",
+                        "system、direct 或已定义的代理名称。",
+                    ),
+                ),
+                row(
+                    "language",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t(
+                        "BCP 47 language tag. Empty follows the system language on the Core host (including a remote Core); if unavailable, the engine decides. Lite provides a language picker.",
+                        "BCP 47 语言标签。空值跟随运行 Core 的主机系统语言（包括远程 Core），无法识别时由引擎决定。Lite 中通过语言列表选择。",
+                    ),
+                ),
+                row(
+                    "region",
+                    Kind::Str,
+                    Def::Is("''"),
+                    t(
+                        "Two-letter country/region code. Empty follows the region in the Core host’s system locale; if unavailable, the engine decides. Search engines apply supported regional preferences on a best-effort basis.",
+                        "两字母国家或地区代码。空值跟随 Core 主机系统语言中的地区，无法识别时由引擎决定。搜索引擎按支持范围尽量应用偏好。",
+                    ),
+                ),
+                row(
+                    "allowed_domains",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Only these domains and their subdomains; also applies to page reads. Empty allows all public domains.",
+                        "仅允许这些域名及子域名，也约束网页读取；空列表允许所有公开域名。",
+                    ),
+                ),
+                row(
+                    "blocked_domains",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Excluded domains and their subdomains; exclusions take precedence.",
+                        "排除的域名及子域名，排除优先。",
+                    ),
+                ),
+                row(
+                    "max_results",
+                    Kind::Int,
+                    Def::Is("8"),
+                    t("Search results, 1–20.", "搜索结果数，1–20。"),
+                ),
+                row(
+                    "read_pages",
+                    Kind::Int,
+                    Def::Is("2"),
+                    t(
+                        "Read up to 0–5 pages when search snippets are insufficient. Explicit page tools remain available at zero.",
+                        "摘要不足时读取 0–5 个网页；设为 0 不影响模型明确调用网页读取。",
+                    ),
+                ),
+                row(
+                    "max_page_chars",
+                    Kind::Int,
+                    Def::Is("12000"),
+                    t(
+                        "Returned page characters, 1000–50000.",
+                        "每页返回字符上限，1000–50000。",
+                    ),
+                ),
+                row(
+                    "timeout_secs",
+                    Kind::Int,
+                    Def::Is("30"),
+                    t(
+                        "Whole operation timeout including queueing, 1–120 seconds.",
+                        "包括排队在内的单次操作超时，1–120 秒。",
+                    ),
+                ),
+                row(
+                    "max_concurrent",
+                    Kind::Int,
+                    Def::Is("4"),
+                    t("Concurrent web operations, 1–16.", "联网操作并发数，1–16。"),
+                ),
+                row(
+                    "interval_ms",
+                    Kind::Int,
+                    Def::Is("1000"),
+                    t(
+                        "Minimum interval per search engine, 250–60000 milliseconds.",
+                        "同一搜索引擎的最小请求间隔，250–60000 毫秒。",
+                    ),
+                ),
+                row(
+                    "cache_secs",
+                    Kind::Int,
+                    Def::Is("600"),
+                    t(
+                        "Successful result lifetime, 0–86400 seconds. Zero disables caching.",
+                        "成功结果缓存时间，0–86400 秒；0 关闭缓存。",
+                    ),
+                ),
+                row(
+                    "max_tool_calls",
+                    Kind::Int,
+                    Def::Is("8"),
+                    t(
+                        "Maximum web operations per model request, 1–32.",
+                        "每个模型请求最多执行联网工具次数，1–32。",
+                    ),
+                ),
+                row(
+                    "fallback_to_upstream",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Allow standalone searches to fall back to the upstream before returning results. This may incur upstream fees.",
+                        "独立搜索返回结果之前失败时允许回退上游，可能产生上游费用。",
                     ),
                 ),
             ],

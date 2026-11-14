@@ -110,6 +110,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `providers` | 对象列表，见 [`providers[]`](#cfg-providers) | `[]` | 上游。一个都没有也是合法配置：控制面照常运行，请求得到「尚未配置上游」的错误。 |
 | `proxies` | 对象列表，见 [`proxies[]`](#cfg-proxies) | `[]` | 出站代理。在这里声明一次，由 `providers[].proxy` 按名字引用。 |
 | `pricing` | 对象，见 [`pricing`](#cfg-pricing) | — | 默认价目表是否定期刷新，以及自定义价目表。 |
+| `web_tools` | 对象，见 [`web_tools`](#cfg-web_tools) | — | 网关执行的搜索与公开网页工具，在 Lite 的「路由 → 辅助请求」中配置。 |
 | `client_probes` | 对象，见 [`client_probes`](#cfg-client_probes) | — | 客户端自行发出的辅助请求（连通性检查、预热、起标题）如何处理。 |
 | `security` | 对象，见 [`security`](#cfg-security) | — | 三项防护。出厂时都处在 `observe`，不改变、不拒绝任何请求。 |
 | `retention` | 对象，见 [`retention`](#cfg-retention) | — | 请求日志保留多久。 |
@@ -1463,3 +1464,33 @@ sync:
 | `TWCORE_LOG` | 日志过滤，`tracing` 语法（`info`、`debug`、`tw_gateway=debug`）。 |
 | `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY`、`NO_PROXY` | 供 `proxy: system` 的上游使用。 |
 | 其他 | 配置中写 `${NAME}` 的位置读取。 |
+
+### 联网工具
+
+在 Lite 的 **路由 → 辅助请求** 中配置搜索、网页读取和页内查找。`core` 直接处理 Claude Code 的独立搜索子请求，省去搜索助手模型调用；Anthropic Messages 和 OpenAI Responses 对话中的联网工具由 Core 执行后交回模型继续处理，主模型仍按实际用量计费。客户端直接抓取网页的行为不变。联网工具响应收齐后按原生 JSON 或 SSE 返回，等待期间保持心跳。支持公开 HTTP/HTTPS 文本网页；指定地理位置或仅使用厂商缓存的搜索模式需要沿用上游。
+
+
+搜索使用 Bing RSS 和 DuckDuckGo HTML，不需要搜索 API Key。验证码和无法识别的页面按失败处理，配合请求间隔、冷却和其他引擎重试，不会当作“没有结果”。HTTP、HTTPS 和 SOCKS 代理连接 Core 已校验的公开 IP，TLS 和 HTTP 保留原始域名。Responses WebSocket 使用同一套受保护的执行流程。只有独立搜索辅助请求可以按显式配置回退上游。
+
+<!-- generated: table web_tools -->
+<a id="cfg-web_tools"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `mode` | `upstream` \| `core` | `upstream` | upstream 沿用上游；core 执行已适配的联网工具。 |
+| `engines` | 字符串列表 | `[]` | 空列表自动选择可用引擎；手动填写 bing、duckduckgo，按顺序尝试。 |
+| `proxy` | 字符串 | `system` | system、direct 或已定义的代理名称。 |
+| `language` | 字符串 | `''` | BCP 47 语言标签。空值跟随运行 Core 的主机系统语言（包括远程 Core），无法识别时由引擎决定。Lite 中通过语言列表选择。 |
+| `region` | 字符串 | `''` | 两字母国家或地区代码。空值跟随 Core 主机系统语言中的地区，无法识别时由引擎决定。搜索引擎按支持范围尽量应用偏好。 |
+| `allowed_domains` | 字符串列表 | `[]` | 仅允许这些域名及子域名，也约束网页读取；空列表允许所有公开域名。 |
+| `blocked_domains` | 字符串列表 | `[]` | 排除的域名及子域名，排除优先。 |
+| `max_results` | 整数 | `8` | 搜索结果数，1–20。 |
+| `read_pages` | 整数 | `2` | 摘要不足时读取 0–5 个网页；设为 0 不影响模型明确调用网页读取。 |
+| `max_page_chars` | 整数 | `12000` | 每页返回字符上限，1000–50000。 |
+| `timeout_secs` | 整数 | `30` | 包括排队在内的单次操作超时，1–120 秒。 |
+| `max_concurrent` | 整数 | `4` | 联网操作并发数，1–16。 |
+| `interval_ms` | 整数 | `1000` | 同一搜索引擎的最小请求间隔，250–60000 毫秒。 |
+| `cache_secs` | 整数 | `600` | 成功结果缓存时间，0–86400 秒；0 关闭缓存。 |
+| `max_tool_calls` | 整数 | `8` | 每个模型请求最多执行联网工具次数，1–32。 |
+| `fallback_to_upstream` | 布尔 | `false` | 独立搜索返回结果之前失败时允许回退上游，可能产生上游费用。 |
+<!-- /generated -->

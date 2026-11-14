@@ -27,6 +27,8 @@ arc-swap = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 http = "1"
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["client-proxy-system", "tokio"] }
 tokio-tungstenite = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -56,6 +58,9 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 # 压缩过的请求体和上游回答：gzip、deflate 用它解，zstd 用上面那个
 flate2 = { workspace = true }
+
+scraper = "0.29"
+quick-xml = { workspace = true }
 
 [dev-dependencies]
 # 假的 Bedrock 要回 eventstream 的二进制帧

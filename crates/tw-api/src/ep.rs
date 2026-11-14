@@ -66,6 +66,9 @@ endpoints! {
     ConfigRepairPlan: GET "/config/repair", () => api::ConfigRepair;
     /// 照那几处修好写回：取值改回默认值、删掉不认识的字段
     RepairConfig: POST "/config/repair", api::ConfigRepairRequest => api::ConfigWritten;
+    WebTools: GET "/web-tools", () => api::WebToolsView;
+    SaveWebTools: PUT "/web-tools", api::WebToolsSave => api::ConfigWritten;
+    TestWebTool: POST "/web-tools/test", api::WebToolRequest => api::WebToolResult;
     SaveListen: PUT "/listen", api::ListenSave => api::ConfigWritten;
 
     // ─────────────────────────────────────────────── 用量与记录

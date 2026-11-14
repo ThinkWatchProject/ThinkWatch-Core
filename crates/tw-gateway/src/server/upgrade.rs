@@ -41,6 +41,26 @@ pub(super) async fn ws_upgrade(
     //
     // **Realtime 的连接例外**：它的模型写在查询串里（`?model=gpt-realtime`），一条连接只用
     // 这一个。和 HTTP 那条路按请求体里的模型一样，路由、密钥的模型范围、别名都按它来
+    if rt.config.web_tools.mode == tw_api::WebToolsMode::Core
+        && crate::client_api::ClientApi::of_path(uri.path())
+            == Some(crate::client_api::ClientApi::OpenaiResponses)
+    {
+        return Ok(ws
+            .max_message_size(16 * 1024 * 1024)
+            .on_upgrade(move |socket| {
+                super::pipeline::web_socket(
+                    socket,
+                    state,
+                    rt,
+                    client_name,
+                    uri,
+                    query,
+                    headers,
+                    from,
+                    live,
+                )
+            }));
+    }
     let realtime = crate::ws::realtime(uri.path());
     let facts = tw_engine::RequestFacts {
         client: client_name.clone(),

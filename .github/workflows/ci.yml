@@ -29,6 +29,9 @@ jobs:
       - name: Release page text
         run: python3 scripts/release_notes_test.py
 
+      - name: Plugin build provenance recorder
+        run: python3 scripts/wasm_toolchain_test.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

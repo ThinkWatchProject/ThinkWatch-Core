@@ -33,6 +33,7 @@ pub mod store;
 pub mod sync;
 mod validate;
 pub mod watch;
+pub mod web_tools;
 mod wire;
 
 pub use aliases::{Alias, Aliases};
@@ -96,6 +97,9 @@ pub struct Config {
     /// 客户端自己发的辅助请求怎么处理。默认只拦 A 类。
     #[serde(default, skip_serializing_if = "is_default")]
     pub client_probes: ClientProbes,
+    /// Search and page tools executed by this gateway.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub web_tools: tw_api::WebToolsConfig,
     /// 两项防护：出站脱敏、工具调用审查。**出厂时都停在「观察」** ——
     /// 只记录，不改变任何行为。对所有上游一视同仁。
     #[serde(default, skip_serializing_if = "is_default")]
@@ -153,6 +157,7 @@ impl Default for Config {
             proxies: Vec::new(),
             pricing: tw_pricing::PricingConfig::default(),
             client_probes: ClientProbes::default(),
+            web_tools: tw_api::WebToolsConfig::default(),
             security: Security::default(),
             retention: Retention::default(),
             failover: Failover::default(),

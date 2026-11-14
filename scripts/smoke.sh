@@ -531,7 +531,7 @@ done
 
 for ep in /status /overview /summary /history /latency /latency/provider /latency/client /storage /quota /security \
           /security/events /sessions /diagnostics /config /config/items /backups /client-prefs /models /in-flight /live \
-          /upstreams/health /plugins; do
+          /upstreams/health /plugins /web-tools; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done

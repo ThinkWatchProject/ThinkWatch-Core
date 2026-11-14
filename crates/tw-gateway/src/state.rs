@@ -23,6 +23,7 @@ mod upstream;
 /// 了，正在排队的请求会失去它们的位置；事件流丢了，界面上的实时列表会
 /// 断一次。这些都不该因为改了一条路由规则而发生。
 pub struct Runtime {
+    pub web_tools: Arc<crate::web_tools::WebTools>,
     pub config: Arc<tw_config::Config>,
     /// 路由引擎。**和配置一起建，一起换** —— 分开持有会让「规则改了但
     /// 引擎还是旧的」变成可能，而那种不一致完全静默。
@@ -122,7 +123,13 @@ impl Runtime {
         let content = sec.content.rules().map_err(bad)?;
         let answer = tw_guard::content::answer::Answer::build(&content);
         let plugins = Arc::new(plugins.build(&config));
+        let mut web_tools = crate::web_tools::WebTools::new(&config)?;
+        if let Some(previous) = previous {
+            web_tools.history = previous.web_tools.history.clone();
+        }
+        let web_tools = Arc::new(web_tools);
         Ok(Self {
+            web_tools,
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
             clients,
@@ -141,6 +148,7 @@ impl Runtime {
     /// 同一份配置、换一份插件。插件文件变了时走这条：配置没变，别的都不用重建
     fn with_plugins(&self, plugins: crate::plugin::PluginSet) -> Self {
         Self {
+            web_tools: self.web_tools.clone(),
             config: self.config.clone(),
             engine: self.engine.clone(),
             clients: self.clients.clone(),

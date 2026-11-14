@@ -694,6 +694,10 @@ fn rebuild(
     if !pricing_yaml.is_empty() {
         out.insert(key("pricing"), Yaml::Mapping(pricing_yaml));
     }
+    let web = section(global::WEB_TOOLS)?;
+    if web != serde_json::to_value(tw_api::WebToolsConfig::default()).expect("default serializes") {
+        out.insert(key("web_tools"), to_yaml(&web));
+    }
     let probes = to_yaml(&section(global::CLIENT_PROBES)?);
     if probes.as_mapping().is_some_and(|m| !m.is_empty()) {
         out.insert(key("client_probes"), probes);

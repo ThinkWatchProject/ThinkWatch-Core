@@ -66,6 +66,7 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Seen>>) {
 
 async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
     let cfg = Config {
+        web_tools: Default::default(),
         retention: Default::default(),
         failover: Default::default(),
         aliases: Default::default(),
@@ -239,6 +240,7 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     // 一个跑六分钟的流式请求在列表里要六分钟后才出现。
     let (up, _) = start_upstream(true).await;
     let cfg = Config {
+        web_tools: Default::default(),
         retention: Default::default(),
         failover: Default::default(),
         aliases: Default::default(),
@@ -352,6 +354,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     // 防火墙黑洞掉，表现为连接挂住十秒而不是立刻被拒。
     let dead_port = spare_port();
     let cfg = Config {
+        web_tools: Default::default(),
         retention: Default::default(),
         // 不重试：连不上的那一次当场交出去（退避着重试见 `retry.rs`）
         failover: tw_config::Failover {
@@ -422,6 +425,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
     let (b, seen_b) = start_upstream(false).await;
 
     let cfg = Config {
+        web_tools: Default::default(),
         retention: Default::default(),
         failover: Default::default(),
         aliases: Default::default(),
@@ -528,6 +532,7 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
     // 那条纪律就是假的。
     let (up, seen) = start_upstream(false).await;
     let cfg = Config {
+        web_tools: Default::default(),
         retention: Default::default(),
         failover: Default::default(),
         aliases: Default::default(),

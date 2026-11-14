@@ -203,6 +203,7 @@ async fn passthrough(
     // 响应在这里包一层
     let seat = crate::content::Seat::default();
     let req = pipeline::Inbound {
+        web_parent: false,
         uri,
         query,
         headers,

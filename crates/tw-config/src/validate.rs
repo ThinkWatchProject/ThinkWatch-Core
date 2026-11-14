@@ -77,6 +77,8 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     Security(crate::PolicyError),
     #[error("{}", self.msg())]
+    WebTools(String),
+    #[error("{}", self.msg())]
     FailoverRange {
         field: &'static str,
         value: u64,
@@ -370,6 +372,9 @@ impl ValidationError {
                  different name"
             ),
             Security(e) => crate::policy_msg(e),
+            WebTools(detail) => {
+                msg!("config.web_tools.invalid", detail = detail => "web_tools: {detail}")
+            }
             FailoverRange {
                 field,
                 value,
@@ -661,6 +666,7 @@ impl ValidationError {
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
+    crate::web_tools::validate(cfg).map_err(ValidationError::WebTools)?;
     // 版本检查放在最前面：一个来自更新版本的配置，我们对它的任何
     // 其他判断都不作数（「schema 太新」）。
     if cfg.version > SCHEMA_VERSION {

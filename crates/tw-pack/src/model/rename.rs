@@ -91,6 +91,9 @@ pub fn rename(snap: &mut Snapshot, id: &ItemId, new_name: &str) {
                     }
                 }
             }
+            (ItemKind::Proxy, ItemKind::Global) if other.name == global::WEB_TOOLS => {
+                swap(item.units.get_mut("web_tools.proxy"), old, new);
+            }
             (ItemKind::Proxy, ItemKind::Provider) => {
                 swap(
                     item.units

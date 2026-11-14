@@ -114,6 +114,7 @@ fn default_at(cfg: &tw_config::Config, field: &str) -> Option<String> {
         "proxies" => to_value(&cfg.proxies),
         "pricing" => to_value(&cfg.pricing),
         "client_probes" => to_value(&cfg.client_probes),
+        "web_tools" => to_value(&cfg.web_tools),
         "security" => to_value(&cfg.security),
         "failover" => to_value(&cfg.failover),
         "aliases" => to_value(&cfg.aliases),

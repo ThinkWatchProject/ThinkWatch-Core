@@ -80,6 +80,7 @@ pub mod global {
     pub const SECURITY: &str = "security";
     pub const DEFAULT_ROUTE: &str = "default_route";
     pub const DEFAULT_KEY: &str = "default_key";
+    pub const WEB_TOOLS: &str = "web_tools";
     pub const CLIENT_PROBES: &str = "client_probes";
     pub const PRICING: &str = "pricing";
     /// 全部，按这个顺序
@@ -89,6 +90,7 @@ pub mod global {
         DEFAULT_ROUTE,
         DEFAULT_KEY,
         CLIENT_PROBES,
+        WEB_TOOLS,
         PRICING,
     ];
 }

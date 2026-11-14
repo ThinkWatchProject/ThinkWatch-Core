@@ -151,3 +151,5 @@ pub fn probe_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
 }
+
+pub mod web_tools;

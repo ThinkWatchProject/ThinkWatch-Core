@@ -521,6 +521,10 @@ fn global_units(cfg: &Config) -> Result<Vec<(&'static str, Units)>, String> {
         global::CLIENT_PROBES,
         fields(global::CLIENT_PROBES, &to_json(&cfg.client_probes)?),
     ));
+    out.push((
+        global::WEB_TOOLS,
+        fields(global::WEB_TOOLS, &to_json(&cfg.web_tools)?),
+    ));
     let mut pricing = to_json(&cfg.pricing)?;
     if let Json::Object(o) = &mut pricing {
         o.remove("sheets");
@@ -554,6 +558,7 @@ fn section_default(section: &str) -> Option<Json> {
         global::FAILOVER => to_json(&tw_config::Failover::default()).ok(),
         global::SECURITY => to_json(&tw_config::Security::default()).ok(),
         global::CLIENT_PROBES => to_json(&tw_config::ClientProbes::default()).ok(),
+        global::WEB_TOOLS => to_json(&tw_api::WebToolsConfig::default()).ok(),
         global::PRICING => to_json(&tw_pricing_default()).ok(),
         _ => None,
     }
@@ -577,6 +582,7 @@ pub(crate) fn section_normalized(section: &str, v: &Json) -> Result<Json, String
         global::FAILOVER => round::<tw_config::Failover>(v),
         global::SECURITY => round::<tw_config::Security>(v),
         global::CLIENT_PROBES => round::<tw_config::ClientProbes>(v),
+        global::WEB_TOOLS => round::<tw_api::WebToolsConfig>(v),
         global::PRICING => {
             let mut out = round::<tw_pricing::PricingConfig>(v)?;
             if let Json::Object(o) = &mut out {
@@ -764,6 +770,12 @@ fn refs_of(
             }
         }
         ItemKind::Global => {
+            if let Some(proxy) = s(units.get("web_tools.proxy"))
+                && proxy != tw_config::SYSTEM
+                && proxy != tw_config::DIRECT
+            {
+                out.insert(ItemId::new(ItemKind::Proxy, proxy));
+            }
             if let Some(r) = s(units.get(global::DEFAULT_ROUTE)) {
                 out.insert(ItemId::new(ItemKind::Route, r));
             }
