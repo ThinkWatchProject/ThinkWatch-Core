@@ -59,12 +59,13 @@ pub fn provider_refs(cfg: &Config, name: &str) -> Vec<ProviderRef> {
     out
 }
 
-/// 用着 `name` 这个代理的上游。
+/// 用着 `name` 这个代理的上游或网关功能。
 pub fn proxy_users(cfg: &Config, name: &str) -> Vec<String> {
     cfg.providers
         .iter()
         .filter(|p| p.proxy == name)
         .map(|p| p.name.clone())
+        .chain((cfg.web_tools.proxy == name).then(|| "web_tools".to_string()))
         .collect()
 }
 
@@ -474,6 +475,13 @@ pub fn rename_proxy(text: &str, cfg: &Config, old: &str, new: &str) -> Result<St
             )?;
         }
     }
+    if cfg.web_tools.proxy == old {
+        out = edit::set(
+            &out,
+            &[Step::key("web_tools"), Step::key("proxy")],
+            Some(&Value::String(new.to_string())),
+        )?;
+    }
     Ok(out)
 }
 
@@ -520,6 +528,18 @@ routes:
 
     fn cfg(text: &str) -> Config {
         crate::try_parse(text).unwrap_or_else(|e| panic!("{e}\n{text}"))
+    }
+
+    #[test]
+    fn web_search_proxy_participates_in_deletion_and_renaming() {
+        let text = format!(
+            "version: 1\nlisten:\n  control:\n    key: {}\nclients:\n  - name: test\n    key: tw-test\nproxies:\n  - name: search\n    type: http\n    addr: localhost:7890\nweb_tools:\n  proxy: search\n",
+            "11".repeat(32)
+        );
+        let cfg = crate::try_parse(&text).unwrap();
+        assert_eq!(proxy_users(&cfg, "search"), ["web_tools"]);
+        let moved = rename_proxy(&text, &cfg, "search", "renamed").unwrap();
+        assert!(moved.contains("proxy: renamed"));
     }
 
     #[test]

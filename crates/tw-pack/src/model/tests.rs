@@ -1170,3 +1170,26 @@ fn alias_visibility_survives_pack_normalization_and_reconstruction() {
             .hide_originals
     );
 }
+
+#[test]
+fn web_settings_and_their_proxy_survive_snapshot_restore_and_rename() {
+    let text = format!(
+        "{}\nweb_tools:\n  mode: core\n  proxy: hk\n  engines: [bing]\n  allowed_domains: [sqlite.org]\n",
+        rich()
+    );
+    let before = pack(&text);
+    let mut snapshot = snap(&before);
+    let web_id = id(ItemKind::Global, global::WEB_TOOLS);
+    assert_eq!(snapshot.items[&web_id].units["web_tools.mode"], "core");
+    assert!(
+        snapshot.items[&web_id]
+            .refs
+            .contains(&id(ItemKind::Proxy, "hk"))
+    );
+    rename(&mut snapshot, &id(ItemKind::Proxy, "hk"), "web-proxy");
+    let restored = mat(&before, &snapshot);
+    let cfg = tw_config::try_parse(&restored.config_yaml).unwrap();
+    assert_eq!(cfg.web_tools.mode, tw_api::WebToolsMode::Core);
+    assert_eq!(cfg.web_tools.proxy, "web-proxy");
+    assert_eq!(cfg.web_tools.allowed_domains, ["sqlite.org"]);
+}

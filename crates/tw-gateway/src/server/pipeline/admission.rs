@@ -51,7 +51,7 @@ pub(super) async fn admit(
     let key = rt.config.clients.iter().find(|c| c.name == req.client_name);
     let max_concurrent = key.and_then(|c| c.max_concurrent);
     let limits: &[tw_config::KeyLimit] = match key {
-        Some(c) if !crate::key_limits::uncounted(req.uri.path()) => &c.limits,
+        Some(c) if !req.web_parent && !crate::key_limits::uncounted(req.uri.path()) => &c.limits,
         _ => &[],
     };
     if let Err(r) = state.key_limits.calendar(&req.client_name, limits) {

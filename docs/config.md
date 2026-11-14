@@ -201,6 +201,7 @@ means.
 | `providers` | list of [`providers[]`](#cfg-providers) | `[]` | Upstreams. None is a valid configuration: the control plane runs and requests are answered with an error saying no upstream is configured. |
 | `proxies` | list of [`proxies[]`](#cfg-proxies) | `[]` | Outbound proxies, declared once and referred to by name from `providers[].proxy`. |
 | `pricing` | object, [`pricing`](#cfg-pricing) | — | Refreshing the default price table, and price sheets of your own. |
+| `web_tools` | object, [`web_tools`](#cfg-web_tools) | — | Gateway-owned search and public-page tools. Configured under Routing → Auxiliary in Lite. |
 | `client_probes` | object, [`client_probes`](#cfg-client_probes) | — | What happens to the helper requests clients send on their own (health checks, warm-ups, titles). |
 | `security` | object, [`security`](#cfg-security) | — | The three guards. All of them start in `observe`, so out of the box nothing is changed or refused. |
 | `retention` | object, [`retention`](#cfg-retention) | — | How long request logs are kept. |
@@ -2024,3 +2025,33 @@ sync:
 | `TWCORE_LOG` | Log filter, in `tracing` syntax (`info`, `debug`, `tw_gateway=debug`). |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | Used by upstreams with `proxy: system`. |
 | Any other | Read where the configuration writes `${NAME}`. |
+
+### Web tools
+
+Configure search, page reading and find-in-page under **Routing → Auxiliary** in Lite. `core` handles standalone Claude Code search requests without a helper model call, and runs hosted web tools in Anthropic Messages and OpenAI Responses requests through a bounded model/tool loop. Main-model calls are still metered. Client-side webpage fetching is unchanged. Web-tool responses are buffered and emitted as native JSON or SSE; keep-alives continue while waiting. Public HTTP/HTTPS text pages are supported; location-specific and cache-only native search modes require upstream execution.
+
+
+Search uses Bing RSS and DuckDuckGo HTML without API keys. Challenges and unrecognized pages are failures, with per-engine pacing and cooldowns; they are never reported as empty search results. HTTP, HTTPS and SOCKS proxies tunnel to the public IPs checked by Core, keeping the original hostname for TLS and HTTP. Responses WebSocket connections use the same protected execution path. Only standalone helper searches can fall back upstream, when explicitly enabled.
+
+<!-- generated: table web_tools -->
+<a id="cfg-web_tools"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `mode` | `upstream` \| `core` | `upstream` | upstream forwards hosted tools; core executes supported web operations. |
+| `engines` | list of strings | `[]` | Empty selects available engines automatically. Otherwise list bing and/or duckduckgo in priority order. |
+| `proxy` | string | `system` | system, direct, or an existing proxy name. |
+| `language` | string | `''` | Language code; empty uses the engine default. |
+| `region` | string | `''` | Region code; empty uses the engine default. |
+| `allowed_domains` | list of strings | `[]` | Only these domains and their subdomains; also applies to page reads. Empty allows all public domains. |
+| `blocked_domains` | list of strings | `[]` | Excluded domains and their subdomains; exclusions take precedence. |
+| `max_results` | integer | `8` | Search results, 1–20. |
+| `read_pages` | integer | `2` | Read up to 0–5 pages when search snippets are insufficient. Explicit page tools remain available at zero. |
+| `max_page_chars` | integer | `12000` | Returned page characters, 1000–50000. |
+| `timeout_secs` | integer | `30` | Whole operation timeout including queueing, 1–120 seconds. |
+| `max_concurrent` | integer | `4` | Concurrent web operations, 1–16. |
+| `interval_ms` | integer | `1000` | Minimum interval per search engine, 250–60000 milliseconds. |
+| `cache_secs` | integer | `600` | Successful result lifetime, 0–86400 seconds. Zero disables caching. |
+| `max_tool_calls` | integer | `8` | Maximum web operations per model request, 1–32. |
+| `fallback_to_upstream` | bool | `false` | Allow standalone searches to fall back to the upstream before returning results. This may incur upstream fees. |
+<!-- /generated -->

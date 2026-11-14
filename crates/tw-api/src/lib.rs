@@ -17,6 +17,8 @@ pub use tw_types::Msg;
 
 mod endpoint;
 pub mod ep;
+mod web_tools;
+pub use web_tools::*;
 #[cfg(feature = "ts")]
 pub mod ts;
 pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
@@ -1222,7 +1224,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **60 起模型规格支持手动推理档位**：[`ModelSpecSave::reasoning_effort`] 区分保留、
 /// 设置和恢复自动。[`ModelRow`] 带上游报告、手动覆盖、实际可用档位和过滤结果。
 /// [`SpecSource::Upstream`] 表示上游报告的规格。请求库 SCHEMA 不变。
-pub const CONTROL_API_VERSION: u32 = 60;
+/// **61 起支持 Core 执行联网工具**：新增 `WebTools`、`SaveWebTools` 和 `TestWebTool`。
+/// 搜索、网页读取和页内查找共用当前连接 Core 的配置。请求库 SCHEMA 不变。
+pub const CONTROL_API_VERSION: u32 = 61;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;

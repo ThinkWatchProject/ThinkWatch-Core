@@ -176,7 +176,7 @@ pub fn proxy_target(cfg: &tw_config::Config, proxy: &str) -> (String, u16) {
         .unwrap_or_else(|| ("api.anthropic.com".to_string(), 443))
 }
 
-trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub(crate) trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 struct Timer {
@@ -578,7 +578,7 @@ fn split_hostport(s: &str) -> Result<(String, u16), Msg> {
     ))
 }
 
-async fn socks5_connect(
+pub(crate) async fn socks5_connect(
     io: &mut Box<dyn Io>,
     p: &ProxyHop,
     host: &str,
@@ -719,7 +719,7 @@ fn socks5_reply(code: u8) -> Msg {
     }
 }
 
-async fn http_connect(
+pub(crate) async fn http_connect(
     io: &mut Box<dyn Io>,
     p: &ProxyHop,
     host: &str,
@@ -807,7 +807,10 @@ async fn tls_handshake(stream: Box<dyn Io>, host: &str) -> Result<(), Msg> {
     tls_handshake_boxed(stream, host).await.map(|_| ())
 }
 
-async fn tls_handshake_boxed(stream: Box<dyn Io>, host: &str) -> Result<Box<dyn Io>, Msg> {
+pub(crate) async fn tls_handshake_boxed(
+    stream: Box<dyn Io>,
+    host: &str,
+) -> Result<Box<dyn Io>, Msg> {
     let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(
         |_| msg!("l1.tls.bad_hostname", host = host => "{host} is not a valid TLS host name."),
     )?;

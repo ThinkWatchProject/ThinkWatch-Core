@@ -45,6 +45,7 @@ pub mod routes;
 pub mod security;
 pub mod shutdown;
 pub mod sync;
+pub mod web_tools;
 pub mod zai;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use shutdown::Shutdown;
@@ -159,6 +160,7 @@ pub fn router(state: ControlState) -> Router {
         .merge(pricing::router())
         .merge(chatgpt::router())
         .merge(zai::router())
+        .merge(web_tools::router())
         .merge(sync::router())
         .fallback(contract::no_such_endpoint)
         .layer(axum::middleware::from_fn(contract::errors_are_messages))

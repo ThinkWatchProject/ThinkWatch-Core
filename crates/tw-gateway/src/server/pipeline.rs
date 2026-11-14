@@ -28,10 +28,12 @@ mod idle;
 mod opening;
 mod plug;
 mod relay;
+mod web;
 
 pub(crate) use commit::KEEPALIVE;
 pub(crate) use hop::stream_fault;
 pub(crate) use relay::PING;
+pub(super) use web::serve_socket as web_socket;
 
 /// 进管线时就定了的东西：身份识别之后，每一步都只读不改。
 pub(super) struct Inbound {
@@ -55,6 +57,8 @@ pub(super) struct Inbound {
     pub(super) traffic: std::sync::Arc<crate::traffic::Traffic>,
     /// 这个请求的报文记录（见 [`crate::content`]）：开始时放进去，每一跳从这里拿
     pub(super) seat: crate::content::Seat,
+    /// A local orchestration record; nested model rounds own the quota usage.
+    pub(super) web_parent: bool,
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -87,14 +91,75 @@ struct Started {
 pub(super) async fn pipeline(
     state: AppState,
     rt: Arc<Runtime>,
+    mut req: Inbound,
+    live: crate::live::Pass,
+    ending: &mut Option<crate::ending::Ending>,
+) -> Result<Response, GatewayError> {
+    let history = memchr::memmem::find(&req.body, b"srvtoolu_tw_").is_some()
+        || memchr::memmem::find(&req.body, b"ws_tw_").is_some();
+    if (rt.config.web_tools.mode == tw_api::WebToolsMode::Core || history)
+        && matches!(
+            req.dialect,
+            tw_dialect::ir::Dialect::Anthropic | tw_dialect::ir::Dialect::Responses
+        )
+        && let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&req.body)
+    {
+        let plan = if rt.config.web_tools.mode == tw_api::WebToolsMode::Core {
+            crate::web_tools::protocol::recognize(req.dialect, &body)
+        } else {
+            Ok(None)
+        };
+        // Restore history even after tools were removed or local execution was
+        // disabled. Expired excerpts degrade to the client's public source metadata.
+        let restored = history
+            && rt
+                .web_tools
+                .history
+                .restore(
+                    &req.client_name,
+                    req.dialect,
+                    &mut body,
+                    matches!(plan, Ok(Some(_))),
+                )
+                .map_err(|m| GatewayError::new(crate::error::Source::Request, m))?;
+        if restored {
+            req.body = Bytes::from(body.to_string());
+        }
+        match plan {
+            Ok(Some(plan)) => {
+                let (reading, _) = read(&req, String::new(), Some(&body), (state.local_time)());
+                let early = commit::early(&state, &req, &reading);
+                let dialect = req.dialect;
+                let abort = req.abort.clone();
+                let run = web::run(state, rt, req, live, plan, body);
+                return match early {
+                    Some(early) => commit::hold(run, dialect, early, abort).await,
+                    None => run.await,
+                };
+            }
+            Err(message) => {
+                return Err(GatewayError::new(crate::error::Source::Request, message));
+            }
+            _ => {}
+        }
+        return forward_pipeline(state, rt, req, live, ending, Some(body)).await;
+    }
+    forward_pipeline(state, rt, req, live, ending, None).await
+}
+
+async fn forward_pipeline(
+    state: AppState,
+    rt: Arc<Runtime>,
     req: Inbound,
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
+    prepared: Option<serde_json::Value>,
 ) -> Result<Response, GatewayError> {
     // 请求体**只解析一次**：本地应答的判定、路由事实、对话的指纹、内容过滤都用这一份（见
     // `read`）。解不开是 None —— 照样往下走，同格式直通照样发
     let (parsed, probed) = heavy(&req.body, || {
-        let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
+        let parsed =
+            prepared.or_else(|| serde_json::from_slice::<serde_json::Value>(&req.body).ok());
         let probed = probe(&state, &rt, &req, parsed.as_ref());
         (parsed, probed)
     })

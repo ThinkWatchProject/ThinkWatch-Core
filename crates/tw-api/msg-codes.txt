@@ -146,6 +146,7 @@ config.upstream_limit_every_calendar
 config.upstream_limit_not_positive
 config.upstream_limit_retention
 config.upstream_limit_two_measures
+config.web_tools.invalid
 config.zero_concurrency
 control.account_service_not_json
 control.account_service_refused
@@ -474,6 +475,7 @@ gw.wait.mixed
 gw.wait.rate_limited
 gw.wait.used_up
 gw.wait.window_full
+gw.web_tools.failed
 gw.ws.alias_unserved
 gw.ws.alias_unserved_rewritten
 gw.ws.bad_header
