@@ -7,6 +7,12 @@ use tw_types::msg;
 /// 的那批和不走代理的那批会慢慢长出不同的超时行为。
 pub(crate) fn base_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // Web search opts into browser content decoding. Other outbound paths
+        // preserve their existing wire-body semantics despite feature unification.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         // 分段超时。**没有整体超时** —— 一个跑了六分钟的
         // Opus 任务不该被中间层掐断，让客户端自己决定何时放弃。
         .connect_timeout(std::time::Duration::from_secs(10))

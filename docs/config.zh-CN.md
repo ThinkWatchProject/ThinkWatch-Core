@@ -1470,7 +1470,7 @@ sync:
 在 Lite 的 **路由 → 辅助请求** 中配置搜索、网页读取和页内查找。`core` 直接处理 Claude Code 的独立搜索子请求，省去搜索助手模型调用；Anthropic Messages 和 OpenAI Responses 对话中的联网工具由 Core 执行后交回模型继续处理，主模型仍按实际用量计费。客户端直接抓取网页的行为不变。联网工具响应收齐后按原生 JSON 或 SSE 返回，等待期间保持心跳。支持公开 HTTP/HTTPS 文本网页；指定地理位置或仅使用厂商缓存的搜索模式需要沿用上游。
 
 
-搜索使用 Bing RSS 和 DuckDuckGo HTML，不需要搜索 API Key。验证码和无法识别的页面按失败处理，配合请求间隔、冷却和其他引擎重试，不会当作“没有结果”。HTTP、HTTPS 和 SOCKS 代理连接 Core 已校验的公开 IP，TLS 和 HTTP 保留原始域名。Responses WebSocket 使用同一套受保护的执行流程。只有独立搜索辅助请求可以按显式配置回退上游。
+搜索直接连接 Google Docs 网页检索、DuckDuckGo 和 Bing，无需 API Key 或浏览器运行时。自动顺序为 Google (Docs)、DuckDuckGo、Bing。Google (Docs) 通过旧版接口搜索公开网页，依赖仍可用的公开文档上下文，Google 调整服务后可能失效；不会读取或修改这些文档，不支持地区偏好，请求间隔至少 6 秒。文档访问失败可选择备用上下文，限流或服务器错误则冷却该引擎并切换其他搜索源。验证码和无法识别的页面按失败处理，配合请求间隔、冷却和其他引擎重试，不会当作“没有结果”。HTTP、HTTPS 和 SOCKS 代理连接 Core 已校验的公开 IP，TLS 和 HTTP 保留原始域名。Responses WebSocket 使用同一套受保护的执行流程。只有独立搜索辅助请求可以按显式配置回退上游。
 
 <!-- generated: table web_tools -->
 <a id="cfg-web_tools"></a>
@@ -1478,7 +1478,7 @@ sync:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `mode` | `upstream` \| `core` | `upstream` | upstream 沿用上游；core 执行已适配的联网工具。 |
-| `engines` | 字符串列表 | `[]` | 空列表自动选择可用引擎；手动填写 bing、duckduckgo，按顺序尝试。 |
+| `engines` | 字符串列表 | `[]` | 空列表依次尝试 google_docs、duckduckgo、bing；也可手动按优先顺序填写这些引擎 ID。 |
 | `proxy` | 字符串 | `system` | system、direct 或已定义的代理名称。 |
 | `language` | 字符串 | `''` | BCP 47 语言标签。空值跟随运行 Core 的主机系统语言（包括远程 Core），无法识别时由引擎决定。Lite 中通过语言列表选择。 |
 | `region` | 字符串 | `''` | 两字母国家或地区代码。空值跟随 Core 主机系统语言中的地区，无法识别时由引擎决定。搜索引擎按支持范围尽量应用偏好。 |
@@ -1489,7 +1489,7 @@ sync:
 | `max_page_chars` | 整数 | `12000` | 每页返回字符上限，1000–50000。 |
 | `timeout_secs` | 整数 | `30` | 包括排队在内的单次操作超时，1–120 秒。 |
 | `max_concurrent` | 整数 | `4` | 联网操作并发数，1–16。 |
-| `interval_ms` | 整数 | `1000` | 同一搜索引擎的最小请求间隔，250–60000 毫秒。 |
+| `interval_ms` | 整数 | `1000` | 同一搜索引擎的最小请求间隔，250–60000 毫秒。搜索源可要求更长间隔（google_docs：6000）。 |
 | `cache_secs` | 整数 | `600` | 成功结果缓存时间，0–86400 秒；0 关闭缓存。 |
 | `max_tool_calls` | 整数 | `8` | 每个模型请求最多执行联网工具次数，1–32。 |
 | `fallback_to_upstream` | 布尔 | `false` | 独立搜索返回结果之前失败时允许回退上游，可能产生上游费用。 |

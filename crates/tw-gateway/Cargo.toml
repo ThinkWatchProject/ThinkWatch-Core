@@ -34,7 +34,8 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }
-reqwest = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true, features = ["cookies", "gzip", "brotli", "deflate", "zstd"] }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
 tokio-rustls = { workspace = true }

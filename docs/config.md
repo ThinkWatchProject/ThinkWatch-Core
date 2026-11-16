@@ -2031,7 +2031,7 @@ sync:
 Configure search, page reading and find-in-page under **Routing → Auxiliary** in Lite. `core` handles standalone Claude Code search requests without a helper model call, and runs hosted web tools in Anthropic Messages and OpenAI Responses requests through a bounded model/tool loop. Main-model calls are still metered. Client-side webpage fetching is unchanged. Web-tool responses are buffered and emitted as native JSON or SSE; keep-alives continue while waiting. Public HTTP/HTTPS text pages are supported; location-specific and cache-only native search modes require upstream execution.
 
 
-Search uses Bing RSS and DuckDuckGo HTML without API keys. Challenges and unrecognized pages are failures, with per-engine pacing and cooldowns; they are never reported as empty search results. HTTP, HTTPS and SOCKS proxies tunnel to the public IPs checked by Core, keeping the original hostname for TLS and HTTP. Responses WebSocket connections use the same protected execution path. Only standalone helper searches can fall back upstream, when explicitly enabled.
+Search connects directly to Google Docs web research, DuckDuckGo and Bing without API keys or a browser runtime. Automatic order is Google (Docs), DuckDuckGo, then Bing. Google (Docs) searches public web pages through a legacy endpoint; it depends on eligible public document contexts and may stop working if Google changes the service. It does not read or edit the context documents, does not support regional preferences, and enforces at least six seconds between requests. Document access failures can select another context; throttling and server errors cool down the engine and fall back to the next source. Challenges and unrecognized pages are failures, with per-engine pacing and cooldowns; they are never reported as empty search results. HTTP, HTTPS and SOCKS proxies tunnel to the public IPs checked by Core, keeping the original hostname for TLS and HTTP. Responses WebSocket connections use the same protected execution path. Only standalone helper searches can fall back upstream, when explicitly enabled.
 
 <!-- generated: table web_tools -->
 <a id="cfg-web_tools"></a>
@@ -2039,7 +2039,7 @@ Search uses Bing RSS and DuckDuckGo HTML without API keys. Challenges and unreco
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `mode` | `upstream` \| `core` | `upstream` | upstream forwards hosted tools; core executes supported web operations. |
-| `engines` | list of strings | `[]` | Empty selects available engines automatically. Otherwise list bing and/or duckduckgo in priority order. |
+| `engines` | list of strings | `[]` | Empty tries google_docs, duckduckgo, then bing. Otherwise list these engine IDs in priority order. |
 | `proxy` | string | `system` | system, direct, or an existing proxy name. |
 | `language` | string | `''` | BCP 47 language tag. Empty follows the system language on the Core host (including a remote Core); if unavailable, the engine decides. Lite provides a language picker. |
 | `region` | string | `''` | Two-letter country/region code. Empty follows the region in the Core host’s system locale; if unavailable, the engine decides. Search engines apply supported regional preferences on a best-effort basis. |
@@ -2050,7 +2050,7 @@ Search uses Bing RSS and DuckDuckGo HTML without API keys. Challenges and unreco
 | `max_page_chars` | integer | `12000` | Returned page characters, 1000–50000. |
 | `timeout_secs` | integer | `30` | Whole operation timeout including queueing, 1–120 seconds. |
 | `max_concurrent` | integer | `4` | Concurrent web operations, 1–16. |
-| `interval_ms` | integer | `1000` | Minimum interval per search engine, 250–60000 milliseconds. |
+| `interval_ms` | integer | `1000` | Minimum interval per search engine, 250–60000 milliseconds. A source may enforce a higher minimum (google_docs: 6000). |
 | `cache_secs` | integer | `600` | Successful result lifetime, 0–86400 seconds. Zero disables caching. |
 | `max_tool_calls` | integer | `8` | Maximum web operations per model request, 1–32. |
 | `fallback_to_upstream` | bool | `false` | Allow standalone searches to fall back to the upstream before returning results. This may incur upstream fees. |

@@ -218,6 +218,12 @@ impl Host for CoreHost {
 /// 同步位置的密码就跟着去了），证书照常校验
 fn http(cfg: &tw_config::Config, proxy: &str) -> Result<reqwest::Client, Msg> {
     let mut b = reqwest::Client::builder()
+        // Search enables reqwest's decoding features workspace-wide. Keep sync
+        // downloads' existing byte semantics independent of that feature set.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .connect_timeout(Duration::from_secs(10))
         // 一轮里的请求是接连发的；两轮之间的空闲连接不留：很多服务端几秒就关掉空闲连接，
         // 留着的下一轮一发就断（发请求那一处另有一次重发）

@@ -17,6 +17,7 @@ pub enum WebToolsMode {
 pub enum SearchEngine {
     Bing,
     Duckduckgo,
+    GoogleDocs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +78,18 @@ pub struct WebToolsView {
     pub config_version: String,
     /// Detected on the Core host, which may be remote. Empty fields mean unavailable.
     pub system_locale: WebSearchLocale,
+    /// Engine capabilities advertised by the connected Core.
+    #[serde(default)]
+    pub available_engines: Vec<WebSearchEngine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WebSearchEngine {
+    pub id: SearchEngine,
+    pub name: String,
+    /// The engine's minimum applies even if the user's configured interval is lower.
+    pub min_interval_ms: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

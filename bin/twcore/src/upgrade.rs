@@ -285,6 +285,12 @@ fn client() -> Result<reqwest::Client> {
 /// 走环境变量里的代理（`HTTPS_PROXY`）：服务器上出网常常只有这一条路。
 fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // Search opts into content decoding; release downloads retain their
+        // existing behavior when those reqwest features are unified.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .user_agent(concat!("twcore/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
