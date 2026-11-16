@@ -476,6 +476,7 @@ gw.wait.rate_limited
 gw.wait.used_up
 gw.wait.window_full
 gw.web_tools.failed
+gw.web_tools.query_mismatch
 gw.ws.alias_unserved
 gw.ws.alias_unserved_rewritten
 gw.ws.bad_header
