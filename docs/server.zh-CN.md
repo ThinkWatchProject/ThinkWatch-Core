@@ -22,6 +22,10 @@ Core 自动选择运行时规模，无需添加 `runtime` 配置或分配器环�
 
 发布包默认使用 mimalloc，减少内存碎片和空闲页留存。Linux 构建在内核允许时对 Core 进程禁用透明大页，降低小对象分配的驻留开销，不改系统设置。启动时记录选定的 worker 数、重任务名额、正文预算和分配器。CPU 和内存上限在启动时确定，执行线程在运行期间按负载自动增加和回收。
 
+正文准入没有公平队列。只要其他正文持续占用预算，大请求可能每次重试都被拒，小请求却仍能进入。压缩上下文的请求也要先上传旧上下文，经过同一道检查；重试不保证最终获得预算。其他预留释放后，合法的大正文可以进入。输入 token 数和缓存命中量不代表这里的占用：预算按正文字节数计费，解压期间包括压缩输入和解压输出。
+
+本地预算不足时会输出一条警告，带 `code="gw.request.memory_busy"`、Core 版本、`stage`（`read` 或 `decode`）、编码、声明长度、已接收及解压字节数，以及拒绝当时的 `budget_bytes`、`used_bytes`、`reserved_bytes`、`requested_charge_bytes`、`additional_bytes`、`available_bytes` 快照。日志不含正文、凭据或请求 URL。拒绝发生在路由和请求记录之前，所以请求历史里没有记录也不能排除本地拒绝。响应另带 `x-thinkwatch-error-code: gw.request.memory_busy`，原有的 `x-thinkwatch-error: rate_limited`、重试头和客户端方言格式不变。仅凭 `rate_limited` 和五秒重试间隔不能确定原因；旧版没有这些诊断时，还需取得运行中的 Core 版本和失败响应正文。
+
 ## 1. 安装
 
 ```sh

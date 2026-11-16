@@ -282,6 +282,11 @@ impl IntoResponse for GatewayError {
             "x-thinkwatch-error",
             HeaderValue::from_static(self.source.slug()),
         );
+        // 保留粗分类和 SDK 的重试语义，另给诊断用的细码：只拿响应头也能区分
+        // 本地正文预算、并发名额、密钥用量和上游限流。
+        if let Ok(code) = HeaderValue::from_str(&self.detail.code) {
+            h.insert("x-thinkwatch-error-code", code);
+        }
         if let Some(r) = self.retry {
             let secs = r.after_ms.div_ceil(1000).max(1);
             h.insert(header::RETRY_AFTER, HeaderValue::from(secs));
@@ -412,6 +417,36 @@ mod tests {
         // 上游自己的限流不带：要等多久由上游说，网关不替它编一个数
         let r = GatewayError::rate_limited(msg!("t.x" => "slow down")).into_response();
         assert!(!r.headers().contains_key("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn body_budget_refusals_have_a_specific_code_without_changing_sdk_retries() {
+        for dialect in [
+            Dialect::Anthropic,
+            Dialect::Chat,
+            Dialect::Responses,
+            Dialect::Gemini,
+        ] {
+            let r = crate::resources::memory_busy()
+                .in_dialect(dialect)
+                .into_response();
+            assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(r.headers()["x-thinkwatch-error"], "rate_limited");
+            assert_eq!(
+                r.headers()["x-thinkwatch-error-code"],
+                "gw.request.memory_busy"
+            );
+            assert_eq!(r.headers()["retry-after"], "5");
+            assert_eq!(r.headers()["retry-after-ms"], "5000");
+            assert_eq!(r.headers()["x-should-retry"], "true");
+            let body = to_bytes(r.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(json["error"].is_object());
+        }
+        let upstream =
+            GatewayError::rate_limited(msg!("t.upstream" => "slow down")).into_response();
+        assert_eq!(upstream.headers()["x-thinkwatch-error"], "rate_limited");
+        assert_eq!(upstream.headers()["x-thinkwatch-error-code"], "t.upstream");
     }
 
     /// 密钥的用量上限拒绝时：多久之后能再来，到重置之前该不该重试。

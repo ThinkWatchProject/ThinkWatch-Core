@@ -1,8 +1,9 @@
 //! 进程级的自动资源调度。配置重载、多个运行时共用同一份预算。
 //!
 //! CPU 重任务先异步等名额，再交给阻塞线程；等候者不会占满 Tokio 的线程。
-//! 正文按字节占预算，并为解析、复制留三倍余量。预算不足时先退避重试，避免已经
-//! 持有一半正文的请求互相等内存。名额跟着 Bytes 的最后一份引用归还。
+//! 正文按字节占预算，并为解析、复制留三倍余量。预算不足时让客户端退避重试，避免已经
+//! 持有一半正文的请求互相等内存。这不是公平队列：持续有其他正文占用时，大请求可能
+//! 反复被拒，小请求仍能通过。名额跟着 Bytes 的最后一份引用归还。
 //!
 //! 单个合法的大正文可以独占预算：自动预算不改变 256 MiB 的单请求上限。这是
 //! 正文缓冲的预算，不是对整个进程 RSS 的硬限制（插件、JSON 对象等另有开销）。
@@ -154,18 +155,65 @@ pub(crate) struct Reservation {
     charged: usize,
 }
 
+/// 在锁内取得的拒绝快照。不能等请求释放预算后再读，否则日志会低报占用。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BudgetDenied {
+    limit: usize,
+    used: usize,
+    reserved: usize,
+    body_bytes: usize,
+    charge: usize,
+}
+
+impl BudgetDenied {
+    pub(crate) fn log(
+        &self,
+        stage: &'static str,
+        received_bytes: usize,
+        decoded_bytes: usize,
+        declared_bytes: Option<u64>,
+        encoding: &'static str,
+    ) {
+        // 只记大小和受控枚举，不记正文、请求头、URL 或客户端标识。
+        tracing::warn!(
+            code = "gw.request.memory_busy",
+            core_version = env!("CARGO_PKG_VERSION"),
+            stage,
+            encoding,
+            ?declared_bytes,
+            received_bytes,
+            decoded_bytes,
+            body_bytes = self.body_bytes,
+            budget_bytes = self.limit,
+            used_bytes = self.used,
+            reserved_bytes = self.reserved,
+            requested_charge_bytes = self.charge,
+            additional_bytes = self.charge - self.reserved,
+            available_bytes = self.limit - self.used,
+            retry_after_ms = crate::error::BUSY_RETRY_AFTER_SECS * 1000,
+            "request rejected before routing: local body buffer budget exhausted"
+        );
+    }
+}
+
 impl Reservation {
     /// 在追加正文或解压输出之前调用。失败不会改变已经占用的预算。
-    pub(crate) fn grow(&mut self, bytes: usize) -> bool {
+    pub(crate) fn grow(&mut self, bytes: usize) -> Result<(), BudgetDenied> {
         let charge = bytes.saturating_mul(BODY_HEADROOM).min(self.budget.limit);
         let extra = charge.saturating_sub(self.charged);
         let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
         if extra > self.budget.limit - *used {
-            return false;
+            return Err(BudgetDenied {
+                limit: self.budget.limit,
+                used: *used,
+                reserved: self.charged,
+                body_bytes: bytes,
+                charge,
+            });
         }
         *used += extra;
         self.charged += extra;
-        true
+        Ok(())
     }
 
     pub(crate) fn wrap(self, data: Bytes) -> Bytes {
@@ -307,7 +355,7 @@ mod tests {
     fn reservations_survive_bytes_clones_and_slices() {
         let budget = Budget::new(30);
         let mut reservation = budget.reserve();
-        assert!(reservation.grow(5));
+        assert!(reservation.grow(5).is_ok());
         let data = reservation.wrap(Bytes::from_static(b"hello"));
         let clone = data.clone();
         let slice = clone.slice(1..3);
@@ -324,11 +372,11 @@ mod tests {
         let budget = Budget::new(30);
         let mut first = budget.reserve();
         let mut second = budget.reserve();
-        assert!(first.grow(6));
-        assert!(second.grow(4));
-        assert!(!first.grow(7));
+        assert!(first.grow(6).is_ok());
+        assert!(second.grow(4).is_ok());
+        assert!(first.grow(7).is_err());
         drop(second);
-        assert!(first.grow(7));
+        assert!(first.grow(7).is_ok());
         drop(first);
         assert_eq!(*budget.used.lock().unwrap(), 0);
     }
@@ -337,10 +385,35 @@ mod tests {
     fn a_large_legal_body_can_run_exclusively_without_deadlocking() {
         let budget = Budget::new(30);
         let mut large = budget.reserve();
-        assert!(large.grow(100));
+        assert!(large.grow(100).is_ok());
         let mut small = budget.reserve();
-        assert!(!small.grow(1));
+        assert!(small.grow(1).is_err());
         drop(large);
-        assert!(small.grow(1));
+        assert!(small.grow(1).is_ok());
+    }
+
+    #[test]
+    fn denial_captures_occupancy_before_the_partial_body_is_released() {
+        let budget = Budget::new(30);
+        let mut held = budget.reserve();
+        held.grow(6).unwrap();
+        let mut reading = budget.reserve();
+        reading.grow(3).unwrap();
+        let denied = reading.grow(5).unwrap_err();
+        assert_eq!(
+            denied,
+            BudgetDenied {
+                limit: 30,
+                used: 27,
+                reserved: 9,
+                body_bytes: 5,
+                charge: 15,
+            }
+        );
+        drop(reading);
+        assert_eq!(*budget.used.lock().unwrap(), 18);
+        assert_eq!(denied.used, 27, "the diagnostic is the refusal snapshot");
+        // 超过预算的合法正文按独占预算计费，日志要同时保留真实字节数和封顶后的费用。
+        assert_eq!(budget.reserve().grow(100).unwrap_err().charge, 30);
     }
 }

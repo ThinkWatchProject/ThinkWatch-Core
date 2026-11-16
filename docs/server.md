@@ -47,6 +47,27 @@ When the budget is occupied, new bodies receive a retryable `429` with
 256 MiB per-request limit still applies. This budget covers request buffering,
 not the entire process RSS.
 
+Body admission has no fairness queue. While other bodies keep occupying the
+budget, a large request can be refused on every retry even though smaller ones
+still fit. A context-compaction request must upload its old context through the
+same check. Retrying is not a guarantee of admission; once the other reservations
+are released, a legal large body can enter. Token counts and cache hits do not
+measure this budget: it accounts for body bytes, including compressed input and
+decoded output during decompression.
+
+For diagnosis, a local budget refusal emits a warning with
+`code="gw.request.memory_busy"`, the Core version, `stage` (`read` or `decode`),
+encoding, declared/received/decoded byte counts, and a snapshot of
+`budget_bytes`, `used_bytes`, `reserved_bytes`, `requested_charge_bytes`,
+`additional_bytes` and `available_bytes` at the refusal. No body content,
+credentials or request URL is logged. This happens before routing and request
+history, so absence from request history does not rule out a local refusal.
+The response carries `x-thinkwatch-error-code: gw.request.memory_busy`; the
+existing `x-thinkwatch-error: rate_limited`, retry headers and client-specific
+JSON shape stay unchanged. The coarse `rate_limited` header and five-second
+retry delay alone do not identify the cause. On older versions without these
+diagnostics, collect the running Core version and error response body too.
+
 Release binaries use mimalloc to reduce allocator fragmentation and retained
 free pages. Linux builds disable transparent huge pages for the Core process
 where the kernel permits it, reducing residency for small allocations without

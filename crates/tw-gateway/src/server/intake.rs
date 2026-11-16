@@ -76,7 +76,14 @@ async fn read_with_budget(
             )));
         }
         // 先记账再拷贝。用满就让客户端退避，不拿着半份正文等别的请求释放。
-        if !reservation.grow(next) {
+        if let Err(denied) = reservation.grow(next) {
+            denied.log(
+                "read",
+                next,
+                0,
+                declared,
+                coding.map_or("identity", Coding::name),
+            );
             return Err(crate::resources::memory_busy());
         }
         raw.extend_from_slice(&data);
@@ -92,11 +99,12 @@ async fn read_with_budget(
         // 客户端取消时阻塞任务仍可能在跑：CPU 名额和预算都跟任务走。
         let _slot = slot;
         let decoded = coding.decode_with(&raw, max, |output| {
-            if reservation.grow(raw.len().saturating_add(output)) {
-                Ok(())
-            } else {
-                Err(Decode::Busy)
-            }
+            reservation
+                .grow(raw.len().saturating_add(output))
+                .map_err(|denied| {
+                    denied.log("decode", raw.len(), output, declared, coding.name());
+                    Decode::Busy
+                })
         })?;
         Ok(reservation.wrap(decoded))
     })
@@ -206,6 +214,41 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_long_body_can_be_repeatedly_refused_while_short_bodies_succeed() {
+        let budget = crate::resources::Budget::new(30);
+        let held = read_with_budget(&mut HeaderMap::new(), chunked(&[b"123456"]), 100, &budget)
+            .await
+            .unwrap();
+        // 重试没有优先权。小正文能用剩下的 12 字节预算，大正文（包括 compact
+        // 传来的旧上下文）每次都会在第二块被拒；每次拒绝都应释放已读的第一块。
+        for _ in 0..8 {
+            let e = read_with_budget(
+                &mut HeaderMap::new(),
+                chunked(&[b"123", b"456789"]),
+                100,
+                &budget,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.detail.code, "gw.request.memory_busy");
+            let short = read_with_budget(&mut HeaderMap::new(), chunked(&[b"1234"]), 100, &budget)
+                .await
+                .unwrap();
+            drop(short);
+        }
+        drop(held);
+        let long = read_with_budget(
+            &mut HeaderMap::new(),
+            chunked(&[b"123", b"456789"]),
+            100,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(&long[..], b"123456789");
     }
 
     #[tokio::test]
