@@ -1,38 +1,107 @@
 //! Search and public-page tools, shared by the gateway and the control-plane tester.
 
+mod cache;
 mod collect;
 mod history;
-mod locale;
 pub(crate) mod protocol;
+mod providers;
 mod public;
+mod quality;
+mod session;
 pub(crate) mod wire;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tw_api::{SearchEngine, WebToolRequest, WebToolResult, WebToolsConfig};
 use tw_types::{Msg, msg};
 
-type PageCached = Arc<AsyncMutex<Option<(Instant, (String, String))>>>;
-
-type Cached = Arc<AsyncMutex<Option<(Instant, WebToolResult)>>>;
-
 pub struct WebTools {
     pub(crate) history: Arc<history::History>,
     config: WebToolsConfig,
     client: public::ClientSettings,
     slots: Semaphore,
-    cache: Mutex<HashMap<String, Cached>>,
-    pages: Mutex<HashMap<String, PageCached>>,
+    cache: cache::Cache<WebToolResult>,
+    pages: cache::Cache<(String, String)>,
     engines: AsyncMutex<HashMap<SearchEngine, EngineState>>,
+    sessions: session::Pool,
 }
 
 #[derive(Default)]
 struct EngineState {
     next: Option<Instant>,
     failed_until: Option<Instant>,
+    last_failure: Option<Msg>,
+}
+
+/// Capabilities come from the same registry that executes requests. Desktop
+/// clients can offer new engines without hard-coding an exhaustive enum list.
+pub fn available_engines() -> Vec<tw_api::WebSearchEngine> {
+    providers::AUTOMATIC
+        .iter()
+        .map(|&engine| {
+            let spec = providers::get(engine).spec();
+            tw_api::WebSearchEngine {
+                id: engine,
+                name: spec.name.into(),
+                min_interval_ms: spec.min_interval_ms,
+            }
+        })
+        .collect()
+}
+
+fn engine_name(engine: SearchEngine) -> &'static str {
+    providers::get(engine).spec().name
+}
+
+fn failure_detail(e: &Msg) -> &str {
+    if e.code == "gw.web_tools.failed" {
+        e.args.get("detail").map(String::as_str).unwrap_or(&e.text)
+    } else {
+        &e.text
+    }
+}
+
+fn http_failure(status: reqwest::StatusCode, headers: &http::HeaderMap) -> Msg {
+    let mut failure = error(format!("source returned HTTP {}", status.as_u16()));
+    failure
+        .args
+        .insert("http_status".into(), status.as_u16().to_string());
+    if matches!(status.as_u16(), 429 | 503)
+        && let Some(value) = headers.get("retry-after").and_then(|v| v.to_str().ok())
+    {
+        let seconds = value.trim().parse::<u64>().ok().or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(value)
+                .ok()
+                .map(|at| (at.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+        });
+        if let Some(seconds) = seconds {
+            failure
+                .args
+                .insert("retry_after_secs".into(), seconds.to_string());
+        }
+    }
+    failure
+}
+
+impl EngineState {
+    fn cooling_down(&self, engine: SearchEngine) -> Msg {
+        let seconds = self
+            .failed_until
+            .map(|until| until.saturating_duration_since(Instant::now()).as_secs() + 1)
+            .unwrap_or(0);
+        let cause = self
+            .last_failure
+            .as_ref()
+            .map(failure_detail)
+            .unwrap_or("previous search failed");
+        error(format!(
+            "{} is cooling down; retry in {seconds}s. Last failure: {cause}",
+            engine_name(engine)
+        ))
+    }
 }
 
 pub(crate) fn error(detail: impl Into<String>) -> Msg {
@@ -113,10 +182,7 @@ impl WebTools {
         result: WebToolResult,
     ) {
         let key = Self::cache_key(identity, request, &self.locale()).unwrap();
-        self.cache.lock().unwrap().insert(
-            key,
-            Arc::new(AsyncMutex::new(Some((Instant::now(), result)))),
-        );
+        *self.cache.get(key).unwrap().lock().await = Some((Instant::now(), result));
     }
     pub fn new(config: &tw_config::Config) -> Result<Self, crate::GatewayError> {
         Ok(Self {
@@ -124,9 +190,10 @@ impl WebTools {
             config: config.web_tools.clone(),
             client: public::ClientSettings::new(config)?,
             slots: Semaphore::new(config.web_tools.max_concurrent as usize),
-            cache: Mutex::new(HashMap::new()),
-            pages: Mutex::new(HashMap::new()),
+            cache: cache::Cache::new(256),
+            pages: cache::Cache::new(32),
             engines: AsyncMutex::new(HashMap::new()),
+            sessions: session::Pool::default(),
         })
     }
 
@@ -155,19 +222,7 @@ impl WebTools {
             } else {
                 format!("{key}\n{}", serde_json::json!([allowed, blocked]))
             };
-            let entry = {
-                let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                if cache.len() >= 256 {
-                    cache.retain(|_, e| Arc::strong_count(e) > 1);
-                }
-                if cache.len() >= 256 && !cache.contains_key(&key) {
-                    return Err(error("too many pending web operations"));
-                }
-                cache
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
-                    .clone()
-            };
+            let entry = self.cache.get(key)?;
             // Holding this lock coalesces concurrent requests without leaving a background
             // operation behind when the last caller is cancelled.
             let mut cached = entry.lock().await;
@@ -229,7 +284,7 @@ impl WebTools {
                 public::validate_domains(allowed_domains)?;
                 public::validate_domains(blocked_domains)?;
                 let engines = if self.config.engines.is_empty() {
-                    vec![SearchEngine::Bing, SearchEngine::Duckduckgo]
+                    providers::AUTOMATIC.to_vec()
                 } else {
                     self.config.engines.clone()
                 };
@@ -243,49 +298,102 @@ impl WebTools {
                         .saturating_sub(Duration::from_millis(20));
                     let budget = remaining
                         / (engine_count - index + usize::from(self.config.read_pages > 0)) as u32;
+                    let mut searching = false;
                     let attempt = tokio::time::timeout(budget, async {
                         if !self.reserve(engine).await {
                             return Ok(None);
                         }
-                        self.search(engine, query, allowed_domains, blocked_domains, locale)
-                            .await
-                            .map(Some)
+                        searching = true;
+                        self.search(
+                            identity,
+                            engine,
+                            query,
+                            allowed_domains,
+                            blocked_domains,
+                            locale,
+                        )
+                        .await
+                        .map(Some)
                     })
                     .await
-                    .unwrap_or_else(|_| Err(error("search engine timed out")));
+                    .unwrap_or_else(|_| {
+                        Err(error(if searching {
+                            "search engine timed out"
+                        } else {
+                            "search rate-limit wait timed out"
+                        }))
+                    });
                     match attempt {
-                        Ok(None) => continue,
+                        Ok(None) => {
+                            let engines = self.engines.lock().await;
+                            if let Some(state) = engines.get(&engine) {
+                                result.warnings.push(state.cooling_down(engine));
+                            }
+                        }
                         Ok(Some(sources)) => {
+                            if let Some(state) = self.engines.lock().await.get_mut(&engine) {
+                                state.failed_until = None;
+                                state.last_failure = None;
+                            }
                             succeeded = true;
                             for source in sources {
                                 if !result.sources.iter().any(|s| s.url == source.url) {
                                     result.sources.push(source);
                                 }
                             }
-                            if result.sources.len() >= self.config.max_results as usize {
+                            // Engine order is failover order. Filling a healthy
+                            // engine's shorter result set from a worse fallback
+                            // can reintroduce unrelated pages.
+                            if !result.sources.is_empty() {
                                 break;
                             }
                         }
                         Err(e) => {
-                            self.engines
-                                .lock()
-                                .await
-                                .entry(engine)
-                                .or_default()
-                                .failed_until = Some(Instant::now() + Duration::from_secs(60));
+                            let query_mismatch = e.code == "gw.web_tools.query_mismatch";
+                            let cooldown = e
+                                .args
+                                .get("retry_after_secs")
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .and_then(|seconds| {
+                                    Instant::now().checked_add(Duration::from_secs(seconds.max(1)))
+                                })
+                                .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
+                            let e =
+                                error(format!("{}: {}", engine_name(engine), failure_detail(&e)));
+                            // A poor match for one query does not make the engine
+                            // unavailable for every other caller for a minute.
+                            if searching && !query_mismatch {
+                                let mut engines = self.engines.lock().await;
+                                let state = engines.entry(engine).or_default();
+                                state.failed_until = Some(cooldown);
+                                state.last_failure = Some(e.clone());
+                            }
                             result.warnings.push(e);
                         }
                     }
                 }
                 if !succeeded {
-                    return Err(error(
-                        "all configured search engines failed or are cooling down",
-                    ));
+                    // Do not discard the engine errors: a challenge, a broken proxy,
+                    // and a timeout need different remedies. Retries during cooldown
+                    // retain the original cause and say when another attempt is due.
+                    let reasons = result
+                        .warnings
+                        .iter()
+                        .map(failure_detail)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(error(format!(
+                        "all configured search engines failed or are cooling down. {reasons}"
+                    )));
                 }
                 result.sources.truncate(self.config.max_results as usize);
                 let mut read = 0;
                 for source in &mut result.sources {
-                    if read >= self.config.read_pages || source.text.chars().count() >= 300 {
+                    if read >= self.config.read_pages
+                        || source.text.chars().count() >= 300
+                        || reqwest::Url::parse(&source.url)
+                            .is_ok_and(|url| url.path().to_ascii_lowercase().ends_with(".pdf"))
+                    {
                         continue;
                     }
                     read += 1;
@@ -303,7 +411,19 @@ impl WebTools {
                     .await
                     .unwrap_or_else(|_| Err(error("optional page reading timed out")))
                     {
-                        Ok((_, text)) => source.text = collect::excerpt(&text, query, 3000),
+                        Ok((_, text)) => {
+                            let excerpt = collect::excerpt(&text, query, 3000);
+                            if !excerpt.is_empty() && !source.text.contains(&excerpt) {
+                                // The engine snippet may be more focused than the
+                                // landing page. Keep it instead of replacing it
+                                // with navigation text or unrelated paragraphs.
+                                source.text = format!("{}\n\n{excerpt}", source.text)
+                                    .trim()
+                                    .chars()
+                                    .take(4000)
+                                    .collect();
+                            }
+                        }
                         Err(e) => result.warnings.push(e),
                     }
                 }
@@ -344,62 +464,101 @@ impl WebTools {
     }
 
     async fn reserve(&self, engine: SearchEngine) -> bool {
-        let delay = {
-            let mut engines = self.engines.lock().await;
-            let state = engines.entry(engine).or_default();
-            let now = Instant::now();
-            if state.failed_until.is_some_and(|until| until > now) {
-                return false;
-            }
-            let at = state.next.unwrap_or(now).max(now);
-            state.next = Some(at + Duration::from_millis(u64::from(self.config.interval_ms)));
-            at.saturating_duration_since(now)
-        };
-        tokio::time::sleep(delay).await;
-        true
+        loop {
+            let delay = {
+                let mut engines = self.engines.lock().await;
+                let state = engines.entry(engine).or_default();
+                let now = Instant::now();
+                if state.failed_until.is_some_and(|until| until > now) {
+                    return false;
+                }
+                let at = state.next.unwrap_or(now);
+                if at <= now {
+                    state.next = Some(
+                        now + Duration::from_millis(u64::from(
+                            self.config
+                                .interval_ms
+                                .max(providers::get(engine).spec().min_interval_ms),
+                        )),
+                    );
+                    return true;
+                }
+                at.saturating_duration_since(now)
+            };
+            // Reserve only when a request can actually start. Cancelled waiters
+            // must not accumulate future slots and delay unrelated searches.
+            tokio::time::sleep(delay).await;
+        }
     }
 
     async fn search(
         &self,
+        identity: &str,
         engine: SearchEngine,
         query: &str,
         allowed: &[String],
         blocked: &[String],
         locale: &tw_api::WebSearchLocale,
     ) -> Result<Vec<tw_api::WebSource>, Msg> {
-        let mut q = query.to_string();
-        if !allowed.is_empty() {
-            q.push_str(&format!(
-                " ({})",
+        let provider = providers::get(engine);
+        let spec = provider.spec();
+        let session = self.sessions.get(identity, spec, locale)?;
+        let context = session::Request {
+            spec,
+            kind: providers::Kind::Document,
+            session: session.as_ref().map(|s| &s.session),
+            locale,
+        };
+        if let Some(session) = &session {
+            session
+                .session
+                .ready
+                .get_or_try_init(|| async {
+                    let home = spec
+                        .home
+                        .expect("session requires a homepage")
+                        .parse()
+                        .unwrap();
+                    let (_, body) = self.fetch(home, None, Some(context), None).await?;
+                    provider.validate_home(&body)
+                })
+                .await?;
+        }
+        let query_context = providers::Query {
+            text: query.trim(),
+            allowed: if allowed.is_empty() {
+                &self.config.allowed_domains
+            } else {
                 allowed
-                    .iter()
-                    .map(|d| format!("site:{d}"))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-            ));
-        } else if !self.config.allowed_domains.is_empty() {
-            q.push_str(&format!(
-                " ({})",
-                self.config
-                    .allowed_domains
-                    .iter()
-                    .map(|d| format!("site:{d}"))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-            ));
-        }
-        let mut url = reqwest::Url::parse(match engine {
-            SearchEngine::Bing => "https://www.bing.com/search",
-            SearchEngine::Duckduckgo => "https://html.duckduckgo.com/html/",
+            },
+            locale,
+        };
+        let mut requests = 0;
+        let mut sources = providers::run(provider, &query_context, |request| {
+            let retry = requests > 0;
+            requests += 1;
+            async move {
+                // The first reservation is made by the scheduler. Further exchange
+                // steps with a source minimum must obey that same engine-wide pace.
+                if retry && spec.min_interval_ms > 0 && !self.reserve(engine).await {
+                    return Err(error("search engine entered cooldown"));
+                }
+                let context = session::Request {
+                    kind: request.kind,
+                    ..context
+                };
+                self.fetch(request.url, None, Some(context), request.form.as_deref())
+                    .await
+                    .map(|(_, body)| body)
+            }
         })
-        .expect("built-in URL");
-        url.query_pairs_mut().append_pair("q", &q);
-        if engine == SearchEngine::Bing {
-            url.query_pairs_mut().append_pair("format", "rss");
+        .await?;
+        let had_results = !sources.is_empty();
+        let usable = quality::filter(query, &mut sources);
+        if had_results && !usable {
+            return Err(msg!("gw.web_tools.query_mismatch" =>
+                "The search engine returned results that did not match the query."));
         }
-        locale::apply(&mut url, engine, locale);
-        let (_, body) = self.fetch(url, None).await?;
-        let mut sources = collect::search(engine, &body)?;
         sources.retain(|s| {
             reqwest::Url::parse(&s.url).ok().is_some_and(|url| {
                 self.allowed(&url) && public::domains_allow(&url, allowed, blocked)
@@ -427,19 +586,7 @@ impl WebTools {
             "{identity}\n{url}\n{}",
             serde_json::json!([allowed, blocked])
         );
-        let entry = {
-            let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
-            if pages.len() >= 32 {
-                pages.retain(|_, p| Arc::strong_count(p) > 1);
-            }
-            if pages.len() >= 32 && !pages.contains_key(&key) {
-                return Err(error("too many pending page reads"));
-            }
-            pages
-                .entry(key)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
-                .clone()
-        };
+        let entry = self.pages.get(key)?;
         let mut cache = entry.lock().await;
         if let Some((at, page)) = &*cache
             && at.elapsed() < Duration::from_secs(u64::from(self.config.cache_secs))
@@ -463,9 +610,11 @@ impl WebTools {
         if !self.allowed(&url) {
             return Err(error("page is excluded by the configured domain rules"));
         }
-        let (kind, body) = self.fetch(url, Some((allowed, blocked))).await?;
+        let (kind, body) = self
+            .fetch(url, Some((allowed, blocked)), None, None)
+            .await?;
         if kind.contains("html") {
-            Ok(collect::page(&body))
+            collect::page(&body)
         } else if kind.starts_with("text/") {
             Ok((String::new(), body))
         } else {
@@ -477,17 +626,36 @@ impl WebTools {
         &self,
         mut url: reqwest::Url,
         filters: Option<(&[String], &[String])>,
+        search: Option<session::Request<'_>>,
+        form: Option<&str>,
     ) -> Result<(String, String), Msg> {
         use futures::StreamExt;
         for _ in 0..6 {
-            let addresses = public::check(&url).await?;
             if let Some((allowed, blocked)) = filters
                 && (!self.allowed(&url) || !public::domains_allow(&url, allowed, blocked))
             {
                 return Err(error("redirect is excluded by the configured domain rules"));
             }
-            let response = self.client.get(&url, &addresses).await?;
+            let response = match search {
+                Some(context) => {
+                    let response = self
+                        .client
+                        .get_search(context.spec, &url, context.headers(&url)?, form)
+                        .await?;
+                    context.remember(&url, response.headers())?;
+                    response
+                }
+                None => {
+                    let addresses = public::check(&url).await?;
+                    self.client.get(&url, &addresses).await?
+                }
+            };
             if response.status().is_redirection() {
+                // Form queries never follow redirects: do not replay their body
+                // into a login, verification, or different document endpoint.
+                if form.is_some() {
+                    return Err(http_failure(response.status(), response.headers()));
+                }
                 let to = response
                     .headers()
                     .get("location")
@@ -501,10 +669,7 @@ impl WebTools {
                 continue;
             }
             if !response.status().is_success() {
-                return Err(error(format!(
-                    "source returned HTTP {}",
-                    response.status().as_u16()
-                )));
+                return Err(http_failure(response.status(), response.headers()));
             }
             let kind = response
                 .headers()
@@ -512,6 +677,10 @@ impl WebTools {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_lowercase();
+            // Reject binary documents before trying to decode them as UTF-8.
+            if search.is_none() && !kind.contains("html") && !kind.starts_with("text/") {
+                return Err(error("page must be HTML or plain text"));
+            }
             let mut bytes = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
@@ -532,11 +701,358 @@ impl WebTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limits_keep_server_retry_after_seconds_and_dates() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(
+            http_failure(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers).arg("retry_after_secs"),
+            "120"
+        );
+        let future = chrono::Utc::now() + chrono::Duration::minutes(2);
+        headers.insert("retry-after", future.to_rfc2822().parse().unwrap());
+        let seconds: u64 = http_failure(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers)
+            .arg("retry_after_secs")
+            .parse()
+            .unwrap();
+        assert!((118..=120).contains(&seconds));
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        assert!(
+            http_failure(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+                .arg("retry_after_secs")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live traditional-engine relevance, filters, and concurrent cache checks"]
+    async fn live_direct_search_matrix() {
+        live_engine_matrix(&[SearchEngine::Duckduckgo]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live Bing relevance with a configured Chinese locale, filters, and cache"]
+    async fn live_bing_search_matrix() {
+        live_engine_matrix(&[SearchEngine::Bing]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live Bing-first search with DuckDuckGo failover, filters, and cache"]
+    async fn live_bing_failover_matrix() {
+        live_engine_matrix(&[SearchEngine::Bing, SearchEngine::Duckduckgo]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live Google Docs relevance, domain filters, and concurrent cache checks"]
+    async fn live_google_docs_search_matrix() {
+        live_engine_matrix(&[SearchEngine::GoogleDocs]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live automatic search with Google Docs and traditional-engine failover"]
+    async fn live_automatic_search_matrix() {
+        live_engine_matrix(providers::AUTOMATIC).await;
+    }
+
+    async fn live_engine_matrix(engines: &[SearchEngine]) {
+        let mut config = tw_config::Config::default();
+        config.web_tools.engines = engines.to_vec();
+        config.web_tools.language = "zh-Hans".into();
+        config.web_tools.region = "CN".into();
+        config.web_tools.read_pages = 0;
+        let tools = WebTools::new(&config).unwrap();
+        let request = |query: &str| WebToolRequest::Search {
+            query: query.into(),
+            allowed_domains: vec![],
+            blocked_domains: vec![],
+        };
+        let mut failures = Vec::new();
+        for (query, domain, path) in [
+            (
+                "Python asyncio TaskGroup documentation",
+                "python.org",
+                "asyncio-task",
+            ),
+            ("Rust OnceLock documentation", "rust-lang.org", "OnceLock"),
+            ("SQLite release notes", "sqlite.org", "changes"),
+            ("劳动合同法 第三十八条", "gov.cn", ""),
+            (
+                "2025 Nobel physics prize winners",
+                "nobelprize.org",
+                "physics/2025",
+            ),
+            (
+                "Apple Mac mini M4 technical specifications",
+                "apple.com",
+                "121555",
+            ),
+            ("中华人民共和国民法典 第一千零六十二条", "gov.cn", ""),
+            ("OpenAI Responses API reference", "openai.com", "responses"),
+        ] {
+            let result = match tools.execute("matrix", &request(query)).await {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push(format!("{query}: {error}"));
+                    continue;
+                }
+            };
+            eprintln!(
+                "{query}: {} sources, {} ms, {:?}, {:?}",
+                result.sources.len(),
+                result.elapsed_ms,
+                result.sources.first().and_then(|s| s.engine),
+                result
+                    .sources
+                    .iter()
+                    .take(3)
+                    .map(|s| &s.url)
+                    .collect::<Vec<_>>()
+            );
+            if engines.len() == 1 {
+                assert!(result.warnings.is_empty(), "{query}: {:?}", result.warnings);
+            }
+            if !result.sources.iter().any(|source| {
+                reqwest::Url::parse(&source.url).is_ok_and(|url| {
+                    public::domains_allow(&url, &[domain.into()], &[]) && url.path().contains(path)
+                })
+            }) {
+                failures.push(format!("{query}: missing {domain}/{path}"));
+            }
+            assert!(
+                result
+                    .sources
+                    .iter()
+                    .all(|s| s.engine.is_some_and(|e| engines.contains(&e)))
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "{engines:?} failed relevance checks: {failures:?}"
+        );
+        let req = request("PostgreSQL transaction isolation documentation");
+        let results =
+            futures::future::join_all((0..4).map(|_| tools.execute("matrix", &req))).await;
+        let results: Vec<_> = results.into_iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(results.iter().filter(|r| r.cached).count(), 3);
+        assert!(results.iter().all(|r| !r.sources.is_empty()));
+        for (allowed_domains, blocked_domains) in [
+            (vec!["sqlite.org".into()], vec![]),
+            (vec![], vec!["sqlite.org".into()]),
+        ] {
+            let result = tools
+                .execute(
+                    "matrix",
+                    &WebToolRequest::Search {
+                        query: "SQLite release notes".into(),
+                        allowed_domains: allowed_domains.clone(),
+                        blocked_domains: blocked_domains.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!result.sources.is_empty());
+            assert!(result.sources.iter().all(|s| public::domains_allow(
+                &reqwest::Url::parse(&s.url).unwrap(),
+                &allowed_domains,
+                &blocked_domains
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn source_minimum_interval_and_capabilities_share_the_registry() {
+        let mut config = tw_config::Config::default();
+        config.web_tools.interval_ms = 250;
+        let tools = WebTools::new(&config).unwrap();
+        assert!(tools.reserve(SearchEngine::GoogleDocs).await);
+        let next = tools.engines.lock().await[&SearchEngine::GoogleDocs]
+            .next
+            .unwrap();
+        assert!(next.saturating_duration_since(Instant::now()) > Duration::from_millis(5900));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                tools.reserve(SearchEngine::GoogleDocs)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            tools.engines.lock().await[&SearchEngine::GoogleDocs].next,
+            Some(next)
+        );
+        let available = available_engines();
+        assert_eq!(available[0].id, SearchEngine::GoogleDocs);
+        assert_eq!(available[0].min_interval_ms, 6000);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiters_do_not_reserve_more_engine_slots() {
+        let tools = WebTools::new(&tw_config::Config::default()).unwrap();
+        assert!(tools.reserve(SearchEngine::Bing).await);
+        let next = tools.engines.lock().await[&SearchEngine::Bing].next;
+        for _ in 0..3 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), tools.reserve(SearchEngine::Bing))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(tools.engines.lock().await[&SearchEngine::Bing].next, next);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_wait_timeout_does_not_mark_the_engine_unavailable() {
+        let mut config = tw_config::Config::default();
+        config.web_tools.timeout_secs = 1;
+        config.web_tools.read_pages = 0;
+        config.web_tools.engines = vec![SearchEngine::Bing];
+        let tools = WebTools::new(&config).unwrap();
+        tools.engines.lock().await.insert(
+            SearchEngine::Bing,
+            EngineState {
+                next: Some(Instant::now() + Duration::from_secs(60)),
+                ..Default::default()
+            },
+        );
+        let failure = tools
+            .execute(
+                "test",
+                &WebToolRequest::Search {
+                    query: "SQLite release notes".into(),
+                    allowed_domains: vec![],
+                    blocked_domains: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.text.contains("rate-limit wait"), "{failure}");
+        assert!(
+            tools.engines.lock().await[&SearchEngine::Bing]
+                .failed_until
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_engines_keep_their_causes_and_retry_deadline() {
+        let mut config = tw_config::Config::default();
+        config.web_tools.engines = vec![SearchEngine::Bing, SearchEngine::Duckduckgo];
+        let tools = WebTools::new(&config).unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        for (engine, reason) in [
+            (SearchEngine::Bing, "source returned HTTP 429"),
+            (
+                SearchEngine::Duckduckgo,
+                "search engine requires a verification challenge",
+            ),
+        ] {
+            tools.engines.lock().await.insert(
+                engine,
+                EngineState {
+                    next: None,
+                    failed_until: Some(until),
+                    last_failure: Some(error(format!("{}: {reason}", engine_name(engine)))),
+                },
+            );
+        }
+        for query in ["SQLite release notes", "Rust documentation"] {
+            let failure = tools
+                .execute(
+                    "test",
+                    &WebToolRequest::Search {
+                        query: query.into(),
+                        allowed_domains: vec![],
+                        blocked_domains: vec![],
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(failure.text.contains("Bing"), "{failure}");
+            assert!(failure.text.contains("429"), "{failure}");
+            assert!(failure.text.contains("DuckDuckGo"), "{failure}");
+            assert!(failure.text.contains("verification challenge"), "{failure}");
+            assert!(failure.text.contains("retry in"), "{failure}");
+            assert_eq!(failure.text.matches("Web tools:").count(), 1, "{failure}");
+            for state in tools.engines.lock().await.values() {
+                assert_eq!(
+                    state.failed_until,
+                    Some(until),
+                    "retry must not extend cooldown"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "uses the public DuckDuckGo search engine"]
+    async fn live_search_duckduckgo() {
+        live_duckduckgo_after_cooldown(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live DuckDuckGo fallback while Google Docs is cooling down"]
+    async fn live_search_google_cooldown_falls_back() {
+        live_duckduckgo_after_cooldown(true).await;
+    }
+
+    async fn live_duckduckgo_after_cooldown(google_failed: bool) {
+        let mut config = tw_config::Config::default();
+        config.web_tools.engines = vec![SearchEngine::Duckduckgo];
+        if google_failed {
+            config.web_tools.engines.insert(0, SearchEngine::GoogleDocs);
+        }
+        config.web_tools.read_pages = 0;
+        let tools = WebTools::new(&config).unwrap();
+        if google_failed {
+            tools.engines.lock().await.insert(
+                SearchEngine::GoogleDocs,
+                EngineState {
+                    failed_until: Some(Instant::now() + Duration::from_secs(60)),
+                    last_failure: Some(error("Google (Docs): source returned HTTP 500")),
+                    ..Default::default()
+                },
+            );
+        }
+        let result = tools
+            .execute(
+                "live-test",
+                &WebToolRequest::Search {
+                    query: "SQLite release notes".into(),
+                    allowed_domains: vec![],
+                    blocked_domains: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        if google_failed {
+            assert!(result.warnings.iter().any(|w| w.text.contains("500")));
+        }
+        assert!(
+            result.sources.iter().any(|s| {
+                reqwest::Url::parse(&s.url).is_ok_and(|url| {
+                    url.host_str()
+                        .is_some_and(|host| host == "sqlite.org" || host.ends_with(".sqlite.org"))
+                        && url.path().contains("changes")
+                })
+            }),
+            "release notes query must find SQLite's release history: {:?}",
+            result.sources
+        );
+        assert!(
+            result
+                .sources
+                .iter()
+                .all(|s| s.engine == Some(SearchEngine::Duckduckgo))
+        );
+    }
+
     #[tokio::test]
     #[ignore = "uses public search engines and public webpages"]
     async fn live_search_read_and_find() {
         let mut config = tw_config::Config::default();
-        config.web_tools.engines = vec![SearchEngine::Bing];
+        config.web_tools.engines = vec![SearchEngine::Duckduckgo];
         config.web_tools.read_pages = 0;
         let tools = WebTools::new(&config).unwrap();
         let search = tools
@@ -550,7 +1066,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!search.sources.is_empty());
+        assert!(
+            search.sources.iter().any(|s| {
+                reqwest::Url::parse(&s.url).is_ok_and(|url| {
+                    url.host_str()
+                        .is_some_and(|host| host == "sqlite.org" || host.ends_with(".sqlite.org"))
+                        && url.path().contains("changes")
+                })
+            }),
+            "release notes query must find SQLite's release history: {:?}",
+            search.sources
+        );
         let page = tools
             .execute(
                 "live-test",

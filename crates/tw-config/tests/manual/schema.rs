@@ -1310,8 +1310,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Is("[]"),
                     t(
-                        "Empty selects available engines automatically. Otherwise list bing and/or duckduckgo in priority order.",
-                        "空列表自动选择可用引擎；手动填写 bing、duckduckgo，按顺序尝试。",
+                        "Empty tries google_docs, duckduckgo, then bing. Otherwise list these engine IDs in priority order.",
+                        "空列表依次尝试 google_docs、duckduckgo、bing；也可手动按优先顺序填写这些引擎 ID。",
                     ),
                 ),
                 row(
@@ -1403,8 +1403,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Int,
                     Def::Is("1000"),
                     t(
-                        "Minimum interval per search engine, 250–60000 milliseconds.",
-                        "同一搜索引擎的最小请求间隔，250–60000 毫秒。",
+                        "Minimum interval per search engine, 250–60000 milliseconds. A source may enforce a higher minimum (google_docs: 6000).",
+                        "同一搜索引擎的最小请求间隔，250–60000 毫秒。搜索源可要求更长间隔（google_docs：6000）。",
                     ),
                 ),
                 row(
