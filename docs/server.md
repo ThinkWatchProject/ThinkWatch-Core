@@ -42,8 +42,15 @@ Incoming request bodies share a process-wide buffering budget: one eighth of
 the machine's memory (the cgroup limit on Linux containers), between 64 and
 512 MiB, with threefold headroom for parsing and copies. The reservation follows
 the last reference to the buffered body, including while a request is queued.
-When the budget is occupied, new bodies receive a retryable `429` with
-`Retry-After`. A single large body can use the budget exclusively; the existing
+Requests wait in arrival order for buffering space, so later small bodies cannot
+keep a large request from entering. Known-size uncompressed uploads reserve their
+space before reading and can upload concurrently. Unknown-size and compressed
+bodies grow one at a time; decompression that runs out of space retries once after
+obtaining exclusive space, without holding a CPU slot while waiting. Each budget
+or admission wait is limited to 30 seconds, after which the request receives a
+retryable `429` with `Retry-After` and Core logs the budget occupancy. An upload
+that sends no body frame for 30 seconds is rejected and releases its reservation.
+A single large body can use the budget exclusively; the existing
 256 MiB per-request limit still applies. This budget covers request buffering,
 not the entire process RSS.
 
