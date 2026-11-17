@@ -1,8 +1,9 @@
 //! 进程级的自动资源调度。配置重载、多个运行时共用同一份预算。
 //!
 //! CPU 重任务先异步等名额，再交给阻塞线程；等候者不会占满 Tokio 的线程。
-//! 正文按字节占预算，并为解析、复制留三倍余量。预算不足时先退避重试，避免已经
-//! 持有一半正文的请求互相等内存。名额跟着 Bytes 的最后一份引用归还。
+//! 正文按字节占预算，并为解析、复制留三倍余量。读取前按顺序等预算，避免小请求
+//! 插队让大请求一直重试。未知长度的正文同一时刻只读一份，避免拿着半份正文互等。
+//! 名额跟着 Bytes 的最后一份引用归还。
 //!
 //! 单个合法的大正文可以独占预算：自动预算不改变 256 MiB 的单请求上限。这是
 //! 正文缓冲的预算，不是对整个进程 RSS 的硬限制（插件、JSON 对象等另有开销）。
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore};
 
 #[cfg(any(target_os = "linux", test))]
 mod cgroup;
@@ -19,6 +20,9 @@ mod cgroup;
 const MIB: usize = 1024 * 1024;
 const BODY_HEADROOM: usize = 3;
 const HEAVY_BODY: usize = 1024 * 1024;
+
+/// 等预算或准入顺序的上限；一直被占用时仍向客户端返回可重试的 429。
+pub(crate) const BODY_WAIT: Duration = Duration::from_secs(30);
 
 /// 突发负载过去后回收阻塞线程；不改变常驻 I/O worker。
 pub const CPU_KEEP_ALIVE: Duration = Duration::from_secs(10);
@@ -131,6 +135,8 @@ pub(crate) fn body_budget() -> &'static Arc<Budget> {
 pub(crate) struct Budget {
     limit: usize,
     used: Mutex<usize>,
+    intake: AsyncMutex<()>,
+    released: Notify,
 }
 
 impl Budget {
@@ -138,7 +144,27 @@ impl Budget {
         Arc::new(Self {
             limit,
             used: Mutex::new(0),
+            intake: AsyncMutex::new(()),
+            released: Notify::new(),
         })
+    }
+
+    /// Tokio 的 mutex 按调用顺序放行。拿到名额之前不读正文，也不占正文预算。
+    pub(crate) async fn admit(&self) -> Result<MutexGuard<'_, ()>, crate::GatewayError> {
+        tokio::time::timeout(BODY_WAIT, self.intake.lock())
+            .await
+            .map_err(|_| self.busy())
+    }
+
+    fn busy(&self) -> crate::GatewayError {
+        let used = *self.used.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::warn!(
+            code = "gw.request.memory_busy",
+            budget_bytes = self.limit,
+            used_bytes = used,
+            "request body budget wait timed out"
+        );
+        memory_busy()
     }
 
     pub(crate) fn reserve(self: &Arc<Self>) -> Reservation {
@@ -155,6 +181,29 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
+    /// 只能由持有 intake 名额的读取者调用；其他请求不能在等候期间插队占预算。
+    pub(crate) async fn wait(&mut self, bytes: usize) -> Result<(), crate::GatewayError> {
+        let budget = self.budget.clone();
+        let deadline = tokio::time::Instant::now() + BODY_WAIT;
+        loop {
+            let released = budget.released.notified();
+            tokio::pin!(released);
+            // 先登记，再检查：释放可能发生在检查和 await 之间。
+            released.as_mut().enable();
+            if self.grow(bytes) {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, released)
+                .await
+                .map_err(|_| budget.busy())?;
+        }
+    }
+
+    /// 解压需要更多空间时，先释放 CPU 名额，再等到可以独占预算后重试一次。
+    pub(crate) async fn exclusive(&mut self) -> Result<(), crate::GatewayError> {
+        self.wait(self.budget.limit).await
+    }
+
     /// 在追加正文或解压输出之前调用。失败不会改变已经占用的预算。
     pub(crate) fn grow(&mut self, bytes: usize) -> bool {
         let charge = bytes.saturating_mul(BODY_HEADROOM).min(self.budget.limit);
@@ -174,12 +223,25 @@ impl Reservation {
             _reservation: self,
         })
     }
+
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        let charge = bytes.saturating_mul(BODY_HEADROOM).min(self.budget.limit);
+        if charge < self.charged {
+            let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
+            *used -= self.charged - charge;
+            self.charged = charge;
+            drop(used);
+            self.budget.released.notify_waiters();
+        }
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
         *used -= self.charged;
+        drop(used);
+        self.budget.released.notify_waiters();
     }
 }
 

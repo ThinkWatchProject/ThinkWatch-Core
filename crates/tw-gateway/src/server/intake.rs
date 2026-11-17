@@ -10,7 +10,7 @@
 //! 没压缩时一个样；`Content-Encoding` 头一并摘掉，上游不会看到它。上限按**解开之后**的大小算：
 //! 一小段压缩数据能解出几百兆，声明的长度和压缩的长度都不作数。
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::http::{HeaderMap, header};
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
@@ -56,9 +56,25 @@ async fn read_with_budget(
     }
     // 认不得的编码在读体之前就拒：不用先收完几百兆再说不认识
     let coding = coding_of(headers)?;
+    // 已知上界的未压缩正文先留足预算，再并行读取。看 body 自己的上界，不信
+    // 客户端随手写的 Content-Length；HTTP 传输层负责兑现它的 size_hint。
+    let bounded = coding.is_none().then(|| body.size_hint().upper()).flatten();
+    let mut admission = Some(budget.admit().await?);
     let mut reservation = budget.reserve();
+    if let Some(size) = bounded {
+        reservation.wait(size.min(max as u64) as usize).await?;
+        drop(admission.take());
+    }
     let mut raw = BytesMut::new();
-    while let Some(frame) = body.frame().await {
+    while let Some(frame) = tokio::time::timeout(crate::resources::BODY_WAIT, body.frame())
+        .await
+        .map_err(|_| {
+            GatewayError::request(msg!(
+                "gw.request.body_idle" =>
+                "The request body stopped arriving for 30 seconds. Send the request again."
+            ))
+        })?
+    {
         let frame = frame.map_err(|e| {
             GatewayError::request(msg!(
                 "gw.request.body_unreadable", detail = e =>
@@ -75,33 +91,23 @@ async fn read_with_budget(
                 "The request body is over the {max}-byte limit."
             )));
         }
-        // 先记账再拷贝。用满就让客户端退避，不拿着半份正文等别的请求释放。
-        if !reservation.grow(next) {
+        // 只有一个未知长度的读取者会拿着半份正文等预算；其他未完成读取的请求
+        // 都已经按可信上界留足了空间，完成它们不需要再等预算。
+        if admission.is_some() {
+            reservation.wait(next).await?;
+        } else if !reservation.grow(next) {
+            // 传输层违反 size_hint 上界时仍不绕过预算，也不拿着半份正文排队。
             return Err(crate::resources::memory_busy());
         }
         raw.extend_from_slice(&data);
     }
     let raw = raw.freeze();
     let Some(coding) = coding else {
+        reservation.shrink(raw.len());
         return Ok(reservation.wrap(raw));
     };
     headers.remove(header::CONTENT_ENCODING);
-    // 解压是纯 CPU 的活，几百兆要几百毫秒：不占 async 线程
-    let slot = crate::resources::heavy_slot().await;
-    let decoded = tokio::task::spawn_blocking(move || {
-        // 客户端取消时阻塞任务仍可能在跑：CPU 名额和预算都跟任务走。
-        let _slot = slot;
-        let decoded = coding.decode_with(&raw, max, |output| {
-            if reservation.grow(raw.len().saturating_add(output)) {
-                Ok(())
-            } else {
-                Err(Decode::Busy)
-            }
-        })?;
-        Ok(reservation.wrap(decoded))
-    })
-    .await
-    .unwrap_or_else(|e| Err(Decode::Failed(e.to_string())));
+    let decoded = decode(coding, raw, max, reservation).await;
     match decoded {
         Ok(b) => Ok(b),
         Err(Decode::Busy) => Err(crate::resources::memory_busy()),
@@ -113,6 +119,51 @@ async fn read_with_budget(
             "gw.request.bad_encoding", encoding = coding.name(), detail = detail =>
             "The request body could not be decoded as {encoding}: {detail}"
         ))),
+    }
+}
+
+async fn decode(
+    coding: Coding,
+    mut raw: Bytes,
+    max: usize,
+    mut reservation: crate::resources::Reservation,
+) -> Result<Bytes, Decode> {
+    let mut retried = false;
+    loop {
+        // 解压不占 async 线程。取消时阻塞任务仍持有自己的 CPU 名额和预算。
+        let slot = crate::resources::heavy_slot().await;
+        let (input, held, decoded) = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let decoded = coding.decode_with(&raw, max, |output| {
+                if reservation.grow(raw.len().saturating_add(output)) {
+                    Ok(())
+                } else {
+                    Err(Decode::Busy)
+                }
+            });
+            (raw, reservation, decoded)
+        })
+        .await
+        .map_err(|e| Decode::Failed(e.to_string()))?;
+        raw = input;
+        reservation = held;
+        match decoded {
+            Ok(decoded) => {
+                // 原始压缩字节用完了，不让它的预留跟随解开的正文继续占着。
+                drop(raw);
+                reservation.shrink(decoded.len());
+                return Ok(reservation.wrap(decoded));
+            }
+            Err(Decode::Busy) if !retried => {
+                // 失败的输出已释放。拿着 intake 名额等，后来的小正文不会抢走空间。
+                // 不持 CPU 名额等内存，其他请求还需要 CPU 才能结束并归还预算。
+                reservation.shrink(raw.len());
+                reservation.exclusive().await.map_err(|_| Decode::Busy)?;
+                // 独占后所有 grow 都能成功，因此至多重新解压一次。
+                retried = true;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -154,7 +205,7 @@ mod tests {
         assert_eq!(&b[..], b"12345");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_bodies_share_a_budget_until_the_last_clone_is_dropped() {
         let budget = crate::resources::Budget::new(30);
         let body = read_with_budget(&mut HeaderMap::new(), chunked(&[b"123456"]), 100, &budget)
@@ -176,7 +227,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelling_a_partial_read_returns_its_budget() {
         use futures::StreamExt;
         let budget = crate::resources::Budget::new(30);
@@ -280,7 +331,7 @@ mod tests {
         h
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn decompression_reserves_output_and_releases_everything_on_failure() {
         let budget = crate::resources::Budget::new(3_000);
         let held = read_with_budget(
@@ -311,6 +362,280 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(&decoded[..], &[b'x'; 1_000]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_large_waiter_gets_budget_before_later_small_bodies() {
+        let budget = crate::resources::Budget::new(30);
+        let held = read_with_budget(&mut HeaderMap::new(), Body::from("123456"), 100, &budget)
+            .await
+            .unwrap();
+        let mut large_headers = HeaderMap::new();
+        let mut large = Box::pin(read_with_budget(
+            &mut large_headers,
+            Body::from("123456789"),
+            100,
+            &budget,
+        ));
+        assert!(futures::poll!(&mut large).is_pending());
+        let mut small_headers = HeaderMap::new();
+        let mut small = Box::pin(read_with_budget(
+            &mut small_headers,
+            Body::from("1234"),
+            100,
+            &budget,
+        ));
+        // 旧实现会让这份小正文直接进入，大正文的每次重试都可能被抢先。
+        assert!(futures::poll!(&mut small).is_pending());
+        drop(held);
+        let large = large.await.unwrap();
+        assert_eq!(&large[..], b"123456789");
+        assert!(futures::poll!(&mut small).is_pending());
+        drop(large);
+        assert_eq!(&small.await.unwrap()[..], b"1234");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_body_can_finish_growing_without_partial_read_deadlock() {
+        let budget = crate::resources::Budget::new(30);
+        let held = read_with_budget(&mut HeaderMap::new(), Body::from("123456"), 100, &budget)
+            .await
+            .unwrap();
+        let mut first_headers = HeaderMap::new();
+        let mut first = Box::pin(read_with_budget(
+            &mut first_headers,
+            chunked(&[b"123", b"456789"]),
+            100,
+            &budget,
+        ));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut second_headers = HeaderMap::new();
+        let mut second = Box::pin(read_with_budget(
+            &mut second_headers,
+            chunked(&[b"123", b"456789"]),
+            100,
+            &budget,
+        ));
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(held);
+        let first = first.await.unwrap();
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(first);
+        assert_eq!(&second.await.unwrap()[..], b"123456789");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_head_waiter_returns_its_partial_body_and_queue_place() {
+        let budget = crate::resources::Budget::new(30);
+        let held = read_with_budget(&mut HeaderMap::new(), Body::from("123456"), 100, &budget)
+            .await
+            .unwrap();
+        let mut large_headers = HeaderMap::new();
+        let mut large = Box::pin(read_with_budget(
+            &mut large_headers,
+            chunked(&[b"123", b"456789"]),
+            100,
+            &budget,
+        ));
+        assert!(futures::poll!(&mut large).is_pending());
+        let mut small_headers = HeaderMap::new();
+        let mut small = Box::pin(read_with_budget(
+            &mut small_headers,
+            Body::from("1234"),
+            100,
+            &budget,
+        ));
+        assert!(futures::poll!(&mut small).is_pending());
+        drop(large);
+        // 原来的竞争者还活着；只有取消者自己的预算和排队名额被归还。
+        assert_eq!(&small.await.unwrap()[..], b"1234");
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanently_occupied_budget_has_a_bounded_wait_and_recovers() {
+        let budget = crate::resources::Budget::new(30);
+        let held = read_with_budget(&mut HeaderMap::new(), Body::from("123456"), 100, &budget)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let e = read_with_budget(&mut HeaderMap::new(), Body::from("123456789"), 100, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), crate::resources::BODY_WAIT);
+        assert_eq!(e.detail.code, "gw.request.memory_busy");
+        assert_eq!(e.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(e.retry.unwrap().after_ms, 5_000);
+        drop(held);
+        assert!(
+            read_with_budget(&mut HeaderMap::new(), Body::from("123456789"), 100, &budget,)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_upload_releases_its_budget_and_admission_place() {
+        use futures::StreamExt;
+        let budget = crate::resources::Budget::new(30);
+        let stream =
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"123456"))])
+                .chain(futures::stream::pending());
+        let e = read_with_budget(
+            &mut HeaderMap::new(),
+            Body::from_stream(stream),
+            100,
+            &budget,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.detail.code, "gw.request.body_idle");
+        assert!(
+            read_with_budget(&mut HeaderMap::new(), Body::from("123456789"), 100, &budget,)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decoded_bodies_return_the_compressed_input_headroom() {
+        let budget = crate::resources::Budget::new(3_003);
+        let decoded = read_with_budget(
+            &mut with_encoding("gzip"),
+            Body::from(gz(&[b'x'; 1_000])),
+            10_000,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded.len(), 1_000);
+        // 解开的正文占 3,000；已经丢掉的压缩字节不能继续占着剩余 3 字节。
+        let next = read_with_budget(&mut HeaderMap::new(), Body::from("x"), 10_000, &budget)
+            .await
+            .unwrap();
+        assert_eq!(&next[..], b"x");
+        drop((decoded, next));
+    }
+
+    #[tokio::test]
+    async fn http_large_requests_wait_and_recover_before_later_small_requests() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc;
+        type HttpState = (
+            std::sync::Arc<crate::resources::Budget>,
+            mpsc::UnboundedSender<String>,
+            mpsc::UnboundedSender<(String, Bytes)>,
+        );
+        async fn receive(
+            State((budget, entered, finished)): State<HttpState>,
+            mut headers: HeaderMap,
+            body: Body,
+        ) -> Result<(), GatewayError> {
+            let label = headers["x-test-request"].to_str().unwrap().to_owned();
+            entered.send(label.clone()).unwrap();
+            let body = read_with_budget(&mut headers, body, 10_000, &budget).await?;
+            // 模拟下游仍持有正文。测试决定何时归还，不依靠请求之间的延时碰运气。
+            finished.send((label, body)).unwrap();
+            Ok(())
+        }
+        async fn event<T>(receiver: &mut mpsc::UnboundedReceiver<T>) -> T {
+            tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let budget = crate::resources::Budget::new(3_000);
+        let json_body = |text: String| {
+            serde_json::json!({
+                "model": "gpt-6.1-sol",
+                "input": [{"role": "user", "content": text}]
+            })
+            .to_string()
+        };
+        let held = read_with_budget(
+            &mut HeaderMap::new(),
+            Body::from(json_body("h".repeat(530))),
+            10_000,
+            &budget,
+        )
+        .await
+        .unwrap();
+        let (entered, mut arrivals) = mpsc::unbounded_channel();
+        let (finished, mut bodies) = mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/v1/responses");
+        let router = Router::new()
+            .route("/v1/responses", post(receive))
+            .with_state((budget, entered, finished));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let large = client
+            .post(&url)
+            .header("x-test-request", "large")
+            .header("content-type", "application/json")
+            .body(json_body("x".repeat(900)))
+            .send();
+        let large = tokio::spawn(large);
+        assert_eq!(event(&mut arrivals).await, "large");
+        let small = client
+            .post(&url)
+            .header("x-test-request", "small")
+            .body(json_body("hello".to_owned()))
+            .send();
+        let small = tokio::spawn(small);
+        assert_eq!(event(&mut arrivals).await, "small");
+        drop(held);
+        let (label, body) = event(&mut bodies).await;
+        assert_eq!(label, "large");
+        assert_eq!(large.await.unwrap().unwrap().status(), 200);
+        assert!(!small.is_finished());
+        drop(body);
+        let (label, body) = event(&mut bodies).await;
+        assert_eq!(label, "small");
+        drop(body);
+        assert_eq!(small.await.unwrap().unwrap().status(), 200);
+
+        // 已知长度的上传只发了一半时，其他放得下的正文仍能并行进入。
+        let partial = json_body("p".repeat(530));
+        let mut upload = tokio::net::TcpStream::connect(address).await.unwrap();
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {address}\r\n\
+             Content-Length: {}\r\nx-test-request: partial\r\n\
+             Connection: close\r\n\r\n",
+            partial.len()
+        );
+        upload.write_all(headers.as_bytes()).await.unwrap();
+        let halfway = partial.len() / 2;
+        upload
+            .write_all(&partial.as_bytes()[..halfway])
+            .await
+            .unwrap();
+        assert_eq!(event(&mut arrivals).await, "partial");
+        let parallel = client
+            .post(&url)
+            .header("x-test-request", "parallel")
+            .body(json_body("hello".to_owned()))
+            .send();
+        let parallel = tokio::spawn(parallel);
+        assert_eq!(event(&mut arrivals).await, "parallel");
+        let (label, body) = event(&mut bodies).await;
+        assert_eq!(label, "parallel");
+        assert_eq!(parallel.await.unwrap().unwrap().status(), 200);
+        drop(body);
+        upload
+            .write_all(&partial.as_bytes()[halfway..])
+            .await
+            .unwrap();
+        let (label, body) = event(&mut bodies).await;
+        assert_eq!(label, "partial");
+        drop(body);
+        let mut response = Vec::new();
+        upload.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
