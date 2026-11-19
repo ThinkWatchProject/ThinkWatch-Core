@@ -127,7 +127,7 @@ jobs:
   # 两个仓库都是公开的，不需要令牌。企业版没有 `sqlx::query!` 这类编译期
   # 连库的宏，`cargo check` 不需要数据库。
   enterprise:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
