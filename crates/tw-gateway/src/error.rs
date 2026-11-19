@@ -23,6 +23,7 @@ pub enum Source {
     Upstream,
     /// 请求本身有问题
     Request,
+    RouteConflict,
     /// 上游说「慢点」：对面的额度到顶了。回 502 的话客户端会当成「服务器
     /// 坏了」而不是「该退避了」，而它们该做的事完全不同。
     RateLimited,
@@ -76,6 +77,7 @@ impl Source {
             Source::Config => "config",
             Source::Upstream => "upstream",
             Source::Request => "request",
+            Source::RouteConflict => "route_conflict",
             Source::RateLimited | Source::Busy => "rate_limited",
             Source::Denied => "denied",
             Source::NotSupported | Source::TooLarge => "request",
@@ -89,6 +91,7 @@ impl Source {
             Source::Config => StatusCode::INTERNAL_SERVER_ERROR,
             Source::Upstream => StatusCode::BAD_GATEWAY,
             Source::Request => StatusCode::BAD_REQUEST,
+            Source::RouteConflict => StatusCode::CONFLICT,
             // 429 而不是 503：客户端至少知道这是限流，可以退避。
             Source::RateLimited | Source::Busy => StatusCode::TOO_MANY_REQUESTS,
             Source::Denied => StatusCode::FORBIDDEN,
@@ -198,6 +201,15 @@ impl GatewayError {
     pub fn upstream(detail: Msg) -> Self {
         Self::new(Source::Upstream, detail)
     }
+    pub(crate) fn conflict(detail: Msg) -> Self {
+        Self::new(Source::RouteConflict, detail)
+    }
+
+    pub(crate) fn route_changed() -> Self {
+        Self::conflict(tw_types::msg!("gw.route.changed" =>
+            "The route changed before the request could be sent. Send the request again to use the current route."))
+    }
+
     pub fn request(detail: Msg) -> Self {
         Self::new(Source::Request, detail)
     }
@@ -238,11 +250,20 @@ impl GatewayError {
     /// 客户端看到的是一个**戛然而止的流**，而截断和「答完了」在 SSE
     /// 里长得一模一样。帧的形状见 [`tw_dialect::convert::error_frame`]。
     pub fn sse_frame(&self) -> String {
-        tw_dialect::convert::error_frame(
+        let frame = tw_dialect::convert::error_frame(
             self.dialect,
             self.source.status().as_u16(),
             &self.client_message(),
-        )
+        );
+        if self.source == Source::RouteConflict
+            && self.dialect == Dialect::Responses
+            && let Some(event) = tw_dialect::frame::parse(frame.as_bytes())
+            && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&event.data)
+        {
+            value["response"]["error"]["code"] = self.detail.code.clone().into();
+            return format!("event: response.failed\ndata: {value}\n\n");
+        }
+        frame
     }
 
     /// 这个错误的响应体，**客户端格式的形状**（见
@@ -258,12 +279,20 @@ impl GatewayError {
             &self.client_message(),
         );
         // 自然周期用完了：OpenAI 格式里写成额度用完（见 [`Retry`]）
-        if self.retry.is_some_and(|r| r.until_reset)
+        let code = if self.source == Source::RouteConflict && self.dialect != Dialect::Gemini {
+            Some(self.detail.code.as_str())
+        } else if self.retry.is_some_and(|r| r.until_reset)
             && matches!(self.dialect, Dialect::Chat | Dialect::Responses)
+        {
+            Some("insufficient_quota")
+        } else {
+            None
+        };
+        if let Some(code) = code
             && let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body)
             && let Some(e) = v.get_mut("error").and_then(|e| e.as_object_mut())
         {
-            e.insert("code".into(), "insufficient_quota".into());
+            e.insert("code".into(), code.into());
             return v.to_string().into_bytes();
         }
         body
@@ -282,6 +311,12 @@ impl IntoResponse for GatewayError {
             "x-thinkwatch-error",
             HeaderValue::from_static(self.source.slug()),
         );
+        if self.source == Source::RouteConflict {
+            h.insert("x-should-retry", HeaderValue::from_static("false"));
+            if let Ok(code) = HeaderValue::from_str(&self.detail.code) {
+                h.insert("x-thinkwatch-error-code", code);
+            }
+        }
         if let Some(r) = self.retry {
             let secs = r.after_ms.div_ceil(1000).max(1);
             h.insert(header::RETRY_AFTER, HeaderValue::from(secs));

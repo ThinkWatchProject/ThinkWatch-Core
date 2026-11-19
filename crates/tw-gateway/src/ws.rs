@@ -259,6 +259,10 @@ pub struct Plugins {
 /// Responses 的连接每一帧用它（[`Self::frame`]）。Realtime 的连接没有 `response.create` 这种
 /// 请求，模型写在升级请求的查询串里：升级时用一次（[`Self::connect`]）。
 pub struct Naming {
+    pub(crate) route: crate::route_switch::ClientRoute,
+    pub(crate) account: [u8; 32],
+    pub(crate) peer: std::net::IpAddr,
+
     /// 升级那一刻的配置和路由引擎：一条连接活多久就用它多久，和 [`Rules`] 一样
     pub config: Arc<tw_config::Config>,
     pub engine: Arc<tw_engine::Engine>,
@@ -350,6 +354,28 @@ pub enum Connect {
 }
 
 impl Naming {
+    fn current(&self, state: &AppState) -> bool {
+        let rt = state.runtime();
+        self.route.matches(&rt, &self.client) && rt.allow.allows(self.peer)
+    }
+
+    fn check_history(
+        &self,
+        state: &AppState,
+        value: &serde_json::Value,
+    ) -> Result<(), GatewayError> {
+        let Some(required) =
+            crate::route_switch::Required::read(tw_dialect::ir::Dialect::Responses, value)
+        else {
+            return Ok(());
+        };
+        let strict = state.route_history.strict(&self.route)
+            || crate::route_switch::manual(&self.engine, self.decision.via_group.as_deref());
+        state
+            .route_history
+            .check(&required, self.route.key, self.account, strict)
+    }
+
     /// 客户端那一侧的名称发给这一家时叫什么（[`crate::models::resolve`]）。`None` = 这一家
     /// 服务不了这个别名
     fn resolve(&self, catalog: &tw_engine::Catalog, name: &str) -> Option<String> {
@@ -444,8 +470,9 @@ impl Naming {
         &self,
         catalog: &tw_engine::Catalog,
         facts: &tw_engine::RequestFacts,
+        strict: bool,
     ) -> Result<Outgoing, Box<NotSent>> {
-        let decision = self.this_frame(facts)?;
+        let decision = self.this_frame(facts, strict)?;
         let p = &self.provider;
         let (mut set, renamed, two) = match self.engine.phase_two(facts, &p.name, &decision.set) {
             Ok(tw_engine::Outcome2::Proceed {
@@ -493,8 +520,18 @@ impl Naming {
     fn this_frame(
         &self,
         facts: &tw_engine::RequestFacts,
+        strict: bool,
     ) -> Result<tw_engine::Decision, Box<NotSent>> {
         match self.engine.route(facts) {
+            Ok(tw_engine::Outcome::Route(d)) if strict => {
+                if d.candidates.contains(&self.provider.name) {
+                    return Ok(d);
+                }
+                Err(NotSent::plain(GatewayError::conflict(msg!(
+                    "gw.route.socket_target" =>
+                    "The current rules select an upstream outside this WebSocket connection. Send this request over HTTP to use the selected route."
+                ))))
+            }
             Ok(tw_engine::Outcome::Route(d)) => Ok(tw_engine::Decision {
                 set: d.set,
                 rewritten_by: d.rewritten_by,
@@ -663,6 +700,7 @@ struct Pipes {
     plugins: Option<Plugins>,
     /// 每个 `response.create` 发出去的模型名怎么定。Responses 的连接才有
     naming: Option<Naming>,
+    reconnect: bool,
     /// 最近一次 `response.create`：客户端要的模型、发出去的模型（别名对过、规则或插件
     /// 换过的那个）和它的密钥映射。回答钩子用
     requested_model: String,
@@ -814,6 +852,12 @@ pub(crate) async fn proxy(
     naming: Option<Naming>,
 ) {
     let hop_started = std::time::Instant::now();
+    if let Some(naming) = &naming
+        && !naming.current(&state)
+    {
+        close_with(client, GatewayError::route_changed().message()).await;
+        return;
+    }
     let connected = connect(&upstream).await;
     // **连不上也要报。**和 HTTP 那条路一样，失败的时候恰恰最需要看这一跳；
     // 报在结局之前，存储层落库时手上才有它
@@ -965,6 +1009,7 @@ pub(crate) async fn proxy(
         written,
         plugins,
         naming,
+        reconnect: false,
         requested_model: String::new(),
         sent_model: String::new(),
         bridge: None,
@@ -1166,7 +1211,7 @@ async fn pump(
                 break 'pump end;
             }
         }
-        if draining
+        if (draining || p.reconnect)
             && waiting.is_none()
             && held.is_empty()
             && p.turns.as_ref().is_some_and(turn::Turns::is_empty)
@@ -1293,7 +1338,12 @@ async fn pump(
         let _ = c_tx
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                 code: CLOSE_RESTART,
-                reason: "the gateway is restarting; reconnect".into(),
+                reason: if p.reconnect {
+                    "the route changed; reconnect"
+                } else {
+                    "the gateway is restarting; reconnect"
+                }
+                .into(),
             })))
             .await;
     }
@@ -1318,6 +1368,14 @@ async fn client_frame(
     waiting: &mut Option<Waiting>,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Step {
+    if p.turns.is_some()
+        && let Some(naming) = &p.naming
+        && !naming.current(state)
+        && matches!(m, Message::Binary(_))
+    {
+        p.reconnect = true;
+        return reply_failed(c_tx, GatewayError::route_changed()).await;
+    }
     let out = match m {
         Message::Text(t) => {
             if p.turns.is_some()
@@ -1401,6 +1459,12 @@ async fn begin_turn(
     let (Some(naming), Some(turns)) = (p.naming.as_ref(), p.turns.as_ref()) else {
         return Step::Go;
     };
+    let route_check = if naming.current(state) {
+        naming.check_history(state, &frame)
+    } else {
+        p.reconnect = true;
+        Err(GatewayError::route_changed())
+    };
     let screening = {
         let s = &p.rules.screen;
         if s.mode.detects() {
@@ -1437,7 +1501,13 @@ async fn begin_turn(
     let line = turns.line.clone();
     // 别名对到这一家、密钥的模型范围继承时看的清单：这一帧（一次请求）用同一份
     let catalog = state.catalog.load();
-    let out = match naming.frame(&catalog, &reading.facts) {
+    let out = match route_check.map_err(NotSent::plain).and_then(|()| {
+        naming.frame(
+            &catalog,
+            &reading.facts,
+            state.route_history.strict(&naming.route),
+        )
+    }) {
         Ok(out) => out,
         // 只是这一帧不发：照样留一行，替它回一个 `response.failed`，连接照常
         Err(no) => {
@@ -1519,12 +1589,61 @@ async fn admitted(
             return reply_failed(c_tx, err).await;
         }
     };
+    if let Some(naming) = &p.naming {
+        let problem = if !naming.current(state) {
+            p.reconnect = true;
+            Err(GatewayError::route_changed())
+        } else {
+            serde_json::from_str(&text).map_or(Ok(()), |frame| naming.check_history(state, &frame))
+        };
+        if let Err(err) = problem {
+            turn.unsent(Vec::new(), err.source.into(), err.detail.clone());
+            return reply_failed(c_tx, err).await;
+        }
+    }
     let model = Some(p.sent_model.clone()).filter(|m| !m.is_empty() && *m != p.requested_model);
     let out = outbound(state, p, turn.id, text);
-    turn.sent(model.clone());
     let size = payload(&out);
-    match u_tx.send(out).await {
+    let sent = if let Some(naming) = &p.naming {
+        use futures::Sink;
+        use std::task::Poll;
+        let mut outgoing = Some(out);
+        let enqueued = std::future::poll_fn(|cx| {
+            let mut sink = std::pin::Pin::new(&mut *u_tx);
+            // Keep checking while the socket is full. Once start_send accepts
+            // the frame, its flush can finish across a reload.
+            let _gate = state
+                .dispatch_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !naming.current(state) {
+                return Poll::Ready(None);
+            }
+            match sink.as_mut().poll_ready(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(Some(
+                    sink.start_send(outgoing.take().expect("only enqueued once")),
+                )),
+                Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        match enqueued {
+            Some(Ok(())) => u_tx.flush().await,
+            Some(Err(err)) => Err(err),
+            None => {
+                p.reconnect = true;
+                let err = GatewayError::route_changed();
+                turn.unsent(Vec::new(), err.source.into(), err.detail.clone());
+                return reply_failed(c_tx, err).await;
+            }
+        }
+    } else {
+        u_tx.send(out).await
+    };
+    match sent {
         Ok(()) => {
+            turn.sent(model.clone());
             turn.sending(size);
             if let Some(t) = p.turns.as_mut() {
                 t.push(turn);
@@ -1642,6 +1761,22 @@ async fn upstream_text(
         e.count(t.len());
     }
     let kind = frame_kind(t);
+    if let Some(naming) = &p.naming
+        && matches!(
+            kind.as_deref(),
+            Some(
+                "response.created"
+                    | "response.completed"
+                    | "response.incomplete"
+                    | "response.output_item.done"
+            )
+        )
+        && let Ok(value) = serde_json::from_str(t)
+    {
+        state
+            .route_history
+            .record(naming.route.key, naming.account, &value);
+    }
     // Realtime 的一次回答收了尾：它的用量加到这条连接的那一行上。**看的是上游原话**，和
     // 别的路一样（占位符不影响数字）
     if p.realtime
@@ -2316,7 +2451,7 @@ fn response_id(frame: &str) -> Option<String> {
 
 /// 替被切掉的那次回答（或者没发出去的那一帧）发的 `response.failed`：和 SSE 那条路同一个
 /// 形状（`tw_dialect` 的错误帧），id 换成这次回答的。没发出去的那一帧没有回答，id 是新的
-fn failed_frame(err: GatewayError, response: Option<&str>) -> String {
+pub(crate) fn failed_frame(err: GatewayError, response: Option<&str>) -> String {
     let until_reset = err.retry.is_some_and(|r| r.until_reset);
     let sse = err
         .in_dialect(tw_dialect::ir::Dialect::Responses)

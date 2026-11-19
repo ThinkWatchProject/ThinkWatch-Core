@@ -25,6 +25,8 @@ use crate::failure::Cause;
 use crate::forward;
 use crate::server::{because, flagged};
 use crate::state::{AppState, Runtime};
+use tw_dialect::ir::Dialect;
+
 use tw_types::msg;
 
 /// `asked_model` 是客户端请求里写的模型名：发出去的不是它、上游答的又是发出去的那个
@@ -143,6 +145,20 @@ pub(super) fn respond(
         session.as_ref(),
     );
     let upstream_dialect = upstream_dialect(req, session.as_ref());
+    let mut history = (status.is_success()
+        && req.dialect == upstream_dialect
+        && matches!(upstream_dialect, Dialect::Responses | Dialect::Anthropic))
+    .then(|| {
+        crate::route_switch::Capture::new(
+            state,
+            rt,
+            &req.client_name,
+            &provider.name,
+            upstream_dialect,
+            plan.is_sse,
+        )
+    })
+    .flatten();
     let mut mode_completion = (stream_trial.is_some() && plan.is_sse)
         .then(|| crate::stream_mode::Completion::new(upstream_dialect));
     let stream_modes = rt.stream_modes.clone();
@@ -339,6 +355,9 @@ pub(super) fn respond(
                     // **旁路嗅探和留档，不缓冲**：看的是上游原话（带占位符的那一版），
                     // usage 和请求记录不受后面的还原、转换影响。先认错误，再记这一家的成败。
                     ending.feed(&chunk);
+                    if let Some(capture) = history.as_mut() {
+                        capture.feed(&chunk);
+                    }
                     if let Some(proof) = mode_completion.as_mut() {
                         proof.feed(&chunk);
                     }
@@ -391,6 +410,9 @@ pub(super) fn respond(
         } else {
             (Some(chunks), Some(_slot))
         };
+        if let Some(capture) = history.as_mut() {
+            capture.finish();
+        }
         let mode_complete = stream_trial.is_some() && match mode_completion {
             Some(proof) => proof.finish(),
             None => crate::stream_mode::whole_answer(upstream_dialect, &relay.whole),

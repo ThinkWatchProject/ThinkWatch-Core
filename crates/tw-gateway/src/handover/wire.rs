@@ -15,6 +15,8 @@ use crate::key_limits::books::{Amount, Period};
 /// 快照里各节的名字。**一节读不懂只丢那一节**（见 [`crate::state::AppState::handover_import`]）
 pub(crate) const AT_MS: &str = "at_ms";
 pub(crate) const AFFINITY: &str = "affinity";
+/// Optional section. Older peers can skip it.
+pub(crate) const ROUTE_HISTORY: &str = "route_history";
 pub(crate) const SEALS: &str = "seals";
 pub(crate) const CACHE_MARKS: &str = "cache_marks";
 pub(crate) const SESSIONS: &str = "sessions";

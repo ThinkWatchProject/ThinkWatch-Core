@@ -34,6 +34,7 @@ pub(super) async fn ws_upgrade(
     started: std::time::Instant,
     live: crate::live::Pass,
     from: Sender,
+    peer: std::net::IpAddr,
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
     // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道。这次的决定
@@ -48,17 +49,7 @@ pub(super) async fn ws_upgrade(
         return Ok(ws
             .max_message_size(16 * 1024 * 1024)
             .on_upgrade(move |socket| {
-                super::pipeline::web_socket(
-                    socket,
-                    state,
-                    rt,
-                    client_name,
-                    uri,
-                    query,
-                    headers,
-                    from,
-                    live,
-                )
+                super::pipeline::web_socket(socket, state, uri, query, headers, from, live, peer)
             }));
     }
     let realtime = crate::ws::realtime(uri.path());
@@ -164,6 +155,17 @@ pub(super) async fn ws_upgrade(
     // 按这次的决定定（指定模型、阶段一的改写），别名对到这一家（见 `crate::ws::Naming`）
     let naming_for = |provider: &tw_config::Provider| crate::ws::Naming {
         config: rt.config.clone(),
+        route: rt
+            .routing
+            .client(&client_name)
+            .expect("authenticated key")
+            .clone(),
+        account: rt
+            .routing
+            .account(&provider.name)
+            .expect("configured provider"),
+        peer,
+
         engine: rt.engine.clone(),
         decision: decision.clone(),
         provider: provider.clone(),

@@ -338,6 +338,20 @@ impl Cache {
             .or_else(|| cfg.access.clone().filter(|a| !a.is_empty()))
     }
 
+    /// A credential written back by our own refresh is still the same account.
+    pub(crate) fn wrote_rotation(&self, name: &str, old: &OAuth, new: &OAuth) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+            .is_some_and(|live| {
+                live.obtained.is_some()
+                    && live.fp == fingerprint(old)
+                    && live.refresh == new.refresh
+                    && new.access.as_deref() == Some(live.access.as_str())
+            })
+    }
+
     /// 这家最近一次刷新失败的原因，和是不是要重新登录。没失败过、或者已经恢复，是 `None`。
     pub fn failure(&self, provider: &str, cfg: &OAuth) -> Option<(Msg, bool)> {
         let g = self.inner.lock().expect("lock not poisoned");

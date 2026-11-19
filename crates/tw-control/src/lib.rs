@@ -336,6 +336,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         None => 0,
     };
     Json(tw_api::Overview {
+        hard_route_switch: Some(true),
         // **磁盘上那一份的版本，不是正在服务的那一份。**改配置时核对的是
         // 文件（见 `ConfigManager::write`）。两者只在文件被改坏、旧配置还在
         // 服务时不一样：这时拿文件的版本去改，得到的是「文件读不懂」，而不是

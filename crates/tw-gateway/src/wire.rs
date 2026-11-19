@@ -10,7 +10,7 @@ impl From<crate::error::Source> for FailureSource {
             Source::Auth => Self::Auth,
             Source::Config => Self::Config,
             Source::Upstream => Self::Upstream,
-            Source::Request => Self::Request,
+            Source::Request | Source::RouteConflict => Self::Request,
             Source::RateLimited | Source::Busy => Self::RateLimited,
             Source::Denied => Self::Denied,
             Source::NotSupported | Source::TooLarge => Self::Request,

@@ -129,7 +129,7 @@ async fn passthrough(
             ),
         ));
     }
-    let (client_name, position) = state.identify(&headers, query.as_deref())?;
+    let (client_name, position) = AppState::identify_in(&rt, &headers, query.as_deref())?;
     // 除了密钥的名字，这条请求是谁发的
     let from = Sender {
         peer: crate::hint::peer_of(peer.ip()),
@@ -153,6 +153,7 @@ async fn passthrough(
             started,
             live,
             from,
+            peer.ip(),
         )
         .await;
     }

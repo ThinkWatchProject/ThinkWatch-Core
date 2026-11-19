@@ -2898,3 +2898,129 @@ async fn closing_frames_belong_to_the_answer_in_progress_unless_they_are_strays(
         }
     }
 }
+
+#[tokio::test]
+async fn a_native_responses_socket_finishes_the_sent_turn_and_fences_the_next() {
+    let (release, hold) = tokio::sync::watch::channel(false);
+    let (a, a_seen) = responder(Some(hold)).await;
+    let (b, b_seen) = responder(None).await;
+    let (gw, _, state) = turns_gateway(
+        a,
+        |cfg| {
+            cfg.providers.push(Provider {
+                name: "next".into(),
+                base_url: format!("http://{b}"),
+                protocol: Some(tw_config::Protocol::OpenaiResponses),
+                ..Default::default()
+            });
+            cfg.routes
+                .push(tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
+                    name: "choose".into(),
+                    when: serde_yaml_ng::from_str("{}").unwrap(),
+                    to: Some("up".into()),
+                    set: None,
+                    deny: None,
+                }]));
+        },
+        None,
+    )
+    .await;
+    let mut socket = connect(gw).await;
+    socket.send(create("already sent")).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.into_text().unwrap().contains("response.created"));
+    let mut next = (*state.config()).clone();
+    next.routes[0].rules[0].to = Some("next".into());
+    state.reload(next).unwrap();
+    socket.send(create("after switch")).await.unwrap();
+    let failed = one_answer(&mut socket).await;
+    assert_eq!(
+        failed.last().unwrap()["response"]["error"]["code"],
+        "gw.route.changed"
+    );
+    release.send(true).unwrap();
+    assert_eq!(
+        one_answer(&mut socket).await.last().unwrap()["type"],
+        "response.completed"
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(frame.is_close());
+    assert_eq!(a_seen.lock().unwrap().len(), 1);
+    assert!(b_seen.lock().unwrap().is_empty());
+
+    let mut socket = connect(gw).await;
+    let stored = serde_json::json!({"type":"response.create","model":"gpt-5","previous_response_id":"resp_1","input":"continue"});
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            stored.to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let failed = one_answer(&mut socket).await;
+    assert_eq!(
+        failed.last().unwrap()["response"]["error"]["code"],
+        "gw.route.history.stored"
+    );
+    assert!(b_seen.lock().unwrap().is_empty());
+
+    socket.send(create("full replay")).await.unwrap();
+    assert_eq!(
+        one_answer(&mut socket).await.last().unwrap()["type"],
+        "response.completed"
+    );
+    assert_eq!(b_seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_reconnected_socket_refuses_a_model_now_routed_to_another_upstream() {
+    let (a, a_seen) = responder(None).await;
+    let (b, b_seen) = responder(None).await;
+    let (gw, _, state) = turns_gateway(
+        a,
+        |cfg| {
+            cfg.providers.push(Provider {
+                name: "next".into(),
+                base_url: format!("http://{b}"),
+                protocol: Some(tw_config::Protocol::OpenaiResponses),
+                ..Default::default()
+            });
+        },
+        None,
+    )
+    .await;
+    let mut cfg = (*state.config()).clone();
+    cfg.routes.push(tw_engine::RouteSet::default_with(vec![
+        tw_engine::Rule {
+            name: "model rule".into(),
+            when: serde_yaml_ng::from_str("{model: gpt-5}").unwrap(),
+            to: Some("next".into()),
+            set: None,
+            deny: None,
+        },
+        tw_engine::Rule {
+            name: "fallback".into(),
+            when: serde_yaml_ng::from_str("{}").unwrap(),
+            to: Some("up".into()),
+            set: None,
+            deny: None,
+        },
+    ]));
+    state.reload(cfg).unwrap();
+    let mut socket = connect(gw).await;
+    socket.send(create("model routed elsewhere")).await.unwrap();
+    let failed = one_answer(&mut socket).await;
+    assert_eq!(
+        failed.last().unwrap()["response"]["error"]["code"],
+        "gw.route.socket_target"
+    );
+    assert!(a_seen.lock().unwrap().is_empty());
+    assert!(b_seen.lock().unwrap().is_empty());
+}

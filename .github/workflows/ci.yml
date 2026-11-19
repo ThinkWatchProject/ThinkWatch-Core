@@ -127,7 +127,7 @@ jobs:
   # 两个仓库都是公开的，不需要令牌。企业版没有 `sqlx::query!` 这类编译期
   # 连库的宏，`cargo check` 不需要数据库。
   enterprise:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,6 +167,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.changed.outputs.layer1 == 'true'
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Toolchain for the plugin sandbox
+        if: steps.changed.outputs.layer1 == 'true'
+        run: bash core/scripts/wasm-toolchain.sh
       # 第一层全部指向这次的 core
       - name: Point enterprise at this core
         if: steps.changed.outputs.layer1 == 'true'

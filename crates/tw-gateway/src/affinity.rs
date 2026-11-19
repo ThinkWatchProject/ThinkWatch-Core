@@ -22,8 +22,7 @@
 //!
 //! **带着上游封存内容的对话另当别论**（见 [`tw_dialect::sealed`]）：那段历史只有封存它的
 //! 那个账号读得出来，换到别家整个请求被拒，而且之后每一轮都被拒。所以每段对话还记着上次
-//! 回答它的那一家（[`Affinity::holder`]），不管策略组、不管缓存凉没凉、配置改没改、那一家
-//! 中途没没了声音。怎么用它见 `server::pipeline::route`。
+//! 回答它的那一家（[`Affinity::holder`]）。用户修改路由后，通过 `route_switch` 校验密文的账号归属。
 //!
 //! **只在内存里**，最多记 [`CAP`] 段、每段最多 [`KEEP_MS`]（带过封存内容的 [`SEALED_KEEP_MS`]）：
 //! core 重启之后第一轮按策略重新排，最坏是一次缓存重建 —— 带着封存内容的对话这时认不出
@@ -141,6 +140,25 @@ impl Conversation {
             key: format!("{route}\n{id}"),
             turn,
         }
+    }
+
+    pub(crate) fn scoped(
+        mut self,
+        client: &crate::route_switch::ClientRoute,
+        strict: bool,
+    ) -> Self {
+        let revision = if strict && client.revision == 0 {
+            u64::MAX
+        } else {
+            client.revision
+        };
+        self.key = format!(
+            "{}\n{}\n{}",
+            blake3::Hash::from_bytes(client.key),
+            revision,
+            self.key
+        );
+        self
     }
 }
 

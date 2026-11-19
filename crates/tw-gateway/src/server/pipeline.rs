@@ -128,7 +128,8 @@ pub(super) async fn pipeline(
         match plan {
             Ok(Some(plan)) => {
                 let (reading, _) = read(&req, String::new(), Some(&body), (state.local_time)());
-                let early = commit::early(&state, &req, &reading);
+                let early = commit::early(&state, &req, &reading)
+                    .filter(|_| crate::route_switch::Required::read(req.dialect, &body).is_none());
                 let dialect = req.dialect;
                 let abort = req.abort.clone();
                 let run = web::run(state, rt, req, live, plan, body);
@@ -175,8 +176,18 @@ async fn forward_pipeline(
         read(&req, intent, parsed.as_ref(), (state.local_time)())
     })
     .await;
-    let conv = conversation(&rt, &req, &reading, fp.as_deref());
-    let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref()) {
+    let conv = conversation(&state, &rt, &req, &reading, fp.as_deref());
+    let required = parsed
+        .as_ref()
+        .and_then(|body| crate::route_switch::Required::read(req.dialect, body));
+    let (choice, decision) = match route(
+        &state,
+        &rt,
+        &req,
+        &reading,
+        conv.as_ref(),
+        required.as_ref(),
+    ) {
         Routed::Go(choice, decision) => (choice, decision),
         // 请求一家上游都不会去：还没配上游、规则没做出决定、规则拒绝了、模型准入没过、规则
         // 选中的上游都服务不了。**照样开始、照样报路由**（尝试链是空的），失败由
@@ -595,6 +606,7 @@ fn read(
 /// **数得出轮次的才算**：要解码出整段对话才知道最后一条是不是工具结果。计 token、
 /// 嵌入、解不开的请求不记 —— 它们照常按策略排序。
 fn conversation(
+    state: &AppState,
     rt: &Runtime,
     req: &Inbound,
     reading: &crate::client_api::Reading,
@@ -604,11 +616,15 @@ fn conversation(
         return None;
     };
     let id = crate::affinity::identity(&req.headers, fp)?;
-    Some(crate::affinity::Conversation::new(
-        rt.engine.route_of(&req.client_name),
-        &id,
-        crate::affinity::turn_of(&d.request),
-    ))
+    let client = rt.routing.client(&req.client_name)?;
+    Some(
+        crate::affinity::Conversation::new(
+            rt.engine.route_of(&req.client_name),
+            &id,
+            crate::affinity::turn_of(&d.request),
+        )
+        .scoped(client, state.route_history.strict(client)),
+    )
 }
 
 /// 输入超出了这个决定所选模型的上下文窗口：这一轮沿用的决定要重新求值。
@@ -836,6 +852,7 @@ fn route(
     req: &Inbound,
     reading: &crate::client_api::Reading,
     conv: Option<&crate::affinity::Conversation>,
+    required: Option<&crate::route_switch::Required>,
 ) -> Routed {
     let facts = &reading.facts;
     let route = rt.engine.route_of(&req.client_name).to_string();
@@ -848,6 +865,13 @@ fn route(
             },
             why,
         )
+    };
+    let Some(client_route) = rt
+        .routing
+        .client(&req.client_name)
+        .filter(|client| client.current(state, &req.client_name))
+    else {
+        return undecided(GatewayError::route_changed());
     };
     // 首次运行还没配完是正常状态，不是配置错误。这条要在规则求值之前挡，
     // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
@@ -912,11 +936,13 @@ fn route(
         }),
         stayed_on: None,
     };
-    // 带着上游封存内容的对话，只有封存它的那一家读得出来（见 `tw_dialect::sealed`）。认得出是
-    // 谁封存的（上次回答它的那一家，见 `crate::affinity`），就送回它那儿：规则这一次选了谁、
-    // 配置改没改、缓存凉没凉都不管。认不出来的照常路由 —— 被拒了，失败的说明会讲清楚
+    let strict_history = state.route_history.strict(client_route)
+        || crate::route_switch::manual(&rt.engine, decision.via_group.as_deref());
+    // Ordinary automatic routing keeps its existing affinity. Once the
+    // operator changes the route, proof comes from the actual response items.
     let sealed = reading
         .sealed
+        .filter(|_| !strict_history)
         .zip(conv)
         .and_then(|(kind, c)| Some((kind, state.affinity.holder(c, now)?)));
     if let Some((tw_dialect::sealed::Sealed::Content, holder)) = &sealed {
@@ -975,6 +1001,23 @@ fn route(
         conv,
         now,
     );
+    if let Some(required) = required.filter(|_| strict_history) {
+        // Use the same health filtering as dispatch before deciding which
+        // account must be able to read this request.
+        let (alive, _) = state.health.filter(&decision.candidates);
+        if let Some(leader) = alive.first() {
+            let account = rt.routing.account(leader).expect("usable provider");
+            if let Err(err) = state
+                .route_history
+                .check(required, client_route.key, account, true)
+            {
+                return Routed::Refused(choice, err);
+            }
+            decision
+                .candidates
+                .retain(|name| rt.routing.account(name) == Some(account));
+        }
+    }
     let mut stayed = arranged.stayed;
     // 封存的只有推理：封存它的那一家排到头上，推理接得上；别家照旧留着做故障转移 —— 去掉推理
     // 也接得下去（见 `crate::seal`）

@@ -252,6 +252,14 @@ impl Group {
         self.providers.iter().any(|m| m.name == name)
     }
 
+    /// The operator's selection, or the first member in older configs without one.
+    pub fn selection(&self) -> Option<&str> {
+        self.selected
+            .as_deref()
+            .filter(|name| self.has(name))
+            .or_else(|| self.providers.first().map(|member| member.name.as_str()))
+    }
+
     /// 成员 `name` 的权重。不是成员的按 1 算
     pub fn weight(&self, name: &str) -> u32 {
         self.providers
@@ -1523,23 +1531,7 @@ impl Engine {
         match g.kind {
             // 顺序就是优先级。第一个健康的就用，缓存持续命中。
             GroupType::Fallback => g.names(),
-            GroupType::Select => {
-                // 选中的排头，其余仍然留着做故障转移 —— **手动选一家不
-                // 等于放弃容错**，那家挂了照样该切。
-                let mut out = Vec::with_capacity(g.providers.len());
-                if let Some(sel) = &g.selected
-                    && g.has(sel)
-                {
-                    out.push(sel.clone());
-                }
-                out.extend(
-                    g.providers
-                        .iter()
-                        .filter(|p| Some(&p.name) != g.selected.as_ref())
-                        .map(|p| p.name.clone()),
-                );
-                out
-            }
+            GroupType::Select => g.selection().map(str::to_owned).into_iter().collect(),
             // 这三种要运行时的数字才排得出来。**这里只给集合，
             // 顺序由 `order` 定** —— 它是纯函数，数据面和试算页都调它。
             GroupType::LoadBalance | GroupType::UrlTest | GroupType::Cheapest => g.names(),
@@ -1892,9 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn select_puts_the_chosen_one_first_but_keeps_the_rest_for_failover() {
-        // **手动选一家不等于放弃容错。**那家挂了照样该切，否则「select」
-        // 就变成了「单点故障」。
+    fn select_uses_only_the_chosen_member() {
         let g = Group {
             name: "pool".into(),
             kind: GroupType::Select,
@@ -1907,7 +1897,7 @@ mod tests {
             vec![g],
             vec![route("x", "{}", "pool")],
         );
-        assert_eq!(candidates(&e, &facts("x")), ["b", "a", "c"]);
+        assert_eq!(candidates(&e, &facts("x")), ["b"]);
     }
 
     #[test]
