@@ -23,6 +23,8 @@ mod upstream;
 /// 了，正在排队的请求会失去它们的位置；事件流丢了，界面上的实时列表会
 /// 断一次。这些都不该因为改了一条路由规则而发生。
 pub struct Runtime {
+    pub(crate) routing: crate::route_switch::Routing,
+
     pub web_tools: Arc<crate::web_tools::WebTools>,
     pub config: Arc<tw_config::Config>,
     /// 路由引擎。**和配置一起建，一起换** —— 分开持有会让「规则改了但
@@ -72,6 +74,15 @@ impl Runtime {
         config: tw_config::Config,
         previous: Option<&Runtime>,
         plugins: &crate::plugin::Plugins,
+    ) -> Result<Self, GatewayError> {
+        Self::build_with_oauth(config, previous, plugins, None)
+    }
+
+    fn build_with_oauth(
+        config: tw_config::Config,
+        previous: Option<&Runtime>,
+        plugins: &crate::plugin::Plugins,
+        oauth: Option<&crate::oauth::Cache>,
     ) -> Result<Self, GatewayError> {
         let mut clients = std::collections::HashMap::new();
         for p in &config.providers {
@@ -128,9 +139,12 @@ impl Runtime {
             web_tools.history = previous.web_tools.history.clone();
         }
         let web_tools = Arc::new(web_tools);
+        let engine = Arc::new(config.engine());
+        let routing = crate::route_switch::Routing::build(&config, &engine, previous, oauth);
         Ok(Self {
+            routing,
             web_tools,
-            engine: Arc::new(config.engine()),
+            engine,
             config: Arc::new(config),
             clients,
             allow,
@@ -148,6 +162,7 @@ impl Runtime {
     /// 同一份配置、换一份插件。插件文件变了时走这条：配置没变，别的都不用重建
     fn with_plugins(&self, plugins: crate::plugin::PluginSet) -> Self {
         Self {
+            routing: self.routing.clone(),
             web_tools: self.web_tools.clone(),
             config: self.config.clone(),
             engine: self.engine.clone(),
@@ -291,6 +306,8 @@ pub struct AppState {
     pub live: crate::live::Live,
     /// 每段对话此刻归到哪一次会话（见 [`crate::session::Sessions`]）。**跨重载存活**
     pub sessions: Arc<crate::session::Sessions>,
+    /// Account fingerprints for history that can only be read by its upstream.
+    pub(crate) route_history: Arc<crate::route_switch::History>,
     /// 每段对话这一轮的路由决定、上次回答它的那一家（见 [`crate::affinity`]）。**跨重载存活**
     pub affinity: Arc<crate::affinity::Affinity>,
     /// 每个 `load-balance` 组轮到了谁（见 [`crate::balance`]）。**跨重载存活**，改了的组从头轮
@@ -310,6 +327,9 @@ pub struct AppState {
     /// 存回去 —— 不排队的话，插件那一路可能拿着换配置之前的那份配置，把刚换进去的
     /// 新配置又换回去
     swap: Arc<std::sync::Mutex<()>>,
+    /// Orders the start of a send against publication of a new routing table.
+    pub(crate) dispatch_gate: Arc<std::sync::Mutex<()>>,
+
     /// Anthropic 流里上游静默多久就补一个 `ping`（见 `relay`）。**测试会把它调短**，
     /// 否则一条心跳的测试要干等十五秒
     pub ping_every: std::time::Duration,
@@ -408,6 +428,7 @@ impl AppState {
             proxies: Arc::new(std::sync::Mutex::new(Default::default())),
             live: crate::live::Live::default(),
             sessions: Default::default(),
+            route_history: Default::default(),
             affinity: Default::default(),
             balance: Default::default(),
             seals: Default::default(),
@@ -415,6 +436,7 @@ impl AppState {
             effort_memory: Default::default(),
             plugins,
             swap: Default::default(),
+            dispatch_gate: Default::default(),
             ping_every: crate::PING_EVERY,
             ping_for: crate::PING_FOR,
             plugin_pool: Arc::new(crate::plugin::pool::Pool::default_size()),
@@ -641,7 +663,7 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = self.rt.load();
-        let next = Runtime::build(config, Some(&old), &self.plugins)?;
+        let next = Runtime::build_with_oauth(config, Some(&old), &self.plugins, Some(&self.oauth))?;
         let broken = crate::plugin::load::newly_broken(&old.plugins, &next.plugins);
         // 比的是写法不是解析出来的地址：网卡名要问系统，而那是监听那一边的事
         let (was, now) = (&old.config.listen.gateway, &next.config.listen.gateway);
@@ -657,7 +679,11 @@ impl AppState {
         self.throttles.configure(&next.config);
         // 删掉的、地址密钥协议变了的上游，记着的推理强度作废
         self.effort_memory.reconcile(&next.config);
-        self.rt.store(Arc::new(next));
+        {
+            let _dispatch = self.dispatch_gate.lock().unwrap_or_else(|p| p.into_inner());
+            self.rt.store(Arc::new(next));
+        }
+        self.route_history.sync_routing(&self.runtime().routing);
         self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表
         // 即承诺），改了范围的立刻生效。新加的、地址凭据变了的在后台补问
@@ -695,6 +721,7 @@ impl AppState {
     pub fn set_config_dir(&self, dir: std::path::PathBuf) {
         // 记着的推理强度也存在这个目录里（见 `crate::effort_memory`）
         self.effort_memory.set_dir(dir.clone());
+        self.route_history.set_dir(&dir, &self.runtime().routing);
         if self.plugins.set_dir(dir) {
             self.reload_plugins();
         }
@@ -727,6 +754,14 @@ impl AppState {
         headers: &HeaderMap,
         query: Option<&str>,
     ) -> Result<(String, crate::auth::KeyPosition), GatewayError> {
+        Self::identify_in(&self.runtime(), headers, query)
+    }
+
+    pub(crate) fn identify_in(
+        rt: &Runtime,
+        headers: &HeaderMap,
+        query: Option<&str>,
+    ) -> Result<(String, crate::auth::KeyPosition), GatewayError> {
         let Some((key, position)) = crate::auth::extract_key_with_position(headers, query) else {
             return Err(GatewayError::auth(msg!(
                 "gw.auth.no_key" =>
@@ -734,7 +769,6 @@ impl AppState {
                  keys under `clients` in config.yaml."
             )));
         };
-        let rt = self.rt.load();
         let found = rt.config.clients.iter().find(|c| key_eq(&c.key, &key));
         match found {
             // **停用的密钥要说清楚是停用了。**这一条和「密钥无效」不同：

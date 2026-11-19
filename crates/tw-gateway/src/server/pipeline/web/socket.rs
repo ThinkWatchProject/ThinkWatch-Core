@@ -13,13 +13,12 @@ type Writer = futures::stream::SplitSink<WebSocket, Message>;
 pub(in crate::server) async fn serve_socket(
     socket: WebSocket,
     state: AppState,
-    rt: Arc<Runtime>,
-    client_name: String,
     uri: axum::http::Uri,
     query: Option<String>,
     headers: axum::http::HeaderMap,
     from: crate::server::Sender,
     _live: crate::live::Pass,
+    peer: std::net::IpAddr,
 ) {
     let (mut writer, mut reader) = socket.split();
     let mut previous: Option<(String, Value, Vec<Value>)> = None;
@@ -56,6 +55,25 @@ pub(in crate::server) async fn serve_socket(
             .await;
             continue;
         }
+        let rt = state.runtime();
+        if !rt.allow.allows(peer) {
+            send_error(
+                &mut writer,
+                "permission_error",
+                "This source is no longer allowed",
+            )
+            .await;
+            return;
+        }
+        let client_name = match AppState::identify_in(&rt, &headers, query.as_deref()) {
+            Ok((client, _)) => client,
+            Err(err) => {
+                let _ = writer
+                    .send(Message::Text(crate::ws::failed_frame(err, None).into()))
+                    .await;
+                return;
+            }
+        };
         body.as_object_mut()
             .expect("response.create object")
             .remove("type");
@@ -140,8 +158,19 @@ pub(in crate::server) async fn serve_socket(
             send_error(&mut writer, "cancelled", "Response was cancelled").await;
             continue;
         }
-        let response =
-            response.unwrap_or_else(|e| e.in_dialect(Dialect::Responses).into_response());
+        let response = match response {
+            Err(err) if err.source == crate::error::Source::RouteConflict => {
+                if writer
+                    .send(Message::Text(crate::ws::failed_frame(err, None).into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            other => other.unwrap_or_else(|e| e.in_dialect(Dialect::Responses).into_response()),
+        };
         let response = match seat.get() {
             Some(capture) => capture.client_answer(axum::http::Version::HTTP_11, response),
             None => response,

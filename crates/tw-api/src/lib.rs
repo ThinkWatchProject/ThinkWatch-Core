@@ -2585,6 +2585,11 @@ pub struct ConfigRejection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Overview {
+    /// Routing changes take effect on the next request, including manual selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub hard_route_switch: Option<bool>,
+
     /// 配置文件现在的版本号。和 `GET /config` 的 `version`、改配置时带的
     /// `base_version` 是同一个。
     ///

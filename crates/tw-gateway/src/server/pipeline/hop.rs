@@ -256,7 +256,17 @@ pub(super) async fn try_upstreams<'a>(
     // 这一跳发出去的推理强度和客户端要的不一样：那一跳在尝试链上的位置和那一项
     let mut effort_note: Option<(usize, tw_api::EffortChange)> = None;
 
+    let route = rt
+        .routing
+        .client(&req.client_name)
+        .expect("authenticated key");
+    let strict_history = state.route_history.strict(route)
+        || crate::route_switch::manual(&rt.engine, decision.via_group.as_deref());
     loop {
+        if !route.current(state, &req.client_name) {
+            halt = Some(GatewayError::route_changed());
+            break;
+        }
         stamp_queued(&mut chain, queued.take());
         stamp_effort(&mut chain, effort_note.take());
         // 候选都试过了，最后一跳在内容之前暂时出错：等待期限之内退避一阵，把暂时出错的那几家再
@@ -803,7 +813,11 @@ pub(super) async fn try_upstreams<'a>(
             .map_or(&started.ledger, |r| &r.ledger);
         let (body, ledger, differs) = super::heavy(&out.body, || {
             // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
-            let unsealed = unseal_upfront(state, req, started, provider, &out);
+            let unsealed = if strict_history {
+                out.body.clone()
+            } else {
+                unseal_upfront(state, req, started, provider, &out)
+            };
             // 发出去的就是客户端原文的那些字节（同格式直通、一个字节都没改）：开头那一遍在
             // 它上面找到的就是这一跳要换的，不再找一遍
             let known = started.hits.as_deref().filter(|_| {
@@ -939,6 +953,7 @@ pub(super) async fn try_upstreams<'a>(
             let sending = async {
                 let sent = send(
                     state,
+                    route,
                     req,
                     provider,
                     http,
@@ -953,6 +968,7 @@ pub(super) async fn try_upstreams<'a>(
                 match sent {
                     Ok(r) => {
                         let resend = Resend {
+                            route,
                             out: &out,
                             body: &body,
                             headers: &upstream_headers,
@@ -971,6 +987,7 @@ pub(super) async fn try_upstreams<'a>(
                         )
                         .await?;
                         let resend = Resend {
+                            route,
                             out: &out,
                             body: uncached.as_ref().unwrap_or(&body),
                             headers: &upstream_headers,
@@ -978,8 +995,12 @@ pub(super) async fn try_upstreams<'a>(
                             conversation: started.conversation.as_deref(),
                             tap: &tap,
                         };
-                        resend_unsealed(state, req, provider, http, resend, r, &mut repair_used)
-                            .await
+                        if strict_history {
+                            Ok(r)
+                        } else {
+                            resend_unsealed(state, req, provider, http, resend, r, &mut repair_used)
+                                .await
+                        }
                     }
                     Err(e) => Err(e),
                 }
@@ -1777,6 +1798,16 @@ pub(super) async fn try_upstreams<'a>(
                 });
                 break;
             }
+            Err(SendError::RouteChanged { dispatched }) => {
+                if !dispatched {
+                    usage_hold.release();
+                }
+                if let Some(p) = probe.take() {
+                    p.withdraw();
+                }
+                halt = Some(GatewayError::route_changed());
+                break;
+            }
             Err(e) => {
                 note_health(
                     &state.bus,
@@ -1785,6 +1816,7 @@ pub(super) async fn try_upstreams<'a>(
                     state.health.record_failure(&provider.name),
                 );
                 let err = match e {
+                    SendError::RouteChanged { .. } => unreachable!("handled above"),
                     // 连不上：上游一个字节都没收到，这一跳不算
                     SendError::Http(e) if e.is_connect() => {
                         usage_hold.release();
@@ -2964,6 +2996,7 @@ fn unseal_upfront(
 
 /// 重发一次要用的：这一跳原来发的那些
 struct Resend<'a> {
+    route: &'a crate::route_switch::ClientRoute,
     out: &'a Outbound,
     body: &'a Bytes,
     headers: &'a [(String, String)],
@@ -3018,6 +3051,7 @@ async fn resend_uncached(
     let stripped = Bytes::from(stripped);
     let r = send(
         state,
+        resend.route,
         req,
         provider,
         http,
@@ -3027,7 +3061,8 @@ async fn resend_uncached(
         resend.aws,
         &resend.tap.resent(),
     )
-    .await?;
+    .await
+    .map_err(SendError::after_dispatch)?;
     Ok((r, Some(stripped)))
 }
 
@@ -3076,6 +3111,7 @@ async fn resend_unsealed(
     );
     send(
         state,
+        resend.route,
         req,
         provider,
         http,
@@ -3086,6 +3122,7 @@ async fn resend_unsealed(
         &resend.tap.resent(),
     )
     .await
+    .map_err(SendError::after_dispatch)
 }
 
 /// 这一跳发往的完整地址。
@@ -3105,6 +3142,18 @@ enum SendError {
     Http(reqwest::Error),
     /// Bedrock 的请求没签成名
     Sign(tw_bedrock::SignError),
+    RouteChanged {
+        dispatched: bool,
+    },
+}
+
+impl SendError {
+    fn after_dispatch(self) -> Self {
+        match self {
+            Self::RouteChanged { .. } => Self::RouteChanged { dispatched: true },
+            other => other,
+        }
+    }
 }
 
 /// 发出这一跳。OAuth 上游回 401 时换一个 token 再发一次。
@@ -3115,6 +3164,7 @@ enum SendError {
 #[allow(clippy::too_many_arguments)]
 async fn send(
     state: &AppState,
+    route: &crate::route_switch::ClientRoute,
     req: &Inbound,
     provider: &tw_config::Provider,
     http: &reqwest::Client,
@@ -3201,6 +3251,16 @@ async fn send(
         .map(|c| (c, provider.bedrock_region().unwrap_or_default()));
     // 发出去的请求体按线上的样子记：压缩过的是压缩之后的（见 `crate::traffic`）
     let (traffic, size) = (&req.traffic, body.len());
+    let dispatch = |request| {
+        dispatch(
+            state,
+            route,
+            &req.client_name,
+            traffic,
+            size,
+            http.execute(request),
+        )
+    };
     if let Some((credentials, region)) = signer {
         let mut request = build(&upstream_headers)
             .body(body.clone())
@@ -3208,9 +3268,7 @@ async fn send(
             .map_err(SendError::Http)?;
         crate::bedrock::sign_request(&mut request, credentials, region).map_err(SendError::Sign)?;
         tap.sending(&request, &plain, &upstream_headers);
-        return dispatch(traffic, size, http.execute(request))
-            .await
-            .map_err(SendError::Http);
+        return dispatch(request).await;
     }
     // 定稿了再发：报文记录记下真正发出去的请求头
     let request = build(&upstream_headers)
@@ -3218,7 +3276,7 @@ async fn send(
         .build()
         .map_err(SendError::Http)?;
     tap.sending(&request, &plain, &upstream_headers);
-    let mut sent = dispatch(traffic, size, http.execute(request)).await;
+    let mut sent = dispatch(request).await;
     // **OAuth 上游回 401：换一个 access token 再发一次，只一次。**token 可能在别处被
     // 吊销了、提前失效了；不重试的话，这个请求连同之后每一个请求都会原样失败，直到
     // 缓存里那个 token 按时间过期。换回来的还是 401，说明问题不在 token
@@ -3228,9 +3286,9 @@ async fn send(
             Ok(fresh) if fresh != upstream_headers => match build(&fresh).body(body).build() {
                 Ok(request) => {
                     tap.sending(&request, &plain, &fresh);
-                    sent = dispatch(traffic, size, http.execute(request)).await;
+                    sent = dispatch(request).await.map_err(SendError::after_dispatch);
                 }
-                Err(e) => sent = Err(e),
+                Err(e) => sent = Err(SendError::Http(e)),
             },
             Ok(_) => {}
             Err(e) => {
@@ -3238,7 +3296,7 @@ async fn send(
             }
         }
     }
-    sent.map_err(SendError::Http)
+    sent
 }
 
 /// 发出去一次：请求体（`size` 字节）记进这个请求的流量，响应套上一层、读到的每一块都记上
@@ -3246,21 +3304,45 @@ async fn send(
 /// 后面读它的每一处拿到的都是解开的字节。**连不上的退回**：地址不通、代理拒绝、握手失败时
 /// 上游一个字节都没收到。别的错误（超时、发到一半断了）照记：请求体多半已经出去了
 async fn dispatch(
+    state: &AppState,
+    route: &crate::route_switch::ClientRoute,
+    client: &str,
     traffic: &std::sync::Arc<crate::traffic::Traffic>,
     size: usize,
     sending: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
-) -> reqwest::Result<reqwest::Response> {
-    traffic.sending(size);
-    match sending.await {
+) -> Result<reqwest::Response, SendError> {
+    let mut sending = std::pin::pin!(sending);
+    let mut started = false;
+    let result = std::future::poll_fn(|cx| {
+        let _gate = if started {
+            None
+        } else {
+            let gate = state
+                .dispatch_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !route.current(state, client) {
+                return std::task::Poll::Ready(Err(SendError::RouteChanged { dispatched: false }));
+            }
+            traffic.sending(size);
+            started = true;
+            Some(gate)
+        };
+        sending
+            .as_mut()
+            .poll(cx)
+            .map(|r| r.map_err(SendError::Http))
+    })
+    .await;
+    match result {
         Ok(r) => Ok(crate::inflate::inflated(crate::traffic::metered(
             r, traffic,
         ))),
-        Err(e) => {
-            if e.is_connect() {
-                traffic.unsent(size);
-            }
-            Err(e)
+        Err(SendError::Http(e)) if e.is_connect() => {
+            traffic.unsent(size);
+            Err(SendError::Http(e))
         }
+        Err(e) => Err(e),
     }
 }
 

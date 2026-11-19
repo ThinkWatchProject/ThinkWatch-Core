@@ -162,6 +162,10 @@ impl AppState {
             serde_json::to_value(self.affinity.handover_export()),
         );
         put(
+            wire::ROUTE_HISTORY,
+            serde_json::to_value(self.route_history.export(&self.runtime().routing)),
+        );
+        put(
             wire::SEALS,
             serde_json::to_value(self.seals.handover_export()),
         );
@@ -224,6 +228,11 @@ impl AppState {
             .map_or(0, |at| crate::server::now_ms().saturating_sub(at));
         let cfg = self.config();
         self.affinity.handover_import(entries(m, wire::AFFINITY));
+        if let Some(history) = section(m, wire::ROUTE_HISTORY) {
+            let rt = self.runtime();
+            self.route_history.import(&rt.routing, history);
+            self.route_history.sync_routing(&rt.routing);
+        }
         self.seals.handover_import(entries(m, wire::SEALS));
         self.cache_marks
             .handover_import(entries(m, wire::CACHE_MARKS));

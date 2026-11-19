@@ -57,6 +57,7 @@ pub mod quota;
 pub mod quote;
 pub mod resources;
 pub mod retry;
+mod route_switch;
 pub mod seal;
 pub mod sent;
 pub mod server;
