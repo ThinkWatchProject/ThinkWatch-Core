@@ -30,7 +30,6 @@ struct File {
 struct KindSpec {
     slug: String,
     name: String,
-    name_zh: String,
 }
 
 #[derive(Deserialize)]
@@ -43,11 +42,8 @@ struct RuleSpec {
     #[serde(default)]
     label: Option<String>,
     name: String,
-    name_zh: String,
     #[serde(default)]
     about: Option<String>,
-    #[serde(default)]
-    about_zh: Option<String>,
     #[serde(default)]
     hosts: Vec<String>,
     #[serde(default)]
@@ -96,13 +92,6 @@ impl Tail {
             Tail::Alnum => "letters or digits",
         }
     }
-    fn zh(self) -> &'static str {
-        match self {
-            Tail::Any => "字符",
-            Tail::Hex => "十六进制字符",
-            Tail::Alnum => "字母或数字",
-        }
-    }
 }
 
 const SOURCE: &str = "data/redact.yaml";
@@ -134,18 +123,16 @@ fn variant(slug: &str) -> String {
 fn kinds(file: &File) -> String {
     let mut s = String::from("&[\n");
     for k in &file.kinds {
-        let ok = |t: &str| !t.trim().is_empty();
         assert!(
-            ok(&k.name) && ok(&k.name_zh),
-            "{SOURCE}: kind `{}` needs both names",
+            !k.name.trim().is_empty(),
+            "{SOURCE}: kind `{}` needs a name",
             k.slug
         );
         writeln!(
             s,
-            "    KindName {{ kind: Kind::{}, name: {:?}, name_zh: {:?} }},",
+            "    KindName {{ kind: Kind::{}, name: {:?} }},",
             variant(&k.slug),
-            k.name,
-            k.name_zh
+            k.name
         )
         .unwrap();
     }
@@ -166,8 +153,8 @@ fn builtins(file: &File) -> String {
             r.kind
         );
         let ok = |t: &str| !t.trim().is_empty();
-        assert!(ok(&r.name) && ok(&r.name_zh), "{at} needs both names");
-        let (matcher, about, about_zh) = match (&r.prefix, &r.prefixes) {
+        assert!(ok(&r.name), "{at} needs a name");
+        let (matcher, about) = match (&r.prefix, &r.prefixes) {
             (Some(_), Some(_)) => panic!("{at}: `prefix` or `prefixes`, not both"),
             (Some(p), None) => {
                 assert!(!p.prefix.is_empty(), "{at}: empty prefix");
@@ -176,14 +163,12 @@ fn builtins(file: &File) -> String {
                     min_tail: p.min_tail,
                     tail: Tail::Any,
                 }];
-                let (en, zh) = describe(&one);
                 (
                     format!(
                         "Matcher::Prefix {{ prefix: {:?}, min_tail: {} }}",
                         p.prefix, p.min_tail
                     ),
-                    en,
-                    zh,
+                    describe(&one),
                 )
             }
             (None, Some(list)) => {
@@ -201,27 +186,22 @@ fn builtins(file: &File) -> String {
                     .unwrap();
                 }
                 m.push_str("] }");
-                let (en, zh) = describe(list);
-                (m, en, zh)
+                (m, describe(list))
             }
             // 代码里的判据：`detector` 是 const fn，查不到这个 id 就是编译错误
-            (None, None) => (
-                format!("detector({:?})", r.id),
-                String::new(),
-                String::new(),
-            ),
+            (None, None) => (format!("detector({:?})", r.id), String::new()),
         };
-        let (about, about_zh) = if matcher.starts_with("detector") {
-            match (&r.about, &r.about_zh) {
-                (Some(en), Some(zh)) if ok(en) && ok(zh) => (en.clone(), zh.clone()),
-                _ => panic!("{at}: a rule whose check is in code needs `about` and `about_zh`"),
+        let about = if matcher.starts_with("detector") {
+            match &r.about {
+                Some(about) if ok(about) => about.clone(),
+                _ => panic!("{at}: a rule whose check is in code needs `about`"),
             }
         } else {
             assert!(
-                r.about.is_none() && r.about_zh.is_none(),
+                r.about.is_none(),
                 "{at}: a prefix rule's description is generated from its prefixes; drop `about`"
             );
-            (about, about_zh)
+            about
         };
         let label = match &r.label {
             Some(l) => format!("Some({l:?})"),
@@ -229,14 +209,12 @@ fn builtins(file: &File) -> String {
         };
         writeln!(
             s,
-            "    Builtin {{ id: {:?}, kind: Kind::{}, name: {:?}, name_zh: {:?}, about: {:?}, \
-             about_zh: {:?}, on_by_default: {}, matcher: {matcher}, label: {label}, hosts: &{:?} }},",
+            "    Builtin {{ id: {:?}, kind: Kind::{}, name: {:?}, about: {:?}, \
+             on_by_default: {}, matcher: {matcher}, label: {label}, hosts: &{:?} }},",
             r.id,
             variant(&r.kind),
             r.name,
-            r.name_zh,
             about,
-            about_zh,
             r.on_by_default,
             r.hosts,
         )
@@ -246,9 +224,9 @@ fn builtins(file: &File) -> String {
     s
 }
 
-/// 前缀类规则的说明，英文和中文。尾巴要求（最短几个、什么字符）一样的前缀连成一段，段的先后
+/// 前缀类规则的英文说明。尾巴要求（最短几个、什么字符）一样的前缀连成一段，段的先后
 /// 按各自第一次出现的位置（`hvs.`、`hvb.` 尾长不同就是两段）
-fn describe(list: &[Prefix]) -> (String, String) {
+fn describe(list: &[Prefix]) -> String {
     let mut runs: Vec<(usize, Tail, Vec<String>)> = Vec::new();
     for p in list {
         let code = format!("`{}`", p.prefix);
@@ -260,8 +238,7 @@ fn describe(list: &[Prefix]) -> (String, String) {
             None => runs.push((p.min_tail, p.tail, vec![code])),
         }
     }
-    let en = runs
-        .iter()
+    runs.iter()
         .enumerate()
         .map(|(i, (n, t, ps))| {
             // 分号后面接着的一段不大写
@@ -273,13 +250,7 @@ fn describe(list: &[Prefix]) -> (String, String) {
             )
         })
         .collect::<Vec<_>>()
-        .join("; ");
-    let zh = runs
-        .iter()
-        .map(|(n, t, ps)| format!("{} 开头，其后至少 {n} 个{}", ps.join("、"), t.zh()))
-        .collect::<Vec<_>>()
-        .join("；");
-    (en, zh)
+        .join("; ")
 }
 
 /// `a`、`a or b`、`a, b or c`

@@ -1226,7 +1226,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`SpecSource::Upstream`] 表示上游报告的规格。请求库 SCHEMA 不变。
 /// **61 起支持 Core 执行联网工具**：新增 `WebTools`、`SaveWebTools` 和 `TestWebTool`。
 /// 搜索、网页读取和页内查找共用当前连接 Core 的配置。请求库 SCHEMA 不变。
-pub const CONTROL_API_VERSION: u32 = 61;
+/// **62 起防护规则和分组视图只返回英文说明**：客户端用规则 ID 和分组 slug 查译文。
+/// 请求库 SCHEMA 不变。
+pub const CONTROL_API_VERSION: u32 = 62;
 
 /// `/live` 的速度看最近多久（见 [`LiveView::tokens_per_sec`]），毫秒
 pub const LIVE_RATE_WINDOW_MS: u64 = 3_000;
@@ -6627,7 +6629,7 @@ pub struct RuleSnapshot {
     pub builtin: bool,
     /// 内置规则的 id，或者自定义规则的名字
     pub id: String,
-    /// 显示的名字：内置规则的英文名（中文名按 id 在规则视图里取 `name_zh`），自定义规则就是它的名字
+    /// The built-in rule's English name, or the custom rule's original name.
     pub name: String,
     /// 自定义规则写的样子，原样（正则、关键词、码位）。内置规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]

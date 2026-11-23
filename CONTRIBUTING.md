@@ -63,6 +63,15 @@ desktop app runs on, so they live in the desktop app (its `tw-adopt` and
 `tw-scan` crates), and the only control-plane endpoint they use is
 `POST /clients/{id}/key`, which issues a client its own gateway key.
 
+## Runtime text
+
+Core-authored runtime text is written in English. Use a stable message
+code and named arguments for messages the clients translate. Built-in
+security rules expose stable IDs, group slugs, and English display text.
+Client applications own the translations for those IDs and slugs. Rule
+patterns, user-supplied names, and upstream text retain their original
+language.
+
 ## Commit messages
 
 Conventional Commits (`fix(scope): subject`), in **English** — this is a

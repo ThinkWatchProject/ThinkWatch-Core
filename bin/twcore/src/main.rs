@@ -622,8 +622,8 @@ fn cmd_remote(path: &Path, what: RemoteCmd) -> Result<()> {
 fn cmd_init(path: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         anyhow::bail!(
-            "{} 已存在。如需重新生成，请添加 --force。\n\
-             这会覆盖当前配置，其中的密钥也将丢失",
+            "{} already exists. To regenerate it, pass --force.\n\
+             This will overwrite the current configuration and discard the keys in it.",
             path.display()
         );
     }
@@ -784,9 +784,9 @@ fn cmd_check(path: &Path) -> Result<()> {
 
 fn already_running(dir: &Path, pid: u32) -> anyhow::Error {
     anyhow::anyhow!(
-        "已有 twcore 实例正在运行（pid {pid}）。\n\
-         两个实例无法共用同一个网关端口，请先停止该实例。\n\
-         如果该进程实际已退出，请删除 {} 后重试",
+        "A twcore instance is already running (PID {pid}).\n\
+         Stop it before starting another instance on the same gateway port.\n\
+         If that process has already exited, remove {} and retry.",
         dir.join("twcore.lock").display()
     )
 }

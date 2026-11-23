@@ -5,22 +5,12 @@ use std::collections::HashSet;
 
 use super::{BUILTINS, DETECTORS, KIND_NAMES, Kind, Matcher, builtin};
 
-/// 界面文案的规矩：书面陈述，不出现「你」「我」
-fn written(zh: &str) -> bool {
-    !zh.contains('你') && !zh.contains('我')
-}
-
 #[test]
-fn every_rule_has_a_name_and_says_what_it_matches_in_both_languages() {
+fn every_rule_has_an_english_name_and_description() {
     let mut ids = HashSet::new();
     for b in BUILTINS {
         assert!(ids.insert(b.id), "{} 出现了两次", b.id);
-        for (field, text) in [
-            ("name", b.name),
-            ("name_zh", b.name_zh),
-            ("about", b.about),
-            ("about_zh", b.about_zh),
-        ] {
+        for (field, text) in [("name", b.name), ("about", b.about)] {
             assert!(!text.trim().is_empty(), "{} 没有 {field}", b.id);
             // 反引号成对：界面按它切出代码样式的那几段
             assert_eq!(
@@ -30,7 +20,6 @@ fn every_rule_has_a_name_and_says_what_it_matches_in_both_languages() {
                 b.id
             );
         }
-        assert!(written(b.name_zh) && written(b.about_zh), "{}", b.id);
     }
 }
 
@@ -86,12 +75,10 @@ fn every_kind_has_names_in_the_order_the_ui_groups_by() {
     let listed: Vec<Kind> = KIND_NAMES.iter().map(|k| k.kind).collect();
     assert_eq!(listed, all, "数据文件里分组的顺序就是 Kind 的顺序");
     for k in KIND_NAMES {
-        assert!(!k.name.trim().is_empty() && !k.name_zh.trim().is_empty());
-        assert!(written(k.name_zh));
+        assert!(!k.name.trim().is_empty());
         assert_eq!(k.kind.name(), k.name);
-        assert_eq!(k.kind.name_zh(), k.name_zh);
     }
-    assert_eq!(Kind::AiServices.name_zh(), "AI 服务");
+    assert_eq!(Kind::AiServices.name(), "AI services");
 }
 
 /// 判据在代码里的规则：数据里每一条都在 [`DETECTORS`] 里（编译期就查过，这里再对一遍值），
@@ -120,17 +107,13 @@ fn every_detector_has_a_rule_in_the_data() {
 fn a_description_lists_what_its_detector_lists() {
     let quoted = |s: &str| format!("`{s}`");
     for b in BUILTINS {
-        let (en, zh) = (b.about, b.about_zh);
+        let en = b.about;
         match b.matcher {
             Matcher::Assignment { suffixes: items }
             | Matcher::Labeled { names: items }
             | Matcher::DomainSuffix { suffixes: items } => {
                 for i in items {
-                    assert!(
-                        en.contains(&quoted(i)) && zh.contains(&quoted(i)),
-                        "{} 的说明里没有 {i}",
-                        b.id
-                    );
+                    assert!(en.contains(&quoted(i)), "{} 的说明里没有 {i}", b.id);
                 }
             }
             Matcher::BankCard { networks } => {
@@ -140,11 +123,11 @@ fn a_description_lists_what_its_detector_lists() {
             }
             Matcher::OpenaiLegacy { min_len } => {
                 let n = min_len.to_string();
-                assert!(en.contains(&n) && zh.contains(&n), "{}", b.id);
+                assert!(en.contains(&n), "{}", b.id);
             }
             Matcher::CnResidentId { born_since } => {
                 let n = born_since.to_string();
-                assert!(en.contains(&n) && zh.contains(&n), "{}", b.id);
+                assert!(en.contains(&n), "{}", b.id);
             }
             _ => {}
         }
@@ -164,7 +147,6 @@ fn rules_that_replace_only_the_value_say_so() {
         );
         if placed {
             assert!(b.about.contains("only the"), "{}：{}", b.id, b.about);
-            assert!(b.about_zh.contains("只换"), "{}：{}", b.id, b.about_zh);
         }
     }
 }
@@ -178,10 +160,6 @@ fn a_prefix_rule_is_described_from_its_prefixes() {
         "Starts with `hvs.`, followed by at least 90 characters; \
          starts with `hvb.`, followed by at least 138 characters"
     );
-    assert_eq!(
-        vault.about_zh,
-        "`hvs.` 开头，其后至少 90 个字符；`hvb.` 开头，其后至少 138 个字符"
-    );
     let shopify = builtin("shopify-token").unwrap();
     assert_eq!(
         shopify.about,
@@ -192,7 +170,6 @@ fn a_prefix_rule_is_described_from_its_prefixes() {
         key.about,
         "Starts with `sk-ant-`, followed by at least 20 characters"
     );
-    assert_eq!(key.about_zh, "`sk-ant-` 开头，其后至少 20 个字符");
 }
 
 /// 服务商域名只给拿到就能用的凭据写：别的规则不参与「凭据发往陌生主机」，写了也没人用

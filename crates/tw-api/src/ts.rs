@@ -514,11 +514,8 @@ mod tests {
             "matcher: Matcher",
             "scope?: Array<ContentScope>",
             "replacement?: string",
-            // 名字、说明由 core 给，中英文各一个字段
-            "name_zh?: string",
-            "why_zh?: string",
+            "name: string",
             "about?: string",
-            "about_zh?: string",
         ] {
             assert!(rule.contains(field), "{field}: {rule}");
         }
@@ -528,9 +525,10 @@ mod tests {
             decl_of(&ts, "GuardDetail")
         );
         let kind = decl_of(&ts, "SecurityKindView");
-        for field in ["slug: string", "name: string", "name_zh: string"] {
+        for field in ["slug: string", "name: string"] {
             assert!(kind.contains(field), "{field}: {kind}");
         }
+        assert!(!rule.contains("_zh") && !kind.contains("_zh"));
         assert_eq!(
             decl_of(&ts, "ContentScope"),
             "export type ContentScope = \"request\" | \"response\""

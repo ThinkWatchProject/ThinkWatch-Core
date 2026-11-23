@@ -245,6 +245,11 @@ fn product_text_is_written_not_spoken() {
             if FORMAT.contains(&lit.as_str()) || lit.contains("CREATE TABLE") {
                 continue;
             }
+            if rel_path.starts_with("bin/twcore/src")
+                && lit.chars().any(|c| matches!(c, '\u{3400}'..='\u{9fff}'))
+            {
+                found.push(format!("{rel}:{line}: write CLI output in English"));
+            }
             for w in SPOKEN.iter().filter(|w| lit.contains(**w)) {
                 found.push(format!("{rel}:{line}  「{w}」  {lit}"));
             }
@@ -267,7 +272,7 @@ fn product_text_is_written_not_spoken() {
 
     assert!(
         found.is_empty(),
-        "这些文字用了口语或人称：\n{}",
+        "Product copy violations:\n{}",
         found.join("\n")
     );
 }

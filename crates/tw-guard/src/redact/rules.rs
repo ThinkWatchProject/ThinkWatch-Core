@@ -121,11 +121,6 @@ impl Kind {
         self.names().name
     }
 
-    /// 分组的中文名
-    pub fn name_zh(&self) -> &'static str {
-        self.names().name_zh
-    }
-
     fn names(&self) -> &'static KindName {
         KIND_NAMES
             .iter()
@@ -252,13 +247,9 @@ pub struct Builtin {
     pub kind: Kind,
     /// 英文名
     pub name: &'static str,
-    /// 中文名
-    pub name_zh: &'static str,
     /// 认什么，给人看的一句话（英文）。按位置认的写明只换哪一段；反引号括起来的一段是代码。
     /// 前缀类的规则由 build.rs 按前缀和长度生成
     pub about: &'static str,
-    /// 同上，中文
-    pub about_zh: &'static str,
     /// 出厂时开不开。**关着的是内网地址和邮箱、手机号**：它们在代码和文档里到处
     /// 都是，按「长得像」认误报得多，而危害远小于一把 key，想脱的人自己开
     pub on_by_default: bool,
@@ -343,7 +334,6 @@ pub const BUILTINS: &[Builtin] = include!(concat!(env!("OUT_DIR"), "/redact_buil
 pub struct KindName {
     pub kind: Kind,
     pub name: &'static str,
-    pub name_zh: &'static str,
 }
 
 /// 每个分组的名字，按界面上的顺序（和 [`Kind`] 的定义顺序一致，测试钉着）。
