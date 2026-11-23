@@ -148,8 +148,6 @@ pub struct Builtin {
     pub id: String,
     /// 英文名
     pub name: String,
-    /// 中文名
-    pub name_zh: String,
     /// 码位规则写的是码位（`U+E0000–U+E007F`）
     pub pattern: String,
     #[serde(rename = "match")]
@@ -165,9 +163,6 @@ pub struct Builtin {
     /// 为什么值得看一眼（英文）。规则名说不清的才写
     #[serde(default)]
     pub why: String,
-    /// 同上，中文。`why` 有的它都有
-    #[serde(default)]
-    pub why_zh: String,
 }
 
 /// `data/content.yaml` 整个文件：分组的名字和规则。
@@ -1070,16 +1065,11 @@ mod tests {
                 .all(|b| b.name.is_ascii() && b.why.is_ascii()),
             "name、why 是英文"
         );
-        // 中文名每条都有，说明有英文的就有中文的
-        for b in builtins() {
-            assert!(!b.name_zh.trim().is_empty(), "{} 没有中文名", b.id);
-            assert_eq!(b.why.is_empty(), b.why_zh.is_empty(), "{}", b.id);
-        }
         // 每条的分组都有名字
         for b in builtins() {
             let k = kinds().iter().find(|k| k.slug == b.group);
             assert!(
-                k.is_some_and(|k| !k.name.is_empty() && !k.name_zh.is_empty()),
+                k.is_some_and(|k| !k.name.is_empty()),
                 "{} 的分组 {} 没有名字",
                 b.id,
                 b.group

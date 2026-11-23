@@ -168,7 +168,7 @@ pub enum Matcher {
     /// 代码里实现的内置检查，没有可展示的模式：工具调用审查的「凭据发往陌生主机」
     /// （`credential-to-network`）、「上传本地文件到外部主机」（`file-to-network`）；
     /// 出站脱敏里按校验位、词表、位置认的那些（`check` 就是规则 id）。
-    /// `check` 是稳定的检查名。出站脱敏的说明在规则的 `about` / `about_zh` 里
+    /// `check` 是稳定的检查名。出站脱敏的说明在规则的 `about` 里
     Builtin { check: String },
 }
 
@@ -211,27 +211,15 @@ pub struct RuleView {
     pub custom: bool,
     /// 英文名；自定义规则就是用户起的名字
     pub name: String,
-    /// 中文名。内置规则都有；自定义规则没有（名字原样显示，不分语言）。
-    ///
-    /// **规则的名字和说明只在 core 写一份**（`data/redact.yaml`、`rules.yaml`、
-    /// `content.yaml`），界面按自己的语言取 `name` 或 `name_zh`，不再自己存名称表
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name_zh: String,
     /// 为什么值得看一眼（英文）：工具调用审查和内容过滤的内置规则，规则名说不清的才有。
     /// 自定义规则没有
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
-    /// 同上，中文。`why` 有的它都有
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub why_zh: String,
     /// 认什么，给人看的一句话（英文）：出站脱敏的内置规则都有，别的没有。按位置认的写明只换
     /// 哪一段（「only the value is replaced」）。**反引号括起来的一段是代码**（前缀、写法），
     /// 界面按代码样式显示、不显示反引号本身；反引号总是成对的
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub about: String,
-    /// 同上，中文
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub about_zh: String,
     /// 分组，[`GuardDetail::kinds`] 里的一个 `slug`。出站脱敏：`saved` / `ai-services` …
     /// `internal` / `custom`；工具调用审查：`command` / `custom`；内容过滤：`invisible` /
     /// `injection` / `persona` / `chinese` / `custom`
@@ -270,7 +258,7 @@ pub struct GuardDetail {
     /// 按界面上的顺序：内置的在前，自定义的在后
     pub rules: Vec<RuleView>,
     /// 规则表的分组，按界面上的顺序；`rules` 里每一条的 `kind` 都在这里，最后一组是
-    /// `custom`（没有自定义规则时也在）。界面的分组名取这里的 `name` / `name_zh`
+    /// `custom`（没有自定义规则时也在）。界面的分组名取这里的英文名 `name`，客户端按 `slug` 查译文
     #[serde(default)]
     pub kinds: Vec<KindView>,
 }
@@ -283,8 +271,6 @@ pub struct KindView {
     pub slug: String,
     /// 英文名
     pub name: String,
-    /// 中文名
-    pub name_zh: String,
 }
 
 impl KindView {
@@ -292,7 +278,6 @@ impl KindView {
         KindView {
             slug: k.slug().to_string(),
             name: k.name().to_string(),
-            name_zh: k.name_zh().to_string(),
         }
     }
 
@@ -401,11 +386,8 @@ pub fn redact(p: &RedactPolicy) -> GuardDetail {
             id: b.id.to_string(),
             custom: false,
             name: b.name.to_string(),
-            name_zh: b.name_zh.to_string(),
             why: String::new(),
-            why_zh: String::new(),
             about: b.about.to_string(),
-            about_zh: b.about_zh.to_string(),
             kind: b.kind.slug().to_string(),
             matcher: matcher(b),
             enabled: p.builtin_on(b),
@@ -421,11 +403,8 @@ pub fn redact(p: &RedactPolicy) -> GuardDetail {
         id: c.name.clone(),
         custom: true,
         name: c.name.clone(),
-        name_zh: String::new(),
         why: String::new(),
-        why_zh: String::new(),
         about: String::new(),
-        about_zh: String::new(),
         kind: "custom".into(),
         matcher: match c.matching {
             ContentMatch::Regex => Matcher::Regex {
@@ -467,11 +446,8 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
             id: r.id.clone(),
             custom: false,
             name: r.name.clone(),
-            name_zh: r.name_zh.clone(),
             why: r.why.clone(),
-            why_zh: r.why_zh.clone(),
             about: String::new(),
-            about_zh: String::new(),
             kind: "command".into(),
             // 代码实现的规则没有可展示的正则，给界面一个专门的 matcher
             matcher: match &r.check {
@@ -496,11 +472,8 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
         id: c.name.clone(),
         custom: true,
         name: c.name.clone(),
-        name_zh: String::new(),
         why: String::new(),
-        why_zh: String::new(),
         about: String::new(),
-        about_zh: String::new(),
         kind: "custom".into(),
         matcher: Matcher::Regex {
             pattern: c.pattern.clone(),
@@ -574,11 +547,8 @@ pub fn content(p: &ContentPolicy) -> GuardDetail {
             id: b.id.clone(),
             custom: false,
             name: b.name.clone(),
-            name_zh: b.name_zh.clone(),
             why: b.why.clone(),
-            why_zh: b.why_zh.clone(),
             about: String::new(),
-            about_zh: String::new(),
             kind: b.group.clone(),
             matcher: content_matcher(b.matching, &b.pattern, false, false),
             enabled: p.builtin_on(b),
@@ -595,11 +565,8 @@ pub fn content(p: &ContentPolicy) -> GuardDetail {
         id: c.name.clone(),
         custom: true,
         name: c.name.clone(),
-        name_zh: String::new(),
         why: String::new(),
-        why_zh: String::new(),
         about: String::new(),
-        about_zh: String::new(),
         kind: "custom".into(),
         matcher: content_matcher(c.matching.engine(), &c.pattern, true, c.case_sensitive),
         enabled: !c.disabled,
@@ -1156,10 +1123,17 @@ mod tests {
         rebuilt.check().unwrap();
     }
 
-    /// 名字、说明、分组名都由 core 给：每条内置规则中英文都有，每条规则的分组都列在 `kinds`
-    /// 里，最后一组是「自定义」
+    /// Core supplies English labels, and every rule's group is listed in `kinds`.
     #[test]
-    fn every_view_names_its_rules_and_groups_in_both_languages() {
+    fn every_view_names_its_rules_and_groups_in_english() {
+        // Quoted literals are examples of what a detector matches, and can be in any language.
+        let english = |text: &str| {
+            !text
+                .split(['`', '“', '”'])
+                .step_by(2)
+                .flat_map(str::chars)
+                .any(|c| matches!(c, '\u{3400}'..='\u{9fff}'))
+        };
         let p = Security {
             redact: RedactPolicy {
                 custom: vec![CustomRedactRule {
@@ -1184,11 +1158,8 @@ mod tests {
             let slugs: Vec<&str> = g.kinds.iter().map(|k| k.slug.as_str()).collect();
             assert_eq!(slugs.last(), Some(&"custom"), "{guard}");
             for k in &g.kinds {
-                assert!(
-                    !k.name.is_empty() && !k.name_zh.is_empty(),
-                    "{guard} {}",
-                    k.slug
-                );
+                assert!(!k.name.is_empty(), "{guard} {}", k.slug);
+                assert!(english(&k.name), "{guard} {}", k.slug);
             }
             for r in &g.rules {
                 assert!(
@@ -1197,18 +1168,18 @@ mod tests {
                     r.id
                 );
                 if r.custom {
-                    assert!(r.name_zh.is_empty() && r.why_zh.is_empty() && r.about.is_empty());
+                    assert_eq!(r.name, "项目号");
+                    assert!(r.why.is_empty() && r.about.is_empty());
                     continue;
                 }
+                assert!(!r.name.is_empty(), "{guard} {}", r.id);
                 assert!(
-                    !r.name.is_empty() && !r.name_zh.is_empty(),
+                    english(&r.name) && english(&r.why) && english(&r.about),
                     "{guard} {}",
                     r.id
                 );
-                assert_eq!(r.why.is_empty(), r.why_zh.is_empty(), "{guard} {}", r.id);
                 let redact = guard == "redact";
                 assert_eq!(!r.about.is_empty(), redact, "{guard} {}", r.id);
-                assert_eq!(!r.about_zh.is_empty(), redact, "{guard} {}", r.id);
             }
             // 分组按界面顺序：规则先出现的组排在前面
             let mut last = 0;
@@ -1218,10 +1189,10 @@ mod tests {
                 last = at;
             }
         }
-        assert_eq!(d.redact.kinds[0].name_zh, "保存的密钥");
+        assert_eq!(d.redact.kinds[0].name, "Saved credentials");
         assert_eq!(d.content.kinds[0].slug, "invisible");
         let anthropic = d.redact.rules.iter().find(|r| r.id == "anthropic-api-key");
-        assert_eq!(anthropic.unwrap().name_zh, "Anthropic API 密钥");
+        assert_eq!(anthropic.unwrap().name, "Anthropic API key");
     }
 
     #[test]
@@ -1237,26 +1208,27 @@ mod tests {
         assert_eq!(key["action"], "placeholder");
         assert_eq!(key["default_action"], "placeholder");
         assert!(key.get("why").is_none() && key.get("scope").is_none());
-        // 名字、说明中英文各一个字段；分组名在 `kinds`
+        // 显示文案用英文，客户端按 id 和 slug 查译文
         assert_eq!(key["id"], "thinkwatch-saved-secret");
-        assert_eq!(key["name_zh"], "ThinkWatch 中保存的密钥");
-        for field in ["name", "about", "about_zh"] {
+        assert_eq!(key["name"], "Credentials saved in ThinkWatch");
+        for field in ["name", "about"] {
             assert!(
                 key[field].as_str().is_some_and(|s| !s.is_empty()),
                 "{field}"
             );
         }
-        assert!(key.get("why_zh").is_none(), "没有的不写");
+        assert!(key.get("name_zh").is_none() && key.get("about_zh").is_none());
         assert_eq!(
             v["redact"]["kinds"][1],
-            serde_json::json!({"slug": "ai-services", "name": "AI services", "name_zh": "AI 服务"})
+            serde_json::json!({"slug": "ai-services", "name": "AI services"})
         );
         let curl = &v["inspect_tools"]["rules"][0];
-        assert_eq!(curl["name_zh"], "下载即执行");
-        assert!(curl["why_zh"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(curl["name"], "Download and run");
+        assert!(curl["why"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(curl.get("why_zh").is_none());
         assert!(curl.get("about").is_none());
         assert_eq!(v["inspect_tools"]["kinds"][0]["slug"], "command");
-        assert_eq!(tags["name_zh"], "Unicode 标签字符");
+        assert_eq!(tags["name"], "Unicode tag characters");
         assert_eq!(tags["scope"], serde_json::json!(["request"]));
         assert_eq!(tags["replacement"], "***");
         assert_eq!(

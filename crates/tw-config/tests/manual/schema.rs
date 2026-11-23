@@ -2505,7 +2505,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             };
             for b in tw_guard::redact::rules::BUILTINS {
                 let on = if b.on_by_default { yes } else { no };
-                let name = if zh { b.name_zh } else { b.name };
+                let name = b.name;
                 out += &format!("| `{}` | {name} | {on} |\n", b.id);
             }
         }
@@ -2517,7 +2517,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             };
             for s in &tw_guard::tools::rules::builtin().dangerous {
                 let a = ToolAction::factory(s).slug();
-                let name = if zh { &s.name_zh } else { &s.name };
+                let name = &s.name;
                 out += &format!("| `{}` | {name} | `{a}` |\n", s.id);
             }
         }
@@ -2530,7 +2530,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             for b in tw_guard::content::builtins() {
                 let on = if b.on_by_default { yes } else { no };
                 let a = ContentAction::factory(b).slug();
-                let name = if zh { &b.name_zh } else { &b.name };
+                let name = &b.name;
                 out += &format!("| `{}` | {name} | {} | {on} | `{a}` |\n", b.id, b.group);
             }
         }

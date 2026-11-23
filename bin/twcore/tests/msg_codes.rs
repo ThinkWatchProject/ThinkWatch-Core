@@ -402,6 +402,23 @@ fn only_placeholders(t: &str) -> bool {
     rest.is_empty()
 }
 
+#[test]
+fn core_message_templates_do_not_include_client_translations() {
+    let (sites, _) = scan(&workspace());
+    for site in sites.iter().filter(|site| !site.test) {
+        if let Some(template) = &site.template {
+            assert!(
+                !template
+                    .chars()
+                    .any(|c| matches!(c, '\u{3400}'..='\u{9fff}')),
+                "{}:{}: write Core message templates in English",
+                site.file,
+                site.line,
+            );
+        }
+    }
+}
+
 /// 按源码生成的清单全文。
 fn manifest(root: &Path) -> String {
     let (sites, consts) = scan(root);

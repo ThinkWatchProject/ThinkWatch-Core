@@ -38,15 +38,9 @@ pub struct RuleSpec {
     pub id: String,
     /// 界面上的名字（英文）
     pub name: String,
-    /// 界面上的名字（中文）。内置规则都有，测试钉着
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name_zh: String,
     pub pattern: String,
     /// **为什么它值得看一眼。**没有这一句，一条命中就只是个规则 id
     pub why: String,
-    /// 同上，中文
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub why_zh: String,
     /// `high` 或 `medium`。不写按 medium 算。
     ///
     /// **只有 high 会在拦截档下切断。**分级的判据是「它能不能一步拿到
@@ -346,10 +340,8 @@ fn custom_rule(c: Custom<'_>) -> Result<Rule, RuleError> {
     let spec = RuleSpec {
         id: c.name.to_string(),
         name: c.name.to_string(),
-        name_zh: String::new(),
         pattern: c.pattern.to_string(),
         why: String::new(),
-        why_zh: String::new(),
         level: Some(if c.cut { "high" } else { "medium" }.to_string()),
         check: None,
     };
@@ -394,33 +386,18 @@ mod tests {
         );
     }
 
-    /// 名字和说明只在这里写一份（界面不再存名称表），中英文都要有
     #[test]
-    fn every_builtin_rule_is_named_and_explained_in_both_languages() {
+    fn every_builtin_rule_has_an_english_name_and_explanation() {
         let f = builtin();
         for x in f.injection.iter().chain(&f.dangerous) {
-            for (field, text) in [
-                ("name", &x.name),
-                ("name_zh", &x.name_zh),
-                ("why", &x.why),
-                ("why_zh", &x.why_zh),
-            ] {
+            for (field, text) in [("name", &x.name), ("why", &x.why)] {
                 assert!(!text.trim().is_empty(), "{} 没写 {field}", x.id);
             }
             assert!(x.name.is_ascii() && x.why.is_ascii(), "{}", x.id);
-            assert!(
-                !x.name_zh.contains(['你', '我']) && !x.why_zh.contains(['你', '我']),
-                "{}：界面文案是书面陈述",
-                x.id
-            );
         }
         let slugs: Vec<&str> = f.kinds.iter().map(|k| k.slug.as_str()).collect();
         assert_eq!(slugs, ["command"]);
-        assert!(
-            f.kinds
-                .iter()
-                .all(|k| !k.name.is_empty() && !k.name_zh.is_empty())
-        );
+        assert!(f.kinds.iter().all(|k| !k.name.is_empty()));
     }
 
     #[test]
